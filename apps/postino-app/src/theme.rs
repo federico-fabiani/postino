@@ -18,7 +18,8 @@ pub const GOLD: Color32 = Color32::from_rgb(0xE4, 0xB9, 0x6A);
 /// A darker gold for text on ivory, where the light gold would fail contrast.
 pub const GOLD_INK: Color32 = Color32::from_rgb(0x8A, 0x5A, 0x12);
 pub const MUTED: Color32 = Color32::from_rgb(0x4F, 0x61, 0x57);
-pub const FAINT: Color32 = Color32::from_rgb(0x6E, 0x7D, 0x73);
+/// Metadata on ivory. Previously `#6E7D73` (3.66:1); this is 4.75:1.
+pub const FAINT: Color32 = Color32::from_rgb(0x5C, 0x6B, 0x61);
 pub const BORDER: Color32 = Color32::from_rgb(0xD9, 0xC9, 0xA8);
 pub const DANGER: Color32 = Color32::from_rgb(0x9A, 0x3B, 0x2A);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x36, 0x6B, 0x4A);
@@ -105,6 +106,12 @@ pub fn medium() -> FontFamily {
     FontFamily::Name("Postino Medium".into())
 }
 
+/// Icons live in their own family. Inter has private-use glyphs for stylistic alternates, so an
+/// icon must never rely on the proportional fallback: the PUA codepoints collide.
+pub fn icon() -> FontFamily {
+    FontFamily::Name("Postino Icons".into())
+}
+
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("Inter".to_owned(), Arc::new(FontData::from_static(include_bytes!("../../../assets/fonts/Inter-Regular.ttf"))));
@@ -118,6 +125,12 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(1, "Inter".to_owned());
     fonts.families.insert(display(), vec!["Inter SemiBold".to_owned(), "Inter".to_owned()]);
     fonts.families.insert(medium(), vec!["Inter Medium".to_owned(), "Inter".to_owned()]);
+
+    // Keep icons isolated. Inter maps several of Phosphor's PUA codepoints to stylistic
+    // alternates (`U+E214` becomes `uni1E72.ss07`), so a shared fallback would render letters.
+    fonts.font_data.insert("Phosphor".to_owned(), Arc::new(FontData::from_static(egui_phosphor::Variant::Regular.font_bytes())));
+    fonts.families.insert(icon(), vec!["Phosphor".to_owned()]);
+
     ctx.set_fonts(fonts);
 }
 
@@ -159,11 +172,11 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
 
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    style.spacing.interact_size.y = 30.0;
+    style.spacing.interact_size.y = 32.0;
     style.text_styles.insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
-    style.text_styles.insert(TextStyle::Button, FontId::new(14.0, FontFamily::Proportional));
-    style.text_styles.insert(TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
-    style.text_styles.insert(TextStyle::Heading, FontId::new(22.0, display()));
-    style.text_styles.insert(TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace));
+    style.text_styles.insert(TextStyle::Button, FontId::new(13.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Small, FontId::new(11.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Heading, FontId::new(20.0, display()));
+    style.text_styles.insert(TextStyle::Monospace, FontId::new(11.5, FontFamily::Monospace));
     ctx.set_style_of(theme, style);
 }

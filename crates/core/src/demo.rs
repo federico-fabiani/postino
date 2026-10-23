@@ -14,7 +14,7 @@ pub fn seed() -> Engine {
         id: ACCOUNT_ID.to_owned(),
         name: "Federico".to_owned(),
         email: "federico@example.it".to_owned(),
-        provider: "Aruba · demo".to_owned(),
+        provider: "Aruba".to_owned(),
     }];
     let folders = vec![
         folder("inbox", "Posta in arrivo", FolderKind::Inbox),

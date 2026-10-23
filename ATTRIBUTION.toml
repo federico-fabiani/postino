@@ -81,6 +81,66 @@ sha256 = "6c77314b6cf32650367cd5405b4cf5ed93176041325c223ad039f0458943f87d"
 usage = "Documentation screenshot of the M0 desktop shell"
 
 [[asset]]
+path = "docs/images/postino-ui-kit.png"
+title = "Postino UI kit, light theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "30becf0b4417dd8302d26909b514a27e7f695d4a8a38d72d6a0df82236a2f8ca"
+usage = "Documentation screenshot of the U0.1 component gallery, light theme"
+
+[[asset]]
+path = "docs/images/postino-ui-kit-dark.png"
+title = "Postino UI kit, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "375eb21101a12845b5c8cb812abd21652bdd74d7f7302120082a84af1e7334f5"
+usage = "Documentation screenshot of the U0.1 component gallery, dark theme"
+
+[[asset]]
+path = "docs/images/postino-u02.png"
+title = "Postino U0.2 shell"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "46c3b6669fc826f59f3a97f3e7549a08fdd78890ef78cd97f8011381b02fcf4e"
+usage = "Documentation screenshot of the U0.2 shell with the custom title bar"
+
+[[asset]]
+path = "docs/images/postino-u02-reading.png"
+title = "Postino U0.2 reading pane"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "ea29554a337cc7ce3a2d38b5a7f2019192ee2f82270ef05580a828e7ebc24746"
+usage = "Documentation screenshot of the U0.2 split reading view"
+
+[[asset]]
+path = "docs/images/postino-u02-full.png"
+title = "Postino U0.2 full-screen reading"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "8b9766e909c0fb24c11bdec5a7ba0d8459573abc94f58ae4bb6eaf68c7e05fb3"
+usage = "Documentation screenshot of the U0.2 full-screen message view"
+
+[[asset]]
+path = "docs/images/postino-u02-dark.png"
+title = "Postino U0.2 shell, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "08bb35cdb23e98988665d79542292ad52d3b03f971cb34d4b058b6a509ac8c10"
+usage = "Documentation screenshot of the U0.2 shell in the dark theme"
+
+[[asset]]
 path = "assets/app-icon/postino-256.png"
 title = "Postino application icon"
 author = "Postino contributors"
@@ -99,3 +159,24 @@ license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
 sha256 = "f25a58d324efc0479a9eb83bd610fedf946bbefe12d0669a147c46497b65548f"
 usage = "Original design sketch, kept for reference"
+
+# Cargo dependencies that carry licensed assets (an icon font, not a vendored file).
+[[dependency]]
+name = "egui-phosphor"
+version = "0.14.0"
+title = "egui-phosphor"
+author = "Romet Tagobert and contributors"
+source = "https://github.com/amPerl/egui-phosphor"
+license = "MIT"
+license_file = "assets/licenses/egui-phosphor-MIT.txt"
+usage = "Phosphor icon font bindings for egui"
+
+[[dependency]]
+name = "Phosphor Icons"
+version = "bundled with egui-phosphor 0.14.0"
+title = "Phosphor Icons"
+author = "Phosphor Icons contributors"
+source = "https://github.com/phosphor-icons/core"
+license = "MIT"
+license_file = "assets/licenses/phosphor-icons-MIT.txt"
+usage = "Icon vocabulary in the Postino UI"

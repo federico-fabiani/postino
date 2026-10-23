@@ -2,11 +2,19 @@
 //! Every action goes through `Engine::call`, the same operation registry the CLI and MCP expose.
 
 use chrono::{DateTime, Datelike, Local, Utc};
-use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Key, Layout, Margin, RichText, Sense, Stroke, Ui, Vec2};
-use postino_core::{Engine, Folder, MessageSummary, MessagesList, SearchResult};
+use eframe::egui::containers::Sides;
+use eframe::egui::{
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key, Layout, Margin, Rect, ResizeDirection, RichText, Sense,
+    Stroke, Ui, UiBuilder, Vec2, ViewportCommand, WidgetInfo, WidgetType,
+};
+use postino_core::{Engine, FolderKind, MessageSummary, MessagesList, SearchResult};
 use serde_json::json;
 
 use crate::theme::{self, GOLD, IVORY, Tokens};
+use crate::ui::icons;
+use crate::ui::tokens::{inset, radius, size as ui_size, space};
+use crate::ui::typography::{self, Role};
+use crate::ui::widgets::{Button, ButtonSize, Chip, EmptyState, IconButton, ListRow, SearchField, SectionHeader};
 
 pub struct PostinoApp {
     engine: Engine,
@@ -21,19 +29,21 @@ pub struct PostinoApp {
     show_palette: bool,
     palette_query: String,
     palette_focus: bool,
+    custom_chrome: bool,
+    reading_open: bool,
+    reading_full: bool,
 }
 
 impl PostinoApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, custom_chrome: bool) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, false);
-        Self::demo()
+        Self::demo(custom_chrome)
     }
 
-    fn demo() -> Self {
-        let engine = Engine::demo();
-        let mut app = Self {
-            engine,
+    fn demo(custom_chrome: bool) -> Self {
+        Self {
+            engine: Engine::demo(),
             folder: "inbox".to_owned(),
             selected: None,
             query: String::new(),
@@ -45,31 +55,37 @@ impl PostinoApp {
             show_palette: false,
             palette_query: String::new(),
             palette_focus: false,
-        };
-        app.selected = app.first_message_in("inbox");
-        app
-    }
-
-    fn first_message_in(&self, folder: &str) -> Option<String> {
-        self.engine
-            .messages()
-            .iter()
-            .filter(|message| if folder == "starred" { message.summary.starred } else { message.summary.folder_id == folder })
-            .max_by(|left, right| left.summary.date.cmp(&right.summary.date))
-            .map(|message| message.summary.id.clone())
+            custom_chrome,
+            reading_open: false,
+            reading_full: false,
+        }
     }
 
     fn select_folder(&mut self, folder: impl Into<String>) {
         self.folder = folder.into();
         self.query.clear();
-        self.selected = self.first_message_in(&self.folder);
+        self.selected = None;
+        self.reading_open = false;
+        self.reading_full = false;
     }
 
     fn select_message(&mut self, id: String) {
-        self.selected = Some(id.clone());
-        let unread = self.engine.message(&id).is_some_and(|message| message.summary.unread);
-        if unread && let Err(error) = self.engine.call("message_flag", json!({ "id": id, "unread": false })) {
-            self.status = format!("Errore: {error}");
+        self.selected = Some(id);
+        self.reading_open = true;
+    }
+
+    fn move_selected(&mut self, folder: &str, confirmation: &str) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        match self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
+            Ok(_) => {
+                self.status = confirmation.to_owned();
+                self.selected = None;
+                self.reading_open = false;
+                self.reading_full = false;
+            }
+            Err(error) => self.status = format!("Errore: {error}"),
         }
     }
 
@@ -113,10 +129,6 @@ impl PostinoApp {
             return;
         };
         self.set_flag(Some(!message.summary.unread), None);
-    }
-
-    fn sync_now(&mut self) {
-        self.status = "Demo: la sincronizzazione IMAP arriva in M1".to_owned();
     }
 
     fn visible_messages(&mut self) -> (Vec<MessageSummary>, usize, usize) {
@@ -170,12 +182,14 @@ impl PostinoApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let mut palette = false;
         let mut escape = false;
+        let mut enter = false;
         let mut next = false;
         let mut previous = false;
         let typing = ctx.egui_wants_keyboard_input();
         ctx.input(|input| {
             palette = input.modifiers.command && input.key_pressed(Key::K);
             escape = input.key_pressed(Key::Escape);
+            enter = !typing && !input.modifiers.command && input.key_pressed(Key::Enter);
             next = !typing && !input.modifiers.command && input.key_pressed(Key::J);
             previous = !typing && !input.modifiers.command && input.key_pressed(Key::K);
         });
@@ -187,10 +201,18 @@ impl PostinoApp {
             }
         }
         if escape {
+            if self.reading_full {
+                self.reading_full = false;
+            } else if self.reading_open {
+                self.reading_open = false;
+            }
             self.show_palette = false;
             self.show_about = false;
         }
-        if !self.show_palette {
+        if !self.show_palette && !self.show_about {
+            if enter && self.reading_open {
+                self.reading_full = true;
+            }
             if next {
                 self.step_selection(1);
             }
@@ -200,49 +222,131 @@ impl PostinoApp {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut Ui) {
-        let t = theme::tokens(self.dark);
-        egui::Panel::top("top")
-            .exact_size(58.0)
-            .frame(Frame::new().fill(t.chrome).inner_margin(Margin::symmetric(16, 8)))
+    fn title_bar(&mut self, ui: &mut Ui) {
+        egui::Panel::top("titlebar")
+            .exact_size(ui_size::TITLE_BAR)
+            .frame(Frame::new().fill(theme::FOREST).inner_margin(Margin::symmetric(inset::MD, 0)))
             .show_separator_line(false)
             .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    logo(ui, 30.0);
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("postino").font(FontId::new(23.0, theme::display())).color(t.text));
-                    ui.add_space(2.0);
-                    Frame::new().fill(GOLD).corner_radius(4.0).inner_margin(Margin::symmetric(6, 2)).show(ui, |ui| {
-                        ui.label(RichText::new("DEMO").font(FontId::new(9.0, theme::medium())).color(theme::FOREST));
-                    });
-                    ui.add_space(22.0);
-                    ui.add_sized([330.0, 30.0], egui::TextEdit::singleline(&mut self.query).hint_text("Cerca in tutte le mail…"));
-                    if !self.query.is_empty() && ui.add(egui::Button::new("×").frame(false)).clicked() {
-                        self.query.clear();
+                let rect = ui.max_rect();
+                let controls_width = 3.0 * 46.0;
+                let drag_rect = Rect::from_min_max(rect.min, egui::pos2(rect.max.x - controls_width, rect.max.y));
+                let drag = ui.interact(drag_rect, ui.id().with("titlebar-drag"), Sense::click_and_drag());
+                if drag.drag_started() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                }
+                if drag.double_clicked() {
+                    let maximized = ui.ctx().input(|input| input.viewport().maximized.unwrap_or(false));
+                    ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+                }
+                let _ = drag.on_hover_cursor(CursorIcon::Grab);
+
+                let wordmark_rect = Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 240.0, rect.max.y));
+                let controls_rect = Rect::from_min_max(egui::pos2(rect.max.x - controls_width, rect.min.y), rect.max);
+                ui.scope_builder(UiBuilder::new().max_rect(wordmark_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
+                    ui.label(icons::icon(icons::MAIL, 16.0, theme::GOLD));
+                    ui.add_space(space::SM);
+                    ui.label(RichText::new("postino").font(FontId::new(15.0, theme::display())).color(theme::IVORY));
+                });
+                ui.scope_builder(UiBuilder::new().max_rect(controls_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+                    if window_control(ui, icons::CLOSE, "Chiudi", true).clicked() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        avatar(ui, 30.0, "F", t.gold, theme::FOREST);
-                        ui.add_space(8.0);
-                        let label = if self.dark { "Chiaro" } else { "Scuro" };
-                        let theme_button = ui.add(egui::Button::new(RichText::new(label).size(11.0)).frame(false)).on_hover_text("Cambia tema");
-                        if theme_button.clicked() {
-                            self.dark = !self.dark;
-                            theme::apply(ui.ctx(), self.dark);
-                        }
-                        ui.add_space(6.0);
-                        let write = egui::Button::new(RichText::new("Scrivi").font(FontId::new(14.0, theme::medium())).color(if self.dark {
-                            theme::FOREST
-                        } else {
-                            IVORY
-                        }))
-                        .fill(if self.dark { GOLD } else { theme::FOREST });
-                        if ui.add(write).clicked() {
-                            self.status = "Composizione in arrivo (M2)".to_owned();
-                        }
-                        if ui.add(egui::Button::new("Sincronizza").fill(t.panel_alt)).clicked() {
-                            self.sync_now();
-                        }
-                    });
+                    let maximized = ui.ctx().input(|input| input.viewport().maximized.unwrap_or(false));
+                    if window_control(ui, icons::SQUARE, if maximized { "Ripristina" } else { "Ingrandisci" }, false).clicked() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Maximized(!maximized));
+                    }
+                    if window_control(ui, icons::MINUS, "Riduci a icona", false).clicked() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+                    }
+                });
+            });
+    }
+
+    fn resize_handles(&self, ctx: &egui::Context) {
+        if !self.custom_chrome {
+            return;
+        }
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        if maximized {
+            return;
+        }
+        let Some(pos) = ctx.input(|input| input.pointer.interact_pos()) else {
+            return;
+        };
+        let rect = ctx.content_rect();
+        let edge = 5.0;
+        let left = pos.x <= rect.left() + edge;
+        let right = pos.x >= rect.right() - edge;
+        let top = pos.y <= rect.top() + edge;
+        let bottom = pos.y >= rect.bottom() - edge;
+        let direction = match (left, right, top, bottom) {
+            (true, _, true, _) => Some(ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(ResizeDirection::SouthEast),
+            (true, ..) => Some(ResizeDirection::West),
+            (_, true, ..) => Some(ResizeDirection::East),
+            (_, _, true, _) => Some(ResizeDirection::North),
+            (_, _, _, true) => Some(ResizeDirection::South),
+            _ => None,
+        };
+        let Some(direction) = direction else {
+            return;
+        };
+        ctx.set_cursor_icon(match direction {
+            ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwSe,
+            ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNeSw,
+            ResizeDirection::West | ResizeDirection::East => CursorIcon::ResizeHorizontal,
+            ResizeDirection::North | ResizeDirection::South => CursorIcon::ResizeVertical,
+        });
+        if ctx.input(|input| input.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(ViewportCommand::BeginResize(direction));
+        }
+    }
+
+    fn toolbar(&mut self, ui: &mut Ui) {
+        let t = theme::tokens(self.dark);
+        egui::Panel::top("toolbar")
+            .exact_size(ui_size::TOOLBAR)
+            .frame(Frame::new().fill(t.chrome).inner_margin(Margin::symmetric(inset::LG, inset::MD)))
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                let total = rect.width();
+                let side_width = (total * 0.24).min(260.0);
+                let search_width = 420.0_f32.min((total - side_width * 2.0).max(200.0));
+                let left_rect = Rect::from_min_max(rect.min, egui::pos2(rect.min.x + side_width, rect.max.y));
+                let search_rect = Rect::from_center_size(rect.center(), Vec2::new(search_width, 40.0));
+                let right_rect = Rect::from_min_max(egui::pos2(rect.max.x - side_width, rect.min.y), rect.max);
+
+                ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
+                    if let Some(account) = self.engine.accounts().first() {
+                        avatar(ui, 24.0, &initials(&account.name), t.gold, theme::FOREST);
+                        ui.add_space(space::SM);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(typography::strong(Role::BodySmall, account.name.clone(), t.text));
+                            ui.label(typography::text(Role::Caption, account.email.clone(), t.text_faint));
+                        });
+                    }
+                });
+                ui.scope_builder(UiBuilder::new().max_rect(search_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
+                    SearchField::new(&mut self.query, "Cerca in tutte le mail…").width(search_width).show(ui);
+                });
+                ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+                    let _ = Button::primary("Scrivi")
+                        .icon(icons::COMPOSE)
+                        .shortcut("C")
+                        .enabled(false)
+                        .disabled_reason("Il composer arriva in U0.4")
+                        .show(ui);
+                    ui.add_space(space::SM);
+                    let theme_icon = if self.dark { icons::SUN } else { icons::MOON };
+                    if IconButton::new(theme_icon, "Cambia tema").show(ui).clicked() {
+                        self.dark = !self.dark;
+                        theme::apply(ui.ctx(), self.dark);
+                    }
                 });
             });
     }
@@ -250,47 +354,55 @@ impl PostinoApp {
     fn sidebar(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
         egui::Panel::left("folders")
-            .resizable(true)
-            .default_size(242.0)
-            .min_size(204.0)
-            .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(12, 14)))
+            .resizable(false)
+            .exact_size(ui_size::SIDEBAR)
+            .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::LG, inset::XL)))
+            .show_separator_line(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    avatar(ui, 34.0, "F", t.gold, theme::FOREST);
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(RichText::new("Federico").font(FontId::new(14.0, theme::medium())).color(t.text));
-                        ui.label(RichText::new("federico@example.it").size(11.0).color(t.text_muted));
-                        ui.label(RichText::new("Aruba · demo").size(10.0).color(t.text_faint));
+                if let Some(account) = self.engine.accounts().first() {
+                    ui.horizontal(|ui| {
+                        avatar(ui, 34.0, &initials(&account.name), t.gold, theme::FOREST);
+                        ui.add_space(space::SM);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(typography::strong(Role::BodySmall, account.name.clone(), t.text));
+                            ui.label(typography::text(Role::Meta, account.email.clone(), t.text_muted));
+                            ui.label(typography::text(Role::Caption, account.provider.clone(), t.text_faint));
+                        });
                     });
-                });
-                ui.add_space(16.0);
-                section_label(ui, "CARTELLE", &t);
-                ui.add_space(6.0);
-                let folders = self.engine.folders().to_vec();
-                for folder in folders {
-                    if folder_row(ui, &folder, self.folder == folder.id, &t).clicked() {
-                        self.select_folder(folder.id.clone());
-                    }
                 }
-                ui.add_space(18.0);
-                section_label(ui, "ETICHETTE", &t);
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    for (label, color) in [("Lavoro", GOLD), ("Personale", t.success), ("Fatture", t.danger)] {
-                        if tag_chip(ui, label, color, &t).clicked() {
-                            self.status = "Etichette in arrivo (M3)".to_owned();
+                ui.add_space(space::LG);
+                let footer_height = 42.0;
+                let scroll_height = (ui.available_height() - footer_height).max(80.0);
+                egui::ScrollArea::vertical().max_height(scroll_height).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    SectionHeader::new("CARTELLE").show(ui);
+                    ui.add_space(space::XS);
+                    let folders = self.engine.folders().to_vec();
+                    for folder in folders {
+                        let meta = if folder.unread > 0 { folder.unread.to_string() } else { String::new() };
+                        let row = ListRow::folder(folder.name.as_str(), meta.as_str())
+                            .icon(folder_icon(folder.kind))
+                            .selected(self.folder == folder.id)
+                            .height(32.0);
+                        if row.show(ui).clicked() {
+                            self.select_folder(folder.id.clone());
                         }
+                    }
+                    ui.add_space(space::LG);
+                    SectionHeader::new("ETICHETTE").show(ui);
+                    ui.add_space(space::XS);
+                    for (label, color) in [("Lavoro", theme::GOLD), ("Personale", t.success), ("Fatture", t.danger)] {
+                        label_row(ui, label, color, &t);
                     }
                 });
                 let remaining = ui.available_height();
-                if remaining > 46.0 {
-                    ui.add_space(remaining - 46.0);
+                if remaining > footer_height {
+                    ui.add_space(remaining - footer_height);
                 }
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.label(RichText::new(format!("Postino {} · M0", env!("CARGO_PKG_VERSION"))).size(10.0).color(t.text_faint));
-                    ui.label(RichText::new("Ctrl+K · comandi").size(10.0).color(t.text_faint));
+                    ui.label(typography::text(Role::Caption, format!("Postino {} · M0", env!("CARGO_PKG_VERSION")), t.text_faint));
+                    ui.label(typography::text(Role::Caption, "Locale · offline", t.text_faint));
                 });
             });
     }
@@ -300,54 +412,66 @@ impl PostinoApp {
         let folder_name =
             self.engine.folders().iter().find(|folder| folder.id == self.folder).map_or_else(|| "Posta".to_owned(), |folder| folder.name.clone());
         let (rows, total, unread) = self.visible_messages();
-        egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(18, 14))).show(ui, |ui| {
+        let searching = !self.query.trim().is_empty();
+        egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(folder_name).font(FontId::new(21.0, theme::display())).color(t.text));
-                ui.label(RichText::new(format!("{unread} non letti · {total}")).size(11.5).color(t.text_muted));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if chip(ui, "Allegati", self.attachments_only, &t).clicked() {
-                        self.attachments_only = !self.attachments_only;
-                    }
-                    if chip(ui, "Non letti", self.unread_only, &t).clicked() {
-                        self.unread_only = !self.unread_only;
-                    }
-                    if chip(ui, "Tutti", !self.unread_only && !self.attachments_only, &t).clicked() {
-                        self.unread_only = false;
-                        self.attachments_only = false;
-                    }
-                });
+                ui.label(typography::strong(Role::Section, folder_name, t.text));
+                ui.add_space(space::SM);
+                ui.label(typography::text(Role::Meta, format!("{unread} non letti · {total}"), t.text_muted));
             });
-            if !self.query.trim().is_empty() {
-                ui.add_space(4.0);
+            ui.add_space(space::XS);
+            ui.horizontal(|ui| {
+                if Chip::new("Tutti").selected(!self.unread_only && !self.attachments_only).show(ui).clicked() {
+                    self.unread_only = false;
+                    self.attachments_only = false;
+                }
+                if Chip::new("Non letti").selected(self.unread_only).show(ui).clicked() {
+                    self.unread_only = !self.unread_only;
+                }
+                if Chip::new("Allegati").icon(icons::PAPERCLIP).selected(self.attachments_only).show(ui).clicked() {
+                    self.attachments_only = !self.attachments_only;
+                }
+            });
+            if searching {
+                ui.add_space(space::XS);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Risultati per {:?}", self.query.trim())).size(11.5).color(t.text_muted));
-                    if ui.add(egui::Button::new(RichText::new("Cancella").size(11.0)).frame(false)).clicked() {
+                    ui.label(typography::text(Role::Meta, format!("Risultati per “{}”", self.query.trim()), t.text_muted));
+                    if Button::ghost("Cancella").size(ButtonSize::Sm).show(ui).clicked() {
                         self.query.clear();
                     }
                 });
             }
-            ui.add_space(8.0);
+            ui.add_space(space::MD);
             if rows.is_empty() {
-                ui.add_space(70.0);
-                ui.vertical_centered(|ui| {
-                    logo(ui, 44.0);
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Nessun messaggio").font(FontId::new(17.0, theme::display())).color(t.text_muted));
-                    ui.label(
-                        RichText::new(if self.query.trim().is_empty() {
-                            "Questa cartella è vuota."
-                        } else {
-                            "Nessun risultato per questa ricerca."
-                        })
-                        .size(12.0)
-                        .color(t.text_faint),
-                    );
-                });
+                let (icon, title, body, action) = if searching {
+                    (icons::SEARCH, "Nessun risultato", "Nessun messaggio corrisponde alla ricerca.", Some("Cancella ricerca"))
+                } else if self.folder == "inbox" {
+                    (icons::INBOX, "Nessun messaggio", "La posta in arrivo è vuota.", None)
+                } else {
+                    (icons::INBOX, "Nessun messaggio", "Questa cartella è vuota.", Some("Vai a Posta in arrivo"))
+                };
+                let mut state = EmptyState::new(icon, title, body);
+                if let Some(action) = action {
+                    state = state.action(action);
+                }
+                if let Some(response) = state.show(ui)
+                    && response.clicked()
+                {
+                    if searching {
+                        self.query.clear();
+                    } else {
+                        self.select_folder("inbox");
+                    }
+                }
                 return;
             }
 
+            let list_width = ui.available_width();
             let mut clicked = None;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let fixed_columns = 12.0 + 30.0 + 120.0 + 52.0 + 20.0;
+                // Leave room for the vertical scroll bar so the star column is not hidden.
+                let subject_width = (list_width - fixed_columns - 16.0).max(80.0);
                 egui_extras::TableBuilder::new(ui)
                     .id_salt("message-list")
                     .striped(false)
@@ -355,24 +479,24 @@ impl PostinoApp {
                     .sense(Sense::click())
                     .auto_shrink([false, false])
                     .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(egui_extras::Column::exact(16.0))
-                    .column(egui_extras::Column::exact(36.0))
-                    .column(egui_extras::Column::exact(148.0))
-                    .column(egui_extras::Column::remainder())
-                    .column(egui_extras::Column::exact(58.0))
-                    .column(egui_extras::Column::exact(22.0))
+                    .column(egui_extras::Column::exact(12.0))
+                    .column(egui_extras::Column::exact(30.0))
+                    .column(egui_extras::Column::exact(120.0))
+                    .column(egui_extras::Column::exact(subject_width))
+                    .column(egui_extras::Column::exact(52.0))
+                    .column(egui_extras::Column::exact(20.0))
                     .header(24.0, |mut header| {
                         header.col(|_| {});
                         header.col(|_| {});
                         header.col(|ui| {
-                            ui.label(RichText::new("MITTENTE").size(9.5).color(t.text_faint));
+                            ui.add(egui::Label::new(typography::text(Role::Caption, "MITTENTE", t.text_faint)).selectable(false));
                         });
                         header.col(|ui| {
-                            ui.label(RichText::new("OGGETTO").size(9.5).color(t.text_faint));
+                            ui.add(egui::Label::new(typography::text(Role::Caption, "OGGETTO", t.text_faint)).selectable(false));
                         });
                         header.col(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new("DATA").size(9.5).color(t.text_faint));
+                                ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
                             });
                         });
                         header.col(|_| {});
@@ -380,19 +504,19 @@ impl PostinoApp {
                     .body(|mut body| {
                         for message in &rows {
                             let selected = self.selected.as_deref() == Some(message.id.as_str());
-                            let fg = if selected { t.selected_text } else { t.text };
-                            body.row(58.0, |mut row| {
+                            let foreground = if selected { t.selected_text } else { t.text };
+                            body.row(ui_size::ROW, |mut row| {
                                 row.set_selected(selected);
                                 row.col(|ui| {
                                     if message.unread {
-                                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-                                        ui.painter().circle_filled(rect.center(), 3.2, GOLD);
+                                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                        ui.painter().circle_filled(rect.center(), 3.0, GOLD);
                                     }
                                 });
                                 row.col(|ui| {
                                     avatar(
                                         ui,
-                                        28.0,
+                                        24.0,
                                         &message.from.initials(),
                                         if selected { GOLD } else { t.panel_alt },
                                         if selected { theme::FOREST } else { t.text },
@@ -403,39 +527,45 @@ impl PostinoApp {
                                         if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
                                     let text = RichText::new(name)
                                         .font(FontId::new(13.0, if message.unread { theme::medium() } else { FontFamily::Proportional }))
-                                        .color(fg);
-                                    ui.add(egui::Label::new(text).truncate());
+                                        .color(foreground);
+                                    ui.add(egui::Label::new(text).truncate().selectable(false));
                                 });
                                 row.col(|ui| {
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
                                         let subject = RichText::new(message.subject.as_str())
                                             .font(FontId::new(13.0, if message.unread { theme::medium() } else { FontFamily::Proportional }))
-                                            .color(fg);
-                                        ui.add(egui::Label::new(subject).truncate());
+                                            .color(foreground);
+                                        ui.add(egui::Label::new(subject).truncate().selectable(false));
                                         let snippet = RichText::new(message.snippet.as_str()).size(11.0).color(if selected {
                                             t.selected_muted
                                         } else {
                                             t.text_muted
                                         });
-                                        ui.add(egui::Label::new(snippet).truncate());
+                                        ui.add(egui::Label::new(snippet).truncate().selectable(false));
                                     });
                                 });
                                 row.col(|ui| {
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(
-                                            RichText::new(format_when(message.date))
-                                                .font(FontId::new(11.0, FontFamily::Monospace))
-                                                .color(if selected { t.selected_muted } else { t.text_faint }),
+                                        ui.add(
+                                            egui::Label::new(typography::mono(
+                                                format_when(message.date),
+                                                10.5,
+                                                if selected { t.selected_muted } else { t.text_faint },
+                                            ))
+                                            .selectable(false),
                                         );
                                     });
                                 });
                                 row.col(|ui| {
-                                    ui.label(RichText::new(if message.starred { "★" } else { "☆" }).size(13.0).color(if message.starred {
-                                        GOLD
+                                    let star_color = if message.starred {
+                                        if selected { t.gold } else { theme::GOLD_INK }
+                                    } else if selected {
+                                        t.selected_muted
                                     } else {
                                         t.text_faint
-                                    }));
+                                    };
+                                    ui.add(egui::Label::new(icons::icon(icons::STAR, 12.0, star_color)).selectable(false));
                                 });
                                 if row.response().clicked() {
                                     clicked = Some(message.id.clone());
@@ -451,129 +581,170 @@ impl PostinoApp {
     }
 
     fn reading_pane(&mut self, ui: &mut Ui) {
+        if !self.reading_open {
+            return;
+        }
         let t = theme::tokens(self.dark);
-        egui::Panel::right("reading")
-            .resizable(true)
-            .default_size(500.0)
-            .min_size(360.0)
-            .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(18, 14)))
-            .show(ui, |ui| {
-                let message = self.selected.as_deref().and_then(|id| self.engine.message(id)).cloned();
-                let Some(message) = message else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(90.0);
-                        logo(ui, 56.0);
-                        ui.add_space(14.0);
-                        ui.label(RichText::new("Seleziona un messaggio").font(FontId::new(18.0, theme::display())).color(t.text_muted));
-                        ui.label(RichText::new("La lettura resta locale e offline.").size(12.0).color(t.text_faint));
-                    });
-                    return;
-                };
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Rispondi").clicked() {
-                        self.status = "Risposta in arrivo (M2)".to_owned();
+        if self.reading_full {
+            egui::CentralPanel::default()
+                .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::XXL, inset::XL)))
+                .show(ui, |ui| self.reading_content(ui, &t, true));
+        } else {
+            egui::Panel::right("reading")
+                .resizable(true)
+                .default_size(600.0)
+                .min_size(420.0)
+                .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::LG, inset::XL)))
+                .show(ui, |ui| self.reading_content(ui, &t, false));
+        }
+    }
+
+    fn reading_content(&mut self, ui: &mut Ui, t: &Tokens, full: bool) {
+        let message = self.selected.as_deref().and_then(|id| self.engine.message(id)).cloned();
+        let Some(message) = message else {
+            self.reading_open = false;
+            return;
+        };
+
+        let (left_action, right_action) = Sides::new().height(36.0).shrink_left().show(
+            ui,
+            |ui| {
+                let mut action = None;
+                if full {
+                    if Button::ghost("Torna alla posta").icon(icons::ARROW_LEFT).shortcut("Esc").show(ui).clicked() {
+                        action = Some(ReadingAction::Back);
                     }
-                    if ui.button("Inoltra").clicked() {
-                        self.status = "Inoltro in arrivo (M2)".to_owned();
+                } else {
+                    if Button::new("Archivia").icon(icons::ARCHIVE).shortcut("E").show(ui).clicked() {
+                        action = Some(ReadingAction::Archive);
                     }
-                    if ui.button("Archivia").clicked() {
-                        self.status = "Archiviazione in arrivo (M3)".to_owned();
+                    if Button::danger("Elimina").icon(icons::TRASH).show(ui).clicked() {
+                        action = Some(ReadingAction::Delete);
                     }
-                    if ui.button("Elimina").clicked() {
-                        self.status = "Eliminazione in arrivo (M3)".to_owned();
+                }
+                ui.add_space(space::SM);
+                let star_label = if message.summary.starred { "Togli stella" } else { "Aggiungi stella" };
+                if IconButton::new(icons::STAR, star_label).selected(message.summary.starred).show(ui).clicked() {
+                    action = Some(ReadingAction::Star);
+                }
+                let read_label = if message.summary.unread { "Segna come letto" } else { "Segna come non letto" };
+                let read_icon = if message.summary.unread { icons::MARK_READ } else { icons::MARK_UNREAD };
+                if IconButton::new(read_icon, read_label).show(ui).clicked() {
+                    action = Some(ReadingAction::Read);
+                }
+                action
+            },
+            |ui| {
+                let mut action = None;
+                if !full {
+                    if IconButton::new(icons::SQUARE, "Apri a schermo intero").show(ui).clicked() {
+                        action = Some(ReadingAction::Expand);
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let star_color = if message.summary.starred { GOLD } else { t.text_muted };
-                        let star =
-                            ui.add(egui::Button::new(RichText::new(if message.summary.starred { "★" } else { "☆" }).color(star_color)).frame(false));
-                        if star.on_hover_text("Aggiungi o togli la stella").clicked() {
-                            self.toggle_star();
-                        }
-                        let read = ui.add(egui::Button::new(if message.summary.unread { "●" } else { "○" }).frame(false));
-                        if read.on_hover_text("Segna come letto o non letto").clicked() {
-                            self.toggle_read();
-                        }
-                    });
-                });
-                ui.add_space(10.0);
-                ui.label(RichText::new(message.summary.subject.as_str()).font(FontId::new(22.0, theme::display())).color(t.text));
-                ui.add_space(10.0);
+                    if IconButton::new(icons::CLOSE, "Chiudi anteprima").show(ui).clicked() {
+                        action = Some(ReadingAction::Close);
+                    }
+                }
+                action
+            },
+        );
+
+        ui.add_space(space::LG);
+        ui.label(typography::strong(Role::Page, message.summary.subject.as_str(), t.text));
+        ui.add_space(space::MD);
+        let to = message.summary.to.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
+        Sides::new().height(38.0).show(
+            ui,
+            |ui| {
                 ui.horizontal(|ui| {
-                    avatar(ui, 36.0, &message.summary.from.initials(), t.gold, theme::FOREST);
-                    ui.add_space(6.0);
+                    avatar(ui, 34.0, &message.summary.from.initials(), t.gold, theme::FOREST);
+                    ui.add_space(space::SM);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(RichText::new(message.summary.from.display()).font(FontId::new(13.5, theme::medium())).color(t.text));
-                        let to = message.summary.to.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
-                        ui.label(RichText::new(format!("a {to}")).size(11.0).color(t.text_muted));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(format_when(message.summary.date)).font(FontId::new(11.0, FontFamily::Monospace)).color(t.text_faint));
+                        ui.label(typography::strong(Role::BodySmall, message.summary.from.display(), t.text));
+                        ui.label(typography::text(Role::Meta, format!("a {to}"), t.text_muted));
                     });
                 });
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for paragraph in message.body_text.split("\n\n") {
-                        let paragraph = paragraph.trim();
-                        if paragraph.is_empty() {
-                            continue;
-                        }
-                        if paragraph.starts_with('>') {
-                            Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
-                                ui.label(RichText::new(paragraph).size(12.5).color(t.text_muted));
-                            });
-                        } else {
-                            ui.label(RichText::new(paragraph).size(14.0).color(t.text));
-                        }
-                        ui.add_space(10.0);
-                    }
-                    if !message.attachments.is_empty() {
-                        ui.add_space(6.0);
-                        section_label(ui, "ALLEGATI", &t);
-                        ui.add_space(4.0);
-                        for attachment in &message.attachments {
-                            Frame::new().fill(t.panel_alt).corner_radius(6.0).inner_margin(Margin::symmetric(10, 8)).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.spacing_mut().item_spacing.y = 1.0;
-                                        ui.label(RichText::new(attachment.filename.as_str()).font(FontId::new(12.5, theme::medium())).color(t.text));
-                                        ui.label(
-                                            RichText::new(format!("{} · {}", attachment.mime, format_size(attachment.size)))
-                                                .size(10.5)
-                                                .color(t.text_faint),
-                                        );
-                                    });
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.button("Salva").clicked() {
-                                            self.status = "Salvataggio allegati in arrivo (M1)".to_owned();
-                                        }
-                                    });
+            },
+            |ui| {
+                ui.label(typography::mono(format_when(message.summary.date), 11.0, t.text_faint));
+            },
+        );
+        ui.add_space(space::MD);
+        ui.separator();
+        ui.add_space(space::MD);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for paragraph in message.body_text.split("\n\n") {
+                let paragraph = paragraph.trim();
+                if paragraph.is_empty() {
+                    continue;
+                }
+                if paragraph.starts_with('>') {
+                    Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
+                        ui,
+                        |ui| {
+                            ui.label(typography::text(Role::Secondary, paragraph, t.text_muted));
+                        },
+                    );
+                } else {
+                    ui.label(typography::text(Role::Body, paragraph, t.text));
+                }
+                ui.add_space(space::LG);
+            }
+            if !message.attachments.is_empty() {
+                ui.add_space(space::SM);
+                ui.label(typography::strong(Role::Caption, "ALLEGATI", t.text_faint));
+                ui.add_space(space::XS);
+                for attachment in &message.attachments {
+                    Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
+                        ui,
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(icons::icon(icons::PAPERCLIP, 16.0, t.text_muted));
+                                ui.add_space(space::SM);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.label(typography::strong(Role::Secondary, attachment.filename.as_str(), t.text));
+                                    ui.label(typography::text(
+                                        Role::Caption,
+                                        format!("{} · {}", attachment.mime, format_size(attachment.size)),
+                                        t.text_faint,
+                                    ));
                                 });
                             });
-                            ui.add_space(6.0);
-                        }
-                    }
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("Modalità demo · nessun server collegato").size(10.5).color(t.text_faint));
-                });
-            });
+                        },
+                    );
+                    ui.add_space(space::SM);
+                }
+            }
+        });
+
+        let action = left_action.or(right_action);
+        match action {
+            Some(ReadingAction::Archive) => self.move_selected("archive", "Messaggio archiviato"),
+            Some(ReadingAction::Delete) => self.move_selected("trash", "Messaggio spostato nel cestino"),
+            Some(ReadingAction::Star) => self.toggle_star(),
+            Some(ReadingAction::Read) => self.toggle_read(),
+            Some(ReadingAction::Close) => self.reading_open = false,
+            Some(ReadingAction::Expand) => self.reading_full = true,
+            Some(ReadingAction::Back) => self.reading_full = false,
+            None => {}
+        }
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
         egui::Panel::bottom("status")
-            .exact_size(28.0)
-            .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(14, 4)))
+            .exact_size(ui_size::STATUS)
+            .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(inset::LG, inset::XS)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 3.0, GOLD);
-                    ui.label(RichText::new(self.status.as_str()).size(10.5).color(t.text_muted));
+                    let dot = if self.engine.is_demo() { theme::GOLD } else { t.success };
+                    ui.painter().circle_filled(rect.center(), 3.0, dot);
+                    ui.label(typography::text(Role::Meta, self.status.as_str(), t.text_muted));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("Ctrl+K comandi · J/K naviga").size(10.5).color(t.text_faint));
+                        ui.label(typography::text(Role::Meta, "Ctrl+K comandi · J/K naviga", t.text_faint));
                     });
                 });
             });
@@ -698,15 +869,30 @@ impl PostinoApp {
 impl PostinoApp {
     /// One frame of the whole shell. Public so a headless test can render it without a window.
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        // The root UI can be wider than the window at fractional display scaling. Pin the whole
+        // shell to the real content rect so right-aligned controls and the status bar stay inside.
+        let content = ui.ctx().content_rect();
+        ui.scope_builder(UiBuilder::new().max_rect(content), |ui| self.show_inner(ui));
+    }
+
+    fn show_inner(&mut self, ui: &mut egui::Ui) {
+        self.resize_handles(ui.ctx());
         self.handle_shortcuts(ui.ctx());
         // egui 0.36 nests panels in the order they are added. The status bar goes first so it is
-        // the outermost panel and spans the full width; the top bar and the three columns sit
-        // above it.
+        // the outermost panel and spans the full width; the title bar and toolbar sit above the
+        // three columns.
         self.status_bar(ui);
-        self.top_bar(ui);
+        if self.custom_chrome {
+            self.title_bar(ui);
+        }
+        self.toolbar(ui);
         self.sidebar(ui);
-        self.reading_pane(ui);
-        self.list_panel(ui);
+        if self.reading_full && self.reading_open {
+            self.reading_pane(ui);
+        } else {
+            self.reading_pane(ui);
+            self.list_panel(ui);
+        }
         self.about(ui);
         self.command_palette(ui);
     }
@@ -718,55 +904,57 @@ impl eframe::App for PostinoApp {
     }
 }
 
-fn section_label(ui: &mut Ui, text: &str, t: &Tokens) {
-    ui.label(RichText::new(text).font(FontId::new(9.5, theme::medium())).color(t.text_faint));
+#[derive(Clone, Copy)]
+enum ReadingAction {
+    Archive,
+    Delete,
+    Star,
+    Read,
+    Close,
+    Expand,
+    Back,
 }
 
-fn chip(ui: &mut Ui, label: &str, active: bool, t: &Tokens) -> egui::Response {
-    let fill = if active { t.selected } else { t.panel_alt };
-    let color = if active { t.selected_text } else { t.text_muted };
-    ui.add(egui::Button::new(RichText::new(label).size(11.0).color(color)).fill(fill))
-}
-
-fn folder_row(ui: &mut Ui, folder: &Folder, selected: bool, t: &Tokens) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 29.0), Sense::click());
-    if selected {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), t.selected);
-    } else if response.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), t.hover);
+fn window_control(ui: &mut Ui, glyph: &str, label: &str, close: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, ui_size::TITLE_BAR), Sense::click());
+    if response.hovered() {
+        let fill = if close { theme::DANGER } else { theme::FOREST_SOFT };
+        ui.painter().rect_filled(rect, CornerRadius::same(0), fill);
     }
-    let fg = if selected { t.selected_text } else { t.text };
-    let muted = if selected { t.selected_muted } else { t.text_muted };
-    let dot = if folder.unread > 0 { GOLD } else { t.border };
-    ui.painter().circle_filled(egui::pos2(rect.left() + 10.0, rect.center().y), 2.6, dot);
-    ui.painter().text(
-        egui::pos2(rect.left() + 22.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        &folder.name,
-        FontId::new(13.0, FontFamily::Proportional),
-        fg,
-    );
-    if folder.unread > 0 {
-        ui.painter().text(
-            egui::pos2(rect.right() - 10.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            folder.unread.to_string(),
-            FontId::new(11.0, FontFamily::Monospace),
-            if selected { GOLD } else { muted },
-        );
-    }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    let galley = ui.painter().layout_no_wrap(glyph.to_owned(), icons::font(12.0), theme::IVORY);
+    let pos = egui::pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5);
+    ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    response.on_hover_text(label)
 }
 
-fn tag_chip(ui: &mut Ui, label: &str, color: Color32, t: &Tokens) -> egui::Response {
-    let response = Frame::new().fill(t.panel_alt).corner_radius(10.0).inner_margin(Margin::symmetric(8, 4)).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 3.0, color);
-            ui.label(RichText::new(label).size(10.5).color(t.text_muted));
-        });
+fn folder_icon(kind: FolderKind) -> &'static str {
+    match kind {
+        FolderKind::Inbox => icons::INBOX,
+        FolderKind::Starred => icons::STAR,
+        FolderKind::Sent => icons::SENT,
+        FolderKind::Drafts => icons::DRAFTS,
+        FolderKind::Archive => icons::ARCHIVE,
+        FolderKind::Spam => icons::WARNING,
+        FolderKind::Trash => icons::TRASH,
+        FolderKind::Custom => icons::FOLDER,
+    }
+}
+
+fn label_row(ui: &mut Ui, label: &str, color: Color32, t: &Tokens) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 3.0, color);
+        ui.label(typography::text(Role::BodySmall, label, t.text_muted));
     });
-    ui.interact(response.response.rect, response.response.id.with("chip"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn initials(name: &str) -> String {
+    let mut letters = name.split_whitespace().filter_map(|word| word.chars().next()).filter(|c| c.is_alphanumeric()).take(2).collect::<String>();
+    if letters.is_empty() {
+        letters = name.chars().filter(|c| c.is_alphanumeric()).take(1).collect();
+    }
+    letters.to_uppercase()
 }
 
 fn avatar(ui: &mut Ui, size: f32, initials: &str, bg: Color32, fg: Color32) {
@@ -828,7 +1016,7 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         theme::apply(&ctx, false);
-        let mut app = PostinoApp::demo();
+        let mut app = PostinoApp::demo(true);
         let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))), ..Default::default() };
         let mut output = ctx.run_ui(raw, |ui| app.show(ui));
         let painted = !output.shapes.is_empty();
@@ -842,7 +1030,7 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         theme::apply(&ctx, true);
-        let mut app = PostinoApp::demo();
+        let mut app = PostinoApp::demo(true);
         let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))), ..Default::default() };
         let mut output = ctx.run_ui(raw, |ui| app.show(ui));
         let painted = !output.shapes.is_empty();
@@ -851,11 +1039,31 @@ mod tests {
     }
 
     #[test]
-    fn demo_starts_on_the_newest_inbox_message() {
-        let app = PostinoApp::demo();
+    fn demo_starts_without_a_selection() {
+        let app = PostinoApp::demo(true);
         assert_eq!(app.folder, "inbox");
-        let selected = app.selected.as_deref().expect("a selected message");
-        let message = app.engine.message(selected).expect("the selected message exists");
-        assert_eq!(message.summary.folder_id, "inbox");
+        assert!(app.selected.is_none());
+        assert!(!app.reading_open);
+    }
+
+    #[test]
+    fn selecting_opens_the_reading_pane() {
+        let mut app = PostinoApp::demo(true);
+        let id = app.engine.messages()[0].summary.id.clone();
+        app.select_message(id.clone());
+        assert_eq!(app.selected.as_deref(), Some(id.as_str()));
+        assert!(app.reading_open);
+        assert!(!app.reading_full);
+    }
+
+    #[test]
+    fn archiving_closes_the_pane_and_moves_the_message() {
+        let mut app = PostinoApp::demo(true);
+        let id = app.engine.messages()[0].summary.id.clone();
+        app.select_message(id.clone());
+        app.move_selected("archive", "archiviato");
+        assert!(app.selected.is_none());
+        assert!(!app.reading_open);
+        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("archive"));
     }
 }

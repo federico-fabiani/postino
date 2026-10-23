@@ -72,6 +72,14 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
+            "message_move",
+            "Move a message",
+            "Move one message to a regular folder, for example `archive` or `trash`. Virtual folders such as `starred` cannot receive messages.",
+            MessageMoveArgs,
+            false,
+            false
+        ),
+        def!(
             "search",
             "Search mail",
             "Case-insensitive search across subjects, people, snippets and bodies of the demo mailbox.",
@@ -140,6 +148,14 @@ pub struct MessageFlagArgs {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct MessageMoveArgs {
+    pub id: String,
+    /// Destination folder id. `starred` is virtual and is refused.
+    pub folder: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     /// Words to look for. Empty queries are refused.
     pub query: String,
@@ -192,6 +208,11 @@ pub struct MessageFlag {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageMove {
+    pub message: MessageSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub query: String,
     pub messages: Vec<MessageSummary>,
@@ -227,6 +248,10 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "message_flag" => {
             let args: MessageFlagArgs = parse(args)?;
             flag(engine, args)
+        }
+        "message_move" => {
+            let args: MessageMoveArgs = parse(args)?;
+            value(MessageMove { message: engine.move_message(&args.id, &args.folder)? })
         }
         "search" => {
             let args: SearchArgs = parse(args)?;
@@ -422,5 +447,34 @@ mod tests {
         let mut engine = Engine::demo();
         let error = engine.call("search", json!({ "query": "   " })).expect_err("query");
         assert!(matches!(error, crate::OpError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn moving_a_message_updates_both_folders() {
+        let mut engine = Engine::demo();
+        let id = engine.messages()[0].summary.id.clone();
+        let inbox_before = engine.folders().iter().find(|folder| folder.id == "inbox").map_or(0, |folder| folder.total);
+        let archive_before = engine.folders().iter().find(|folder| folder.id == "archive").map_or(0, |folder| folder.total);
+        let result = call(&mut engine, "message_move", json!({ "id": id, "folder": "archive" }));
+        assert_eq!(result["message"]["folder_id"], "archive");
+        let inbox_after = engine.folders().iter().find(|folder| folder.id == "inbox").map_or(0, |folder| folder.total);
+        let archive_after = engine.folders().iter().find(|folder| folder.id == "archive").map_or(0, |folder| folder.total);
+        assert_eq!(inbox_after, inbox_before.saturating_sub(1));
+        assert_eq!(archive_after, archive_before.saturating_add(1));
+    }
+
+    #[test]
+    fn virtual_folders_cannot_receive_messages() {
+        let mut engine = Engine::demo();
+        let id = engine.messages()[0].summary.id.clone();
+        let error = engine.call("message_move", json!({ "id": id, "folder": "starred" })).expect_err("virtual folder");
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn moving_an_unknown_message_fails() {
+        let mut engine = Engine::demo();
+        let error = engine.call("message_move", json!({ "id": "missing", "folder": "archive" })).expect_err("unknown message");
+        assert!(matches!(error, crate::OpError::Failed(_)));
     }
 }

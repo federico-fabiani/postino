@@ -82,6 +82,24 @@ impl Engine {
         Ok(summary)
     }
 
+    /// Move one message to a regular folder. Virtual folders such as `starred` are views, not
+    /// destinations.
+    pub fn move_message(&mut self, id: &str, folder_id: &str) -> Result<MessageSummary, OpError> {
+        let target =
+            self.folders.iter().find(|folder| folder.id == folder_id).ok_or_else(|| OpError::Failed(format!("unknown folder {folder_id:?}")))?;
+        if target.kind.is_virtual() {
+            return Err(OpError::InvalidArgs(format!("folder {folder_id:?} is virtual and cannot receive messages")));
+        }
+        let target_id = target.id.clone();
+        let Some(message) = self.messages.iter_mut().find(|message| message.summary.id == id) else {
+            return Err(OpError::Failed(format!("unknown message {id:?}")));
+        };
+        message.summary.folder_id = target_id;
+        let summary = message.summary.clone();
+        self.recount();
+        Ok(summary)
+    }
+
     /// Call any operation by name with JSON arguments. This is the only door a frontend uses.
     pub fn call(&mut self, name: &str, args: Value) -> Result<Value, OpError> {
         ops::dispatch(self, name, args)

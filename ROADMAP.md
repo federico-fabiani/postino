@@ -24,6 +24,29 @@ verifiable demo, not a promise.
 **Note:** on Windows GNU, `cargo test` needs `dlltool.exe` from MSYS2 MinGW on `PATH`. See
 [development](docs/development.md).
 
+## U0 — UI foundation (next, before M1)
+
+The M0 shell proved the architecture but not the product. U0 builds the design system and the
+interaction model before real mail makes them expensive to change. Full spec:
+[docs/ui/plan.md](docs/ui/plan.md).
+
+- [x] **U0.1 Foundations** — spacing/type/radius/control tokens, Phosphor icons, Button,
+      IconButton, TextField, SearchField, Chip, Badge, ListRow, SectionHeader, EmptyState, Toast,
+      Menu, Dialog, focus ring; live gallery (`postino-app --gallery`) and headless test.
+- [x] **U0.2 Frame** — custom title bar on Windows/Linux, centred search, new toolbar hierarchy,
+      sidebar/list/reading/status rebuilt from components, adaptive widths, 44/36 px rows.
+      Screenshots: `docs/images/postino-u02.png`, `postino-u02-reading.png`, `postino-u02-full.png`,
+      `postino-u02-dark.png`.
+- [ ] **U0.3 Interaction** — selection and multi-select, scroll-follow, full keyboard map, command
+      table, palette with arrows/Enter/shortcuts, `?` sheet, context menus, batch bar, undo/toast,
+      read-state policy, reading pane open/expand/Esc.
+- [ ] **U0.4 Compose** — composer component, draft operations, autosave, reply/forward prefill,
+      demo send, Drafts folder.
+- [ ] **U0.5 Labels and polish** — label create/apply/filter, empty/loading/error states, reduced
+      motion, accessibility pass, final screenshots and docs.
+- [ ] Verify: every component in the gallery in light/dark; full keyboard-only workflow; no dead
+      actions; no ad-hoc literals in screens; `cargo xtask ci` green.
+
 ## M1 — read real mail
 
 - [ ] SQLCipher store, migrations, WAL, key in the OS keyring.

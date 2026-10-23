@@ -78,16 +78,30 @@ Rules enforced by `cargo xtask layers`:
 
 ## 5. UI rules
 
+The UI foundation is specified in `docs/ui/plan.md`. It is not optional decoration: it is the
+contract that keeps the app from becoming a pile of one-off patches.
+
 - The palette is the product: forest `#173D32`, ivory `#F5EBD6`, warm gold `#E4B96A`.
 - Gold on ivory is decorative only (1.55:1). Body text is forest on ivory (10.1:1) or ivory on
-  forest. Never use gold for body text on a light surface.
+  forest. Never use gold for body text on a light surface. Use `GOLD_INK` for a gold star or link
+  that must carry meaning on ivory.
 - Inter for interface text, JetBrains Mono for timestamps, identifiers and metadata.
-- The app must stay usable with the keyboard. `Ctrl+K` opens the command palette; `J`/`K` move
-  through the list; `Esc` closes overlays.
+- **Screens compose components; they do not hand-roll them.** Spacing, type, radii, control heights
+  and icon sizes come from tokens. If a screen needs a new value, add it to the tokens first.
+- **One command table.** Every UI action has an id, label, icon, shortcut, enabled rule and handler
+  in the UI command table. Palette, menus, context menus, tooltips and buttons read it. Never
+  maintain a second list in the palette.
+- The app must work without a mouse: selection, multi-select, open, archive, star, label, compose,
+  send, undo. `Ctrl+K` opens the command palette, `J`/`K` move, `Enter` opens, `Esc` goes back,
+  `?` shows the shortcut sheet.
+- Text inside list rows is not selectable; the row is the click target. The reading pane is where
+  text is selected.
+- No dead buttons. An action either works or is visibly unavailable with a reason.
+- Every new screen needs a headless render test. `PostinoApp::show` exists so a test can render the
+  real shell without a window. The UI gallery (`postino-app --gallery`) is the component review
+  surface.
 - Do not introduce blue or violet as a primary accent. They are reserved for semantic states only
   when a warm alternative would be ambiguous.
-- Every new screen needs a headless render test. `PostinoApp::show` exists so a test can render the
-  real shell without a window.
 
 ## 6. Code and tests
 
