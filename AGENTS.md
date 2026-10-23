@@ -147,3 +147,15 @@ Append one line when significant time is lost to an issue likely to recur. Forma
   fix/avoid: use the 0.36 API; panels are shown on a `Ui`, not a `Context`.
 - [egui 0.36] Panels nest in the order added (first = outermost). A bottom status bar added after
   the side panels spans only the centre. fix/avoid: add the bottom panel before the side panels.
+- [egui/Windows] An undecorated eframe window can stay blank because it starts hidden and never gets
+  a redraw. fix/avoid: set `ViewportBuilder::with_visible(true)` when using
+  `with_decorations(false)`.
+- [egui/fonts] Inter maps several Phosphor PUA codepoints to stylistic alternates, so a shared
+  proportional fallback renders letters instead of icons. fix/avoid: load Phosphor in a dedicated
+  `FontFamily` and use it for every icon, never the proportional fallback.
+- [Windows/DPI] A DPI-unaware PowerShell host virtualizes `GetWindowRect`/`PrintWindow`, so a
+  125%-scaled app looks clipped and off-centre in captures. fix/avoid: call `SetProcessDPIAware()`
+  before capturing.
+- [egui/layout] At fractional display scaling the root UI can be wider than the real content rect,
+  pushing right-aligned controls and the status bar off-screen. fix/avoid: wrap `show` in
+  `scope_builder(UiBuilder::new().max_rect(ctx.content_rect()))`.
