@@ -1,0 +1,24 @@
+[package]
+name = "postino-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Postino command line and MCP server"
+
+[[bin]]
+name = "postino"
+path = "src/main.rs"
+
+[dependencies]
+postino-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

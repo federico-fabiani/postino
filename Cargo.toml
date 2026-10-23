@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+default-members = ["crates/*", "apps/postino-app", "apps/postino-cli", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+repository = "https://github.com/federicopostino/postino"
+
+[workspace.dependencies]
+# internal
+postino-core = { path = "crates/core", version = "0.1.0" }
+
+# foundation
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "1", features = ["derive"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+directories = "6"
+anyhow = "1"
+
+# cli
+clap = { version = "4.6", features = ["derive"] }
+
+# ui
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.36", default-features = false }
+
+# build tooling
+cargo_metadata = "0.23"
+toml = "0.9"
+sha2 = "0.10"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

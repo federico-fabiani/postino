@@ -1,0 +1,18 @@
+[package]
+name = "postino-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Postino domain model, operations and the agent-first operation registry"
+
+[dependencies]
+chrono.workspace = true
+directories.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

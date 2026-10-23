@@ -1,0 +1,101 @@
+version = 1
+
+[[asset]]
+path = "assets/fonts/Inter-Regular.ttf"
+title = "Inter Regular"
+author = "Rasmus Andersson"
+source = "https://github.com/rsms/inter"
+license = "OFL-1.1"
+license_file = "assets/fonts/OFL-Inter.txt"
+sha256 = "40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82"
+usage = "Postino interface text"
+
+[[asset]]
+path = "assets/fonts/Inter-Medium.ttf"
+title = "Inter Medium"
+author = "Rasmus Andersson"
+source = "https://github.com/rsms/inter"
+license = "OFL-1.1"
+license_file = "assets/fonts/OFL-Inter.txt"
+sha256 = "97ad806f526e41546d46365bb3a393145f75b7b1568913db74549ad8b8dba872"
+usage = "Postino interface emphasis and the wordmark"
+
+[[asset]]
+path = "assets/fonts/Inter-SemiBold.ttf"
+title = "Inter SemiBold"
+author = "Rasmus Andersson"
+source = "https://github.com/rsms/inter"
+license = "OFL-1.1"
+license_file = "assets/fonts/OFL-Inter.txt"
+sha256 = "78a843fade9d4612a5567302fb595b56976eb5fcebf4fea5a5912d638bafcde3"
+usage = "Postino headings and display text"
+
+[[asset]]
+path = "assets/fonts/JetBrainsMono-Regular.ttf"
+title = "JetBrains Mono Regular"
+author = "JetBrains"
+source = "https://github.com/JetBrains/JetBrainsMono"
+license = "OFL-1.1"
+license_file = "assets/fonts/OFL-JetBrainsMono.txt"
+sha256 = "e6fd0d7e91550b3ed2b735d4312474362c4716edc4fc0577a0f61ed782d5aed1"
+usage = "Postino timestamps, identifiers and command-line metadata"
+
+[[asset]]
+path = "assets/brand/postino-mark.svg"
+title = "Postino mark, full colour"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "6174107f54f82dfc533298e947028f95629d97b771d72b032b9317337f1fd522"
+usage = "Application and documentation mark on light surfaces"
+
+[[asset]]
+path = "assets/brand/postino-mark-inverse.svg"
+title = "Postino mark, inverse"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "4eb485fbea7b2e9cb4d4d8d595753ef6adb5fc91610732e3c75cd577b345c13f"
+usage = "Application and documentation mark on dark surfaces"
+
+[[asset]]
+path = "assets/brand/postino-mark-mono.svg"
+title = "Postino mark, monochrome"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "1bd497292b5ccfe7ef12f235fcee0d53b5d24f1685a0423183e4e38cf7020879"
+usage = "One-colour contexts and small sizes"
+
+[[asset]]
+path = "docs/images/postino-m0.png"
+title = "Postino M0 desktop screenshot"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "6c77314b6cf32650367cd5405b4cf5ed93176041325c223ad039f0458943f87d"
+usage = "Documentation screenshot of the M0 desktop shell"
+
+[[asset]]
+path = "assets/app-icon/postino-256.png"
+title = "Postino application icon"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "f0657daa2d48f63178a1d8d4c54bff009e093631a4fa4c4f2e3eb51e0514579b"
+usage = "Desktop window and taskbar icon"
+
+[[asset]]
+path = "assets/brand/proposta-logo.svg"
+title = "Postino logo sketch"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "f25a58d324efc0479a9eb83bd610fedf946bbefe12d0669a147c46497b65548f"
+usage = "Original design sketch, kept for reference"

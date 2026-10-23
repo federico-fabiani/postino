@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Postino">
+  <rect width="48" height="48" rx="10" fill="#173D32"/>
+  <path d="M14 17.5v14h20v-14" fill="none" stroke="#F5EBD6" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M14 17.5 24 26l10-8.5" fill="none" stroke="#F5EBD6" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m19 30 5 4 5-4" fill="none" stroke="#E4B96A" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

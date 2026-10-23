@@ -1,0 +1,23 @@
+[package]
+name = "postino-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Postino desktop app (egui)"
+
+[[bin]]
+name = "postino-app"
+path = "src/main.rs"
+
+[dependencies]
+postino-core.workspace = true
+chrono.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true
+env_logger.workspace = true
+log.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

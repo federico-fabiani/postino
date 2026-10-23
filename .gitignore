@@ -1,0 +1,11 @@
+/target
+/dist
+/log
+/corpus
+/fuzz-out
+*.db
+*.db-shm
+*.db-wal
+.env
+.DS_Store
+Thumbs.db
