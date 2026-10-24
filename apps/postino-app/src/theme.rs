@@ -112,6 +112,12 @@ pub fn icon() -> FontFamily {
     FontFamily::Name("Postino Icons".into())
 }
 
+/// The filled Phosphor variant. Used for toggles that must read as active without a coloured
+/// background, such as a starred message.
+pub fn icon_fill() -> FontFamily {
+    FontFamily::Name("Postino Icons Fill".into())
+}
+
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("Inter".to_owned(), Arc::new(FontData::from_static(include_bytes!("../../../assets/fonts/Inter-Regular.ttf"))));
@@ -130,6 +136,8 @@ pub fn install_fonts(ctx: &egui::Context) {
     // alternates (`U+E214` becomes `uni1E72.ss07`), so a shared fallback would render letters.
     fonts.font_data.insert("Phosphor".to_owned(), Arc::new(FontData::from_static(egui_phosphor::Variant::Regular.font_bytes())));
     fonts.families.insert(icon(), vec!["Phosphor".to_owned()]);
+    fonts.font_data.insert("Phosphor Fill".to_owned(), Arc::new(FontData::from_static(egui_phosphor::Variant::Fill.font_bytes())));
+    fonts.families.insert(icon_fill(), vec!["Phosphor Fill".to_owned()]);
 
     ctx.set_fonts(fonts);
 }

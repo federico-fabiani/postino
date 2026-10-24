@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1 foundations and U0.2 frame implemented; U0.3 interaction is next · **Last updated:** 2026-10-23
+> **Status:** U0.1 foundations, U0.2 frame and U0.3 interaction implemented; U0.4 compose is next · **Last updated:** 2026-10-24
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
@@ -237,12 +237,17 @@ per action, no hidden mutation.
 - Adaptive widths and compact/comfortable density.
 - Light/dark screenshots and layout tests.
 
-### U0.3 Interaction — next
+### U0.3 Interaction — done
 
 - Selection/multi-select model, scroll-follow, focus rings.
 - Keyboard map, command table, palette with arrows/Enter/Esc/shortcuts, `?` sheet.
 - Context menus, batch bar, undo/toast, read-state policy.
 - Reading pane open/close/full-screen with per-message scroll.
+
+Shipped in `apps/postino-app/src/app.rs`: click/Ctrl-click/Shift-click selection, Shift+arrow
+extension, `X`/Space toggle, `Ctrl+A`, batch undo, row/folder/empty/reading context menus, and a
+searchable shortcut sheet. Reply/forward/labels stay explicitly disabled with a reason until their
+milestones.
 
 ### U0.4 Compose and drafts
 

@@ -272,7 +272,7 @@ impl GalleryApp {
             MenuItem::new("Archivia").icon(icons::ARCHIVE).shortcut("E"),
             MenuItem::new("Elimina").icon(icons::TRASH).shortcut("⌫").danger(true),
         ];
-        Menu::new(&items).show(ui);
+        let _ = Menu::new(&items).show(ui);
     }
 
     fn dialogs(&self, ui: &mut Ui, t: &Tokens) {

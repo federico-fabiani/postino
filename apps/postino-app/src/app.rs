@@ -1,11 +1,14 @@
 //! The egui shell. Panels are deliberately plain: folder rail, message table, reading pane.
 //! Every action goes through `Engine::call`, the same operation registry the CLI and MCP expose.
 
+use std::collections::BTreeSet;
+use std::time::Duration;
+
 use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key, Layout, Margin, Rect, ResizeDirection, RichText, Sense,
-    Stroke, Ui, UiBuilder, Vec2, ViewportCommand, WidgetInfo, WidgetType,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
+    RichText, Sense, Stroke, Ui, UiBuilder, Vec2, ViewportCommand, WidgetInfo, WidgetType,
 };
 use postino_core::{Engine, FolderKind, MessageSummary, MessagesList, SearchResult};
 use serde_json::json;
@@ -14,12 +17,21 @@ use crate::theme::{self, GOLD, IVORY, Tokens};
 use crate::ui::icons;
 use crate::ui::tokens::{inset, radius, size as ui_size, space};
 use crate::ui::typography::{self, Role};
-use crate::ui::widgets::{Button, ButtonSize, Chip, EmptyState, IconButton, ListRow, SearchField, SectionHeader};
+use crate::ui::widgets::{
+    Button, ButtonSize, Chip, EmptyState, IconButton, IconButtonSize, ListRow, Menu, MenuItem, SearchField, SectionHeader, Toast,
+};
 
 pub struct PostinoApp {
     engine: Engine,
     folder: String,
+    /// Keyboard focus and the message shown in the reading pane.
     selected: Option<String>,
+    /// The rows painted as selected. It always contains `selected` when non-empty.
+    selection: BTreeSet<String>,
+    /// Shift-click and Shift+arrow range anchor.
+    anchor: Option<String>,
+    pending_read: Option<PendingRead>,
+    toast: Option<ToastState>,
     query: String,
     unread_only: bool,
     attachments_only: bool,
@@ -29,6 +41,13 @@ pub struct PostinoApp {
     show_palette: bool,
     palette_query: String,
     palette_focus: bool,
+    palette_selected: usize,
+    focus_search: bool,
+    show_shortcuts: bool,
+    shortcut_query: String,
+    shortcut_focus: bool,
+    scroll_to_selected: bool,
+    now: f64,
     custom_chrome: bool,
     reading_open: bool,
     reading_full: bool,
@@ -46,6 +65,10 @@ impl PostinoApp {
             engine: Engine::demo(),
             folder: "inbox".to_owned(),
             selected: None,
+            selection: BTreeSet::new(),
+            anchor: None,
+            pending_read: None,
+            toast: None,
             query: String::new(),
             unread_only: false,
             attachments_only: false,
@@ -55,6 +78,13 @@ impl PostinoApp {
             show_palette: false,
             palette_query: String::new(),
             palette_focus: false,
+            palette_selected: 0,
+            focus_search: false,
+            show_shortcuts: false,
+            shortcut_query: String::new(),
+            shortcut_focus: false,
+            scroll_to_selected: false,
+            now: 0.0,
             custom_chrome,
             reading_open: false,
             reading_full: false,
@@ -64,32 +94,271 @@ impl PostinoApp {
     fn select_folder(&mut self, folder: impl Into<String>) {
         self.folder = folder.into();
         self.query.clear();
-        self.selected = None;
+        self.clear_selection();
         self.reading_open = false;
         self.reading_full = false;
     }
 
-    fn select_message(&mut self, id: String) {
-        self.selected = Some(id);
-        self.reading_open = true;
+    fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.anchor = None;
+        self.selected = None;
+        self.pending_read = None;
     }
 
-    fn move_selected(&mut self, folder: &str, confirmation: &str) {
-        let Some(id) = self.selected.clone() else {
-            return;
-        };
-        match self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
-            Ok(_) => {
-                self.status = confirmation.to_owned();
-                self.selected = None;
-                self.reading_open = false;
-                self.reading_full = false;
-            }
-            Err(error) => self.status = format!("Errore: {error}"),
+    fn selection_ids(&self) -> Vec<String> {
+        if self.selection.is_empty() { self.selected.iter().cloned().collect() } else { self.selection.iter().cloned().collect() }
+    }
+
+    /// Keyboard shortcuts and context menus apply to the whole selection. The reading pane always
+    /// acts on its focused message only.
+    fn action_ids(&self) -> Vec<String> {
+        self.selection_ids()
+    }
+
+    fn select_only(&mut self, id: String) {
+        self.selection.clear();
+        self.selection.insert(id.clone());
+        self.anchor = Some(id.clone());
+        self.selected = Some(id);
+    }
+
+    /// Move the highlight without opening the reading pane. `J`/`K` use this while the pane is
+    /// closed, so browsing never marks anything read.
+    fn focus_message(&mut self, id: String) {
+        if self.selected.as_deref() != Some(id.as_str()) {
+            self.pending_read = None;
+        }
+        if self.reading_open {
+            self.close_reading();
+        }
+        self.select_only(id);
+    }
+
+    /// Select and open a message. Read state is delayed by 600 ms so a quick pass through the
+    /// list does not clear every unread marker.
+    fn open_message(&mut self, id: String) {
+        let same = self.selected.as_deref() == Some(id.as_str());
+        if !same {
+            self.pending_read = None;
+        }
+        self.select_only(id.clone());
+        self.reading_open = true;
+        let unread = self.engine.message(&id).is_some_and(|message| message.summary.unread);
+        let already_pending = self.pending_read.as_ref().is_some_and(|pending| pending.id == id);
+        if unread && !already_pending {
+            self.pending_read = Some(PendingRead { id, at: self.now + 0.6 });
         }
     }
 
-    fn step_selection(&mut self, delta: i32) {
+    fn toggle_selection(&mut self, id: String) {
+        if !self.selection.remove(&id) {
+            self.selection.insert(id.clone());
+            self.anchor = Some(id.clone());
+            self.selected = Some(id);
+        } else if self.selected.as_deref() == Some(id.as_str()) {
+            self.selected = self.selection.iter().next_back().cloned();
+            if self.anchor.as_deref() == Some(id.as_str()) {
+                self.anchor = self.selected.clone();
+            }
+        }
+        if self.selection.is_empty() {
+            self.anchor = None;
+            self.selected = None;
+            self.close_reading();
+        }
+        self.close_reading_if_multi();
+    }
+
+    fn extend_selection(&mut self, id: String, rows: &[MessageSummary]) {
+        let anchor = self.anchor.clone().or_else(|| self.selected.clone());
+        let Some(anchor) = anchor else {
+            self.focus_message(id);
+            return;
+        };
+        let Some(from) = rows.iter().position(|message| message.id == anchor) else {
+            self.focus_message(id);
+            return;
+        };
+        let Some(to) = rows.iter().position(|message| message.id == id) else {
+            return;
+        };
+        let (start, end) = if from <= to { (from, to) } else { (to, from) };
+        self.selection = rows[start..=end].iter().map(|message| message.id.clone()).collect();
+        self.selected = Some(id);
+        self.close_reading_if_multi();
+    }
+
+    fn select_all(&mut self, rows: &[MessageSummary]) {
+        if rows.is_empty() {
+            return;
+        }
+        self.selection = rows.iter().map(|message| message.id.clone()).collect();
+        let focus = self.selected.as_ref().and_then(|id| rows.iter().find(|message| &message.id == id)).map(|message| message.id.clone());
+        self.selected = focus.or_else(|| rows.first().map(|message| message.id.clone()));
+        self.anchor = rows.first().map(|message| message.id.clone());
+        self.close_reading_if_multi();
+    }
+
+    fn close_reading_if_multi(&mut self) {
+        if self.selection.len() > 1 {
+            self.close_reading();
+        }
+    }
+
+    fn prune_selection(&mut self, rows: &[MessageSummary]) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let visible: BTreeSet<&str> = rows.iter().map(|message| message.id.as_str()).collect();
+        self.selection.retain(|id| visible.contains(id.as_str()));
+        if self.selection.is_empty() {
+            self.selected = None;
+            self.anchor = None;
+            self.pending_read = None;
+            return;
+        }
+        if let Some(selected) = self.selected.as_deref()
+            && !self.selection.contains(selected)
+        {
+            self.selected = self.selection.iter().next_back().cloned();
+        }
+        if let Some(anchor) = self.anchor.as_deref()
+            && !self.selection.contains(anchor)
+        {
+            self.anchor = self.selected.clone();
+        }
+    }
+
+    fn row_targets(&self, id: &str) -> Vec<String> {
+        if self.selection.len() > 1 && self.selection.contains(id) { self.selection_ids() } else { vec![id.to_owned()] }
+    }
+
+    fn run_row_action(&mut self, id: &str, action: RowAction) {
+        let targets = self.row_targets(id);
+        match action {
+            RowAction::Open => self.open_message(id.to_owned()),
+            RowAction::MarkRead => self.set_unread_many(&targets, false),
+            RowAction::MarkUnread => self.set_unread_many(&targets, true),
+            RowAction::Star => self.set_starred_many(&targets, true),
+            RowAction::Unstar => self.set_starred_many(&targets, false),
+            RowAction::Archive => self.move_many(&targets, "archive", "Messaggio archiviato", "Messaggi archiviati"),
+            RowAction::Delete => self.move_many(&targets, "trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+        }
+    }
+
+    fn bulk_bar(&mut self, ui: &mut Ui, t: &Tokens) {
+        let ids = self.action_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let all_starred = ids.iter().all(|id| self.engine.message(id).is_some_and(|message| message.summary.starred));
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.label(typography::strong(Role::BodySmall, format!("{} selezionati", ids.len()), t.text));
+            ui.add_space(space::MD);
+            if IconButton::new(command_icon("read", icons::MARK_READ), command_label("read", "Segna come letto"))
+                .size(IconButtonSize::Sm)
+                .show(ui)
+                .clicked()
+            {
+                action = Some(BulkAction::Read);
+            }
+            if IconButton::new(command_icon("unread", icons::MARK_UNREAD), command_label("unread", "Segna come non letto"))
+                .size(IconButtonSize::Sm)
+                .show(ui)
+                .clicked()
+            {
+                action = Some(BulkAction::Unread);
+            }
+            if all_starred {
+                if IconButton::new(icons::STAR_FILL, command_label("unstar", "Togli stella"))
+                    .filled(true)
+                    .accent(true)
+                    .size(IconButtonSize::Sm)
+                    .show(ui)
+                    .clicked()
+                {
+                    action = Some(BulkAction::Unstar);
+                }
+            } else if IconButton::new(command_icon("star", icons::STAR), command_label("star", "Aggiungi stella"))
+                .size(IconButtonSize::Sm)
+                .show(ui)
+                .clicked()
+            {
+                action = Some(BulkAction::Star);
+            }
+            ui.add_space(space::XS);
+            if IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia"))
+                .size(IconButtonSize::Sm)
+                .show(ui)
+                .clicked()
+            {
+                action = Some(BulkAction::Archive);
+            }
+            if IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina"))
+                .danger(true)
+                .size(IconButtonSize::Sm)
+                .show(ui)
+                .clicked()
+            {
+                action = Some(BulkAction::Delete);
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if Button::ghost(command_label("clear_selection", "Deseleziona")).size(ButtonSize::Sm).show(ui).clicked() {
+                    action = Some(BulkAction::Clear);
+                }
+            });
+        });
+        match action {
+            Some(BulkAction::Read) => self.set_unread_many(&ids, false),
+            Some(BulkAction::Unread) => self.set_unread_many(&ids, true),
+            Some(BulkAction::Star) => self.set_starred_many(&ids, true),
+            Some(BulkAction::Unstar) => self.set_starred_many(&ids, false),
+            Some(BulkAction::Archive) => self.move_many(&ids, "archive", "Messaggio archiviato", "Messaggi archiviati"),
+            Some(BulkAction::Delete) => self.move_many(&ids, "trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            Some(BulkAction::Clear) => self.clear_selection(),
+            None => {}
+        }
+    }
+
+    fn close_reading(&mut self) {
+        self.reading_open = false;
+        self.reading_full = false;
+        self.pending_read = None;
+    }
+
+    fn move_selected(&mut self, folder: &str, confirmation: &str, plural: &str) {
+        let ids = self.action_ids();
+        self.move_many(&ids, folder, confirmation, plural);
+    }
+
+    fn move_many(&mut self, ids: &[String], folder: &str, confirmation: &str, plural: &str) {
+        let mut moved = Vec::new();
+        for id in ids {
+            let Some(previous) = self.engine.message(id).map(|message| message.summary.folder_id.clone()) else {
+                continue;
+            };
+            match self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
+                Ok(_) => moved.push((id.clone(), previous)),
+                Err(error) => {
+                    self.status = format!("Errore: {error}");
+                    return;
+                }
+            }
+        }
+        if moved.is_empty() {
+            return;
+        }
+        let message = if moved.len() == 1 { confirmation.to_owned() } else { plural.to_owned() };
+        self.status = message.clone();
+        self.clear_selection();
+        self.reading_open = false;
+        self.reading_full = false;
+        self.push_toast(message, UndoAction::Move(moved));
+    }
+
+    fn step_selection(&mut self, delta: i32, extend: bool) {
         let (rows, _, _) = self.visible_messages();
         if rows.is_empty() {
             return;
@@ -102,33 +371,178 @@ impl PostinoApp {
             }
             None => 0,
         };
-        if let Some(message) = rows.get(next) {
-            self.select_message(message.id.clone());
-        }
-    }
-
-    fn set_flag(&mut self, unread: Option<bool>, starred: Option<bool>) {
-        let Some(id) = self.selected.clone() else {
+        let Some(message) = rows.get(next) else {
             return;
         };
+        if extend {
+            self.extend_selection(message.id.clone(), &rows);
+        } else if self.reading_open {
+            self.open_message(message.id.clone());
+        } else {
+            self.focus_message(message.id.clone());
+        }
+        self.scroll_to_selected = true;
+    }
+
+    fn set_flag_for(&mut self, id: &str, unread: Option<bool>, starred: Option<bool>) -> bool {
         match self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
-            Ok(_) => self.status = "Aggiornato · demo".to_owned(),
-            Err(error) => self.status = format!("Errore: {error}"),
+            Ok(_) => true,
+            Err(error) => {
+                self.status = format!("Errore: {error}");
+                false
+            }
         }
     }
 
     fn toggle_star(&mut self) {
-        let Some(message) = self.selected.as_deref().and_then(|id| self.engine.message(id)).cloned() else {
+        let ids = self.action_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let all_starred = ids.iter().all(|id| self.engine.message(id).is_some_and(|message| message.summary.starred));
+        self.set_starred_many(&ids, !all_starred);
+    }
+
+    fn set_starred(&mut self, starred: bool) {
+        let ids = self.action_ids();
+        self.set_starred_many(&ids, starred);
+    }
+
+    fn toggle_star_for(&mut self, id: &str) {
+        let Some(starred) = self.engine.message(id).map(|message| message.summary.starred) else {
             return;
         };
-        self.set_flag(None, Some(!message.summary.starred));
+        self.set_starred_for(id, !starred);
+    }
+
+    fn set_starred_for(&mut self, id: &str, starred: bool) {
+        self.set_starred_many(&[id.to_owned()], starred);
+    }
+
+    fn set_starred_many(&mut self, ids: &[String], starred: bool) {
+        let mut changes = Vec::new();
+        for id in ids {
+            let Some(previous) = self.engine.message(id).map(|message| message.summary.starred) else {
+                continue;
+            };
+            if previous == starred {
+                continue;
+            }
+            if !self.set_flag_for(id, None, Some(starred)) {
+                return;
+            }
+            changes.push((id.clone(), previous));
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let message = if changes.len() == 1 {
+            if starred { "Stella aggiunta" } else { "Stella rimossa" }.to_owned()
+        } else if starred {
+            format!("Stella aggiunta a {} messaggi", changes.len())
+        } else {
+            format!("Stella rimossa da {} messaggi", changes.len())
+        };
+        self.status = message.clone();
+        self.push_toast(message, UndoAction::Starred(changes));
     }
 
     fn toggle_read(&mut self) {
-        let Some(message) = self.selected.as_deref().and_then(|id| self.engine.message(id)).cloned() else {
+        let Some(id) = self.selected.clone() else {
             return;
         };
-        self.set_flag(Some(!message.summary.unread), None);
+        let Some(unread) = self.engine.message(&id).map(|message| message.summary.unread) else {
+            return;
+        };
+        self.set_unread_for(&id, !unread);
+    }
+
+    fn set_unread_for(&mut self, id: &str, unread: bool) {
+        self.set_unread_many(&[id.to_owned()], unread);
+    }
+
+    fn set_unread_many(&mut self, ids: &[String], unread: bool) {
+        let mut changes = Vec::new();
+        for id in ids {
+            let Some(previous) = self.engine.message(id).map(|message| message.summary.unread) else {
+                continue;
+            };
+            if previous == unread {
+                continue;
+            }
+            if !self.set_flag_for(id, Some(unread), None) {
+                return;
+            }
+            changes.push((id.clone(), previous));
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let message = if changes.len() == 1 {
+            if unread { "Messaggio non letto" } else { "Messaggio letto" }.to_owned()
+        } else if unread {
+            format!("{} messaggi segnati come non letti", changes.len())
+        } else {
+            format!("{} messaggi segnati come letti", changes.len())
+        };
+        self.status = message.clone();
+        self.push_toast(message, UndoAction::Unread(changes));
+    }
+
+    fn mark_read_after_delay(&mut self, id: &str) {
+        self.set_unread_for(id, false);
+    }
+
+    fn maybe_complete_read(&mut self) {
+        let Some(pending) = self.pending_read.take() else {
+            return;
+        };
+        if self.now >= pending.at {
+            self.mark_read_after_delay(&pending.id);
+        } else {
+            self.pending_read = Some(pending);
+        }
+    }
+
+    fn push_toast(&mut self, message: impl Into<String>, undo: UndoAction) {
+        self.toast = Some(ToastState { message: message.into(), undo, until: self.now + 8.0 });
+    }
+
+    fn undo_last(&mut self) {
+        let Some(toast) = self.toast.take() else {
+            return;
+        };
+        let mut error = None;
+        match toast.undo {
+            UndoAction::Unread(changes) => {
+                for (id, unread) in changes {
+                    if let Err(cause) = self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": null })) {
+                        error = Some(cause);
+                        break;
+                    }
+                }
+            }
+            UndoAction::Starred(changes) => {
+                for (id, starred) in changes {
+                    if let Err(cause) = self.engine.call("message_flag", json!({ "id": id, "unread": null, "starred": starred })) {
+                        error = Some(cause);
+                        break;
+                    }
+                }
+            }
+            UndoAction::Move(changes) => {
+                for (id, folder) in changes {
+                    if let Err(cause) = self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
+                        error = Some(cause);
+                        break;
+                    }
+                }
+            }
+        }
+        match error {
+            Some(error) => self.status = format!("Errore: {error}"),
+            None => self.status = "Annullato".to_owned(),
+        }
     }
 
     fn visible_messages(&mut self) -> (Vec<MessageSummary>, usize, usize) {
@@ -182,43 +596,163 @@ impl PostinoApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let mut palette = false;
         let mut escape = false;
+        let mut shortcuts = false;
         let mut enter = false;
+        let mut open = false;
         let mut next = false;
         let mut previous = false;
+        let mut mark_unread = false;
+        let mut star = false;
+        let mut archive = false;
+        let mut delete = false;
+        let mut undo = false;
+        let mut extend = false;
+        let mut toggle = false;
+        let mut select_all = false;
+        let mut focus_search = false;
         let typing = ctx.egui_wants_keyboard_input();
         ctx.input(|input| {
             palette = input.modifiers.command && input.key_pressed(Key::K);
             escape = input.key_pressed(Key::Escape);
+            shortcuts = !typing && !input.modifiers.command && input.key_pressed(Key::Questionmark);
             enter = !typing && !input.modifiers.command && input.key_pressed(Key::Enter);
-            next = !typing && !input.modifiers.command && input.key_pressed(Key::J);
-            previous = !typing && !input.modifiers.command && input.key_pressed(Key::K);
+            open = !typing && !input.modifiers.command && input.key_pressed(Key::O);
+            next = !typing && !input.modifiers.command && (input.key_pressed(Key::J) || input.key_pressed(Key::ArrowDown));
+            previous = !typing && !input.modifiers.command && (input.key_pressed(Key::K) || input.key_pressed(Key::ArrowUp));
+            extend = input.modifiers.shift;
+            mark_unread = !typing && !input.modifiers.command && input.key_pressed(Key::U);
+            star = !typing && !input.modifiers.command && input.key_pressed(Key::S);
+            archive = !typing && !input.modifiers.command && input.key_pressed(Key::E);
+            delete = !typing && !input.modifiers.command && input.key_pressed(Key::Delete);
+            undo = !typing && !input.modifiers.command && input.key_pressed(Key::Z);
+            toggle = !typing && !input.modifiers.command && (input.key_pressed(Key::Space) || input.key_pressed(Key::X));
+            select_all = !typing && input.modifiers.command && input.key_pressed(Key::A);
+            focus_search = !typing && !input.modifiers.command && input.key_pressed(Key::Slash);
         });
         if palette {
             self.show_palette = !self.show_palette;
             self.palette_focus = self.show_palette;
             if self.show_palette {
                 self.palette_query.clear();
+                self.palette_selected = 0;
+                self.show_shortcuts = false;
+                self.show_about = false;
+            }
+        }
+        if shortcuts {
+            self.show_shortcuts = !self.show_shortcuts;
+            self.show_palette = false;
+            self.show_about = false;
+            if self.show_shortcuts {
+                self.shortcut_query.clear();
+                self.shortcut_focus = true;
             }
         }
         if escape {
-            if self.reading_full {
+            if self.show_palette {
+                self.show_palette = false;
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            } else if self.show_shortcuts {
+                self.show_shortcuts = false;
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            } else if self.show_about {
+                self.show_about = false;
+            } else if typing {
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            } else if self.reading_full {
                 self.reading_full = false;
             } else if self.reading_open {
-                self.reading_open = false;
+                self.close_reading();
+            } else {
+                self.clear_selection();
             }
-            self.show_palette = false;
-            self.show_about = false;
         }
-        if !self.show_palette && !self.show_about {
-            if enter && self.reading_open {
+        if self.show_palette || self.show_shortcuts || self.show_about {
+            return;
+        }
+        if focus_search {
+            self.focus_search = true;
+        }
+        if select_all {
+            let (rows, _, _) = self.visible_messages();
+            self.select_all(&rows);
+        }
+        if toggle && let Some(id) = self.selected.clone() {
+            self.toggle_selection(id);
+        }
+        if enter {
+            if self.reading_open {
                 self.reading_full = true;
+            } else if let Some(id) = self.selected.clone() {
+                self.open_message(id);
             }
-            if next {
-                self.step_selection(1);
-            }
-            if previous {
-                self.step_selection(-1);
-            }
+        }
+        if open && let Some(id) = self.selected.clone() {
+            self.open_message(id);
+        }
+        if mark_unread {
+            self.mark_unread();
+        }
+        if star {
+            self.toggle_star();
+        }
+        if archive {
+            self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati");
+        }
+        if delete {
+            self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino");
+        }
+        if undo {
+            self.undo_last();
+        }
+        if next {
+            self.step_selection(1, extend);
+        }
+        if previous {
+            self.step_selection(-1, extend);
+        }
+    }
+
+    fn mark_unread(&mut self) {
+        let ids = self.action_ids();
+        self.set_unread_many(&ids, true);
+    }
+
+    fn mark_all_read(&mut self, folder: &str) {
+        let ids = self
+            .engine
+            .messages()
+            .iter()
+            .filter(|message| message.summary.unread)
+            .filter(|message| if folder == "starred" { message.summary.starred } else { message.summary.folder_id == folder })
+            .map(|message| message.summary.id.clone())
+            .collect::<Vec<_>>();
+        self.set_unread_many(&ids, false);
+    }
+
+    fn tick(&mut self, ctx: &egui::Context) {
+        self.now = ctx.input(|input| input.time);
+        self.maybe_complete_read();
+        if let Some(pending) = &self.pending_read {
+            ctx.request_repaint_after(Duration::from_secs_f64((pending.at - self.now).max(0.0)));
+        }
+        let expired = self.toast.as_ref().is_some_and(|toast| self.now >= toast.until);
+        if expired {
+            self.toast = None;
+        } else if let Some(toast) = &self.toast {
+            ctx.request_repaint_after(Duration::from_secs_f64((toast.until - self.now).max(0.0)));
+        }
+    }
+
+    fn toast_overlay(&mut self, ctx: &egui::Context) {
+        let Some(state) = &self.toast else {
+            return;
+        };
+        let message = state.message.clone();
+        if let Some(response) = Toast::new(&message).undo("Annulla").show_overlay(ctx, "postino-toast")
+            && response.clicked()
+        {
+            self.undo_last();
         }
     }
 
@@ -322,17 +856,25 @@ impl PostinoApp {
 
                 ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
                     if let Some(account) = self.engine.accounts().first() {
+                        let details = if account.provider.trim().is_empty() {
+                            account.email.clone()
+                        } else {
+                            format!("{} · {}", account.email, account.provider)
+                        };
                         avatar(ui, 24.0, &initials(&account.name), t.gold, theme::FOREST);
                         ui.add_space(space::SM);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(typography::strong(Role::BodySmall, account.name.clone(), t.text));
-                            ui.label(typography::text(Role::Caption, account.email.clone(), t.text_faint));
+                            ui.label(typography::text(Role::Caption, details, t.text_faint));
                         });
                     }
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(search_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-                    SearchField::new(&mut self.query, "Cerca in tutte le mail…").width(search_width).show(ui);
+                    let _ = SearchField::new(&mut self.query, "Cerca in tutte le mail…").width(search_width).focus(self.focus_search).show(ui);
+                    if self.focus_search {
+                        self.focus_search = false;
+                    }
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
                     let _ = Button::primary("Scrivi")
@@ -359,21 +901,9 @@ impl PostinoApp {
             .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::LG, inset::XL)))
             .show_separator_line(false)
             .show(ui, |ui| {
-                if let Some(account) = self.engine.accounts().first() {
-                    ui.horizontal(|ui| {
-                        avatar(ui, 34.0, &initials(&account.name), t.gold, theme::FOREST);
-                        ui.add_space(space::SM);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(typography::strong(Role::BodySmall, account.name.clone(), t.text));
-                            ui.label(typography::text(Role::Meta, account.email.clone(), t.text_muted));
-                            ui.label(typography::text(Role::Caption, account.provider.clone(), t.text_faint));
-                        });
-                    });
-                }
-                ui.add_space(space::LG);
                 let footer_height = 42.0;
                 let scroll_height = (ui.available_height() - footer_height).max(80.0);
+                let mut folder_action = None;
                 egui::ScrollArea::vertical().max_height(scroll_height).auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     SectionHeader::new("CARTELLE").show(ui);
@@ -385,9 +915,23 @@ impl PostinoApp {
                             .icon(folder_icon(folder.kind))
                             .selected(self.folder == folder.id)
                             .height(32.0);
-                        if row.show(ui).clicked() {
+                        let response = row.show(ui);
+                        if response.clicked() {
                             self.select_folder(folder.id.clone());
                         }
+                        response.context_menu(|ui| {
+                            let items = [
+                                MenuItem::new("Nuova etichetta").enabled(false).reason("Le etichette arrivano in U0.5"),
+                                MenuItem::new("Rinomina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
+                                MenuItem::new("Elimina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
+                                MenuItem::separator(),
+                                menu_item("mark_folder_read"),
+                            ];
+                            if let Some(4) = Menu::new(&items).show(ui) {
+                                folder_action = Some((folder.id.clone(), FolderAction::MarkAllRead));
+                                ui.close();
+                            }
+                        });
                     }
                     ui.add_space(space::LG);
                     SectionHeader::new("ETICHETTE").show(ui);
@@ -396,6 +940,9 @@ impl PostinoApp {
                         label_row(ui, label, color, &t);
                     }
                 });
+                if let Some((folder, FolderAction::MarkAllRead)) = folder_action {
+                    self.mark_all_read(&folder);
+                }
                 let remaining = ui.available_height();
                 if remaining > footer_height {
                     ui.add_space(remaining - footer_height);
@@ -412,26 +959,32 @@ impl PostinoApp {
         let folder_name =
             self.engine.folders().iter().find(|folder| folder.id == self.folder).map_or_else(|| "Posta".to_owned(), |folder| folder.name.clone());
         let (rows, total, unread) = self.visible_messages();
+        self.prune_selection(&rows);
         let searching = !self.query.trim().is_empty();
+        let multi = self.selection.len() > 1;
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(typography::strong(Role::Section, folder_name, t.text));
-                ui.add_space(space::SM);
-                ui.label(typography::text(Role::Meta, format!("{unread} non letti · {total}"), t.text_muted));
-            });
-            ui.add_space(space::XS);
-            ui.horizontal(|ui| {
-                if Chip::new("Tutti").selected(!self.unread_only && !self.attachments_only).show(ui).clicked() {
-                    self.unread_only = false;
-                    self.attachments_only = false;
-                }
-                if Chip::new("Non letti").selected(self.unread_only).show(ui).clicked() {
-                    self.unread_only = !self.unread_only;
-                }
-                if Chip::new("Allegati").icon(icons::PAPERCLIP).selected(self.attachments_only).show(ui).clicked() {
-                    self.attachments_only = !self.attachments_only;
-                }
-            });
+            if multi {
+                self.bulk_bar(ui, &t);
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(typography::strong(Role::Section, folder_name, t.text));
+                    ui.add_space(space::SM);
+                    ui.label(typography::text(Role::Meta, format!("{unread} non letti · {total}"), t.text_muted));
+                });
+                ui.add_space(space::XS);
+                ui.horizontal(|ui| {
+                    if Chip::new("Tutti").selected(!self.unread_only && !self.attachments_only).show(ui).clicked() {
+                        self.unread_only = false;
+                        self.attachments_only = false;
+                    }
+                    if Chip::new("Non letti").selected(self.unread_only).show(ui).clicked() {
+                        self.unread_only = !self.unread_only;
+                    }
+                    if Chip::new("Allegati").icon(icons::PAPERCLIP).selected(self.attachments_only).show(ui).clicked() {
+                        self.attachments_only = !self.attachments_only;
+                    }
+                });
+            }
             if searching {
                 ui.add_space(space::XS);
                 ui.horizontal(|ui| {
@@ -443,6 +996,29 @@ impl PostinoApp {
             }
             ui.add_space(space::MD);
             if rows.is_empty() {
+                let mut empty_action = None;
+                let background = ui.interact(ui.available_rect_before_wrap(), ui.id().with("empty-list-menu"), Sense::click());
+                background.context_menu(|ui| {
+                    let items = [
+                        MenuItem::new("Nuova etichetta").enabled(false).reason("Le etichette arrivano in U0.5"),
+                        MenuItem::separator(),
+                        menu_item("refresh"),
+                        menu_item("select_all").enabled(false).reason("Non ci sono messaggi da selezionare"),
+                        MenuItem::new("Scrivi").icon(icons::COMPOSE).enabled(false).reason("Il composer arriva in U0.4"),
+                        MenuItem::new("Cancella ricerca").icon(icons::CLOSE).enabled(searching).reason("Nessuna ricerca attiva"),
+                    ];
+                    match Menu::new(&items).show(ui) {
+                        Some(2) => {
+                            empty_action = Some(EmptyAction::Refresh);
+                            ui.close();
+                        }
+                        Some(5) => {
+                            empty_action = Some(EmptyAction::ClearSearch);
+                            ui.close();
+                        }
+                        _ => {}
+                    }
+                });
                 let (icon, title, body, action) = if searching {
                     (icons::SEARCH, "Nessun risultato", "Nessun messaggio corrisponde alla ricerca.", Some("Cancella ricerca"))
                 } else if self.folder == "inbox" {
@@ -463,15 +1039,21 @@ impl PostinoApp {
                         self.select_folder("inbox");
                     }
                 }
+                match empty_action {
+                    Some(EmptyAction::Refresh) => self.status = "Dati demo già aggiornati".to_owned(),
+                    Some(EmptyAction::ClearSearch) => self.query.clear(),
+                    None => {}
+                }
                 return;
             }
 
-            let list_width = ui.available_width();
             let mut clicked = None;
+            let mut star_clicked = None;
+            let mut context_clicked = None;
+            let mut context_action = None;
+            let modifiers = ui.input(|input| input.modifiers);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let fixed_columns = 12.0 + 30.0 + 120.0 + 52.0 + 20.0;
-                // Leave room for the vertical scroll bar so the star column is not hidden.
-                let subject_width = (list_width - fixed_columns - 16.0).max(80.0);
+                let mut focus_rect = None;
                 egui_extras::TableBuilder::new(ui)
                     .id_salt("message-list")
                     .striped(false)
@@ -481,10 +1063,10 @@ impl PostinoApp {
                     .cell_layout(Layout::left_to_right(Align::Center))
                     .column(egui_extras::Column::exact(12.0))
                     .column(egui_extras::Column::exact(30.0))
-                    .column(egui_extras::Column::exact(120.0))
-                    .column(egui_extras::Column::exact(subject_width))
+                    .column(egui_extras::Column::exact(140.0))
                     .column(egui_extras::Column::exact(52.0))
-                    .column(egui_extras::Column::exact(20.0))
+                    .column(egui_extras::Column::remainder())
+                    .column(egui_extras::Column::exact(24.0))
                     .header(24.0, |mut header| {
                         header.col(|_| {});
                         header.col(|_| {});
@@ -492,18 +1074,17 @@ impl PostinoApp {
                             ui.add(egui::Label::new(typography::text(Role::Caption, "MITTENTE", t.text_faint)).selectable(false));
                         });
                         header.col(|ui| {
-                            ui.add(egui::Label::new(typography::text(Role::Caption, "OGGETTO", t.text_faint)).selectable(false));
+                            ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
                         });
                         header.col(|ui| {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
-                            });
+                            ui.add(egui::Label::new(typography::text(Role::Caption, "OGGETTO", t.text_faint)).selectable(false));
                         });
                         header.col(|_| {});
                     })
                     .body(|mut body| {
                         for message in &rows {
-                            let selected = self.selected.as_deref() == Some(message.id.as_str());
+                            let focused = self.selected.as_deref() == Some(message.id.as_str());
+                            let selected = self.selection.contains(&message.id);
                             let foreground = if selected { t.selected_text } else { t.text };
                             body.row(ui_size::ROW, |mut row| {
                                 row.set_selected(selected);
@@ -531,6 +1112,22 @@ impl PostinoApp {
                                     ui.add(egui::Label::new(text).truncate().selectable(false));
                                 });
                                 row.col(|ui| {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(typography::mono(
+                                                format_when(message.date),
+                                                10.5,
+                                                if selected { t.selected_muted } else { t.text_faint },
+                                            ))
+                                            .selectable(false),
+                                        );
+                                    });
+                                });
+                                row.col(|ui| {
+                                    // The cell layout starts content at the top. Centre the two lines
+                                    // explicitly so the subject never touches the selected row edge.
+                                    let top = ((ui.available_height() - 28.0) * 0.5).max(0.0);
+                                    ui.add_space(top);
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
                                         let subject = RichText::new(message.subject.as_str())
@@ -546,18 +1143,6 @@ impl PostinoApp {
                                     });
                                 });
                                 row.col(|ui| {
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.add(
-                                            egui::Label::new(typography::mono(
-                                                format_when(message.date),
-                                                10.5,
-                                                if selected { t.selected_muted } else { t.text_faint },
-                                            ))
-                                            .selectable(false),
-                                        );
-                                    });
-                                });
-                                row.col(|ui| {
                                     let star_color = if message.starred {
                                         if selected { t.gold } else { theme::GOLD_INK }
                                     } else if selected {
@@ -565,17 +1150,69 @@ impl PostinoApp {
                                     } else {
                                         t.text_faint
                                     };
-                                    ui.add(egui::Label::new(icons::icon(icons::STAR, 12.0, star_color)).selectable(false));
+                                    let star = if message.starred {
+                                        icons::icon_filled(icons::STAR_FILL, 13.0, star_color)
+                                    } else {
+                                        icons::icon(icons::STAR, 13.0, star_color)
+                                    };
+                                    let response = ui.add(egui::Label::new(star).sense(Sense::click()).selectable(false));
+                                    if response.clicked() {
+                                        star_clicked = Some(message.id.clone());
+                                    }
+                                    if response.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
                                 });
-                                if row.response().clicked() {
-                                    clicked = Some(message.id.clone());
+                                let response = row.response();
+                                if focused && self.scroll_to_selected {
+                                    response.scroll_to_me(None);
                                 }
+                                if focused && !selected {
+                                    focus_rect = Some(response.rect.shrink(1.0));
+                                }
+                                if response.secondary_clicked() {
+                                    context_clicked = Some(message.id.clone());
+                                }
+                                if response.clicked() {
+                                    clicked = Some((message.id.clone(), modifiers));
+                                }
+                                let (items, actions) = row_context_menu(message);
+                                response.context_menu(|ui| {
+                                    if let Some(index) = Menu::new(&items).show(ui)
+                                        && let Some(Some(action)) = actions.get(index)
+                                    {
+                                        context_action = Some((message.id.clone(), *action));
+                                        ui.close();
+                                    }
+                                });
                             });
                         }
                     });
+                if let Some(rect) = focus_rect {
+                    crate::ui::tokens::paint_focus_ring(ui, rect, radius::CONTROL, &t);
+                }
             });
-            if let Some(id) = clicked {
-                self.select_message(id);
+            self.scroll_to_selected = false;
+            if let Some(id) = star_clicked {
+                self.toggle_star_for(&id);
+            } else {
+                if let Some(id) = context_clicked
+                    && !self.selection.contains(&id)
+                {
+                    self.focus_message(id);
+                }
+                if let Some((id, modifiers)) = clicked {
+                    if modifiers.command {
+                        self.toggle_selection(id);
+                    } else if modifiers.shift {
+                        self.extend_selection(id, &rows);
+                    } else {
+                        self.open_message(id);
+                    }
+                }
+            }
+            if let Some((id, action)) = context_action {
+                self.run_row_action(&id, action);
             }
         });
     }
@@ -602,7 +1239,7 @@ impl PostinoApp {
     fn reading_content(&mut self, ui: &mut Ui, t: &Tokens, full: bool) {
         let message = self.selected.as_deref().and_then(|id| self.engine.message(id)).cloned();
         let Some(message) = message else {
-            self.reading_open = false;
+            self.close_reading();
             return;
         };
 
@@ -611,25 +1248,46 @@ impl PostinoApp {
             |ui| {
                 let mut action = None;
                 if full {
-                    if Button::ghost("Torna alla posta").icon(icons::ARROW_LEFT).shortcut("Esc").show(ui).clicked() {
+                    if Button::ghost(command_label("back", "Torna alla posta"))
+                        .icon(command_icon("back", icons::ARROW_LEFT))
+                        .shortcut(command_shortcut("back", "Esc"))
+                        .show(ui)
+                        .clicked()
+                    {
                         action = Some(ReadingAction::Back);
                     }
                 } else {
-                    if Button::new("Archivia").icon(icons::ARCHIVE).shortcut("E").show(ui).clicked() {
+                    if Button::new(command_label("archive", "Archivia"))
+                        .icon(command_icon("archive", icons::ARCHIVE))
+                        .shortcut(command_shortcut("archive", "E"))
+                        .show(ui)
+                        .clicked()
+                    {
                         action = Some(ReadingAction::Archive);
                     }
-                    if Button::danger("Elimina").icon(icons::TRASH).show(ui).clicked() {
+                    if Button::danger(command_label("delete", "Elimina"))
+                        .icon(command_icon("delete", icons::TRASH))
+                        .shortcut(command_shortcut("delete", "Canc"))
+                        .show(ui)
+                        .clicked()
+                    {
                         action = Some(ReadingAction::Delete);
                     }
                 }
                 ui.add_space(space::SM);
-                let star_label = if message.summary.starred { "Togli stella" } else { "Aggiungi stella" };
-                if IconButton::new(icons::STAR, star_label).selected(message.summary.starred).show(ui).clicked() {
+                let star_id = if message.summary.starred { "unstar" } else { "star" };
+                let star_icon = if message.summary.starred { icons::STAR_FILL } else { icons::STAR };
+                if IconButton::new(star_icon, command_label(star_id, "Stella"))
+                    .filled(message.summary.starred)
+                    .accent(message.summary.starred)
+                    .show(ui)
+                    .clicked()
+                {
                     action = Some(ReadingAction::Star);
                 }
-                let read_label = if message.summary.unread { "Segna come letto" } else { "Segna come non letto" };
+                let read_id = if message.summary.unread { "read" } else { "unread" };
                 let read_icon = if message.summary.unread { icons::MARK_READ } else { icons::MARK_UNREAD };
-                if IconButton::new(read_icon, read_label).show(ui).clicked() {
+                if IconButton::new(read_icon, command_label(read_id, "Letto")).show(ui).clicked() {
                     action = Some(ReadingAction::Read);
                 }
                 action
@@ -637,10 +1295,10 @@ impl PostinoApp {
             |ui| {
                 let mut action = None;
                 if !full {
-                    if IconButton::new(icons::SQUARE, "Apri a schermo intero").show(ui).clicked() {
+                    if IconButton::new(command_icon("expand", icons::SQUARE), command_label("expand", "Apri a schermo intero")).show(ui).clicked() {
                         action = Some(ReadingAction::Expand);
                     }
-                    if IconButton::new(icons::CLOSE, "Chiudi anteprima").show(ui).clicked() {
+                    if IconButton::new(command_icon("close", icons::CLOSE), command_label("close", "Chiudi lettura")).show(ui).clicked() {
                         action = Some(ReadingAction::Close);
                     }
                 }
@@ -649,7 +1307,8 @@ impl PostinoApp {
         );
 
         ui.add_space(space::LG);
-        ui.label(typography::strong(Role::Page, message.summary.subject.as_str(), t.text));
+        let subject = ui.label(typography::strong(Role::Page, message.summary.subject.as_str(), t.text));
+        reading_context_menu(subject, message.summary.subject.clone(), message.summary.from.display());
         ui.add_space(space::MD);
         let to = message.summary.to.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
         Sides::new().height(38.0).show(
@@ -660,7 +1319,8 @@ impl PostinoApp {
                     ui.add_space(space::SM);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(typography::strong(Role::BodySmall, message.summary.from.display(), t.text));
+                        let sender = ui.label(typography::strong(Role::BodySmall, message.summary.from.display(), t.text));
+                        reading_context_menu(sender, message.summary.subject.clone(), message.summary.from.display());
                         ui.label(typography::text(Role::Meta, format!("a {to}"), t.text_muted));
                     });
                 });
@@ -672,7 +1332,7 @@ impl PostinoApp {
         ui.add_space(space::MD);
         ui.separator();
         ui.add_space(space::MD);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(("reading-scroll", message.summary.id.as_str())).auto_shrink([false, false]).show(ui, |ui| {
             for paragraph in message.body_text.split("\n\n") {
                 let paragraph = paragraph.trim();
                 if paragraph.is_empty() {
@@ -720,11 +1380,11 @@ impl PostinoApp {
 
         let action = left_action.or(right_action);
         match action {
-            Some(ReadingAction::Archive) => self.move_selected("archive", "Messaggio archiviato"),
-            Some(ReadingAction::Delete) => self.move_selected("trash", "Messaggio spostato nel cestino"),
+            Some(ReadingAction::Archive) => self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati"),
+            Some(ReadingAction::Delete) => self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
             Some(ReadingAction::Star) => self.toggle_star(),
             Some(ReadingAction::Read) => self.toggle_read(),
-            Some(ReadingAction::Close) => self.reading_open = false,
+            Some(ReadingAction::Close) => self.close_reading(),
             Some(ReadingAction::Expand) => self.reading_full = true,
             Some(ReadingAction::Back) => self.reading_full = false,
             None => {}
@@ -744,7 +1404,7 @@ impl PostinoApp {
                     ui.painter().circle_filled(rect.center(), 3.0, dot);
                     ui.label(typography::text(Role::Meta, self.status.as_str(), t.text_muted));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(typography::text(Role::Meta, "Ctrl+K comandi · J/K naviga", t.text_faint));
+                        ui.label(typography::text(Role::Meta, "Ctrl+K comandi · J/K naviga · ? scorciatoie", t.text_faint));
                     });
                 });
             });
@@ -797,62 +1457,155 @@ impl PostinoApp {
         let ctx = ui.ctx().clone();
         let mut open = self.show_palette;
         let mut chosen = None;
+        // Consume the navigation keys before the text field sees them. Otherwise the caret
+        // swallows the arrows and only the first command can ever run.
+        let down = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown));
+        let up = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp));
+        let enter = ctx.input(|input| input.key_pressed(Key::Enter));
+        let navigated = down || up;
         egui::Window::new("Comandi")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_TOP, [0.0, 110.0])
-            .default_width(440.0)
+            .default_width(480.0)
             .show(&ctx, |ui| {
-                let response = ui.add_sized([420.0, 30.0], egui::TextEdit::singleline(&mut self.palette_query).hint_text("Cerca un comando…"));
+                let response =
+                    ui.add_sized([ui.available_width(), 32.0], egui::TextEdit::singleline(&mut self.palette_query).hint_text("Cerca un comando…"));
                 if self.palette_focus {
                     response.request_focus();
                     self.palette_focus = false;
                 }
-                ui.add_space(6.0);
-                let query = self.palette_query.trim().to_lowercase();
-                let actions = [
-                    ("Segna come letto", "read"),
-                    ("Segna come non letto", "unread"),
-                    ("Aggiungi stella", "star"),
-                    ("Togli stella", "unstar"),
-                    ("Vai a Posta in arrivo", "inbox"),
-                    ("Vai a Preferiti", "starred"),
-                    ("Tema chiaro/scuro", "theme"),
-                    ("Informazioni su Postino", "about"),
-                ];
-                let mut first = None;
-                for (label, id) in actions {
-                    if !query.is_empty() && !label.to_lowercase().contains(&query) {
-                        continue;
-                    }
-                    if first.is_none() {
-                        first = Some(id);
-                    }
-                    if ui.selectable_label(false, RichText::new(label).size(13.0)).clicked() {
-                        chosen = Some(id);
-                    }
+                if response.changed() {
+                    self.palette_selected = 0;
                 }
-                ui.add_space(6.0);
-                ui.label(RichText::new("Invio esegue il primo comando · Esc chiude").size(10.0).color(t.text_faint));
-                if ui.input(|input| input.key_pressed(Key::Enter))
-                    && let Some(id) = first
-                {
-                    chosen = Some(id);
+                let filtered = filtered_commands(&self.palette_query);
+                if filtered.is_empty() {
+                    ui.add_space(space::MD);
+                    ui.label(typography::text(Role::BodySmall, "Nessun comando corrisponde.", t.text_muted));
+                } else {
+                    self.palette_selected = self.palette_selected.min(filtered.len() - 1);
+                    if down {
+                        self.palette_selected = (self.palette_selected + 1) % filtered.len();
+                    }
+                    if up {
+                        self.palette_selected = (self.palette_selected + filtered.len() - 1) % filtered.len();
+                    }
+                    let has_message = self.selected.is_some();
+                    if enter {
+                        let command = filtered[self.palette_selected];
+                        if !command.needs_message || has_message {
+                            chosen = Some(command.id);
+                        }
+                    }
+                    ui.add_space(space::SM);
+                    egui::ScrollArea::vertical().max_height(330.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for (index, command) in filtered.iter().enumerate() {
+                            let enabled = !command.needs_message || has_message;
+                            let selected = index == self.palette_selected;
+                            let response = Button::ghost(command.label)
+                                .icon(command.icon)
+                                .shortcut(command.shortcut)
+                                .full_width()
+                                .selected(selected)
+                                .enabled(enabled)
+                                .disabled_reason("Seleziona prima un messaggio")
+                                .show(ui);
+                            if response.clicked() {
+                                chosen = Some(command.id);
+                            }
+                            if selected && navigated {
+                                response.scroll_to_me(None);
+                            }
+                        }
+                    });
                 }
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Caption, "↑↓ scegli · Invio esegue · Esc chiude", t.text_faint));
             });
         self.show_palette = open;
-        if let Some(action) = chosen {
-            self.execute_command(action, &ctx);
+        if !open {
+            ctx.memory_mut(|memory| memory.stop_text_input());
+        }
+        if let Some(id) = chosen {
+            self.execute_command(id, &ctx);
         }
     }
 
-    fn execute_command(&mut self, action: &str, ctx: &egui::Context) {
-        match action {
-            "read" => self.set_flag(Some(false), None),
-            "unread" => self.set_flag(Some(true), None),
-            "star" => self.set_flag(None, Some(true)),
-            "unstar" => self.set_flag(None, Some(false)),
+    fn shortcuts_sheet(&mut self, ui: &mut Ui) {
+        if !self.show_shortcuts {
+            return;
+        }
+        let t = theme::tokens(self.dark);
+        let mut open = self.show_shortcuts;
+        egui::Window::new("Scorciatoie")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(420.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(typography::text(Role::Meta, "La posta si usa anche senza mouse.", t.text_muted));
+                ui.add_space(space::SM);
+                let search = ui.add_sized(
+                    [ui.available_width(), 32.0],
+                    egui::TextEdit::singleline(&mut self.shortcut_query).hint_text("Cerca una scorciatoia…"),
+                );
+                if self.shortcut_focus {
+                    search.request_focus();
+                    self.shortcut_focus = false;
+                }
+                ui.add_space(space::MD);
+                let query = self.shortcut_query.trim().to_lowercase();
+                let commands = COMMANDS
+                    .iter()
+                    .filter(|command| !command.shortcut.is_empty())
+                    .filter(|command| {
+                        query.is_empty() || command.label.to_lowercase().contains(&query) || command.shortcut.to_lowercase().contains(&query)
+                    })
+                    .collect::<Vec<_>>();
+                if commands.is_empty() {
+                    ui.label(typography::text(Role::BodySmall, "Nessuna scorciatoia corrisponde.", t.text_muted));
+                } else {
+                    egui::Grid::new("shortcuts-grid").num_columns(2).spacing([space::XXL, space::SM]).show(ui, |ui| {
+                        for command in commands {
+                            ui.label(typography::text(Role::BodySmall, command.label, t.text));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(typography::mono(command.shortcut, 10.5, t.text_faint));
+                            });
+                            ui.end_row();
+                        }
+                    });
+                }
+            });
+        self.show_shortcuts = open;
+    }
+
+    fn execute_command(&mut self, id: &'static str, ctx: &egui::Context) {
+        self.show_palette = false;
+        ctx.memory_mut(|memory| memory.stop_text_input());
+        match id {
+            "open" => {
+                if let Some(message) = self.selected.clone() {
+                    self.open_message(message);
+                }
+            }
+            "expand" => {
+                if let Some(message) = self.selected.clone() {
+                    self.open_message(message);
+                    self.reading_full = true;
+                }
+            }
+            "read" => {
+                if let Some(message) = self.selected.clone() {
+                    self.set_unread_for(&message, false);
+                }
+            }
+            "unread" => self.mark_unread(),
+            "star" => self.set_starred(true),
+            "unstar" => self.set_starred(false),
+            "archive" => self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati"),
+            "delete" => self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
             "inbox" => self.select_folder("inbox"),
             "starred" => self.select_folder("starred"),
             "theme" => {
@@ -860,9 +1613,43 @@ impl PostinoApp {
                 theme::apply(ctx, self.dark);
             }
             "about" => self.show_about = true,
+            "shortcuts" => {
+                self.show_shortcuts = true;
+                self.shortcut_query.clear();
+                self.shortcut_focus = true;
+            }
+            "palette" => self.show_palette = true,
+            "select_all" => {
+                let (rows, _, _) = self.visible_messages();
+                self.select_all(&rows);
+            }
+            "toggle" => {
+                if let Some(message) = self.selected.clone() {
+                    self.toggle_selection(message);
+                }
+            }
+            "clear_selection" => self.clear_selection(),
+            "focus_search" => self.focus_search = true,
+            "next" => self.step_selection(1, false),
+            "previous" => self.step_selection(-1, false),
+            "extend_next" => self.step_selection(1, true),
+            "extend_previous" => self.step_selection(-1, true),
+            "refresh" => self.status = "Dati demo già aggiornati".to_owned(),
+            "mark_folder_read" => {
+                let folder = self.folder.clone();
+                self.mark_all_read(&folder);
+            }
+            "back" => self.reading_full = false,
+            "close" => {
+                if self.reading_full {
+                    self.reading_full = false;
+                } else {
+                    self.close_reading();
+                }
+            }
+            "undo" => self.undo_last(),
             _ => {}
         }
-        self.show_palette = false;
     }
 }
 
@@ -876,6 +1663,7 @@ impl PostinoApp {
     }
 
     fn show_inner(&mut self, ui: &mut egui::Ui) {
+        self.tick(ui.ctx());
         self.resize_handles(ui.ctx());
         self.handle_shortcuts(ui.ctx());
         // egui 0.36 nests panels in the order they are added. The status bar goes first so it is
@@ -895,6 +1683,8 @@ impl PostinoApp {
         }
         self.about(ui);
         self.command_palette(ui);
+        self.shortcuts_sheet(ui);
+        self.toast_overlay(ui.ctx());
     }
 }
 
@@ -915,6 +1705,149 @@ enum ReadingAction {
     Back,
 }
 
+#[derive(Clone, Copy)]
+enum BulkAction {
+    Read,
+    Unread,
+    Star,
+    Unstar,
+    Archive,
+    Delete,
+    Clear,
+}
+
+#[derive(Clone, Copy)]
+enum FolderAction {
+    MarkAllRead,
+}
+
+#[derive(Clone, Copy)]
+enum EmptyAction {
+    Refresh,
+    ClearSearch,
+}
+
+#[derive(Clone, Copy)]
+enum RowAction {
+    Open,
+    MarkRead,
+    MarkUnread,
+    Star,
+    Unstar,
+    Archive,
+    Delete,
+}
+
+struct PendingRead {
+    id: String,
+    at: f64,
+}
+
+struct ToastState {
+    message: String,
+    undo: UndoAction,
+    until: f64,
+}
+
+enum UndoAction {
+    Unread(Vec<(String, bool)>),
+    Starred(Vec<(String, bool)>),
+    Move(Vec<(String, String)>),
+}
+
+#[derive(Clone, Copy)]
+struct Command {
+    id: &'static str,
+    label: &'static str,
+    icon: &'static str,
+    shortcut: &'static str,
+    needs_message: bool,
+    in_palette: bool,
+}
+
+const COMMANDS: &[Command] = &[
+    Command { id: "open", label: "Apri messaggio", icon: icons::MAIL, shortcut: "Invio", needs_message: true, in_palette: true },
+    Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", needs_message: true, in_palette: true },
+    Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", needs_message: true, in_palette: true },
+    Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", needs_message: true, in_palette: true },
+    Command { id: "star", label: "Aggiungi stella", icon: icons::STAR, shortcut: "S", needs_message: true, in_palette: true },
+    Command { id: "unstar", label: "Togli stella", icon: icons::STAR, shortcut: "S", needs_message: true, in_palette: true },
+    Command { id: "archive", label: "Archivia", icon: icons::ARCHIVE, shortcut: "E", needs_message: true, in_palette: true },
+    Command { id: "delete", label: "Elimina", icon: icons::TRASH, shortcut: "Canc", needs_message: true, in_palette: true },
+    Command { id: "inbox", label: "Vai a Posta in arrivo", icon: icons::INBOX, shortcut: "", needs_message: false, in_palette: true },
+    Command { id: "starred", label: "Vai a Preferiti", icon: icons::STAR, shortcut: "", needs_message: false, in_palette: true },
+    Command { id: "theme", label: "Cambia tema", icon: icons::MOON, shortcut: "", needs_message: false, in_palette: true },
+    Command { id: "about", label: "Informazioni su Postino", icon: icons::INFO, shortcut: "", needs_message: false, in_palette: true },
+    Command { id: "shortcuts", label: "Scorciatoie da tastiera", icon: icons::KEYBOARD, shortcut: "?", needs_message: false, in_palette: true },
+    Command { id: "select_all", label: "Seleziona tutto", icon: icons::LIST, shortcut: "Ctrl+A", needs_message: false, in_palette: true },
+    Command { id: "toggle", label: "Seleziona o deseleziona", icon: icons::CHECK, shortcut: "X / Spazio", needs_message: true, in_palette: true },
+    Command { id: "clear_selection", label: "Deseleziona", icon: icons::X_CIRCLE, shortcut: "Esc", needs_message: false, in_palette: true },
+    Command { id: "focus_search", label: "Cerca nelle mail", icon: icons::SEARCH, shortcut: "/", needs_message: false, in_palette: true },
+    Command { id: "next", label: "Messaggio successivo", icon: icons::CHEVRON_DOWN, shortcut: "J / ↓", needs_message: false, in_palette: false },
+    Command { id: "previous", label: "Messaggio precedente", icon: icons::CHEVRON_UP, shortcut: "K / ↑", needs_message: false, in_palette: false },
+    Command {
+        id: "extend_next",
+        label: "Estendi selezione in basso",
+        icon: icons::CHEVRON_DOWN,
+        shortcut: "Shift+J / Shift+↓",
+        needs_message: false,
+        in_palette: false,
+    },
+    Command {
+        id: "extend_previous",
+        label: "Estendi selezione in alto",
+        icon: icons::CHEVRON_UP,
+        shortcut: "Shift+K / Shift+↑",
+        needs_message: false,
+        in_palette: false,
+    },
+    Command { id: "close", label: "Chiudi lettura", icon: icons::CLOSE, shortcut: "Esc", needs_message: false, in_palette: false },
+    Command { id: "undo", label: "Annulla ultima azione", icon: icons::UNDO, shortcut: "Z", needs_message: false, in_palette: false },
+    Command { id: "palette", label: "Apri i comandi", icon: icons::COMMAND, shortcut: "Ctrl+K", needs_message: false, in_palette: false },
+    Command { id: "refresh", label: "Aggiorna", icon: icons::SYNC, shortcut: "", needs_message: false, in_palette: false },
+    Command {
+        id: "mark_folder_read",
+        label: "Segna tutto come letto",
+        icon: icons::MARK_READ,
+        shortcut: "",
+        needs_message: false,
+        in_palette: false,
+    },
+    Command { id: "back", label: "Torna alla posta", icon: icons::ARROW_LEFT, shortcut: "Esc", needs_message: false, in_palette: false },
+];
+
+fn command(id: &str) -> Option<&'static Command> {
+    COMMANDS.iter().find(|command| command.id == id)
+}
+
+fn command_label(id: &str, fallback: &'static str) -> &'static str {
+    command(id).map_or(fallback, |command| command.label)
+}
+
+fn command_icon(id: &str, fallback: &'static str) -> &'static str {
+    command(id).map_or(fallback, |command| command.icon)
+}
+
+fn command_shortcut(id: &str, fallback: &'static str) -> &'static str {
+    command(id).map_or(fallback, |command| command.shortcut)
+}
+
+fn menu_item(id: &str) -> MenuItem<'static> {
+    match command(id) {
+        Some(command) => MenuItem::new(command.label).icon(command.icon).shortcut(command.shortcut),
+        None => MenuItem::new("Azione non disponibile").enabled(false).reason("Comando non registrato"),
+    }
+}
+
+fn filtered_commands(query: &str) -> Vec<&'static Command> {
+    let query = query.trim().to_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|command| command.in_palette)
+        .filter(|command| query.is_empty() || command.label.to_lowercase().contains(&query) || command.shortcut.to_lowercase().contains(&query))
+        .collect()
+}
+
 fn window_control(ui: &mut Ui, glyph: &str, label: &str, close: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, ui_size::TITLE_BAR), Sense::click());
     if response.hovered() {
@@ -926,6 +1859,67 @@ fn window_control(ui: &mut Ui, glyph: &str, label: &str, close: bool) -> egui::R
     ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
     response.on_hover_text(label)
+}
+
+fn reading_context_menu(response: egui::Response, subject: String, sender: String) {
+    response.context_menu(|ui| {
+        let items = [
+            MenuItem::new("Copia oggetto").icon(icons::COPY),
+            MenuItem::new("Copia mittente").icon(icons::COPY),
+            MenuItem::separator(),
+            MenuItem::new("Apri in finestra").icon(icons::EXTERNAL).enabled(false).reason("La finestra separata arriva in U0.5"),
+            MenuItem::new("Mostra originale").icon(icons::EYE).enabled(false).reason("Il sorgente MIME arriva con lo store M1"),
+        ];
+        match Menu::new(&items).show(ui) {
+            Some(0) => {
+                ui.ctx().copy_text(subject);
+                ui.close();
+            }
+            Some(1) => {
+                ui.ctx().copy_text(sender);
+                ui.close();
+            }
+            _ => {}
+        }
+    });
+}
+
+fn row_context_menu(message: &MessageSummary) -> (Vec<MenuItem<'static>>, Vec<Option<RowAction>>) {
+    let mut items = Vec::new();
+    let mut actions = Vec::new();
+    items.push(menu_item("open"));
+    actions.push(Some(RowAction::Open));
+    items.push(MenuItem::new("Rispondi").icon(icons::REPLY).enabled(false).reason("Il composer arriva in U0.4"));
+    actions.push(None);
+    items.push(MenuItem::new("Rispondi a tutti").icon(icons::REPLY_ALL).enabled(false).reason("Il composer arriva in U0.4"));
+    actions.push(None);
+    items.push(MenuItem::new("Inoltra").icon(icons::FORWARD).enabled(false).reason("Il composer arriva in U0.4"));
+    actions.push(None);
+    items.push(MenuItem::separator());
+    actions.push(None);
+    if message.unread {
+        items.push(menu_item("read"));
+        actions.push(Some(RowAction::MarkRead));
+    } else {
+        items.push(menu_item("unread"));
+        actions.push(Some(RowAction::MarkUnread));
+    }
+    if message.starred {
+        items.push(menu_item("unstar").icon(icons::STAR_FILL));
+        actions.push(Some(RowAction::Unstar));
+    } else {
+        items.push(menu_item("star"));
+        actions.push(Some(RowAction::Star));
+    }
+    items.push(MenuItem::new("Etichetta").icon(icons::TAG).enabled(false).reason("Le etichette arrivano in U0.5"));
+    actions.push(None);
+    items.push(MenuItem::separator());
+    actions.push(None);
+    items.push(menu_item("archive"));
+    actions.push(Some(RowAction::Archive));
+    items.push(menu_item("delete").danger(true));
+    actions.push(Some(RowAction::Delete));
+    (items, actions)
 }
 
 fn folder_icon(kind: FolderKind) -> &'static str {
@@ -1011,6 +2005,25 @@ fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    fn frame(ctx: &egui::Context, app: &mut PostinoApp, events: Vec<egui::Event>) {
+        let raw =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))), events, ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+    }
+
+    fn key(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    fn ready_app() -> (egui::Context, PostinoApp) {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let app = PostinoApp::demo(true);
+        (ctx, app)
+    }
+
     #[test]
     fn shell_renders_one_frame() {
         let ctx = egui::Context::default();
@@ -1050,20 +2063,189 @@ mod tests {
     fn selecting_opens_the_reading_pane() {
         let mut app = PostinoApp::demo(true);
         let id = app.engine.messages()[0].summary.id.clone();
-        app.select_message(id.clone());
+        app.open_message(id.clone());
         assert_eq!(app.selected.as_deref(), Some(id.as_str()));
         assert!(app.reading_open);
         assert!(!app.reading_full);
     }
 
     #[test]
+    fn focusing_does_not_open_the_reading_pane() {
+        let mut app = PostinoApp::demo(true);
+        let id = app.engine.messages()[0].summary.id.clone();
+        app.focus_message(id.clone());
+        assert_eq!(app.selected.as_deref(), Some(id.as_str()));
+        assert!(!app.reading_open);
+    }
+
+    #[test]
+    fn opening_an_unread_message_marks_it_read_after_the_delay_and_undoes() {
+        let mut app = PostinoApp::demo(true);
+        let id = app.engine.messages().iter().find(|message| message.summary.unread).expect("an unread demo message").summary.id.clone();
+        app.now = 10.0;
+        app.open_message(id.clone());
+        assert!(app.engine.message(&id).is_some_and(|message| message.summary.unread), "opening must not mark read immediately");
+        app.now = 10.7;
+        app.maybe_complete_read();
+        assert!(app.engine.message(&id).is_some_and(|message| !message.summary.unread), "the 600 ms timer must mark the message read");
+        assert!(app.toast.is_some(), "the read action must offer an undo");
+        app.undo_last();
+        assert!(app.engine.message(&id).is_some_and(|message| message.summary.unread), "undo must restore the unread state");
+    }
+
+    #[test]
+    fn keyboard_navigates_opens_expands_and_closes() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        let first = rows[0].id.clone();
+        let second = rows[1].id.clone();
+
+        frame(&ctx, &mut app, vec![key(Key::J, Modifiers::NONE)]);
+        assert_eq!(app.selected.as_deref(), Some(first.as_str()), "J focuses the first row");
+        assert!(!app.reading_open, "focusing must not open the pane");
+
+        frame(&ctx, &mut app, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(app.selected.as_deref(), Some(second.as_str()), "ArrowDown moves to the next row");
+        assert!(!app.reading_open);
+
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(app.reading_open, "Enter opens the focused row");
+        assert!(!app.reading_full);
+
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(app.reading_full, "a second Enter expands the pane");
+
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.reading_open, "Esc first returns from full content");
+        assert!(!app.reading_full);
+
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.reading_open, "a second Esc closes the reading pane");
+    }
+
+    #[test]
+    fn multi_selection_toggles_extends_and_selects_all() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+
+        app.select_only(rows[0].id.clone());
+        app.toggle_selection(rows[1].id.clone());
+        assert_eq!(app.selection.len(), 2, "Ctrl-click adds a second row");
+        assert_eq!(app.selected.as_deref(), Some(rows[1].id.as_str()), "the last toggled row takes focus");
+        assert!(!app.reading_open, "multi-select closes the single-message pane");
+
+        app.extend_selection(rows[3].id.clone(), &rows);
+        assert_eq!(app.selection.len(), 3, "Shift-click extends from the anchor");
+        assert!(app.selection.contains(&rows[3].id));
+
+        app.select_all(&rows);
+        assert_eq!(app.selection.len(), rows.len());
+        assert!(!app.reading_open);
+        app.clear_selection();
+        assert!(app.selection.is_empty());
+        assert!(app.selected.is_none());
+    }
+
+    #[test]
+    fn multi_selection_renders_the_bulk_bar() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        app.select_all(&rows);
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.selection.len() > 1);
+        assert!(!app.reading_open);
+    }
+
+    #[test]
+    fn shift_arrow_extends_the_selection_headlessly() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+
+        frame(&ctx, &mut app, vec![key(Key::J, Modifiers::NONE)]);
+        assert_eq!(app.selected.as_deref(), Some(rows[0].id.as_str()));
+        frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::SHIFT), key(Key::J, Modifiers::SHIFT)]);
+        assert_eq!(app.selection.len(), 2, "Shift+J extends from the anchor");
+        assert!(app.selection.contains(&rows[0].id));
+        assert!(app.selection.contains(&rows[1].id));
+        assert!(!app.reading_open);
+    }
+
+    #[test]
+    fn moving_a_batch_is_one_undo_step() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        let ids = vec![rows[0].id.clone(), rows[1].id.clone()];
+        app.select_only(rows[0].id.clone());
+        app.toggle_selection(rows[1].id.clone());
+        app.move_many(&ids, "archive", "Messaggio archiviato", "Messaggi archiviati");
+        assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.folder_id == "archive")));
+        assert!(app.selection.is_empty(), "moving clears the selection");
+        app.undo_last();
+        assert!(
+            ids.iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.folder_id != "archive")),
+            "one undo restores the whole batch"
+        );
+    }
+
+    #[test]
+    fn batch_flags_share_one_undo_step() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let ids = app
+            .engine
+            .messages()
+            .iter()
+            .filter(|message| message.summary.unread)
+            .take(2)
+            .map(|message| message.summary.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        app.set_unread_many(&ids, false);
+        assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| !message.summary.unread)));
+        app.undo_last();
+        assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.unread)), "one undo restores every flag change");
+    }
+
+    #[test]
+    fn palette_arrows_and_enter_run_the_selected_command() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        app.focus_message(rows[0].id.clone());
+
+        frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::COMMAND), key(Key::K, Modifiers::COMMAND)]);
+        assert!(app.show_palette, "Ctrl+K opens the palette");
+
+        frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::NONE), key(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(app.palette_selected, 1, "ArrowDown moves the palette selection");
+
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(!app.show_palette, "Enter runs the selected command and closes the palette");
+        assert!(app.reading_open && app.reading_full, "the second command is 'Apri a schermo intero'");
+    }
+
+    #[test]
     fn archiving_closes_the_pane_and_moves_the_message() {
         let mut app = PostinoApp::demo(true);
         let id = app.engine.messages()[0].summary.id.clone();
-        app.select_message(id.clone());
-        app.move_selected("archive", "archiviato");
+        app.open_message(id.clone());
+        app.move_selected("archive", "archiviato", "archiviati");
         assert!(app.selected.is_none());
         assert!(!app.reading_open);
         assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("archive"));
+    }
+
+    #[test]
+    fn palette_filters_commands_and_keeps_every_row() {
+        let all = filtered_commands("");
+        assert!(all.len() > 4, "the palette should list more than the first command");
+        let search = filtered_commands("stella");
+        assert!(search.iter().any(|command| command.id == "star"));
+        assert!(search.iter().all(|command| command.label.to_lowercase().contains("stella")));
     }
 }

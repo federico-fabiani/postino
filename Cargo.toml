@@ -31,7 +31,7 @@ clap = { version = "4.6", features = ["derive"] }
 # ui
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 egui_extras = { version = "0.36", default-features = false }
-egui-phosphor = "0.14"
+egui-phosphor = { version = "0.14", features = ["fill"] }
 
 # build tooling
 cargo_metadata = "0.23"

@@ -49,6 +49,7 @@ pub struct Button<'a> {
     kind: ButtonKind,
     size: ButtonSize,
     enabled: bool,
+    selected: bool,
     full_width: bool,
     disabled_reason: Option<&'a str>,
 }
@@ -63,6 +64,7 @@ impl<'a> Button<'a> {
             kind: ButtonKind::Secondary,
             size: ButtonSize::Md,
             enabled: true,
+            selected: false,
             full_width: false,
             disabled_reason: None,
         }
@@ -114,6 +116,12 @@ impl<'a> Button<'a> {
     }
 
     #[must_use]
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    #[must_use]
     pub fn full_width(mut self) -> Self {
         self.full_width = true;
         self
@@ -143,7 +151,12 @@ impl<'a> Button<'a> {
 
         let hovered = self.enabled && response.hovered();
         let pressed = self.enabled && response.is_pointer_button_down_on();
-        let (fill, stroke, foreground) = paint_colors(self.kind, &t, self.enabled, hovered, pressed);
+        let (mut fill, mut stroke, mut foreground) = paint_colors(self.kind, &t, self.enabled, hovered, pressed);
+        if self.selected && !pressed {
+            fill = t.selected;
+            stroke = Color32::TRANSPARENT;
+            foreground = if self.enabled { t.selected_text } else { t.selected_muted };
+        }
 
         if fill != Color32::TRANSPARENT {
             ui.painter().rect_filled(rect, CornerRadius::same(radius::CONTROL), fill);
@@ -164,7 +177,8 @@ impl<'a> Button<'a> {
         let galley = layout(ui, self.label, &font, foreground);
         paint_left(ui, rect, cursor, &galley);
         if let Some(shortcut) = self.shortcut {
-            let galley = layout(ui, shortcut, &shortcut_font, t.text_faint);
+            let shortcut_color = if self.selected { t.selected_muted } else { t.text_faint };
+            let galley = layout(ui, shortcut, &shortcut_font, shortcut_color);
             paint_right(ui, rect, rect.right() - padding, &galley);
         }
 
@@ -208,6 +222,8 @@ pub struct IconButton<'a> {
     label: &'a str,
     size: IconButtonSize,
     selected: bool,
+    filled: bool,
+    accent: bool,
     enabled: bool,
     danger: bool,
 }
@@ -215,7 +231,7 @@ pub struct IconButton<'a> {
 impl<'a> IconButton<'a> {
     #[must_use]
     pub fn new(icon: &'a str, label: &'a str) -> Self {
-        Self { icon, label, size: IconButtonSize::Md, selected: false, enabled: true, danger: false }
+        Self { icon, label, size: IconButtonSize::Md, selected: false, filled: false, accent: false, enabled: true, danger: false }
     }
 
     #[must_use]
@@ -227,6 +243,20 @@ impl<'a> IconButton<'a> {
     #[must_use]
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    /// Draw the glyph from the filled variant. Pair it with `accent` for a toggle that should
+    /// read as active without a coloured square behind it.
+    #[must_use]
+    pub fn filled(mut self, filled: bool) -> Self {
+        self.filled = filled;
+        self
+    }
+
+    #[must_use]
+    pub fn accent(mut self, accent: bool) -> Self {
+        self.accent = accent;
         self
     }
 
@@ -250,14 +280,33 @@ impl<'a> IconButton<'a> {
         let hovered = self.enabled && response.hovered();
         let pressed = self.enabled && response.is_pointer_button_down_on();
 
+        let accent_color = t.gold_ink;
         let (fill, foreground) = if !self.enabled {
             (Color32::TRANSPARENT, t.text_faint)
         } else if self.selected || pressed {
             (t.selected, t.selected_text)
         } else if hovered {
-            (t.hover, if self.danger { t.danger } else { t.text })
+            (
+                t.hover,
+                if self.danger {
+                    t.danger
+                } else if self.accent {
+                    accent_color
+                } else {
+                    t.text
+                },
+            )
         } else {
-            (Color32::TRANSPARENT, if self.danger { t.danger } else { t.text_muted })
+            (
+                Color32::TRANSPARENT,
+                if self.danger {
+                    t.danger
+                } else if self.accent {
+                    accent_color
+                } else {
+                    t.text_muted
+                },
+            )
         };
         if fill != Color32::TRANSPARENT {
             ui.painter().rect_filled(rect, CornerRadius::same(radius::CONTROL), fill);
@@ -265,7 +314,8 @@ impl<'a> IconButton<'a> {
         if self.enabled && response.has_focus() {
             tokens::paint_focus_ring(ui, rect, radius::CONTROL, &t);
         }
-        let galley = layout(ui, self.icon, &icons::font(icon_size), foreground);
+        let font = if self.filled { icons::font_filled(icon_size) } else { icons::font(icon_size) };
+        let galley = layout(ui, self.icon, &font, foreground);
         let pos = eframe::egui::pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5);
         ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
 

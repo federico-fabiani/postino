@@ -100,12 +100,20 @@ pub struct SearchField<'a> {
     hint: &'a str,
     width: Option<f32>,
     enabled: bool,
+    focus: bool,
 }
 
 impl<'a> SearchField<'a> {
     #[must_use]
     pub fn new(text: &'a mut String, hint: &'a str) -> Self {
-        Self { text, hint, width: None, enabled: true }
+        Self { text, hint, width: None, enabled: true, focus: false }
+    }
+
+    /// Request keyboard focus for the next frame. The caller clears the flag afterwards.
+    #[must_use]
+    pub fn focus(mut self, focus: bool) -> Self {
+        self.focus = focus;
+        self
     }
 
     #[must_use]
@@ -145,6 +153,9 @@ impl<'a> SearchField<'a> {
                         .desired_width(f32::INFINITY)
                         .margin(Margin::ZERO);
                     let response = ui.add(edit);
+                    if self.focus {
+                        response.request_focus();
+                    }
                     if !self.text.is_empty()
                         && crate::ui::widgets::IconButton::new(icons::CLOSE, "Cancella ricerca")
                             .size(crate::ui::widgets::IconButtonSize::Sm)

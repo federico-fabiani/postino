@@ -15,17 +15,18 @@ pub struct MenuItem<'a> {
     enabled: bool,
     danger: bool,
     separator: bool,
+    reason: Option<&'a str>,
 }
 
 impl<'a> MenuItem<'a> {
     #[must_use]
     pub fn new(label: &'a str) -> Self {
-        Self { icon: None, label, shortcut: None, enabled: true, danger: false, separator: false }
+        Self { icon: None, label, shortcut: None, enabled: true, danger: false, separator: false, reason: None }
     }
 
     #[must_use]
     pub fn separator() -> Self {
-        Self { icon: None, label: "", shortcut: None, enabled: false, danger: false, separator: true }
+        Self { icon: None, label: "", shortcut: None, enabled: false, danger: false, separator: true, reason: None }
     }
 
     #[must_use]
@@ -49,6 +50,13 @@ impl<'a> MenuItem<'a> {
     #[must_use]
     pub fn danger(mut self, danger: bool) -> Self {
         self.danger = danger;
+        self
+    }
+
+    /// Explain why a disabled item cannot be used. No dead button without a reason.
+    #[must_use]
+    pub fn reason(mut self, reason: &'a str) -> Self {
+        self.reason = Some(reason);
         self
     }
 
@@ -100,7 +108,13 @@ impl<'a> MenuItem<'a> {
         }
 
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label));
-        if self.enabled { response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand) } else { response }
+        if self.enabled {
+            response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
+        } else if let Some(reason) = self.reason {
+            response.on_hover_text(reason)
+        } else {
+            response
+        }
     }
 }
 
@@ -122,8 +136,10 @@ impl<'a> Menu<'a> {
         self
     }
 
-    pub fn show(self, ui: &mut Ui) {
+    /// Returns the index of the clicked item in `items` (separators included).
+    pub fn show(self, ui: &mut Ui) -> Option<usize> {
         let t = tokens::tokens(ui.visuals().dark_mode);
+        let mut clicked = None;
         Frame::new()
             .fill(t.panel)
             .stroke(Stroke::new(1.0, t.border))
@@ -131,9 +147,12 @@ impl<'a> Menu<'a> {
             .inner_margin(Margin::symmetric(inset::XS, inset::XS))
             .show(ui, |ui| {
                 ui.set_width(self.width);
-                for item in self.items {
-                    item.show(ui);
+                for (index, item) in self.items.iter().enumerate() {
+                    if item.show(ui).clicked() {
+                        clicked = Some(index);
+                    }
                 }
             });
+        clicked
     }
 }

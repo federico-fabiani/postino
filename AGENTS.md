@@ -159,3 +159,8 @@ Append one line when significant time is lost to an issue likely to recur. Forma
 - [egui/layout] At fractional display scaling the root UI can be wider than the real content rect,
   pushing right-aligned controls and the status bar off-screen. fix/avoid: wrap `show` in
   `scope_builder(UiBuilder::new().max_rect(ctx.content_rect()))`.
+- [egui/TableBuilder] cell content is laid out from the top even when the cell uses
+  `Align::Center`; a two-line subject touches the selected row edge. fix/avoid: add an explicit
+  top inset before the vertical block.
+- [egui/TextEdit] a focused single-line field swallows Up/Down before the palette can use them.
+  fix/avoid: `ctx.input_mut(|i| i.consume_key(...))` before drawing the field.

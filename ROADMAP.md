@@ -37,7 +37,7 @@ interaction model before real mail makes them expensive to change. Full spec:
       sidebar/list/reading/status rebuilt from components, adaptive widths, 44/36 px rows.
       Screenshots: `docs/images/postino-u02.png`, `postino-u02-reading.png`, `postino-u02-full.png`,
       `postino-u02-dark.png`.
-- [ ] **U0.3 Interaction** — selection and multi-select, scroll-follow, full keyboard map, command
+- [x] **U0.3 Interaction** — selection and multi-select, scroll-follow, full keyboard map, command
       table, palette with arrows/Enter/shortcuts, `?` sheet, context menus, batch bar, undo/toast,
       read-state policy, reading pane open/expand/Esc.
 - [ ] **U0.4 Compose** — composer component, draft operations, autosave, reply/forward prefill,
