@@ -71,6 +71,17 @@ const SCREENSHOT_SETTLE_FRAMES: u32 = 4;
 /// A visible window replies within a frame or two. This bound turns a hidden or minimized window
 /// into an actionable error instead of a hung process.
 const SCREENSHOT_WAIT_FRAMES: u32 = 120;
+/// The instant every screenshot formats its dates against. Frozen so a capture does not change
+/// when the wall clock crosses a minute, and quoted verbatim in `docs/development.md`.
+pub const SCREENSHOT_CLOCK: &str = "2026-10-24T10:42:00Z";
+
+/// Parse [`SCREENSHOT_CLOCK`]. A literal cannot fail in practice, but the parser returns a reason
+/// instead of panicking so a future edit to the constant cannot crash a capture.
+pub fn screenshot_clock() -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(SCREENSHOT_CLOCK)
+        .map(|date| date.with_timezone(&Utc))
+        .map_err(|error| format!("invalid screenshot clock {SCREENSHOT_CLOCK:?}: {error}"))
+}
 
 /// Below this available width a side reading pane leaves no usable list, so reading becomes a
 /// full-width overlay with a back button.
@@ -121,6 +132,9 @@ pub struct PostinoApp {
     shortcut_focus: bool,
     scroll_to_selected: bool,
     now: f64,
+    /// The wall clock every date is formatted against. Normal mode updates it each frame; a
+    /// screenshot freezes it so two runs a minute apart render identical bytes.
+    now_utc: DateTime<Utc>,
     custom_chrome: bool,
     reading_open: bool,
     reading_full: bool,
@@ -138,13 +152,24 @@ impl PostinoApp {
 
     /// Build the shell in the exact state a docs screenshot shows. Used only by `--screenshot`;
     /// normal startup keeps its own constructor so nothing here runs in a user session.
-    pub fn screenshot(cc: &eframe::CreationContext<'_>, state: ScreenshotState, dark: bool, out: PathBuf) -> Self {
+    pub fn screenshot(
+        cc: &eframe::CreationContext<'_>,
+        state: ScreenshotState,
+        dark: bool,
+        custom_chrome: bool,
+        out: PathBuf,
+        now: DateTime<Utc>,
+    ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, dark);
         // A docs image must not catch the composer or palette mid fade-in: with no animation the
-        // first laid-out frame is already the final one.
-        cc.egui_ctx.all_styles_mut(|style| style.animation_time = 0.0);
-        let mut app = Self::demo(true);
+        // first laid-out frame is already the final one. A blinking caret would make the frame
+        // depend on how long the GPU took to start, so screenshot mode keeps it visible.
+        cc.egui_ctx.all_styles_mut(|style| {
+            style.animation_time = 0.0;
+            style.visuals.text_cursor.blink = false;
+        });
+        let mut app = Self::demo_at(custom_chrome, now);
         app.dark = dark;
         app.seed_screenshot(state);
         app.screenshot = Some(ScreenshotMode { out, frames: 0, requested: false, waited: 0 });
@@ -181,7 +206,7 @@ impl PostinoApp {
                     mime: "application/pdf".to_owned(),
                     size: 248_320,
                 }];
-                composer.saved_at = Some("10:42".to_owned());
+                composer.saved_at = Some(format_time(self.now_utc));
                 composer.focus = Some(ComposerFocus::Body);
                 self.start_composer(composer);
             }
@@ -223,7 +248,11 @@ impl PostinoApp {
     }
 
     fn demo(custom_chrome: bool) -> Self {
-        let engine = Engine::demo();
+        Self::demo_at(custom_chrome, Utc::now())
+    }
+
+    fn demo_at(custom_chrome: bool, now: DateTime<Utc>) -> Self {
+        let engine = Engine::demo_at(now);
         let labels_cache = engine.label_summaries();
         Self {
             engine,
@@ -255,6 +284,7 @@ impl PostinoApp {
             shortcut_focus: false,
             scroll_to_selected: false,
             now: 0.0,
+            now_utc: now,
             custom_chrome,
             reading_open: false,
             reading_full: false,
@@ -1421,7 +1451,7 @@ impl PostinoApp {
         state.subject = message.summary.subject.clone();
         state.body = message.body_text.clone();
         state.attachments = message.attachments.clone();
-        state.saved_at = Some(message.summary.date.with_timezone(&Local).format("%H:%M").to_string());
+        state.saved_at = Some(format_time(message.summary.date));
         state.focus = Some(ComposerFocus::Body);
         self.start_composer(state);
     }
@@ -1472,7 +1502,7 @@ impl PostinoApp {
                     let id = saved.draft.summary.id.clone();
                     self.composer.draft_id = Some(id);
                     self.composer.attachments = saved.draft.attachments;
-                    self.composer.mark_saved(Local::now().format("%H:%M").to_string());
+                    self.composer.mark_saved(format_time(self.now_utc));
                     if notify {
                         self.status = "Bozza salvata".to_owned();
                     }
@@ -1556,7 +1586,12 @@ impl PostinoApp {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
-        self.now = ctx.input(|input| input.time);
+        // A screenshot owns a frozen clock: the frame budget, not the wall clock, decides when the
+        // capture happens, and every date must render against the same instant twice in a row.
+        if self.screenshot.is_none() {
+            self.now = ctx.input(|input| input.time);
+            self.now_utc = Utc::now();
+        }
         self.maybe_complete_read();
         if self.composer.open && self.composer.dirty {
             let elapsed = self.now - self.composer.last_edit;
@@ -1903,6 +1938,7 @@ impl PostinoApp {
 
     fn list_panel(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
+        let now_utc = self.now_utc;
         let current_folder_name =
             self.engine.folders().iter().find(|folder| folder.id == self.folder).map_or_else(|| "Posta".to_owned(), |folder| folder.name.clone());
         let narrowed_folder_name =
@@ -2141,7 +2177,7 @@ impl PostinoApp {
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         ui.add(
                                             egui::Label::new(typography::mono(
-                                                format_when(message.date),
+                                                format_when(message.date, now_utc),
                                                 10.5,
                                                 if selected { t.selected_muted } else { t.text_faint },
                                             ))
@@ -2282,6 +2318,7 @@ impl PostinoApp {
 
     fn reading_content(&mut self, ui: &mut Ui, t: &Tokens, full: bool) {
         let message = self.selected.as_deref().and_then(|id| self.engine.message(id)).cloned();
+        let now_utc = self.now_utc;
         let Some(message) = message else {
             self.close_reading();
             return;
@@ -2429,7 +2466,7 @@ impl PostinoApp {
                 });
             },
             |ui| {
-                ui.label(typography::mono(format_when(message.summary.date), 11.0, t.text_faint));
+                ui.label(typography::mono(format_when(message.summary.date, now_utc), 11.0, t.text_faint));
             },
         );
         let mut chip_filter = None;
@@ -3814,9 +3851,9 @@ fn logo(ui: &mut Ui, size: f32) {
     ui.painter().line_segment([egui::pos2(rect.center().x + half, chevron_y - size * 0.07), egui::pos2(rect.center().x, chevron_y)], gold);
 }
 
-fn format_when(date: DateTime<Utc>) -> String {
+fn format_when(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let local = date.with_timezone(&Local);
-    let now = Local::now();
+    let now = now.with_timezone(&Local);
     if local.date_naive() == now.date_naive() {
         local.format("%H:%M").to_string()
     } else if local.year() == now.year() {
@@ -3824,6 +3861,12 @@ fn format_when(date: DateTime<Utc>) -> String {
     } else {
         local.format("%d/%m/%Y").to_string()
     }
+}
+
+/// A clock time in the user's timezone. Display stays local; only the source of "now" is the
+/// app-owned clock.
+fn format_time(date: DateTime<Utc>) -> String {
+    date.with_timezone(&Local).format("%H:%M").to_string()
 }
 
 fn format_size(bytes: u64) -> String {
@@ -3838,7 +3881,24 @@ fn format_size(bytes: u64) -> String {
 
 /// Encode the viewport surface exactly as eframe captured it. `ColorImage` is sRGB with the same
 /// channel order as PNG's RGBA, so no conversion is involved.
+///
+/// The bytes go to `<out>.tmp` first and are renamed over the destination, so a failed or killed
+/// capture never leaves a truncated PNG behind. The temp file is removed on error.
 fn write_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
+    let mut temp_os = path.as_os_str().to_os_string();
+    temp_os.push(".tmp");
+    let temp = PathBuf::from(temp_os);
+    if let Err(error) = encode_png(&temp, image) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    std::fs::rename(&temp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        format!("{}: {error}", path.display())
+    })
+}
+
+fn encode_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
     let width = u32::try_from(image.size[0]).map_err(|_| "the screenshot is wider than a PNG allows".to_owned())?;
     let height = u32::try_from(image.size[1]).map_err(|_| "the screenshot is taller than a PNG allows".to_owned())?;
     let pixels = image.pixels.iter().flat_map(|color| color.to_array()).collect::<Vec<u8>>();
@@ -4417,6 +4477,61 @@ mod tests {
         let error = ScreenshotState::parse("nope").expect_err("nope is not a scene");
         assert!(error.contains("unknown screenshot state"), "{error}");
         assert!(error.contains("shell, reading, compose, palette, labels, label_menu, label_editor"), "{error}");
+    }
+
+    #[test]
+    fn the_screenshot_clock_is_a_fixed_instant() {
+        let frozen = screenshot_clock().expect("the screenshot clock parses");
+        assert_eq!(frozen.format("%Y-%m-%dT%H:%M:%SZ").to_string(), SCREENSHOT_CLOCK);
+        let app = PostinoApp::demo_at(true, frozen);
+        assert_eq!(app.now_utc, frozen);
+        assert_eq!(app.engine.messages()[0].summary.date, frozen - chrono::Duration::minutes(8), "demo dates must follow the seam");
+    }
+
+    #[test]
+    fn frozen_clock_formats_dates_without_the_wall_clock() {
+        let frozen = screenshot_clock().expect("the screenshot clock parses");
+        let date = DateTime::parse_from_rfc3339("2026-10-24T09:30:00Z").expect("the fixture date parses").with_timezone(&Utc);
+        let first = format_when(date, frozen);
+        // Real time moving on must not change what the same message renders as.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(format_when(date, frozen), first, "the real clock must not leak into a screenshot date");
+        let same_day = format_when(date, date + chrono::Duration::minutes(5));
+        assert_eq!(same_day, date.with_timezone(&Local).format("%H:%M").to_string(), "a same-day instant keeps the time format");
+        assert_ne!(format_when(date, date + chrono::Duration::days(400)), first, "another year shows the full date");
+    }
+
+    #[test]
+    fn screenshot_mode_never_advances_the_clock() {
+        let frozen = screenshot_clock().expect("the screenshot clock parses");
+        let mut app = PostinoApp::demo_at(true, frozen);
+        app.screenshot = Some(ScreenshotMode { out: PathBuf::from("unused.png"), frames: 0, requested: false, waited: 0 });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.now_utc, frozen, "a screenshot must render against its own clock, not the wall clock");
+    }
+
+    #[test]
+    fn png_writer_round_trips_a_two_by_two_image() {
+        let pixels = [Color32::from_rgb(23, 61, 50), Color32::from_rgb(245, 235, 214), Color32::from_rgb(228, 185, 106), Color32::from_rgb(0, 0, 0)];
+        let image = egui::ColorImage::new([2, 2], pixels.to_vec());
+        let directory = std::env::temp_dir().join("postino-app-p01-tests");
+        std::fs::create_dir_all(&directory).expect("a private temp folder");
+        let path = directory.join(format!("png-round-trip-{}.png", std::process::id()));
+        write_png(&path, &image).expect("the PNG writer");
+
+        let file = std::fs::File::open(&path).expect("the written PNG");
+        let mut reader = png::Decoder::new(std::io::BufReader::new(file)).read_info().expect("a PNG reader");
+        let mut buffer = vec![0; reader.output_buffer_size().expect("an RGBA buffer")];
+        let info = reader.next_frame(&mut buffer).expect("the PNG frame");
+        assert_eq!((info.width, info.height), (2, 2));
+        let expected = pixels.iter().flat_map(|pixel| pixel.to_array()).collect::<Vec<_>>();
+        assert_eq!(&buffer[..info.buffer_size()], &expected[..]);
+        assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists(), "the atomic write must remove its temp file");
+        std::fs::remove_file(&path).expect("remove the test image");
     }
 
     #[test]

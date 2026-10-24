@@ -64,8 +64,8 @@ Status: `todo` · `active` · `review` · `done`.
 | ID | Package | Outcome | Status |
 |---|---|---|---|
 | P0 | Screenshot harness | `--screenshot` states for shell, reading, compose, palette; dark variants; docs regenerated | done |
-| P0.1 | Harness hardening | frozen clock, strict flags, no-hang watchdog, atomic PNG, parser/PNG tests | todo |
-| P1 | U0.5 labels | label create/rename/delete/apply/filter in engine, GUI, CLI, MCP; counts; keyboard | review |
+| P0.1 | Harness hardening | frozen clock, strict flags, no-hang watchdog, atomic PNG, parser/PNG tests | done |
+| P1 | U0.5 labels | label create/rename/delete/apply/filter in engine, GUI, CLI, MCP; counts; keyboard | done |
 | P2 | U0.5 polish | loading/error/empty states, reduced motion, a11y pass, final light/dark screenshots | todo |
 | P3 | M1 store | SQLite (encryption seam + keyring), migrations, WAL, repository behind the engine | todo |
 | P4 | M1 MIME | parser/serializer, sanitized HTML subset, plain-text alternative, attachment storage | todo |

@@ -181,3 +181,6 @@ Append one line when significant time is lost to an issue likely to recur. Forma
 - [agents] a delegated agent cleaned its scratch files with a wildcard in a shared temp directory and
   removed other sessions' files. fix/avoid: give every agent its own temp subfolder and forbid
   deletes outside it in the brief.
+- [egui/screenshots] formatting with `Local::now()`/`Utc::now()` makes PNG captures change every
+  minute and breaks attribution hashes. fix/avoid: own the clock in the app, freeze it in screenshot
+  mode, and seed demo dates from the same instant.

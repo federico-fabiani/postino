@@ -8,7 +8,9 @@ mod app;
 mod theme;
 mod ui;
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eframe::egui;
 
@@ -20,28 +22,78 @@ const DEFAULT_SIZE: [f32; 2] = [1280.0, 720.0];
 /// The smallest window the app claims to support. A smaller `--size` would be clamped by the OS
 /// and produce a misleading image, so the parser refuses it.
 const MIN_SIZE: [f32; 2] = [980.0, 600.0];
+/// A scripted capture must fail loudly instead of waiting forever for a window that never paints.
+const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Every flag the app understands. Used in the parse error so a typo is self-correcting.
+const ACCEPTED_FLAGS: &str = "--screenshot <state>, --out <path>, --dark, --native-chrome, --size WxH, --gallery";
 
+#[derive(Debug, PartialEq)]
 struct ScreenshotRequest {
     state: app::ScreenshotState,
     out: PathBuf,
     size: Option<[f32; 2]>,
 }
 
+/// The validated command line. `screenshot` and `gallery` are mutually exclusive by construction.
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    screenshot: Option<ScreenshotRequest>,
+    gallery: bool,
+    dark: bool,
+    native_chrome: bool,
+}
+
+#[derive(Debug, Default)]
+struct ParsedArgs {
+    state: Option<app::ScreenshotState>,
+    out: Option<PathBuf>,
+    size: Option<[f32; 2]>,
+    gallery: bool,
+    dark: bool,
+    native_chrome: bool,
+}
+
+impl ParsedArgs {
+    /// Turn the collected flags into a launch decision, enforcing the combinations that would
+    /// otherwise open the wrong window or drop an argument on the floor.
+    fn finish(self) -> Result<Args, String> {
+        if self.gallery && self.state.is_some() {
+            return Err("--screenshot and --gallery cannot be combined; run one or the other".to_owned());
+        }
+        let screenshot = match self.state {
+            Some(state) => {
+                let out = self.out.ok_or_else(|| "--screenshot needs --out <path.png>".to_owned())?;
+                Some(ScreenshotRequest { state, out, size: self.size })
+            }
+            None => {
+                if self.out.is_some() {
+                    return Err("--out is only valid with --screenshot".to_owned());
+                }
+                if self.size.is_some() {
+                    return Err("--size is only valid with --screenshot".to_owned());
+                }
+                None
+            }
+        };
+        Ok(Args { screenshot, gallery: self.gallery, dark: self.dark, native_chrome: self.native_chrome })
+    }
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).target(env_logger::Target::Stderr).init();
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let screenshot = match parse_screenshot_args(&args) {
-        Ok(request) => request,
+    // `args_os` never panics on an undecodable path; only flags are lossily converted to text.
+    let raw = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let args = match parse_args(&raw) {
+        Ok(args) => args,
         Err(error) => {
             eprintln!("postino-app: {error}");
             std::process::exit(2);
         }
     };
-    let gallery = args.iter().any(|arg| arg == "--gallery");
-    let dark = args.iter().any(|arg| arg == "--dark");
-    let native_chrome = args.iter().any(|arg| arg == "--native-chrome");
-    // A screenshot shows the real shell, including its own title bar, on every host.
-    let custom_chrome = screenshot.is_some() || (!native_chrome && !cfg!(target_os = "macos"));
+    let Args { screenshot, gallery, dark, native_chrome } = args;
+    // The normal window draws its own forest title bar. Screenshot mode obeys the same rule so it
+    // captures what a user sees, and macOS keeps its native title bar.
+    let custom_chrome = !native_chrome && !cfg!(target_os = "macos");
     let (title, size) = if gallery {
         ("Postino UI kit", [1400.0, 1000.0])
     } else {
@@ -49,7 +101,6 @@ fn main() -> eframe::Result<()> {
     };
     let mut viewport = egui::ViewportBuilder::default().with_title(title).with_inner_size(size).with_min_inner_size(MIN_SIZE).with_visible(true);
     if custom_chrome {
-        // The desktop shell draws its own forest title bar. macOS keeps the native traffic lights.
         viewport = viewport.with_decorations(false);
     }
     match eframe::icon_data::from_png_bytes(APP_ICON) {
@@ -57,42 +108,142 @@ fn main() -> eframe::Result<()> {
         Err(error) => log::warn!("app icon: {error}"),
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    if let Some(request) = screenshot {
-        return eframe::run_native(
-            title,
-            options,
-            Box::new(move |cc| Ok(Box::new(app::PostinoApp::screenshot(cc, request.state, dark, request.out)))),
-        );
+    let Some(request) = screenshot else {
+        if gallery {
+            return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(ui::gallery::GalleryApp::new(cc, dark)))));
+        }
+        return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(app::PostinoApp::new(cc, custom_chrome)))));
+    };
+    let clock = match app::screenshot_clock() {
+        Ok(clock) => clock,
+        Err(error) => {
+            eprintln!("postino-app: {error}");
+            std::process::exit(2);
+        }
+    };
+    let out = request.out.clone();
+    // A window closed before painting returns `Ok`, so a file left by an earlier run must not make
+    // the capture look successful. Start from no destination; the atomic write creates it.
+    if let Err(error) = clear_output(&out) {
+        eprintln!("postino-app: {error}");
+        std::process::exit(1);
     }
-    if gallery {
-        eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(ui::gallery::GalleryApp::new(cc, dark)))))
-    } else {
-        eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(app::PostinoApp::new(cc, custom_chrome)))))
+    // The frame budget cannot fire when the window stops painting, so a wall-clock thread turns a
+    // closed, hidden or minimized window into a non-zero exit instead of a hung script.
+    start_watchdog(SCREENSHOT_TIMEOUT);
+    let result = eframe::run_native(
+        title,
+        options,
+        Box::new(move |cc| Ok(Box::new(app::PostinoApp::screenshot(cc, request.state, dark, custom_chrome, request.out, clock)))),
+    );
+    if let Err(error) = result {
+        eprintln!("postino-app: the screenshot window failed: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = verify_output(&out) {
+        eprintln!("postino-app: {error}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Exit when a scripted capture has not finished in time. The thread lives until the process ends;
+/// a successful capture returns from `main` long before it fires.
+fn start_watchdog(timeout: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout);
+        eprintln!("postino-app: the screenshot did not finish within {} s; the window never painted a surface", timeout.as_secs());
+        std::process::exit(1);
+    });
+}
+
+/// Remove the previous capture, if any. A window closed before the capture returns `Ok` from
+/// eframe, and a leftover file would make that failure look like success.
+fn clear_output(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot replace {}: {error}", path.display())),
     }
 }
 
-/// Parse `--screenshot <state> --out <path.png> [--size WxH]`. Returns `None` when the flag is
-/// absent so the normal desktop and gallery startup paths are untouched.
-fn parse_screenshot_args(args: &[String]) -> Result<Option<ScreenshotRequest>, String> {
-    let Some(position) = args.iter().position(|arg| arg == "--screenshot") else {
-        return Ok(None);
-    };
-    let name = args
-        .get(position + 1)
-        .ok_or_else(|| "--screenshot needs a state: shell, reading, compose, palette, labels, label_menu, label_editor".to_owned())?;
-    let state = app::ScreenshotState::parse(name)?;
-    let out = match args.iter().position(|arg| arg == "--out").and_then(|position| args.get(position + 1)) {
-        Some(path) => PathBuf::from(path),
-        None => return Err("--screenshot needs --out <path.png>".to_owned()),
-    };
-    let size = match args.iter().position(|arg| arg == "--size") {
-        Some(position) => {
-            let value = args.get(position + 1).ok_or_else(|| "--size needs a size like 980x600".to_owned())?;
-            Some(parse_size(value)?)
+/// A window closed by the user returns `Ok` without a file. Treat a missing or empty PNG as a
+/// failed capture so a script never uses a stale or truncated image.
+fn verify_output(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| format!("the screenshot was not written to {}: {error}", path.display()))?;
+    if metadata.len() == 0 {
+        return Err(format!("{} is empty; the window probably closed before the capture", path.display()));
+    }
+    Ok(())
+}
+
+/// Parse the whole command line. An empty line is a normal desktop launch; anything ambiguous is
+/// an error with a person-readable reason (exit code 2).
+fn parse_args(raw: &[OsString]) -> Result<Args, String> {
+    let mut parsed = ParsedArgs::default();
+    let mut seen = Vec::new();
+    let mut index = 0;
+    while let Some(argument) = raw.get(index) {
+        let flag = argument.to_string_lossy();
+        match flag.as_ref() {
+            "--screenshot" => {
+                mark(&mut seen, "--screenshot")?;
+                let state = text_value(raw, &mut index, "--screenshot")?;
+                parsed.state = Some(app::ScreenshotState::parse(&state)?);
+            }
+            "--out" => {
+                mark(&mut seen, "--out")?;
+                parsed.out = Some(PathBuf::from(raw_value(raw, &mut index, "--out")?));
+            }
+            "--size" => {
+                mark(&mut seen, "--size")?;
+                let value = text_value(raw, &mut index, "--size")?;
+                parsed.size = Some(parse_size(&value)?);
+            }
+            "--dark" => {
+                mark(&mut seen, "--dark")?;
+                parsed.dark = true;
+            }
+            "--native-chrome" => {
+                mark(&mut seen, "--native-chrome")?;
+                parsed.native_chrome = true;
+            }
+            "--gallery" => {
+                mark(&mut seen, "--gallery")?;
+                parsed.gallery = true;
+            }
+            other => {
+                return Err(format!("unknown argument {other:?}; accepted flags are {ACCEPTED_FLAGS}"));
+            }
         }
-        None => None,
-    };
-    Ok(Some(ScreenshotRequest { state, out, size }))
+        index += 1;
+    }
+    parsed.finish()
+}
+
+/// Refuse a repeated flag instead of silently keeping the last value.
+fn mark(seen: &mut Vec<&'static str>, flag: &'static str) -> Result<(), String> {
+    if seen.contains(&flag) {
+        return Err(format!("{flag} was given more than once"));
+    }
+    seen.push(flag);
+    Ok(())
+}
+
+/// Consume the value after a flag. A missing value or another flag is an error, so
+/// `--screenshot shell --out --dark` can never create a file named `--dark`.
+fn raw_value(raw: &[OsString], index: &mut usize, flag: &str) -> Result<OsString, String> {
+    let value = raw.get(*index + 1).ok_or_else(|| format!("{flag} needs a value; accepted flags are {ACCEPTED_FLAGS}"))?;
+    let text = value.to_string_lossy();
+    if text.starts_with("--") {
+        return Err(format!("{flag} needs a value, not another flag ({text}); accepted flags are {ACCEPTED_FLAGS}"));
+    }
+    *index += 1;
+    Ok(value.clone())
+}
+
+fn text_value(raw: &[OsString], index: &mut usize, flag: &str) -> Result<String, String> {
+    raw_value(raw, index, flag).map(|value| value.to_string_lossy().into_owned())
 }
 
 /// Parse `WxH` in logical points. Only whole numbers are accepted so a typo cannot silently
@@ -119,20 +270,128 @@ fn parse_size(text: &str) -> Result<[f32; 2], String> {
 mod tests {
     use super::*;
 
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    fn parse(values: &[&str]) -> Result<Args, String> {
+        parse_args(&args(values))
+    }
+
+    fn request(values: &[&str]) -> ScreenshotRequest {
+        parse(values).expect("valid arguments").screenshot.expect("a screenshot request")
     }
 
     #[test]
-    fn screenshot_size_is_optional_and_parsed() {
-        let request =
-            parse_screenshot_args(&args(&["--screenshot", "labels", "--out", "labels.png"])).expect("valid args").expect("a screenshot request");
+    fn accepts_a_screenshot_with_its_destination() {
+        let parsed = parse(&["--screenshot", "reading", "--out", "reading.png"]).expect("valid arguments");
+        let request = parsed.screenshot.expect("a screenshot request");
+        assert_eq!(request.state, app::ScreenshotState::Reading);
+        assert_eq!(request.out, PathBuf::from("reading.png"));
         assert_eq!(request.size, None, "the default size applies when --size is absent");
+        assert!(!parsed.dark);
+        assert!(!parsed.native_chrome);
+        assert!(!parsed.gallery);
+    }
 
-        let request = parse_screenshot_args(&args(&["--screenshot", "labels", "--out", "labels.png", "--size", "980x600"]))
-            .expect("valid args")
-            .expect("a screenshot request");
+    #[test]
+    fn accepts_flags_in_any_order() {
+        let parsed = parse(&["--out", "compose.png", "--size", "980x600", "--native-chrome", "--dark", "--screenshot", "compose"])
+            .expect("order must not matter");
+        let request = parsed.screenshot.expect("a screenshot request");
+        assert_eq!(request.state, app::ScreenshotState::Compose);
+        assert_eq!(request.out, PathBuf::from("compose.png"));
         assert_eq!(request.size, Some([980.0, 600.0]));
+        assert!(parsed.dark);
+        assert!(parsed.native_chrome);
+    }
+
+    #[test]
+    fn accepts_the_default_size_and_a_larger_one() {
+        assert_eq!(request(&["--screenshot", "shell", "--out", "a.png"]).size, None);
+        assert_eq!(request(&["--screenshot", "shell", "--out", "a.png", "--size", "1600x900"]).size, Some([1600.0, 900.0]));
+    }
+
+    #[test]
+    fn accepts_normal_and_gallery_startup() {
+        let plain = parse(&[]).expect("an empty command line is a normal launch");
+        assert!(plain.screenshot.is_none());
+        assert!(!plain.gallery);
+        let gallery = parse(&["--gallery", "--dark"]).expect("gallery launch");
+        assert!(gallery.gallery);
+        assert!(gallery.dark);
+        assert!(gallery.screenshot.is_none());
+        assert!(parse(&["--native-chrome"]).expect("normal launch with native chrome").native_chrome);
+    }
+
+    #[test]
+    fn rejects_unknown_flags_and_equals_forms() {
+        for case in [
+            &["--bogus"][..],
+            &["--screenshot=shell"][..],
+            &["--out=a.png"][..],
+            &["--dark=true"][..],
+            &["shell"][..],
+            &["--screenshot", "shell", "--out", "a.png", "extra"][..],
+        ] {
+            assert!(parse(case).is_err(), "{case:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn rejects_a_missing_value_or_another_flag_as_a_value() {
+        for case in [
+            &["--screenshot"][..],
+            &["--screenshot", "--out", "a.png"][..],
+            &["--screenshot", "shell", "--out"][..],
+            &["--screenshot", "shell", "--out", "--dark"][..],
+            &["--screenshot", "shell", "--size", "--dark", "--out", "a.png"][..],
+            &["--screenshot", "shell", "--out", "a.png", "--size"][..],
+        ] {
+            let error = parse(case).expect_err("an incomplete flag must be refused");
+            assert!(error.contains("needs a value"), "{case:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_flags() {
+        for case in [
+            &["--screenshot", "shell", "--screenshot", "reading", "--out", "a.png"][..],
+            &["--screenshot", "shell", "--out", "a.png", "--out", "b.png"][..],
+            &["--dark", "--dark"][..],
+            &["--gallery", "--gallery"][..],
+            &["--native-chrome", "--native-chrome"][..],
+            &["--screenshot", "shell", "--out", "a.png", "--size", "980x600", "--size", "1280x720"][..],
+        ] {
+            let error = parse(case).expect_err("duplicates must be refused");
+            assert!(error.contains("more than once"), "{case:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn screenshot_and_gallery_cannot_be_combined() {
+        for case in [
+            &["--screenshot", "shell", "--gallery", "--out", "a.png"][..],
+            &["--gallery", "--screenshot", "shell", "--out", "a.png"][..],
+            &["--gallery", "--out", "a.png", "--screenshot", "shell"][..],
+        ] {
+            let error = parse(case).expect_err("the two launch modes conflict");
+            assert!(error.contains("--gallery"), "{case:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_screenshot_needs_an_output_and_out_needs_a_screenshot() {
+        let error = parse(&["--screenshot", "shell"]).expect_err("missing destination");
+        assert!(error.contains("--out"), "{error}");
+        assert!(parse(&["--out", "a.png"]).is_err(), "--out alone must not silently launch the desktop");
+        assert!(parse(&["--size", "980x600"]).is_err(), "--size alone must not silently launch the desktop");
+    }
+
+    #[test]
+    fn unknown_states_are_refused() {
+        let error = parse(&["--screenshot", "nope", "--out", "a.png"]).expect_err("unknown state");
+        assert!(error.contains("unknown screenshot state"), "{error}");
     }
 
     #[test]
@@ -141,5 +400,43 @@ mod tests {
         for bad in ["1280", "1280*720", "12.5x720", "x720", "1280x", "1280x720x2", "abcx600", "979x600", "980x599"] {
             assert!(parse_size(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn a_missing_or_empty_output_is_a_failure() {
+        let directory = std::env::temp_dir().join("postino-app-p01-tests");
+        std::fs::create_dir_all(&directory).expect("a private temp folder");
+        let missing = directory.join(format!("missing-{}.png", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        let error = verify_output(&missing).expect_err("a missing file means the window never captured");
+        assert!(error.contains("was not written"), "{error}");
+
+        let empty = directory.join(format!("empty-{}.png", std::process::id()));
+        std::fs::write(&empty, b"").expect("an empty file");
+        let error = verify_output(&empty).expect_err("an empty file is not a capture");
+        assert!(error.contains("is empty"), "{error}");
+        std::fs::remove_file(&empty).expect("remove the test file");
+    }
+
+    #[test]
+    fn a_previous_capture_is_cleared_before_a_run() {
+        let directory = std::env::temp_dir().join("postino-app-p01-tests");
+        std::fs::create_dir_all(&directory).expect("a private temp folder");
+        let path = directory.join(format!("clear-{}.png", std::process::id()));
+        std::fs::write(&path, b"stale capture").expect("a stale capture");
+        clear_output(&path).expect("remove the previous image");
+        assert!(!path.exists(), "a closed window must not find an earlier image");
+        clear_output(&path).expect("a missing destination is not an error");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_non_unicode_path_is_kept_as_os_bytes() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = OsString::from_wide(&[0x61, 0xD800, 0x62, 0x2E, 0x70, 0x6E, 0x67]);
+        let raw = vec![OsString::from("--screenshot"), OsString::from("shell"), OsString::from("--out"), path.clone()];
+        let parsed = parse_args(&raw).expect("a non-Unicode path must not panic");
+        assert_eq!(parsed.screenshot.expect("a screenshot request").out, PathBuf::from(path));
     }
 }

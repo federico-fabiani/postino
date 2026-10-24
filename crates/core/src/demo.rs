@@ -8,8 +8,14 @@ use crate::model::{Account, Address, Attachment, Folder, FolderKind, Label, Labe
 
 const ACCOUNT_ID: &str = "acc_demo";
 
+/// Demo mail relative to the real clock. The app, CLI and MCP use this.
 pub fn seed() -> Engine {
-    let now = Utc::now();
+    seed_at(Utc::now())
+}
+
+/// Demo mail as if the clock read `now`. `--screenshot` passes a fixed instant so two captures a
+/// minute apart render the same relative dates.
+pub fn seed_at(now: DateTime<Utc>) -> Engine {
     let accounts = vec![Account {
         id: ACCOUNT_ID.to_owned(),
         name: "Federico".to_owned(),

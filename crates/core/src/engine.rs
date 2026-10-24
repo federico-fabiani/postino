@@ -51,6 +51,12 @@ impl Engine {
         crate::demo::seed()
     }
 
+    /// The M0 walking skeleton seeded as if the clock read `now`. A screenshot passes a fixed
+    /// instant so the rendered dates never depend on the wall clock.
+    pub fn demo_at(now: chrono::DateTime<Utc>) -> Self {
+        crate::demo::seed_at(now)
+    }
+
     pub(crate) fn from_parts(accounts: Vec<Account>, folders: Vec<Folder>, messages: Vec<Message>, labels: Vec<Label>, demo: bool) -> Self {
         let next_label_seq = labels
             .iter()
@@ -533,6 +539,7 @@ fn validate_attachments(attachments: &[Attachment]) -> Result<(), OpError> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::DateTime;
     use serde_json::json;
 
     use super::*;
@@ -544,6 +551,14 @@ mod tests {
         assert_eq!(engine.accounts().len(), 1);
         assert!(engine.messages().len() >= 10);
         assert!(engine.folders().iter().any(|folder| folder.kind == FolderKind::Inbox));
+    }
+
+    #[test]
+    fn demo_dates_are_relative_to_the_requested_instant() {
+        let now = DateTime::parse_from_rfc3339("2026-10-24T10:42:00Z").expect("fixture").with_timezone(&Utc);
+        let engine = Engine::demo_at(now);
+        assert_eq!(engine.messages()[0].summary.date, now - chrono::Duration::minutes(8));
+        assert!(engine.messages().iter().all(|message| message.summary.date < now));
     }
 
     #[test]
