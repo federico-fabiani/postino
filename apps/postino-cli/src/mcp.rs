@@ -175,6 +175,45 @@ mod tests {
     }
 
     #[test]
+    fn draft_tools_are_exposed_and_the_demo_send_works() {
+        let mut engine = Engine::demo();
+        let tools = request(&mut engine, "tools/list");
+        let definitions = tools["result"]["tools"].as_array().expect("tools");
+        let draft_send = definitions.iter().find(|tool| tool["name"] == "draft_send").expect("draft_send");
+        assert!(draft_send["description"].as_str().is_some_and(|description| description.contains("Demo only")));
+
+        let saved = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "draft_save",
+                    "arguments": {
+                        "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
+                        "subject": "Bozza via MCP",
+                        "body_text": "Corpo"
+                    }
+                }
+            }),
+        )
+        .expect("response");
+        let id = saved["result"]["structuredContent"]["draft"]["summary"]["id"].as_str().expect("id").to_owned();
+        let sent = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": { "name": "draft_send", "arguments": { "id": id } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(sent["result"]["structuredContent"]["message"]["folder_id"], "sent");
+    }
+
+    #[test]
     fn unknown_methods_are_json_rpc_errors() {
         let mut engine = Engine::demo();
         let response = request(&mut engine, "mail/steal");

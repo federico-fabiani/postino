@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1 foundations, U0.2 frame and U0.3 interaction implemented; U0.4 compose is next · **Last updated:** 2026-10-24
+> **Status:** U0.1 foundations, U0.2 frame, U0.3 interaction and U0.4 compose implemented; U0.5 labels and polish is next · **Last updated:** 2026-10-24
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
@@ -198,6 +198,16 @@ per action, no hidden mutation.
   labelled demo until SMTP exists.
 - The composer is a component, so the future HTML/Tailwind advanced mode can reuse its shell.
 
+Shipped in U0.4: `ComposerState` + `Composer` in `ui/widgets/composer.rs`, autosave after 1.2 s of
+inactivity, `draft_save`/`draft_send` in the registry, `Re:`/`Fwd:` prefills, signature from the
+account, drag-and-drop attachment metadata and a Markdown formatting bar. The base composer is
+plain text; HTML/Tailwind formatting remains a later milestone.
+
+The composer is a fixed 720 × 600 pt window: recipients, Cc/Bcc toggles, subject, formatting bar,
+body, attachments and a footer that never scrolls away. `Cc` and `Bcc` open as fields and collapse
+when emptied; the drop zone is shown only while there are no attachments. Screenshots:
+`docs/images/postino-u04-compose.png` and `postino-u04-compose-dark.png`.
+
 ## 8. Labels
 
 - One label model, shown as chips in the sidebar and in the reading pane.
@@ -246,14 +256,18 @@ per action, no hidden mutation.
 
 Shipped in `apps/postino-app/src/app.rs`: click/Ctrl-click/Shift-click selection, Shift+arrow
 extension, `X`/Space toggle, `Ctrl+A`, batch undo, row/folder/empty/reading context menus, and a
-searchable shortcut sheet. Reply/forward/labels stay explicitly disabled with a reason until their
-milestones.
+searchable shortcut sheet. Reply/forward arrived in U0.4; labels stay explicitly disabled with a
+reason until U0.5.
 
-### U0.4 Compose and drafts
+### U0.4 Compose and drafts — done
 
 - Composer component, draft ops in the engine, autosave, demo send.
 - Reply/reply-all/forward prefill.
 - Drafts folder and counts.
+
+Shipped in `apps/postino-app/src/ui/widgets/composer.rs` and `apps/postino-app/src/app.rs`.
+`draft_save` creates or updates one draft in place; `draft_send` is demo-only, moves the draft to
+Sent and is undoable. Attachments are metadata-only in M0, as is the send itself.
 
 ### U0.5 Labels and polish
 

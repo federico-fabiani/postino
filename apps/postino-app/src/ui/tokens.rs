@@ -54,6 +54,13 @@ pub mod size {
     pub const TOOLBAR: f32 = 56.0;
     pub const STATUS: f32 = 28.0;
     pub const SIDEBAR: f32 = 240.0;
+    pub const COMPOSER_WIDTH: f32 = 720.0;
+    pub const COMPOSER_HEIGHT: f32 = 600.0;
+    pub const COMPOSER_MIN_HEIGHT: f32 = 480.0;
+    pub const COMPOSER_HEADER: f32 = 40.0;
+    pub const COMPOSER_BODY_MIN: f32 = 96.0;
+    pub const COMPOSER_BODY_MAX: f32 = 310.0;
+    pub const ATTACHMENT_LIST_MAX: f32 = 36.0;
 }
 
 /// Type scale in points. No other sizes should appear in component code.

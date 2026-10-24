@@ -164,3 +164,17 @@ Append one line when significant time is lost to an issue likely to recur. Forma
   top inset before the vertical block.
 - [egui/TextEdit] a focused single-line field swallows Up/Down before the palette can use them.
   fix/avoid: `ctx.input_mut(|i| i.consume_key(...))` before drawing the field.
+- [egui/Window] `Window::show` returns `Option<InnerResponse<Option<R>>>`, so the closure result is
+  nested twice. fix/avoid: unwrap both levels or the action type looks wrong.
+- [egui/TextEdit] `TextEditOutput.cursor_range` uses the `CharIndex` newtype, and restored cursor
+  state must be stored under `ui.make_persistent_id(id_salt)`. fix/avoid: use `.0` and the same id.
+- [egui/DroppedFile] `DroppedFileHandle` is an `Arc<dyn DroppedFile>`: the path is a `path()`
+  method, not a field. fix/avoid: call `file.path().to_path_buf()`.
+- [egui/TextField] `horizontal_centered` inside a vertical layout stretches the field to the whole
+  remaining height, pushing the rest of the form off-screen. fix/avoid: use `horizontal`, which
+  already centres items vertically and stays content-sized.
+- [Windows/screenshots] `PrintWindow` returns an all-black bitmap for the glow surface, and injected
+  input does nothing on a disconnected desktop. fix/avoid: capture the client area from the screen
+  with a DPI-aware process; seed UI state for the shot instead of clicking.
+- [PowerShell] `Set-Content` / `Get-Content -Raw` re-encode UTF-8 as ANSI and corrupt accented text.
+  fix/avoid: use the edit/write tools, or `[System.IO.File]::ReadAllText/WriteAllText` with UTF-8.

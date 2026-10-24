@@ -2,14 +2,15 @@
 //! in every state, in light and dark.
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, ScrollArea, Stroke, StrokeKind, Ui, Vec2};
+use postino_core::{Account, Attachment};
 
 use crate::theme;
 use crate::ui::icons;
-use crate::ui::tokens::{self, Tokens, inset, radius, space};
+use crate::ui::tokens::{self, Tokens, inset, radius, size as ui_size, space};
 use crate::ui::typography::{self, Role};
 use crate::ui::widgets::{
-    Badge, BadgeKind, Button, ButtonKind, ButtonSize, Chip, Dialog, EmptyState, IconButton, IconButtonSize, ListRow, Menu, MenuItem, SectionHeader,
-    Toast, ToastKind,
+    Badge, BadgeKind, Button, ButtonKind, ButtonSize, Chip, ComposeMode, Composer, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize,
+    ListRow, Menu, MenuItem, SectionHeader, Toast, ToastKind,
 };
 
 pub struct GalleryApp {
@@ -17,11 +18,38 @@ pub struct GalleryApp {
     name: String,
     search: String,
     note: String,
+    composer: ComposerState,
+    account: Account,
 }
 
 impl Default for GalleryApp {
     fn default() -> Self {
-        Self { dark: false, name: "Federico".to_owned(), search: String::new(), note: String::new() }
+        let mut composer = ComposerState::new(ComposeMode::New);
+        composer.to = "Giulia Ferri <giulia.ferri@example.com>".to_owned();
+        composer.cc = "Marco Bianchi <marco.bianchi@example.com>".to_owned();
+        composer.show_cc = true;
+        composer.subject = "Preventivo sito web — bozza finale".to_owned();
+        composer.body = "Ciao Giulia,\n\nil preventivo mi torna. Ti confermo la call di lunedì.\n\n-- \nFederico\nfederico@example.it".to_owned();
+        composer.attachments = vec![Attachment {
+            id: "att_gallery".to_owned(),
+            filename: "preventivo-postino.pdf".to_owned(),
+            mime: "application/pdf".to_owned(),
+            size: 248_320,
+        }];
+        Self {
+            dark: false,
+            name: "Federico".to_owned(),
+            search: String::new(),
+            note: String::new(),
+            composer,
+            account: Account {
+                id: "acc_demo".to_owned(),
+                name: "Federico".to_owned(),
+                email: "federico@example.it".to_owned(),
+                provider: "Aruba".to_owned(),
+                signature: "Federico\nfederico@example.it".to_owned(),
+            },
+        }
     }
 }
 
@@ -53,11 +81,12 @@ impl GalleryApp {
                 self.sections(ui, &t);
                 self.feedback(ui);
                 self.menus(ui, &t);
+                self.composer(ui, &t);
                 self.dialogs(ui, &t);
                 ui.add_space(space::HUGE);
                 ui.label(typography::text(
                     Role::Caption,
-                    "Phosphor Regular (MIT) · Inter e JetBrains Mono (OFL) · Postino UI kit, U0.1",
+                    "Phosphor Regular (MIT) · Inter e JetBrains Mono (OFL) · Postino UI kit, U0.4",
                     t.text_faint,
                 ));
                 ui.add_space(space::XXXL);
@@ -72,7 +101,7 @@ impl GalleryApp {
                 ui.add_space(space::SM);
                 ui.vertical(|ui| {
                     ui.label(typography::text(Role::Page, "Postino UI kit", t.text));
-                    ui.label(typography::text(Role::Meta, "Componenti, stati e token · U0.1", t.text_muted));
+                    ui.label(typography::text(Role::Meta, "Componenti, stati e token · U0.4", t.text_muted));
                 });
             });
             ui.add_space(space::XL);
@@ -273,6 +302,19 @@ impl GalleryApp {
             MenuItem::new("Elimina").icon(icons::TRASH).shortcut("⌫").danger(true),
         ];
         let _ = Menu::new(&items).show(ui);
+    }
+
+    fn composer(&mut self, ui: &mut Ui, t: &Tokens) {
+        section(ui, "Composer", t);
+        egui::Frame::new()
+            .fill(t.panel)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(radius::WINDOW)
+            .inner_margin(Margin::symmetric(inset::XL, inset::LG))
+            .show(ui, |ui| {
+                ui.set_width(ui_size::COMPOSER_WIDTH);
+                let _ = Composer::new(&mut self.composer, &self.account, true).show(ui);
+            });
     }
 
     fn dialogs(&self, ui: &mut Ui, t: &Tokens) {

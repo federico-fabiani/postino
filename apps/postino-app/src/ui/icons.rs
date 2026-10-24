@@ -71,6 +71,11 @@ pub const BELL: &str = regular::BELL;
 pub const CHECK_CIRCLE: &str = regular::CHECK_CIRCLE;
 pub const X_CIRCLE: &str = regular::X_CIRCLE;
 pub const SPINNER: &str = regular::CIRCLE_NOTCH;
+pub const TEXT_BOLD: &str = regular::TEXT_B;
+pub const TEXT_ITALIC: &str = regular::TEXT_ITALIC;
+pub const LIST_BULLETS: &str = regular::LIST_BULLETS;
+pub const QUOTES: &str = regular::QUOTES;
+pub const LINK: &str = regular::LINK;
 
 /// An icon as rich text. Use with `ui.label`, a button label, or a painter galley.
 #[must_use]

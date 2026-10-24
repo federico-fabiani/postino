@@ -4,7 +4,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::engine::Engine;
-use crate::model::{Account, Address, Attachment, Folder, FolderKind, Message, MessageSummary};
+use crate::model::{Account, Address, Attachment, Folder, FolderKind, Message, MessageSummary, snippet};
 
 const ACCOUNT_ID: &str = "acc_demo";
 
@@ -15,6 +15,7 @@ pub fn seed() -> Engine {
         name: "Federico".to_owned(),
         email: "federico@example.it".to_owned(),
         provider: "Aruba".to_owned(),
+        signature: "Federico\nfederico@example.it".to_owned(),
     }];
     let folders = vec![
         folder("inbox", "Posta in arrivo", FolderKind::Inbox),
@@ -274,11 +275,4 @@ fn message(
 fn attach(message: &mut Message, id: &str, filename: &str, mime: &str, size: u64) {
     message.attachments.push(Attachment { id: id.to_owned(), filename: filename.to_owned(), mime: mime.to_owned(), size });
     message.summary.has_attachments = true;
-}
-
-fn snippet(body: &str) -> String {
-    let line = body.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
-    let mut chars = line.chars();
-    let text = chars.by_ref().take(120).collect::<String>();
-    if chars.next().is_some() { format!("{text}…") } else { text }
 }

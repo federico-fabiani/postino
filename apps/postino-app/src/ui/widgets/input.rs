@@ -16,12 +16,13 @@ pub struct TextField<'a> {
     width: Option<f32>,
     multiline: bool,
     rows: usize,
+    focus: bool,
 }
 
 impl<'a> TextField<'a> {
     #[must_use]
     pub fn new(text: &'a mut String, hint: &'a str) -> Self {
-        Self { text, hint, label: None, leading_icon: None, error: None, width: None, multiline: false, rows: 3 }
+        Self { text, hint, label: None, leading_icon: None, error: None, width: None, multiline: false, rows: 3, focus: false }
     }
 
     #[must_use]
@@ -55,6 +56,13 @@ impl<'a> TextField<'a> {
         self
     }
 
+    /// Request keyboard focus for the next frame. The caller clears the flag afterwards.
+    #[must_use]
+    pub fn focus(mut self, focus: bool) -> Self {
+        self.focus = focus;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> Response {
         let t = tokens::tokens(ui.visuals().dark_mode);
         let width = self.width.unwrap_or_else(|| ui.available_width());
@@ -69,19 +77,23 @@ impl<'a> TextField<'a> {
             .inner_margin(Margin::symmetric(inset::LG, inset::SM));
         let inner = frame.show(ui, |ui| {
             ui.set_width((width - space::LG * 2.0).max(40.0));
-            ui.horizontal_centered(|ui| {
+            ui.horizontal(|ui| {
                 if let Some(icon) = self.leading_icon {
                     ui.label(icons::icon(icon, 14.0, t.text_faint));
                 }
                 let edit = if self.multiline { TextEdit::multiline(self.text).desired_rows(self.rows) } else { TextEdit::singleline(self.text) };
-                ui.add(
+                let response = ui.add(
                     edit.hint_text(self.hint)
                         .font(FontId::new(type_size::BODY_SMALL, FontFamily::Proportional))
                         .text_color(t.text)
                         .frame(Frame::NONE)
                         .desired_width(f32::INFINITY)
                         .margin(Margin::ZERO),
-                )
+                );
+                if self.focus {
+                    response.request_focus();
+                }
+                response
             })
             .inner
         });

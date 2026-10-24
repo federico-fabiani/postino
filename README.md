@@ -3,9 +3,10 @@
 **Local-first, agent-first mail.** A fast, native email client written in Rust, with one operation
 registry shared by the desktop app, the CLI and an MCP server.
 
-> **Status: M0, walking skeleton.** The shell, the operation registry, the CLI and the MCP server
-> work against a synthetic demo mailbox. IMAP, SMTP, SQLite and the background daemon land in M1-M4.
-> No real account is configured and no mail leaves the machine yet.
+> **Status: M0 walking skeleton + U0 UI foundation.** The shell, the operation registry, the CLI and
+> the MCP server work against a synthetic demo mailbox. IMAP, SMTP, SQLite and the background daemon
+> land in M1-M4. No real account is configured, no mail leaves the machine, and the composer's send
+> is explicitly a local demo.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -21,11 +22,19 @@ MCP      ─┘
   `#E4B96A`.
 - Folder rail, message table, reading pane, filters, read/starred toggles, command palette
   (`Ctrl+K`), dark theme and a demo inbox with realistic threads and attachments.
-- Seven typed operations with JSON Schemas: `app_info`, `accounts_list`, `folders_list`,
-  `messages_list`, `message_get`, `message_flag`, `search`.
-- `postino` CLI for humans and scripts, including `postino run` for any operation.
+- Compose window with To/Cc/Bcc, subject, signature, Markdown formatting, drag-and-drop attachment
+  metadata, autosaved drafts and reply/reply-all/forward prefill. Send is demo-only until M2 and is
+  undoable.
+- Ten typed operations with JSON Schemas: `app_info`, `accounts_list`, `folders_list`,
+  `messages_list`, `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_send`,
+  `search`.
+- `postino` CLI for humans and scripts, including friendly `draft save --send` and `postino run`
+  for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
-- Headless rendering test of the shell, operation-schema tests, MCP protocol tests and CLI tests.
+- Headless rendering tests of the shell, gallery and composer, operation-schema tests, MCP protocol
+  tests.
+
+![Postino composer: recipients, subject, Markdown formatting bar, body and attachment, with the draft save state in the footer](docs/images/postino-u04-compose.png)
 
 Everything below the UI is headless and has no egui dependency.
 
@@ -44,6 +53,7 @@ cargo run -p postino-cli -- --demo messages --folder inbox --limit 5
 cargo run -p postino-cli -- --demo read msg_001
 cargo run -p postino-cli -- --demo search fattura
 cargo run -p postino-cli -- --demo run messages_list folder=inbox limit=2
+cargo run -p postino-cli -- --demo draft save --to "Giulia <giulia.ferri@example.com>" --subject "Ciao" --body "Ci sentiamo domani." --send
 ```
 
 The app is `postino-app`; the command is `postino`. The product name stays Postino.

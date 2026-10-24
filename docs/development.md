@@ -1,6 +1,6 @@
 # Development
 
-> **Status:** M0 · **Last updated:** 2026-10-23
+> **Status:** M0 + U0.4 · **Last updated:** 2026-10-24
 
 ## 1. Toolchain
 
@@ -94,10 +94,12 @@ they have a reason to exist.
 
 ## 8. Testing
 
-- **Core:** operation behaviour, schema validity, pagination, flag counts, unknown arguments.
-- **CLI:** MCP protocol (`initialize`, `tools/list`, `tools/call`, errors, notifications).
-- **UI:** headless render with `Context::run_ui` and `PostinoApp::show`. The test asserts the shell
-  paints at least one shape.
+- **Core:** operation behaviour, schema validity, pagination, flag counts, draft validation and
+  address parsing.
+- **CLI:** `run` argument parsing, recipient flags, MCP protocol (`initialize`, `tools/list`,
+  `tools/call`, errors, notifications).
+- **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery and
+  composer. The test asserts the shell paints at least one shape.
 - **Future:** a fake IMAP/SMTP server, MIME fixtures, property tests for parsers, fuzzing for MIME
   and HTML.
 
@@ -118,9 +120,12 @@ cargo run -p postino-app
 ```
 
 For a quick visual check on Windows, start the built binary and capture the screen with
-`System.Drawing` (the maintainers use this during development). The shell is deterministic enough
-that the demo inbox is a useful fixture. A future `egui_kittest` screenshot harness will make this
-part of CI.
+`System.Drawing` (the maintainers use this during development). Use a DPI-aware capture process:
+a 125% display turns a 1280 × 720 window into a 1600 × 900 PNG, and a DPI-unaware host captures the
+wrong rectangle. `PrintWindow` returns a black bitmap for the glow surface, so capture the window's
+client area from the screen instead. A commit-worthy screenshot must be retaken after the layout
+changes; the U0.4 set is in `docs/images/`. A future `egui_kittest` screenshot harness will make this
+part of CI and remove the dependency on an interactive desktop.
 
 ## 10. Style
 

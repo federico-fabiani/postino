@@ -53,21 +53,31 @@ agent can read the message and recover.
 | `messages_list` | yes | Message summaries, paginated, filterable |
 | `message_get` | yes | One message with body and attachments |
 | `message_flag` | no | Set read/unread and/or starred |
+| `message_move` | no | Move a message to a regular folder |
+| `draft_save` | no | Create or update one draft in place |
+| `draft_send` | no | Demo only: move a draft to Sent, with no SMTP connection |
 | `search` | yes | Case-insensitive search over subjects, people and bodies |
 
 Annotations:
 
-- `readOnlyHint`: true for every tool except `message_flag`.
+- `readOnlyHint`: true for reads; false for `message_flag`, `message_move`, `draft_save` and
+  `draft_send`.
 - `destructiveHint`: false in M0. Sending and deletion will be marked destructive in M6.
 - `idempotentHint`: true for reads and for `message_flag`.
 - `openWorldHint`: false. The server talks to the local engine, not the open internet.
+
+`draft_save` refuses CR/LF in addresses or the subject, validates every recipient, caps recipients
+and attachments, and returns the draft with a stable id. `draft_send` requires at least one
+recipient and is explicitly labelled demo: it moves the draft to Sent locally, without opening a
+connection. Real submission, dry-run, rate limits and an audit log arrive with M2.
 
 ## Safety
 
 - The server is opt-in and stdio-only; there is no network listener.
 - The daemon pipe (M4) will be same-user and token-authenticated.
-- Future send tools will support `dry_run`, idempotency keys, a recipient cap, a rate limit and an
-  audit log. See `docs/threat-model.md`.
+- `draft_send` is demo-only and never opens a connection. The real M2 send tool will add `dry_run`,
+  idempotency keys, a rate limit and an audit log; recipient caps and header-injection checks are
+  already in place. See `docs/threat-model.md`.
 - Tool arguments are validated against `deny_unknown_fields`; typos are rejected rather than
   ignored.
 - Never put credentials, tokens or message bodies in logs.

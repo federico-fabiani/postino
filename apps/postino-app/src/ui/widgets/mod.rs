@@ -3,6 +3,7 @@
 
 mod button;
 mod chip;
+mod composer;
 mod dialog;
 mod feedback;
 mod input;
@@ -12,6 +13,7 @@ mod section;
 
 pub use button::{Button, ButtonKind, ButtonSize, IconButton, IconButtonSize};
 pub use chip::{Badge, BadgeKind, Chip};
+pub use composer::{AUTOSAVE_DELAY, ComposeMode, Composer, ComposerFocus, ComposerState, compose_body, quote_body, signature_body};
 pub use dialog::Dialog;
 pub use feedback::{EmptyState, Toast, ToastKind};
 pub use input::{SearchField, TextField};

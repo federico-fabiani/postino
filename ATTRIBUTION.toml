@@ -141,6 +141,36 @@ sha256 = "1054e0b07d3b797aa0bd1f1d0379f11b763d8d5a2da2114e50ce2652875da1c9"
 usage = "Documentation screenshot of the U0.2 shell in the dark theme"
 
 [[asset]]
+path = "docs/images/postino-u04.png"
+title = "Postino U0.4 reading pane"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "7c255a224f5332c5e706a75e99b58d9e8a81a60e956d55be50c859fcc90cf11f"
+usage = "Documentation screenshot of the U0.4 reading pane with reply and forward actions"
+
+[[asset]]
+path = "docs/images/postino-u04-compose.png"
+title = "Postino U0.4 composer"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "39ec5076c16644b32063d95e544249cbd7ea13a7f48f9d08f57dae783ecf7e8f"
+usage = "Documentation screenshot of the U0.4 composer with recipients, attachment and draft state"
+
+[[asset]]
+path = "docs/images/postino-u04-compose-dark.png"
+title = "Postino U0.4 composer, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "830bb03f8f77398d5778faa017c8f083f67c173ab195e6387fe1963f2fa3ff8b"
+usage = "Documentation screenshot of the U0.4 composer in the dark theme"
+
+[[asset]]
 path = "assets/app-icon/postino-256.png"
 title = "Postino application icon"
 author = "Postino contributors"

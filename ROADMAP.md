@@ -1,6 +1,6 @@
 # Postino roadmap
 
-> **Current milestone:** M0 — walking skeleton · **Last updated:** 2026-10-23
+> **Current milestone:** U0 — UI foundation (M0 skeleton done) · **Last updated:** 2026-10-24
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.
@@ -8,7 +8,7 @@ verifiable demo, not a promise.
 ## M0 — walking skeleton (done)
 
 - [x] Cargo workspace, edition 2024, Rust 1.95+, MIT OR Apache-2.0.
-- [x] `postino-core` with domain types, demo engine and seven typed operations.
+- [x] `postino-core` with domain types, demo engine and typed operations.
 - [x] JSON Schemas derived from Rust request types with `schemars`; unknown keys rejected.
 - [x] `postino` CLI: `info`, `tools`, `schema`, `accounts`, `folders`, `messages`, `read`,
       `search`, `flag`, `run`, `mcp`.
@@ -24,7 +24,7 @@ verifiable demo, not a promise.
 **Note:** on Windows GNU, `cargo test` needs `dlltool.exe` from MSYS2 MinGW on `PATH`. See
 [development](docs/development.md).
 
-## U0 — UI foundation (next, before M1)
+## U0 — UI foundation (in progress, before M1)
 
 The M0 shell proved the architecture but not the product. U0 builds the design system and the
 interaction model before real mail makes them expensive to change. Full spec:
@@ -40,8 +40,10 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] **U0.3 Interaction** — selection and multi-select, scroll-follow, full keyboard map, command
       table, palette with arrows/Enter/shortcuts, `?` sheet, context menus, batch bar, undo/toast,
       read-state policy, reading pane open/expand/Esc.
-- [ ] **U0.4 Compose** — composer component, draft operations, autosave, reply/forward prefill,
-      demo send, Drafts folder.
+- [x] **U0.4 Compose** — composer component, draft operations, autosave, reply/forward prefill,
+      demo send, Drafts folder and counts. `draft_save` and `draft_send` are in the CLI/MCP registry;
+      attachments are metadata-only until M2. Screenshots: `docs/images/postino-u04.png`,
+      `postino-u04-compose.png`, `postino-u04-compose-dark.png`.
 - [ ] **U0.5 Labels and polish** — label create/apply/filter, empty/loading/error states, reduced
       motion, accessibility pass, final screenshots and docs.
 - [ ] Verify: every component in the gallery in light/dark; full keyboard-only workflow; no dead

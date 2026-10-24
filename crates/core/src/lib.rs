@@ -15,5 +15,5 @@ pub mod model;
 pub mod ops;
 
 pub use engine::{Engine, OpError};
-pub use model::{Account, Address, Attachment, Folder, FolderKind, Message, MessageSummary};
-pub use ops::{AccountsList, AppInfo, FoldersList, MessageFlag, MessageGet, MessagesList, OpDef, SearchResult, op_defs};
+pub use model::{Account, Address, Attachment, DraftContent, Folder, FolderKind, Message, MessageSummary};
+pub use ops::{AccountsList, AppInfo, DraftSave, DraftSend, FoldersList, MessageFlag, MessageGet, MessagesList, OpDef, SearchResult, op_defs};

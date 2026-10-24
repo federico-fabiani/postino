@@ -10,7 +10,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
     RichText, Sense, Stroke, Ui, UiBuilder, Vec2, ViewportCommand, WidgetInfo, WidgetType,
 };
-use postino_core::{Engine, FolderKind, MessageSummary, MessagesList, SearchResult};
+use postino_core::{Account, Address, DraftSave, DraftSend, Engine, FolderKind, Message, MessageSummary, MessagesList, SearchResult};
 use serde_json::json;
 
 use crate::theme::{self, GOLD, IVORY, Tokens};
@@ -18,7 +18,8 @@ use crate::ui::icons;
 use crate::ui::tokens::{inset, radius, size as ui_size, space};
 use crate::ui::typography::{self, Role};
 use crate::ui::widgets::{
-    Button, ButtonSize, Chip, EmptyState, IconButton, IconButtonSize, ListRow, Menu, MenuItem, SearchField, SectionHeader, Toast,
+    AUTOSAVE_DELAY, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerFocus, ComposerState, EmptyState, IconButton, IconButtonSize, ListRow,
+    Menu, MenuItem, SearchField, SectionHeader, Toast, compose_body, quote_body, signature_body,
 };
 
 pub struct PostinoApp {
@@ -51,6 +52,7 @@ pub struct PostinoApp {
     custom_chrome: bool,
     reading_open: bool,
     reading_full: bool,
+    composer: ComposerState,
 }
 
 impl PostinoApp {
@@ -88,6 +90,7 @@ impl PostinoApp {
             custom_chrome,
             reading_open: false,
             reading_full: false,
+            composer: ComposerState::closed(),
         }
     }
 
@@ -238,6 +241,10 @@ impl PostinoApp {
         let targets = self.row_targets(id);
         match action {
             RowAction::Open => self.open_message(id.to_owned()),
+            RowAction::Reply => self.reply_to(id, ComposeMode::Reply),
+            RowAction::ReplyAll => self.reply_to(id, ComposeMode::ReplyAll),
+            RowAction::Forward => self.reply_to(id, ComposeMode::Forward),
+            RowAction::EditDraft => self.edit_draft(id),
             RowAction::MarkRead => self.set_unread_many(&targets, false),
             RowAction::MarkUnread => self.set_unread_many(&targets, true),
             RowAction::Star => self.set_starred_many(&targets, true),
@@ -538,6 +545,11 @@ impl PostinoApp {
                     }
                 }
             }
+            UndoAction::Send(id) => {
+                if let Err(cause) = self.engine.call("message_move", json!({ "id": id, "folder": "drafts" })) {
+                    error = Some(cause);
+                }
+            }
         }
         match error {
             Some(error) => self.status = format!("Errore: {error}"),
@@ -594,6 +606,17 @@ impl PostinoApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.composer.open {
+            let send = ctx.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Enter));
+            let escape = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+            if send {
+                self.send_composer();
+            }
+            if escape && self.composer.open {
+                self.close_composer();
+            }
+            return;
+        }
         let mut palette = false;
         let mut escape = false;
         let mut shortcuts = false;
@@ -610,6 +633,10 @@ impl PostinoApp {
         let mut toggle = false;
         let mut select_all = false;
         let mut focus_search = false;
+        let mut compose = false;
+        let mut reply = false;
+        let mut reply_all = false;
+        let mut forward = false;
         let typing = ctx.egui_wants_keyboard_input();
         ctx.input(|input| {
             palette = input.modifiers.command && input.key_pressed(Key::K);
@@ -628,6 +655,10 @@ impl PostinoApp {
             toggle = !typing && !input.modifiers.command && (input.key_pressed(Key::Space) || input.key_pressed(Key::X));
             select_all = !typing && input.modifiers.command && input.key_pressed(Key::A);
             focus_search = !typing && !input.modifiers.command && input.key_pressed(Key::Slash);
+            compose = !typing && !input.modifiers.command && input.key_pressed(Key::C);
+            reply = !typing && !input.modifiers.command && input.key_pressed(Key::R);
+            reply_all = !typing && !input.modifiers.command && input.key_pressed(Key::A);
+            forward = !typing && !input.modifiers.command && input.key_pressed(Key::F);
         });
         if palette {
             self.show_palette = !self.show_palette;
@@ -672,6 +703,20 @@ impl PostinoApp {
         }
         if focus_search {
             self.focus_search = true;
+        }
+        if compose {
+            self.compose_new();
+        }
+        if let Some(id) = self.selected.clone() {
+            if reply {
+                self.reply_to(&id, ComposeMode::Reply);
+            }
+            if reply_all {
+                self.reply_to(&id, ComposeMode::ReplyAll);
+            }
+            if forward {
+                self.reply_to(&id, ComposeMode::Forward);
+            }
         }
         if select_all {
             let (rows, _, _) = self.visible_messages();
@@ -730,9 +775,235 @@ impl PostinoApp {
         self.set_unread_many(&ids, false);
     }
 
+    fn account(&self) -> Option<&Account> {
+        self.engine.accounts().first()
+    }
+
+    fn start_composer(&mut self, mut state: ComposerState) {
+        if self.composer.open && self.composer.dirty && !self.save_composer(false) {
+            return;
+        }
+        state.open = true;
+        self.composer = state;
+        self.show_palette = false;
+        self.show_shortcuts = false;
+        self.show_about = false;
+    }
+
+    fn compose_new(&mut self) {
+        let Some(account) = self.account().cloned() else {
+            self.status = "Nessun account configurato".to_owned();
+            return;
+        };
+        let mut state = ComposerState::new(ComposeMode::New);
+        state.body = signature_body(&account.signature);
+        state.focus = Some(ComposerFocus::To);
+        self.start_composer(state);
+    }
+
+    fn reply_to(&mut self, id: &str, mode: ComposeMode) {
+        let Some(message) = self.engine.message(id).cloned() else {
+            self.status = "Messaggio non trovato".to_owned();
+            return;
+        };
+        let Some(account) = self.account().cloned() else {
+            self.status = "Nessun account configurato".to_owned();
+            return;
+        };
+        let own = account.email.trim().to_ascii_lowercase();
+        let (to, cc) =
+            if mode == ComposeMode::Forward { (Vec::new(), Vec::new()) } else { reply_recipients(&message, &own, mode == ComposeMode::ReplyAll) };
+        let subject = match mode {
+            ComposeMode::Forward => forward_subject(&message.summary.subject),
+            _ => reply_subject(&message.summary.subject),
+        };
+        let quoted = match mode {
+            ComposeMode::Forward => Some(forward_block(&message)),
+            ComposeMode::Reply | ComposeMode::ReplyAll => Some(reply_block(&message)),
+            ComposeMode::New | ComposeMode::Draft => None,
+        };
+        let mut state = ComposerState::new(mode);
+        state.to = Address::format_list(&to);
+        state.cc = Address::format_list(&cc);
+        state.show_cc = !cc.is_empty();
+        state.show_bcc = false;
+        state.subject = subject;
+        state.body = compose_body(&account.signature, quoted);
+        state.attachments = if mode == ComposeMode::Forward { message.attachments.clone() } else { Vec::new() };
+        state.focus = Some(ComposerFocus::Body);
+        self.start_composer(state);
+    }
+
+    fn edit_draft(&mut self, id: &str) {
+        let Some(message) = self.engine.message(id).cloned() else {
+            self.status = "Bozza non trovata".to_owned();
+            return;
+        };
+        let is_draft = self
+            .engine
+            .folders()
+            .iter()
+            .find(|folder| folder.id == message.summary.folder_id)
+            .is_some_and(|folder| folder.kind == FolderKind::Drafts);
+        if !is_draft {
+            self.status = "Questo messaggio non è una bozza".to_owned();
+            return;
+        }
+        let mut state = ComposerState::new(ComposeMode::Draft);
+        state.draft_id = Some(message.summary.id.clone());
+        state.to = Address::format_list(&message.summary.to);
+        state.cc = Address::format_list(&message.cc);
+        state.bcc = Address::format_list(&message.bcc);
+        state.show_cc = !message.cc.is_empty();
+        state.show_bcc = !message.bcc.is_empty();
+        state.subject = message.summary.subject.clone();
+        state.body = message.body_text.clone();
+        state.attachments = message.attachments.clone();
+        state.saved_at = Some(message.summary.date.with_timezone(&Local).format("%H:%M").to_string());
+        state.focus = Some(ComposerFocus::Body);
+        self.start_composer(state);
+    }
+
+    fn save_composer(&mut self, notify: bool) -> bool {
+        if !self.composer.open {
+            return false;
+        }
+        if !self.composer.dirty && self.composer.draft_id.is_none() {
+            if notify {
+                self.status = "Nessuna modifica da salvare".to_owned();
+            }
+            return true;
+        }
+        if !self.composer.dirty && self.composer.draft_id.is_some() {
+            if notify {
+                self.status = "Bozza già salvata".to_owned();
+            }
+            return true;
+        }
+        let (to, cc, bcc) = match self.composer.recipients() {
+            Ok(recipients) => recipients,
+            Err(error) => {
+                self.composer.mark_failed(error, self.now);
+                if notify {
+                    self.status = "Controlla gli indirizzi della bozza".to_owned();
+                }
+                return false;
+            }
+        };
+        let mut args = json!({
+            "to": to,
+            "cc": cc,
+            "bcc": bcc,
+            "subject": self.composer.subject,
+            "body_text": self.composer.body,
+            "attachments": self.composer.attachments,
+        });
+        if let Some(id) = &self.composer.draft_id
+            && let Some(object) = args.as_object_mut()
+        {
+            object.insert("id".to_owned(), json!(id));
+        }
+        let result = self.engine.call("draft_save", args);
+        match result {
+            Ok(value) => match serde_json::from_value::<DraftSave>(value) {
+                Ok(saved) => {
+                    let id = saved.draft.summary.id.clone();
+                    self.composer.draft_id = Some(id);
+                    self.composer.attachments = saved.draft.attachments;
+                    self.composer.mark_saved(Local::now().format("%H:%M").to_string());
+                    if notify {
+                        self.status = "Bozza salvata".to_owned();
+                    }
+                    true
+                }
+                Err(error) => {
+                    self.composer.mark_failed(format!("risposta non valida: {error}"), self.now);
+                    false
+                }
+            },
+            Err(error) => {
+                self.composer.mark_failed(error.to_string(), self.now);
+                if notify {
+                    self.status = format!("Errore: {error}");
+                }
+                false
+            }
+        }
+    }
+
+    fn send_composer(&mut self) {
+        if !self.composer.open {
+            return;
+        }
+        if !self.save_composer(true) {
+            return;
+        }
+        let Some(id) = self.composer.draft_id.clone() else {
+            self.composer.mark_failed("Aggiungi almeno un destinatario prima di inviare", self.now);
+            return;
+        };
+        match self.engine.call("draft_send", json!({ "id": id })) {
+            Ok(value) => match serde_json::from_value::<DraftSend>(value) {
+                Ok(sent) => {
+                    self.composer = ComposerState::closed();
+                    self.status = format!(
+                        "Messaggio spostato in {} (demo)",
+                        self.engine
+                            .folders()
+                            .iter()
+                            .find(|folder| folder.id == sent.message.folder_id)
+                            .map_or("Inviati", |folder| folder.name.as_str())
+                    );
+                    self.push_toast("Messaggio inviato in modalità demo", UndoAction::Send(id));
+                }
+                Err(error) => self.composer.mark_failed(format!("risposta non valida: {error}"), self.now),
+            },
+            Err(error) => self.composer.mark_failed(error.to_string(), self.now),
+        }
+    }
+
+    fn close_composer(&mut self) {
+        if !self.composer.open {
+            return;
+        }
+        if self.composer.dirty && !self.save_composer(true) {
+            return;
+        }
+        self.composer = ComposerState::closed();
+    }
+
+    fn discard_composer(&mut self) {
+        if !self.composer.open {
+            return;
+        }
+        if let Some(id) = self.composer.draft_id.clone()
+            && self.engine.message(&id).is_some()
+        {
+            match self.engine.call("message_move", json!({ "id": id, "folder": "trash" })) {
+                Ok(_) => {
+                    self.composer = ComposerState::closed();
+                    self.status = "Bozza spostata nel cestino".to_owned();
+                    self.push_toast("Bozza scartata", UndoAction::Move(vec![(id, "drafts".to_owned())]));
+                }
+                Err(error) => self.composer.mark_failed(error.to_string(), self.now),
+            }
+            return;
+        }
+        self.composer = ComposerState::closed();
+        self.status = "Bozza scartata".to_owned();
+    }
+
     fn tick(&mut self, ctx: &egui::Context) {
         self.now = ctx.input(|input| input.time);
         self.maybe_complete_read();
+        if self.composer.open && self.composer.dirty {
+            let elapsed = self.now - self.composer.last_edit;
+            if elapsed >= AUTOSAVE_DELAY {
+                let _ = self.save_composer(false);
+            } else {
+                ctx.request_repaint_after(Duration::from_secs_f64((AUTOSAVE_DELAY - elapsed).max(0.0)));
+            }
+        }
         if let Some(pending) = &self.pending_read {
             ctx.request_repaint_after(Duration::from_secs_f64((pending.at - self.now).max(0.0)));
         }
@@ -877,12 +1148,9 @@ impl PostinoApp {
                     }
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
-                    let _ = Button::primary("Scrivi")
-                        .icon(icons::COMPOSE)
-                        .shortcut("C")
-                        .enabled(false)
-                        .disabled_reason("Il composer arriva in U0.4")
-                        .show(ui);
+                    if Button::primary("Scrivi").icon(icons::COMPOSE).shortcut("C").show(ui).clicked() {
+                        self.compose_new();
+                    }
                     ui.add_space(space::SM);
                     let theme_icon = if self.dark { icons::SUN } else { icons::MOON };
                     if IconButton::new(theme_icon, "Cambia tema").show(ui).clicked() {
@@ -910,7 +1178,13 @@ impl PostinoApp {
                     ui.add_space(space::XS);
                     let folders = self.engine.folders().to_vec();
                     for folder in folders {
-                        let meta = if folder.unread > 0 { folder.unread.to_string() } else { String::new() };
+                        let meta = if folder.kind == FolderKind::Drafts && folder.total > 0 {
+                            folder.total.to_string()
+                        } else if folder.unread > 0 {
+                            folder.unread.to_string()
+                        } else {
+                            String::new()
+                        };
                         let row = ListRow::folder(folder.name.as_str(), meta.as_str())
                             .icon(folder_icon(folder.kind))
                             .selected(self.folder == folder.id)
@@ -948,7 +1222,7 @@ impl PostinoApp {
                     ui.add_space(remaining - footer_height);
                 }
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.label(typography::text(Role::Caption, format!("Postino {} · M0", env!("CARGO_PKG_VERSION")), t.text_faint));
+                    ui.label(typography::text(Role::Caption, format!("Postino {} · M0 + U0.4", env!("CARGO_PKG_VERSION")), t.text_faint));
                     ui.label(typography::text(Role::Caption, "Locale · offline", t.text_faint));
                 });
             });
@@ -1004,12 +1278,16 @@ impl PostinoApp {
                         MenuItem::separator(),
                         menu_item("refresh"),
                         menu_item("select_all").enabled(false).reason("Non ci sono messaggi da selezionare"),
-                        MenuItem::new("Scrivi").icon(icons::COMPOSE).enabled(false).reason("Il composer arriva in U0.4"),
+                        menu_item("compose"),
                         MenuItem::new("Cancella ricerca").icon(icons::CLOSE).enabled(searching).reason("Nessuna ricerca attiva"),
                     ];
                     match Menu::new(&items).show(ui) {
                         Some(2) => {
                             empty_action = Some(EmptyAction::Refresh);
+                            ui.close();
+                        }
+                        Some(4) => {
+                            empty_action = Some(EmptyAction::Compose);
                             ui.close();
                         }
                         Some(5) => {
@@ -1021,6 +1299,8 @@ impl PostinoApp {
                 });
                 let (icon, title, body, action) = if searching {
                     (icons::SEARCH, "Nessun risultato", "Nessun messaggio corrisponde alla ricerca.", Some("Cancella ricerca"))
+                } else if self.folder == "drafts" {
+                    (icons::DRAFTS, "Nessuna bozza", "Le bozze si salvano da sole mentre scrivi.", Some("Scrivi"))
                 } else if self.folder == "inbox" {
                     (icons::INBOX, "Nessun messaggio", "La posta in arrivo è vuota.", None)
                 } else {
@@ -1035,12 +1315,15 @@ impl PostinoApp {
                 {
                     if searching {
                         self.query.clear();
+                    } else if self.folder == "drafts" {
+                        self.compose_new();
                     } else {
                         self.select_folder("inbox");
                     }
                 }
                 match empty_action {
                     Some(EmptyAction::Refresh) => self.status = "Dati demo già aggiornati".to_owned(),
+                    Some(EmptyAction::Compose) => self.compose_new(),
                     Some(EmptyAction::ClearSearch) => self.query.clear(),
                     None => {}
                 }
@@ -1130,7 +1413,9 @@ impl PostinoApp {
                                     ui.add_space(top);
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
-                                        let subject = RichText::new(message.subject.as_str())
+                                        let subject_text =
+                                            if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() };
+                                        let subject = RichText::new(subject_text)
                                             .font(FontId::new(13.0, if message.unread { theme::medium() } else { FontFamily::Proportional }))
                                             .color(foreground);
                                         ui.add(egui::Label::new(subject).truncate().selectable(false));
@@ -1176,7 +1461,13 @@ impl PostinoApp {
                                 if response.clicked() {
                                     clicked = Some((message.id.clone(), modifiers));
                                 }
-                                let (items, actions) = row_context_menu(message);
+                                let is_draft = self
+                                    .engine
+                                    .folders()
+                                    .iter()
+                                    .find(|folder| folder.id == message.folder_id)
+                                    .is_some_and(|folder| folder.kind == FolderKind::Drafts);
+                                let (items, actions) = row_context_menu(message, is_draft);
                                 response.context_menu(|ui| {
                                     if let Some(index) = Menu::new(&items).show(ui)
                                         && let Some(Some(action)) = actions.get(index)
@@ -1242,11 +1533,18 @@ impl PostinoApp {
             self.close_reading();
             return;
         };
+        let is_draft = self
+            .engine
+            .folders()
+            .iter()
+            .find(|folder| folder.id == message.summary.folder_id)
+            .is_some_and(|folder| folder.kind == FolderKind::Drafts);
 
         let (left_action, right_action) = Sides::new().height(36.0).shrink_left().show(
             ui,
             |ui| {
                 let mut action = None;
+                let compact = ui.available_width() < 560.0;
                 if full {
                     if Button::ghost(command_label("back", "Torna alla posta"))
                         .icon(command_icon("back", icons::ARROW_LEFT))
@@ -1255,6 +1553,13 @@ impl PostinoApp {
                         .clicked()
                     {
                         action = Some(ReadingAction::Back);
+                    }
+                } else if compact {
+                    if IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia")).show(ui).clicked() {
+                        action = Some(ReadingAction::Archive);
+                    }
+                    if IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina")).danger(true).show(ui).clicked() {
+                        action = Some(ReadingAction::Delete);
                     }
                 } else {
                     if Button::new(command_label("archive", "Archivia"))
@@ -1275,6 +1580,23 @@ impl PostinoApp {
                     }
                 }
                 ui.add_space(space::SM);
+                if is_draft {
+                    if IconButton::new(command_icon("edit_draft", icons::COMPOSE), command_label("edit_draft", "Modifica bozza")).show(ui).clicked() {
+                        action = Some(ReadingAction::EditDraft);
+                    }
+                } else {
+                    if IconButton::new(command_icon("reply", icons::REPLY), command_label("reply", "Rispondi")).show(ui).clicked() {
+                        action = Some(ReadingAction::Reply);
+                    }
+                    if IconButton::new(command_icon("reply_all", icons::REPLY_ALL), command_label("reply_all", "Rispondi a tutti")).show(ui).clicked()
+                    {
+                        action = Some(ReadingAction::ReplyAll);
+                    }
+                    if IconButton::new(command_icon("forward", icons::FORWARD), command_label("forward", "Inoltra")).show(ui).clicked() {
+                        action = Some(ReadingAction::Forward);
+                    }
+                }
+                ui.add_space(space::XS);
                 let star_id = if message.summary.starred { "unstar" } else { "star" };
                 let star_icon = if message.summary.starred { icons::STAR_FILL } else { icons::STAR };
                 if IconButton::new(star_icon, command_label(star_id, "Stella"))
@@ -1307,7 +1629,8 @@ impl PostinoApp {
         );
 
         ui.add_space(space::LG);
-        let subject = ui.label(typography::strong(Role::Page, message.summary.subject.as_str(), t.text));
+        let subject_text = if message.summary.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.summary.subject.as_str() };
+        let subject = ui.label(typography::strong(Role::Page, subject_text, t.text));
         reading_context_menu(subject, message.summary.subject.clone(), message.summary.from.display());
         ui.add_space(space::MD);
         let to = message.summary.to.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
@@ -1382,6 +1705,22 @@ impl PostinoApp {
         match action {
             Some(ReadingAction::Archive) => self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati"),
             Some(ReadingAction::Delete) => self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            Some(ReadingAction::Reply) => {
+                let id = message.summary.id.clone();
+                self.reply_to(&id, ComposeMode::Reply);
+            }
+            Some(ReadingAction::ReplyAll) => {
+                let id = message.summary.id.clone();
+                self.reply_to(&id, ComposeMode::ReplyAll);
+            }
+            Some(ReadingAction::Forward) => {
+                let id = message.summary.id.clone();
+                self.reply_to(&id, ComposeMode::Forward);
+            }
+            Some(ReadingAction::EditDraft) => {
+                let id = message.summary.id.clone();
+                self.edit_draft(&id);
+            }
             Some(ReadingAction::Star) => self.toggle_star(),
             Some(ReadingAction::Read) => self.toggle_read(),
             Some(ReadingAction::Close) => self.close_reading(),
@@ -1404,10 +1743,60 @@ impl PostinoApp {
                     ui.painter().circle_filled(rect.center(), 3.0, dot);
                     ui.label(typography::text(Role::Meta, self.status.as_str(), t.text_muted));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(typography::text(Role::Meta, "Ctrl+K comandi · J/K naviga · ? scorciatoie", t.text_faint));
+                        let hint = if self.composer.open {
+                            "Ctrl+Invio invia · Esc chiude e conserva"
+                        } else {
+                            "Ctrl+K comandi · J/K naviga · ? scorciatoie"
+                        };
+                        ui.label(typography::text(Role::Meta, hint, t.text_faint));
                     });
                 });
             });
+    }
+
+    fn composer_window(&mut self, ui: &mut Ui) {
+        if !self.composer.open {
+            return;
+        }
+        let Some(account) = self.account().cloned() else {
+            self.composer = ComposerState::closed();
+            return;
+        };
+        let t = theme::tokens(self.dark);
+        let height = (ui.ctx().content_rect().height() - 48.0).clamp(ui_size::COMPOSER_MIN_HEIGHT, ui_size::COMPOSER_HEIGHT);
+        let response = egui::Window::new("Postino composer")
+            .id(egui::Id::new("postino-composer"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([ui_size::COMPOSER_WIDTH, height])
+            .frame(
+                Frame::new()
+                    .fill(t.panel)
+                    .stroke(Stroke::new(1.0, t.border))
+                    .corner_radius(radius::WINDOW)
+                    .inner_margin(Margin::symmetric(inset::XL, inset::LG)),
+            )
+            .show(ui.ctx(), |ui| Composer::new(&mut self.composer, &account, self.engine.is_demo()).show(ui));
+        let Some(inner) = response else {
+            return;
+        };
+        let Some(action) = inner.inner else {
+            return;
+        };
+        if action.discard {
+            self.discard_composer();
+        } else if action.close {
+            self.close_composer();
+        } else if action.send {
+            self.send_composer();
+        } else if action.save {
+            let _ = self.save_composer(true);
+        }
+        if !self.composer.open {
+            ui.ctx().memory_mut(|memory| memory.stop_text_input());
+        }
     }
 
     fn about(&mut self, ui: &mut Ui) {
@@ -1422,7 +1811,7 @@ impl PostinoApp {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Postino").font(FontId::new(22.0, theme::display())).color(t.text));
-                    ui.label(RichText::new(format!("{} · M0 walking skeleton", env!("CARGO_PKG_VERSION"))).size(11.0).color(t.text_muted));
+                    ui.label(RichText::new(format!("{} · M0 + U0.4", env!("CARGO_PKG_VERSION"))).size(11.0).color(t.text_muted));
                 });
             });
             ui.add_space(12.0);
@@ -1585,6 +1974,28 @@ impl PostinoApp {
         self.show_palette = false;
         ctx.memory_mut(|memory| memory.stop_text_input());
         match id {
+            "compose" => self.compose_new(),
+            "reply" => {
+                if let Some(message) = self.selected.clone() {
+                    self.reply_to(&message, ComposeMode::Reply);
+                }
+            }
+            "reply_all" => {
+                if let Some(message) = self.selected.clone() {
+                    self.reply_to(&message, ComposeMode::ReplyAll);
+                }
+            }
+            "forward" => {
+                if let Some(message) = self.selected.clone() {
+                    self.reply_to(&message, ComposeMode::Forward);
+                }
+            }
+            "edit_draft" => {
+                if let Some(message) = self.selected.clone() {
+                    self.edit_draft(&message);
+                }
+            }
+            "send" => self.send_composer(),
             "open" => {
                 if let Some(message) = self.selected.clone() {
                     self.open_message(message);
@@ -1684,6 +2095,7 @@ impl PostinoApp {
         self.about(ui);
         self.command_palette(ui);
         self.shortcuts_sheet(ui);
+        self.composer_window(ui);
         self.toast_overlay(ui.ctx());
     }
 }
@@ -1698,6 +2110,10 @@ impl eframe::App for PostinoApp {
 enum ReadingAction {
     Archive,
     Delete,
+    Reply,
+    ReplyAll,
+    Forward,
+    EditDraft,
     Star,
     Read,
     Close,
@@ -1724,12 +2140,17 @@ enum FolderAction {
 #[derive(Clone, Copy)]
 enum EmptyAction {
     Refresh,
+    Compose,
     ClearSearch,
 }
 
 #[derive(Clone, Copy)]
 enum RowAction {
     Open,
+    Reply,
+    ReplyAll,
+    Forward,
+    EditDraft,
     MarkRead,
     MarkUnread,
     Star,
@@ -1753,6 +2174,7 @@ enum UndoAction {
     Unread(Vec<(String, bool)>),
     Starred(Vec<(String, bool)>),
     Move(Vec<(String, String)>),
+    Send(String),
 }
 
 #[derive(Clone, Copy)]
@@ -1766,7 +2188,13 @@ struct Command {
 }
 
 const COMMANDS: &[Command] = &[
+    Command { id: "compose", label: "Scrivi", icon: icons::COMPOSE, shortcut: "C", needs_message: false, in_palette: true },
     Command { id: "open", label: "Apri messaggio", icon: icons::MAIL, shortcut: "Invio", needs_message: true, in_palette: true },
+    Command { id: "reply", label: "Rispondi", icon: icons::REPLY, shortcut: "R", needs_message: true, in_palette: true },
+    Command { id: "reply_all", label: "Rispondi a tutti", icon: icons::REPLY_ALL, shortcut: "A", needs_message: true, in_palette: true },
+    Command { id: "forward", label: "Inoltra", icon: icons::FORWARD, shortcut: "F", needs_message: true, in_palette: true },
+    Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", needs_message: true, in_palette: false },
+    Command { id: "send", label: "Invia (demo)", icon: icons::SEND, shortcut: "Ctrl+Invio", needs_message: false, in_palette: false },
     Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", needs_message: true, in_palette: true },
     Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", needs_message: true, in_palette: true },
     Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", needs_message: true, in_palette: true },
@@ -1884,17 +2312,22 @@ fn reading_context_menu(response: egui::Response, subject: String, sender: Strin
     });
 }
 
-fn row_context_menu(message: &MessageSummary) -> (Vec<MenuItem<'static>>, Vec<Option<RowAction>>) {
+fn row_context_menu(message: &MessageSummary, is_draft: bool) -> (Vec<MenuItem<'static>>, Vec<Option<RowAction>>) {
     let mut items = Vec::new();
     let mut actions = Vec::new();
     items.push(menu_item("open"));
     actions.push(Some(RowAction::Open));
-    items.push(MenuItem::new("Rispondi").icon(icons::REPLY).enabled(false).reason("Il composer arriva in U0.4"));
-    actions.push(None);
-    items.push(MenuItem::new("Rispondi a tutti").icon(icons::REPLY_ALL).enabled(false).reason("Il composer arriva in U0.4"));
-    actions.push(None);
-    items.push(MenuItem::new("Inoltra").icon(icons::FORWARD).enabled(false).reason("Il composer arriva in U0.4"));
-    actions.push(None);
+    if is_draft {
+        items.push(menu_item("edit_draft"));
+        actions.push(Some(RowAction::EditDraft));
+    } else {
+        items.push(menu_item("reply"));
+        actions.push(Some(RowAction::Reply));
+        items.push(menu_item("reply_all"));
+        actions.push(Some(RowAction::ReplyAll));
+        items.push(menu_item("forward"));
+        actions.push(Some(RowAction::Forward));
+    }
     items.push(MenuItem::separator());
     actions.push(None);
     if message.unread {
@@ -1920,6 +2353,66 @@ fn row_context_menu(message: &MessageSummary) -> (Vec<MenuItem<'static>>, Vec<Op
     items.push(menu_item("delete").danger(true));
     actions.push(Some(RowAction::Delete));
     (items, actions)
+}
+
+fn reply_recipients(message: &Message, own_email: &str, all: bool) -> (Vec<Address>, Vec<Address>) {
+    let mut to = Vec::new();
+    if !message.summary.from.email.trim().eq_ignore_ascii_case(own_email) {
+        to.push(message.summary.from.clone());
+    }
+    if to.is_empty() {
+        to.extend(message.summary.to.iter().filter(|address| !address.email.trim().eq_ignore_ascii_case(own_email)).cloned());
+    }
+    let mut cc = if all { message.summary.to.iter().chain(message.cc.iter()).cloned().collect::<Vec<_>>() } else { Vec::new() };
+    let to = dedupe_recipients(to, own_email);
+    let excluded = to.iter().map(|address| address.email.trim().to_ascii_lowercase()).collect::<BTreeSet<_>>();
+    cc.retain(|address| !excluded.contains(&address.email.trim().to_ascii_lowercase()));
+    let cc = dedupe_recipients(cc, own_email);
+    (to, cc)
+}
+
+fn dedupe_recipients(addresses: Vec<Address>, own_email: &str) -> Vec<Address> {
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::new();
+    for address in addresses {
+        let email = address.email.trim().to_ascii_lowercase();
+        if email.is_empty() || email == own_email || !seen.insert(email) {
+            continue;
+        }
+        unique.push(address);
+    }
+    unique
+}
+
+fn reply_subject(subject: &str) -> String {
+    let subject = subject.trim();
+    if subject.to_ascii_lowercase().starts_with("re:") { subject.to_owned() } else { format!("Re: {subject}") }
+}
+
+fn forward_subject(subject: &str) -> String {
+    let subject = subject.trim();
+    if subject.to_ascii_lowercase().starts_with("fwd:") { subject.to_owned() } else { format!("Fwd: {subject}") }
+}
+
+fn reply_block(message: &Message) -> String {
+    let date = message.summary.date.with_timezone(&Local).format("%d/%m/%Y %H:%M");
+    format!("Il giorno {date}, {} ha scritto:\n{}", message.summary.from.display(), quote_body(&message.body_text))
+}
+
+fn forward_block(message: &Message) -> String {
+    let to = message.summary.to.iter().map(Address::display).collect::<Vec<_>>().join(", ");
+    let date = message.summary.date.with_timezone(&Local).format("%d/%m/%Y %H:%M");
+    let mut block = format!(
+        "---------- Messaggio inoltrato ----------\nDa: {}\nData: {date}\nA: {to}\nOggetto: {}\n",
+        message.summary.from.display(),
+        message.summary.subject
+    );
+    if !message.cc.is_empty() {
+        block.push_str(&format!("Cc: {}\n", message.cc.iter().map(Address::display).collect::<Vec<_>>().join(", ")));
+    }
+    block.push('\n');
+    block.push_str(&message.body_text);
+    block
 }
 
 fn folder_icon(kind: FolderKind) -> &'static str {
@@ -2212,6 +2705,155 @@ mod tests {
     }
 
     #[test]
+    fn compose_opens_with_the_signature_and_renders_headlessly() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.compose_new();
+        assert!(app.composer.open);
+        assert_eq!(app.composer.mode, ComposeMode::New);
+        assert!(app.composer.body.contains("Federico"));
+        assert_eq!(app.composer.focus, Some(ComposerFocus::To));
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.composer.open);
+    }
+
+    #[test]
+    fn c_opens_the_composer_and_escape_keeps_the_draft() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![key(Key::C, Modifiers::NONE)]);
+        assert!(app.composer.open, "C opens the composer");
+        app.composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
+        app.composer.subject = "Bozza da tastiera".to_owned();
+        app.composer.body = "Corpo".to_owned();
+        app.composer.touch(0.0);
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.composer.open, "Esc closes the composer");
+        assert!(app.engine.messages().iter().any(|message| message.summary.subject == "Bozza da tastiera"), "Esc must save the draft before closing");
+    }
+
+    #[test]
+    fn ctrl_enter_sends_from_the_composer() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
+        app.composer.subject = "Invio da tastiera".to_owned();
+        app.composer.body = "Corpo".to_owned();
+        app.composer.touch(0.0);
+        frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::COMMAND), key(Key::Enter, Modifiers::COMMAND)]);
+        assert!(!app.composer.open, "Ctrl+Enter sends and closes the composer");
+        assert!(
+            app.engine.messages().iter().any(|message| message.summary.subject == "Invio da tastiera" && message.summary.folder_id == "sent"),
+            "the demo send moves the message to Sent"
+        );
+    }
+
+    #[test]
+    fn reply_and_forward_prefill_the_composer() {
+        let mut app = PostinoApp::demo(true);
+        let with_attachment = app
+            .engine
+            .messages()
+            .iter()
+            .find(|message| message.summary.has_attachments && !message.attachments.is_empty())
+            .map(|message| message.summary.id.clone())
+            .expect("a demo message with an attachment");
+
+        app.reply_to(&with_attachment, ComposeMode::Reply);
+        assert!(app.composer.open);
+        assert_eq!(app.composer.mode, ComposeMode::Reply);
+        assert!(app.composer.to.contains("giulia.ferri@example.com"));
+        assert!(app.composer.subject.starts_with("Re:"));
+        assert!(app.composer.body.contains("ha scritto:"));
+        assert!(app.composer.attachments.is_empty(), "reply does not copy the original attachments");
+
+        app.composer = ComposerState::closed();
+        app.reply_to(&with_attachment, ComposeMode::Forward);
+        assert_eq!(app.composer.mode, ComposeMode::Forward);
+        assert!(app.composer.to.is_empty());
+        assert!(app.composer.subject.starts_with("Fwd:"));
+        assert_eq!(app.composer.attachments.len(), 1, "forward copies the attachment metadata");
+    }
+
+    #[test]
+    fn an_invalid_recipient_blocks_saving_and_keeps_the_composer_open() {
+        let mut app = PostinoApp::demo(true);
+        app.compose_new();
+        app.composer.to = "Giulia <non-una-mail>".to_owned();
+        app.composer.subject = "Non salvabile".to_owned();
+        app.composer.touch(1.0);
+        assert!(!app.save_composer(true));
+        assert!(app.composer.open);
+        assert!(app.composer.save_error.is_some(), "the composer explains why it did not save");
+        assert!(!app.engine.messages().iter().any(|message| message.summary.subject == "Non salvabile"));
+    }
+
+    #[test]
+    fn autosave_updates_one_draft_in_place() {
+        let mut app = PostinoApp::demo(true);
+        let before = app.engine.folders().iter().find(|folder| folder.kind == FolderKind::Drafts).map_or(0, |folder| folder.total);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
+        app.composer.subject = "Bozza di prova".to_owned();
+        app.composer.body = "Prima versione".to_owned();
+        app.composer.touch(1.0);
+        assert!(app.save_composer(false));
+        let id = app.composer.draft_id.clone().expect("draft id");
+        app.composer.body = "Seconda versione".to_owned();
+        app.composer.touch(2.0);
+        assert!(app.save_composer(false));
+        assert_eq!(app.composer.draft_id.as_deref(), Some(id.as_str()));
+        assert_eq!(app.engine.message(&id).map(|message| message.body_text.as_str()), Some("Seconda versione"));
+        let after = app.engine.folders().iter().find(|folder| folder.kind == FolderKind::Drafts).map_or(0, |folder| folder.total);
+        assert_eq!(after, before + 1, "autosave must not duplicate the draft");
+    }
+
+    #[test]
+    fn closing_keeps_the_draft_and_sending_moves_it_to_sent() {
+        let mut app = PostinoApp::demo(true);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
+        app.composer.subject = "Invio demo".to_owned();
+        app.composer.body = "Corpo".to_owned();
+        app.composer.touch(1.0);
+        app.close_composer();
+        assert!(!app.composer.open);
+        let id = app
+            .engine
+            .messages()
+            .iter()
+            .find(|message| message.summary.subject == "Invio demo")
+            .map(|message| message.summary.id.clone())
+            .expect("saved draft");
+        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("drafts"));
+
+        app.edit_draft(&id);
+        app.send_composer();
+        assert!(!app.composer.open);
+        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("sent"));
+        app.undo_last();
+        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("drafts"));
+    }
+
+    #[test]
+    fn reply_all_excludes_the_account_address() {
+        let mut app = PostinoApp::demo(true);
+        let sent = app
+            .engine
+            .messages()
+            .iter()
+            .find(|message| message.summary.folder_id == "sent" && message.summary.to.len() > 1)
+            .map(|message| message.summary.id.clone())
+            .expect("a sent message with several recipients");
+        app.reply_to(&sent, ComposeMode::ReplyAll);
+        assert!(app.composer.to.contains("marco.bianchi@example.com"));
+        assert!(app.composer.to.contains("giulia.ferri@example.com"));
+        assert!(!app.composer.to.contains("federico@example.it"));
+        assert!(!app.composer.cc.contains("federico@example.it"));
+    }
+
+    #[test]
     fn palette_arrows_and_enter_run_the_selected_command() {
         let (ctx, mut app) = ready_app();
         frame(&ctx, &mut app, vec![]);
@@ -2226,7 +2868,7 @@ mod tests {
 
         frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
         assert!(!app.show_palette, "Enter runs the selected command and closes the palette");
-        assert!(app.reading_open && app.reading_full, "the second command is 'Apri a schermo intero'");
+        assert!(app.reading_open && !app.reading_full, "the second command is 'Apri messaggio'");
     }
 
     #[test]

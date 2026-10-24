@@ -1,7 +1,7 @@
 # Postino architecture
 
-> **Status:** M0 walking skeleton · **Last updated:** 2026-10-23 · **Target:** a local-first,
-> agent-first mail client that is fast on every desktop.
+> **Status:** M0 walking skeleton + U0 UI foundation · **Last updated:** 2026-10-24 · **Target:** a
+> local-first, agent-first mail client that is fast on every desktop.
 
 ## 1. Shape today
 
@@ -43,7 +43,9 @@ This is the same contract as the Crafting Apps, with one improvement: schemas ar
 types, so a handler and its public schema cannot drift.
 
 Current operations: `app_info`, `accounts_list`, `folders_list`, `messages_list`, `message_get`,
-`message_flag`, `search`. They are enough to prove the path through all three clients.
+`message_flag`, `message_move`, `draft_save`, `draft_send`, `search`. They are enough to prove the
+path through all three clients. `draft_save` updates one draft in place and `draft_send` is a local
+demo until SMTP arrives in M2; neither opens a network connection.
 
 ## 3. The target shape
 

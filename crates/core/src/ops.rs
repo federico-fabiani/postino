@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::engine::{Engine, OpError};
-use crate::model::{Account, Folder, FolderKind, Message, MessageSummary};
+use crate::model::{Account, Address, Attachment, DraftContent, Folder, FolderKind, Message, MessageSummary};
 
 /// One operation as the CLI and MCP see it.
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +76,22 @@ pub fn op_defs() -> Vec<OpDef> {
             "Move a message",
             "Move one message to a regular folder, for example `archive` or `trash`. Virtual folders such as `starred` cannot receive messages.",
             MessageMoveArgs,
+            false,
+            false
+        ),
+        def!(
+            "draft_save",
+            "Save a draft",
+            "Create or update a draft in Drafts. Omit `id` for a new draft, pass the returned id to update it in place. Recipients are structured addresses; header injection is refused.",
+            DraftSaveArgs,
+            false,
+            false
+        ),
+        def!(
+            "draft_send",
+            "Send a draft (demo)",
+            "Demo only: move a draft to Sent and record the current timestamp. No SMTP server is contacted; real submission arrives in M2. At least one To, Cc or Bcc recipient is required.",
+            DraftSendArgs,
             false,
             false
         ),
@@ -156,6 +172,44 @@ pub struct MessageMoveArgs {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct DraftSaveArgs {
+    /// Existing draft id returned by a previous draft_save. Omit to create a draft.
+    pub id: Option<String>,
+    /// Primary recipients. An empty list is allowed while drafting.
+    #[serde(default)]
+    pub to: Vec<Address>,
+    #[serde(default)]
+    pub cc: Vec<Address>,
+    #[serde(default)]
+    pub bcc: Vec<Address>,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body_text: String,
+    /// Attachment metadata. M0 stores the name, MIME type and size; the bytes arrive in M2.
+    #[serde(default)]
+    pub attachments: Vec<DraftAttachment>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DraftAttachment {
+    /// Stable id. Omit it and the engine assigns one when the draft is saved.
+    pub id: Option<String>,
+    pub filename: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DraftSendArgs {
+    /// Draft id returned by draft_save.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     /// Words to look for. Empty queries are refused.
     pub query: String,
@@ -213,6 +267,16 @@ pub struct MessageMove {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftSave {
+    pub draft: Message,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftSend {
+    pub message: MessageSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub query: String,
     pub messages: Vec<MessageSummary>,
@@ -252,6 +316,31 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "message_move" => {
             let args: MessageMoveArgs = parse(args)?;
             value(MessageMove { message: engine.move_message(&args.id, &args.folder)? })
+        }
+        "draft_save" => {
+            let args: DraftSaveArgs = parse(args)?;
+            let content = DraftContent {
+                to: args.to,
+                cc: args.cc,
+                bcc: args.bcc,
+                subject: args.subject,
+                body_text: args.body_text,
+                attachments: args
+                    .attachments
+                    .into_iter()
+                    .map(|attachment| Attachment {
+                        id: attachment.id.unwrap_or_default(),
+                        filename: attachment.filename,
+                        mime: attachment.mime,
+                        size: attachment.size,
+                    })
+                    .collect(),
+            };
+            value(DraftSave { draft: engine.save_draft(args.id.as_deref(), content)? })
+        }
+        "draft_send" => {
+            let args: DraftSendArgs = parse(args)?;
+            value(DraftSend { message: engine.send_draft(&args.id)? })
         }
         "search" => {
             let args: SearchArgs = parse(args)?;
@@ -476,5 +565,66 @@ mod tests {
         let mut engine = Engine::demo();
         let error = engine.call("message_move", json!({ "id": "missing", "folder": "archive" })).expect_err("unknown message");
         assert!(matches!(error, crate::OpError::Failed(_)));
+    }
+
+    #[test]
+    fn draft_save_and_send_work_through_the_registry() {
+        let mut engine = Engine::demo();
+        let saved = call(
+            &mut engine,
+            "draft_save",
+            json!({
+                "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
+                "subject": "Proposta",
+                "body_text": "Ciao Giulia,\n\nci sentiamo domani."
+            }),
+        );
+        let id = saved["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
+        assert_eq!(saved["draft"]["summary"]["folder_id"], "drafts");
+        let sent = call(&mut engine, "draft_send", json!({ "id": id }));
+        assert_eq!(sent["message"]["folder_id"], "sent");
+        let drafts = call(&mut engine, "messages_list", json!({ "folder": "drafts" }));
+        assert!(!drafts["messages"].as_array().expect("rows").iter().any(|row| row["id"] == json!(id)));
+    }
+
+    #[test]
+    fn draft_schema_exposes_structured_recipients() {
+        let schema = super::op_defs().into_iter().find(|def| def.name == "draft_save").expect("draft_save").input_schema;
+        assert!(schema["properties"]["to"]["items"].is_object());
+        assert!(schema["properties"]["body_text"].is_object());
+        assert!(schema["properties"]["attachments"]["items"].is_object());
+    }
+
+    #[test]
+    fn draft_recipients_reject_unknown_fields() {
+        let mut engine = Engine::demo();
+        let error = engine
+            .call(
+                "draft_save",
+                json!({
+                    "to": [{ "email": "giulia.ferri@example.com", "nmae": "typo" }],
+                    "subject": "Ciao",
+                    "body_text": "Corpo"
+                }),
+            )
+            .expect_err("unknown address field");
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn draft_attachments_can_omit_the_id() {
+        let mut engine = Engine::demo();
+        let saved = call(
+            &mut engine,
+            "draft_save",
+            json!({
+                "to": [{ "email": "giulia.ferri@example.com" }],
+                "subject": "Con allegato",
+                "body_text": "Corpo",
+                "attachments": [{ "filename": "preventivo.pdf", "mime": "application/pdf", "size": 1200 }]
+            }),
+        );
+        let id = saved["draft"]["attachments"][0]["id"].as_str().expect("generated attachment id");
+        assert!(!id.is_empty());
     }
 }

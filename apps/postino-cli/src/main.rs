@@ -14,7 +14,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
-use postino_core::{AccountsList, AppInfo, Engine, FoldersList, MessageFlag, MessageGet, MessageSummary, MessagesList, SearchResult};
+use postino_core::{
+    AccountsList, Address, AppInfo, DraftSave, DraftSend, Engine, FoldersList, MessageFlag, MessageGet, MessageSummary, MessagesList, SearchResult,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -29,6 +31,33 @@ struct Cli {
     json: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum DraftCommand {
+    /// Create or update a draft in the Drafts folder.
+    Save {
+        /// Existing draft id; omit to create a new draft.
+        #[arg(long)]
+        id: Option<String>,
+        /// Recipient. Repeat for multiple addresses; `Name <mail>` or bare mail.
+        #[arg(long = "to", value_name = "ADDRESS", required = true)]
+        to: Vec<String>,
+        #[arg(long = "cc", value_name = "ADDRESS")]
+        cc: Vec<String>,
+        #[arg(long = "bcc", value_name = "ADDRESS")]
+        bcc: Vec<String>,
+        #[arg(long, default_value = "")]
+        subject: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Send the draft immediately after saving it (demo).
+        #[arg(long)]
+        send: bool,
+    },
+    /// Demo only: move an existing draft to Sent. The demo engine is in-memory; use
+    /// `draft save --send` to create and send a draft in one CLI command.
+    Send { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -88,6 +117,11 @@ enum Command {
         #[arg(long, conflicts_with = "starred")]
         unstar: bool,
     },
+    /// Save or send a draft.
+    Draft {
+        #[command(subcommand)]
+        command: DraftCommand,
+    },
     /// Call any operation with JSON or key=value arguments.
     Run {
         op: String,
@@ -117,7 +151,13 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
     let json_output = cli.json;
     let needs_mail = matches!(
         &cli.command,
-        Command::Accounts | Command::Folders { .. } | Command::Messages { .. } | Command::Read { .. } | Command::Search { .. } | Command::Flag { .. }
+        Command::Accounts
+            | Command::Folders { .. }
+            | Command::Messages { .. }
+            | Command::Read { .. }
+            | Command::Search { .. }
+            | Command::Flag { .. }
+            | Command::Draft { .. }
     );
     if needs_mail && engine.accounts().is_empty() {
         bail!("nessun account configurato; riprova con --demo per i dati sintetici");
@@ -256,33 +296,85 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 say(format_summary(&result.message))?;
             }
         }
-        Command::Run { op, args, params } => {
-            let mut object = match args {
-                Some(text) => {
-                    let value: Value = serde_json::from_str(&text).with_context(|| format!("--args is not JSON: {text}"))?;
-                    if !value.is_object() {
-                        bail!("--args must be a JSON object");
+        Command::Draft { command } => match command {
+            DraftCommand::Save { id, to, cc, bcc, subject, body, send } => {
+                let args = json!({
+                    "id": id,
+                    "to": parse_cli_addresses(to, "--to")?,
+                    "cc": parse_cli_addresses(cc, "--cc")?,
+                    "bcc": parse_cli_addresses(bcc, "--bcc")?,
+                    "subject": subject,
+                    "body_text": body,
+                });
+                let saved: DraftSave = decode(call(engine, "draft_save", args)?)?;
+                let draft_id = saved.draft.summary.id.clone();
+                if send {
+                    let sent: DraftSend = decode(call(engine, "draft_send", json!({ "id": draft_id }))?)?;
+                    if json_output {
+                        print_json(&sent)?;
+                    } else {
+                        say(format!("Messaggio spostato in Inviati (demo).\n{}", format_summary(&sent.message)))?;
                     }
-                    value
+                } else if json_output {
+                    print_json(&saved)?;
+                } else {
+                    say(format!(
+                        "Bozza salvata: {}\n{}\nIl motore demo è in memoria: usa --send per inviarla subito.",
+                        draft_id,
+                        format_summary(&saved.draft.summary)
+                    ))?;
                 }
-                None => json!({}),
-            };
-            let Some(map) = object.as_object_mut() else {
-                bail!("--args must be a JSON object");
-            };
-            for param in params {
-                let Some((key, raw)) = param.split_once('=') else {
-                    bail!("argument {param:?} is not KEY=VALUE");
-                };
-                let value = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
-                map.insert(key.to_owned(), value);
             }
+            DraftCommand::Send { id } => {
+                let sent: DraftSend = decode(call(engine, "draft_send", json!({ "id": id }))?)?;
+                if json_output {
+                    print_json(&sent)?;
+                } else {
+                    say(format!("Messaggio spostato in Inviati (demo).\n{}", format_summary(&sent.message)))?;
+                }
+            }
+        },
+        Command::Run { op, args, params } => {
+            let object = parse_run_args(args, params)?;
             let result = call(engine, &op, object)?;
             print_json(&result)?;
         }
         Command::Mcp => mcp::serve(engine)?,
     }
     Ok(())
+}
+
+fn parse_cli_addresses(values: Vec<String>, field: &str) -> Result<Vec<Address>> {
+    let mut addresses = Vec::new();
+    for value in values {
+        let parsed = Address::parse_list(&value).map_err(|error| anyhow::anyhow!("{field}: {error}"))?;
+        addresses.extend(parsed);
+    }
+    Ok(addresses)
+}
+
+fn parse_run_args(args: Option<String>, params: Vec<String>) -> Result<Value> {
+    let mut object = match args {
+        Some(text) => {
+            let value: Value = serde_json::from_str(&text).with_context(|| format!("--args is not JSON: {text}"))?;
+            if !value.is_object() {
+                bail!("--args must be a JSON object");
+            }
+            value
+        }
+        None => json!({}),
+    };
+    let Some(map) = object.as_object_mut() else {
+        bail!("--args must be a JSON object");
+    };
+    for param in params {
+        let Some((key, raw)) = param.split_once('=') else {
+            bail!("argument {param:?} is not KEY=VALUE");
+        };
+        let value = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+        map.insert(key.to_owned(), value);
+    }
+    Ok(object)
 }
 
 fn call(engine: &mut Engine, name: &str, args: Value) -> Result<Value> {
@@ -353,5 +445,48 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_run_args_reach_the_draft_operations() {
+        let mut engine = Engine::demo();
+        let args = parse_run_args(
+            Some(
+                json!({
+                    "to": [{ "email": "giulia.ferri@example.com" }],
+                    "subject": "Bozza da CLI",
+                    "body_text": "Corpo"
+                })
+                .to_string(),
+            ),
+            Vec::new(),
+        )
+        .expect("run arguments");
+        let saved = call(&mut engine, "draft_save", args).expect("draft_save through the CLI");
+        let id = saved["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
+        let args = parse_run_args(Some(json!({ "id": id }).to_string()), Vec::new()).expect("send arguments");
+        call(&mut engine, "draft_send", args).expect("draft_send through the CLI");
+        assert!(engine.messages().iter().any(|message| message.summary.subject == "Bozza da CLI" && message.summary.folder_id == "sent"));
+    }
+
+    #[test]
+    fn run_args_merge_key_value_overrides() {
+        let args = parse_run_args(Some(json!({ "id": "one" }).to_string()), vec!["subject=Ciao".to_owned()]).expect("arguments");
+        assert_eq!(args["id"], "one");
+        assert_eq!(args["subject"], "Ciao");
+    }
+
+    #[test]
+    fn cli_recipient_flags_accept_repeated_and_comma_lists() {
+        let addresses = parse_cli_addresses(vec!["Giulia <giulia@example.com>, marco@example.com".to_owned(), "info@example.it".to_owned()], "--to")
+            .expect("addresses");
+        assert_eq!(addresses.len(), 3);
+        assert_eq!(addresses[0].name, "Giulia");
+        assert!(parse_cli_addresses(vec!["not-an-address".to_owned()], "--bcc").is_err());
     }
 }
