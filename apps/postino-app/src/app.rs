@@ -2,15 +2,17 @@
 //! Every action goes through `Engine::call`, the same operation registry the CLI and MCP expose.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
-    RichText, Sense, Stroke, Ui, UiBuilder, Vec2, ViewportCommand, WidgetInfo, WidgetType,
+    RichText, Sense, Stroke, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType,
 };
-use postino_core::{Account, Address, DraftSave, DraftSend, Engine, FolderKind, Message, MessageSummary, MessagesList, SearchResult};
+use postino_core::{Account, Address, Attachment, DraftSave, DraftSend, Engine, FolderKind, Message, MessageSummary, MessagesList, SearchResult};
 use serde_json::json;
 
 use crate::theme::{self, GOLD, IVORY, Tokens};
@@ -21,6 +23,43 @@ use crate::ui::widgets::{
     AUTOSAVE_DELAY, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerFocus, ComposerState, EmptyState, IconButton, IconButtonSize, ListRow,
     Menu, MenuItem, SearchField, SectionHeader, Toast, compose_body, quote_body, signature_body,
 };
+
+/// The shell scenes `--screenshot` can render. Add a label here and a branch in
+/// [`PostinoApp::seed_screenshot`] to grow the set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenshotState {
+    Shell,
+    Reading,
+    Compose,
+    Palette,
+}
+
+impl ScreenshotState {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "shell" => Ok(Self::Shell),
+            "reading" => Ok(Self::Reading),
+            "compose" => Ok(Self::Compose),
+            "palette" => Ok(Self::Palette),
+            other => Err(format!("unknown screenshot state {other:?}; expected one of: shell, reading, compose, palette")),
+        }
+    }
+}
+
+/// A screenshot request in flight. The event can only arrive on a later frame, so the mode counts
+/// frames both before the request and while waiting for the reply.
+struct ScreenshotMode {
+    out: PathBuf,
+    frames: u32,
+    requested: bool,
+    waited: u32,
+}
+
+/// Let the layout and the font atlas settle before asking for the surface.
+const SCREENSHOT_SETTLE_FRAMES: u32 = 4;
+/// A visible window replies within a frame or two. This bound turns a hidden or minimized window
+/// into an actionable error instead of a hung process.
+const SCREENSHOT_WAIT_FRAMES: u32 = 120;
 
 pub struct PostinoApp {
     engine: Engine,
@@ -53,6 +92,8 @@ pub struct PostinoApp {
     reading_open: bool,
     reading_full: bool,
     composer: ComposerState,
+    /// Deterministic PNG capture, set only by `--screenshot`.
+    screenshot: Option<ScreenshotMode>,
 }
 
 impl PostinoApp {
@@ -60,6 +101,64 @@ impl PostinoApp {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, false);
         Self::demo(custom_chrome)
+    }
+
+    /// Build the shell in the exact state a docs screenshot shows. Used only by `--screenshot`;
+    /// normal startup keeps its own constructor so nothing here runs in a user session.
+    pub fn screenshot(cc: &eframe::CreationContext<'_>, state: ScreenshotState, dark: bool, out: PathBuf) -> Self {
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx, dark);
+        // A docs image must not catch the composer or palette mid fade-in: with no animation the
+        // first laid-out frame is already the final one.
+        cc.egui_ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut app = Self::demo(true);
+        app.dark = dark;
+        app.seed_screenshot(state);
+        app.screenshot = Some(ScreenshotMode { out, frames: 0, requested: false, waited: 0 });
+        app
+    }
+
+    /// Apply the state named on the command line. Every scene is deterministic: no timer, no
+    /// pointer and no focus side effect may change it between the first frame and the capture.
+    fn seed_screenshot(&mut self, state: ScreenshotState) {
+        match state {
+            ScreenshotState::Shell => {}
+            ScreenshotState::Reading => {
+                let first = self.visible_messages().0.first().map(|message| message.id.clone());
+                if let Some(id) = first {
+                    self.open_message(id);
+                    // Show the steady state after the 600 ms read delay: message read, no undo
+                    // toast racing the capture.
+                    self.now = 1.0;
+                    self.maybe_complete_read();
+                    self.toast = None;
+                }
+            }
+            ScreenshotState::Compose => {
+                let mut composer = ComposerState::new(ComposeMode::New);
+                composer.to = "Giulia Ferri <giulia.ferri@example.com>".to_owned();
+                composer.cc = "Marco Bianchi <marco.bianchi@example.com>".to_owned();
+                composer.show_cc = true;
+                composer.subject = "Preventivo sito web — bozza finale".to_owned();
+                composer.body = "Ciao Giulia,\n\nti confermo il preventivo per il sito: 2.400 € + IVA, consegna in tre settimane.\nResto a disposizione per la call di lunedì.\n\n-- \nFederico\nfederico@example.it"
+                    .to_owned();
+                composer.attachments = vec![Attachment {
+                    id: "att_screenshot".to_owned(),
+                    filename: "preventivo-postino.pdf".to_owned(),
+                    mime: "application/pdf".to_owned(),
+                    size: 248_320,
+                }];
+                composer.saved_at = Some("10:42".to_owned());
+                composer.focus = Some(ComposerFocus::Body);
+                self.start_composer(composer);
+            }
+            ScreenshotState::Palette => {
+                self.show_palette = true;
+                self.palette_focus = true;
+                self.palette_query = "scr".to_owned();
+                self.palette_selected = 0;
+            }
+        }
     }
 
     fn demo(custom_chrome: bool) -> Self {
@@ -91,6 +190,7 @@ impl PostinoApp {
             reading_open: false,
             reading_full: false,
             composer: ComposerState::closed(),
+            screenshot: None,
         }
     }
 
@@ -2073,7 +2173,49 @@ impl PostinoApp {
         ui.scope_builder(UiBuilder::new().max_rect(content), |ui| self.show_inner(ui));
     }
 
+    /// Drive the deterministic capture. Runs only when `--screenshot` built the app.
+    fn capture_screenshot(&mut self, ctx: &egui::Context) {
+        let Some(mode) = self.screenshot.as_mut() else {
+            return;
+        };
+        if !mode.requested {
+            mode.frames = mode.frames.saturating_add(1);
+            if mode.frames >= SCREENSHOT_SETTLE_FRAMES {
+                ctx.send_viewport_cmd(ViewportCommand::Screenshot(UserData::default()));
+                mode.requested = true;
+            }
+            ctx.request_repaint();
+            return;
+        }
+        let image = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(Arc::clone(image)),
+                _ => None,
+            })
+        });
+        if let Some(image) = image {
+            let out = mode.out.clone();
+            self.screenshot = None;
+            match write_png(&out, &image) {
+                Ok(()) => eprintln!("postino-app: screenshot saved to {}", out.display()),
+                Err(error) => {
+                    eprintln!("postino-app: cannot save screenshot: {error}");
+                    std::process::exit(1);
+                }
+            }
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        }
+        mode.waited = mode.waited.saturating_add(1);
+        if mode.waited > SCREENSHOT_WAIT_FRAMES {
+            eprintln!("postino-app: the window did not return a screenshot after {SCREENSHOT_WAIT_FRAMES} frames; is it hidden or minimized?");
+            std::process::exit(1);
+        }
+        ctx.request_repaint();
+    }
+
     fn show_inner(&mut self, ui: &mut egui::Ui) {
+        self.capture_screenshot(ui.ctx());
         self.tick(ui.ctx());
         self.resize_handles(ui.ctx());
         self.handle_shortcuts(ui.ctx());
@@ -2494,6 +2636,22 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Encode the viewport surface exactly as eframe captured it. `ColorImage` is sRGB with the same
+/// channel order as PNG's RGBA, so no conversion is involved.
+fn write_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
+    let width = u32::try_from(image.size[0]).map_err(|_| "the screenshot is wider than a PNG allows".to_owned())?;
+    let height = u32::try_from(image.size[1]).map_err(|_| "the screenshot is taller than a PNG allows".to_owned())?;
+    let pixels = image.pixels.iter().flat_map(|color| color.to_array()).collect::<Vec<u8>>();
+    let file = std::fs::File::create(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| format!("{}: {error}", path.display()))?;
+    writer.write_image_data(&pixels).map_err(|error| format!("{}: {error}", path.display()))?;
+    writer.finish().map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2889,5 +3047,20 @@ mod tests {
         let search = filtered_commands("stella");
         assert!(search.iter().any(|command| command.id == "star"));
         assert!(search.iter().all(|command| command.label.to_lowercase().contains("stella")));
+    }
+
+    #[test]
+    fn screenshot_states_parse_and_reject_unknown_labels() {
+        for (name, state) in [
+            ("shell", ScreenshotState::Shell),
+            ("reading", ScreenshotState::Reading),
+            ("compose", ScreenshotState::Compose),
+            ("palette", ScreenshotState::Palette),
+        ] {
+            assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
+        }
+        let error = ScreenshotState::parse("labels").expect_err("labels is not a scene yet");
+        assert!(error.contains("unknown screenshot state"), "{error}");
+        assert!(error.contains("shell, reading, compose, palette"), "{error}");
     }
 }

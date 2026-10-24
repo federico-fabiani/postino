@@ -2597,6 +2597,7 @@ dependencies = [
  "egui_extras",
  "env_logger",
  "log",
+ "png",
  "postino-core",
  "serde_json",
 ]

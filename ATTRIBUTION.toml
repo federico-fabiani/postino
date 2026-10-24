@@ -147,7 +147,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "7c255a224f5332c5e706a75e99b58d9e8a81a60e956d55be50c859fcc90cf11f"
+sha256 = "a6821f6d429f11a1f4ba7f738acc82ad25ccb2a283a2c55c826a91fb9d1d93c7"
 usage = "Documentation screenshot of the U0.4 reading pane with reply and forward actions"
 
 [[asset]]
@@ -157,7 +157,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "39ec5076c16644b32063d95e544249cbd7ea13a7f48f9d08f57dae783ecf7e8f"
+sha256 = "776f5225a4677212b8462022e2a44df2fb64dd84f6d7ffc37b0a2fcf6f968c3d"
 usage = "Documentation screenshot of the U0.4 composer with recipients, attachment and draft state"
 
 [[asset]]
@@ -167,7 +167,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "830bb03f8f77398d5778faa017c8f083f67c173ab195e6387fe1963f2fa3ff8b"
+sha256 = "9ab83e41490dd3583cfd593cf66c32321671b7ee4d0822a0c29052d9f5264b7e"
 usage = "Documentation screenshot of the U0.4 composer in the dark theme"
 
 [[asset]]

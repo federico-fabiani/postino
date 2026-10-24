@@ -119,13 +119,22 @@ The debug binary opens a window:
 cargo run -p postino-app
 ```
 
-For a quick visual check on Windows, start the built binary and capture the screen with
-`System.Drawing` (the maintainers use this during development). Use a DPI-aware capture process:
-a 125% display turns a 1280 × 720 window into a 1600 × 900 PNG, and a DPI-unaware host captures the
-wrong rectangle. `PrintWindow` returns a black bitmap for the glow surface, so capture the window's
-client area from the screen instead. A commit-worthy screenshot must be retaken after the layout
-changes; the U0.4 set is in `docs/images/`. A future `egui_kittest` screenshot harness will make this
-part of CI and remove the dependency on an interactive desktop.
+Deterministic screenshots render the real shell without mouse or keyboard injection:
+
+```sh
+cargo run -p postino-app -- --screenshot shell --out docs/images/postino-m0.png
+cargo run -p postino-app -- --screenshot reading --out tmp-reading.png
+cargo run -p postino-app -- --screenshot compose --dark --out tmp-compose-dark.png
+```
+
+The states are `shell` (demo inbox, no selection), `reading` (first inbox message open), `compose`
+(the composer prefilled with the docs fixture) and `palette` (command palette open). `--dark`
+applies the dark theme.
+The window is 1280 × 720 logical, so at 125% DPI the PNG is 1600 × 900: the process captures its own
+viewport with `ViewportCommand::Screenshot`, writes the PNG and closes. It never injects input,
+never calls `PrintWindow` and does not need an interactive desktop. The images in `docs/images/` are
+generated from this command and never hand-cropped; regenerate them after a layout change. An
+unknown state exits with the list of supported labels instead of opening a window.
 
 ## 10. Style
 
