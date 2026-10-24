@@ -137,7 +137,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "08bb35cdb23e98988665d79542292ad52d3b03f971cb34d4b058b6a509ac8c10"
+sha256 = "1054e0b07d3b797aa0bd1f1d0379f11b763d8d5a2da2114e50ce2652875da1c9"
 usage = "Documentation screenshot of the U0.2 shell in the dark theme"
 
 [[asset]]
