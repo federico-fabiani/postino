@@ -178,3 +178,6 @@ Append one line when significant time is lost to an issue likely to recur. Forma
   with a DPI-aware process; seed UI state for the shot instead of clicking.
 - [PowerShell] `Set-Content` / `Get-Content -Raw` re-encode UTF-8 as ANSI and corrupt accented text.
   fix/avoid: use the edit/write tools, or `[System.IO.File]::ReadAllText/WriteAllText` with UTF-8.
+- [agents] a delegated agent cleaned its scratch files with a wildcard in a shared temp directory and
+  removed other sessions' files. fix/avoid: give every agent its own temp subfolder and forbid
+  deletes outside it in the brief.
