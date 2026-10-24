@@ -3,12 +3,14 @@
 //! Names are `snake_case` because MCP clients reject dots. Unknown argument keys are refused, so
 //! a typo fails loudly instead of being silently ignored.
 
+use std::collections::BTreeSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::engine::{Engine, OpError};
-use crate::model::{Account, Address, Attachment, DraftContent, Folder, FolderKind, Message, MessageSummary};
+use crate::model::{Account, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, Message, MessageSummary};
 
 /// One operation as the CLI and MCP see it.
 #[derive(Debug, Clone, Serialize)]
@@ -57,7 +59,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "messages_list",
             "List messages",
-            "Message summaries in a folder, newest first. Bodies are fetched separately with message_get.",
+            "Message summaries, newest first. `label` alone spans every folder; with `folder` it returns the intersection; with neither it defaults to `inbox`. Unknown folder or label ids are an error. Bodies are fetched separately with message_get.",
             MessagesListArgs,
             true,
             false
@@ -98,9 +100,49 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search",
             "Search mail",
-            "Case-insensitive search across subjects, people, snippets and bodies of the demo mailbox.",
+            "Case-insensitive search across subjects, people, snippets and bodies of the demo mailbox. Optional `folder` and `label` filters are applied before the row limit; unknown ids are an error.",
             SearchArgs,
             true,
+            false
+        ),
+        def!(
+            "labels_list",
+            "List labels",
+            "Every local label with its mailbox-wide total and unread message counts. Labels are local metadata held in memory until M1 and are never synced to a server.",
+            LabelsListArgs,
+            true,
+            false
+        ),
+        def!(
+            "label_create",
+            "Create a label",
+            "Create a local label with a semantic colour: gold, forest, success, danger or muted. Names are trimmed, 1-48 characters, free of control, bidi and format characters, and unique ignoring case. Ids are never reused. Labels are local metadata until M1.",
+            LabelCreateArgs,
+            false,
+            false
+        ),
+        def!(
+            "label_update",
+            "Rename or recolour a label",
+            "Change a label's name and/or semantic colour. Provide at least one field; the name follows label_create validation and the id never changes. Labels are local metadata until M1.",
+            LabelUpdateArgs,
+            false,
+            false
+        ),
+        def!(
+            "label_delete",
+            "Delete a label",
+            "Delete a label and detach it from every message that carries it. Returns the deleted label and the number of affected messages. This removes metadata only, never mail; labels are local and in-memory until M1.",
+            LabelDeleteArgs,
+            false,
+            false
+        ),
+        def!(
+            "label_apply",
+            "Apply or remove a label",
+            "Apply one label to `message_ids` when `apply` is true, or remove it when false. Accepts 1-500 message ids, is idempotent, and rejects unknown labels or messages before changing anything. Labels are local metadata until M1.",
+            LabelApplyArgs,
+            false,
             false
         ),
     ]
@@ -128,7 +170,8 @@ pub struct FoldersListArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessagesListArgs {
-    /// Folder id; defaults to `inbox`. `starred` is the virtual starred folder.
+    /// Folder id; `starred` is the virtual starred folder. With `label` and no folder, every
+    /// folder is searched; with neither, this defaults to `inbox`.
     pub folder: Option<String>,
     /// Account id; omit for every account.
     pub account: Option<String>,
@@ -141,6 +184,8 @@ pub struct MessagesListArgs {
     /// Only messages with at least one attachment.
     #[serde(default)]
     pub with_attachments: bool,
+    /// Only messages carrying this label id. Unknown label ids are an error.
+    pub label: Option<String>,
     /// Page size, 1-200. Defaults to 50.
     pub limit: Option<u32>,
     /// Rows to skip before the page. Defaults to 0.
@@ -215,8 +260,51 @@ pub struct SearchArgs {
     pub query: String,
     /// Restrict to one folder id.
     pub folder: Option<String>,
-    /// Maximum matches, 1-200. Defaults to 50.
+    /// Restrict to messages carrying this label id. Unknown label ids are an error.
+    pub label: Option<String>,
+    /// Maximum matches, 1-200. Defaults to 50. Applied after the folder and label filters.
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelsListArgs {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelCreateArgs {
+    /// 1-48 characters after trimming, no control, bidi or format characters, unique ignoring case.
+    pub name: String,
+    /// Semantic colour: gold, forest, success, danger or muted.
+    pub color: LabelColor,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelUpdateArgs {
+    /// Stable label id returned by label_create or labels_list.
+    pub id: String,
+    /// New name. Omit to keep the current name.
+    pub name: Option<String>,
+    /// New semantic colour. Omit to keep the current colour.
+    pub color: Option<LabelColor>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelDeleteArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelApplyArgs {
+    /// Label id returned by labels_list.
+    pub id: String,
+    /// One or more message ids, at most 500 per call.
+    pub message_ids: Vec<String>,
+    /// True applies the label; false removes it. The operation is idempotent.
+    pub apply: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +333,8 @@ pub struct FoldersList {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagesList {
-    pub folder: String,
+    /// The folder id when the list is folder-scoped, or null when a label spans every folder.
+    pub folder: Option<String>,
     pub messages: Vec<MessageSummary>,
     pub total: usize,
     pub unread: usize,
@@ -281,6 +370,34 @@ pub struct SearchResult {
     pub query: String,
     pub messages: Vec<MessageSummary>,
     pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelsList {
+    pub labels: Vec<LabelSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelCreate {
+    pub label: LabelSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelUpdate {
+    pub label: LabelSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelDelete {
+    pub label: Label,
+    pub affected: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelApply {
+    pub label: LabelSummary,
+    /// Messages whose label set actually changed. Repeating the same call returns 0.
+    pub changed: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +463,28 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let args: SearchArgs = parse(args)?;
             search(engine, args)
         }
+        "labels_list" => {
+            let _: LabelsListArgs = parse(args)?;
+            value(LabelsList { labels: engine.label_summaries() })
+        }
+        "label_create" => {
+            let args: LabelCreateArgs = parse(args)?;
+            value(LabelCreate { label: engine.create_label(&args.name, args.color)? })
+        }
+        "label_update" => {
+            let args: LabelUpdateArgs = parse(args)?;
+            value(LabelUpdate { label: engine.update_label(&args.id, args.name.as_deref(), args.color)? })
+        }
+        "label_delete" => {
+            let args: LabelDeleteArgs = parse(args)?;
+            let (label, affected) = engine.delete_label(&args.id)?;
+            value(LabelDelete { label, affected })
+        }
+        "label_apply" => {
+            let args: LabelApplyArgs = parse(args)?;
+            let (label, changed) = engine.set_label(&args.id, &args.message_ids, args.apply)?;
+            value(LabelApply { label, changed })
+        }
         other => Err(OpError::UnknownOp(other.to_owned())),
     }
 }
@@ -391,22 +530,46 @@ fn page_bounds(limit: Option<u32>, offset: Option<u32>) -> (usize, usize) {
 }
 
 fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
-    let folder = find_folder(engine, args.folder.as_deref().unwrap_or("inbox"))?;
-    if let Some(account) = &args.account
+    if let Some(label) = &args.label
+        && engine.label(label).is_none()
+    {
+        return Err(OpError::Failed(format!("unknown label {label:?}")));
+    }
+    let folder = match args.folder.as_deref() {
+        Some(id) => Some(find_folder(engine, id)?),
+        // A label on its own is a mailbox-wide view; without either filter the list stays inbox-first.
+        None if args.label.is_some() => None,
+        None => Some(find_folder(engine, "inbox")?),
+    };
+    if let (Some(account), Some(folder)) = (&args.account, folder)
         && folder.account_id != *account
     {
         return Err(OpError::Failed(format!("folder {:?} does not belong to account {account:?}", folder.id)));
     }
+    let account_folders = match (&args.account, folder) {
+        (Some(account), None) => {
+            if !engine.accounts().iter().any(|candidate| candidate.id == *account) {
+                return Err(OpError::Failed(format!("unknown account {account:?}")));
+            }
+            Some(engine.folders().iter().filter(|folder| folder.account_id == *account).map(|folder| folder.id.as_str()).collect::<BTreeSet<_>>())
+        }
+        _ => None,
+    };
 
     let mut rows: Vec<&Message> = engine
         .messages()
         .iter()
         .filter(|message| {
-            let in_folder = if folder.kind == FolderKind::Starred { message.summary.starred } else { message.summary.folder_id == folder.id };
-            in_folder
+            let in_scope = match folder {
+                Some(folder) if folder.kind == FolderKind::Starred => message.summary.starred,
+                Some(folder) => message.summary.folder_id == folder.id,
+                None => account_folders.as_ref().is_none_or(|folders| folders.contains(message.summary.folder_id.as_str())),
+            };
+            in_scope
                 && (!args.unread_only || message.summary.unread)
                 && (!args.starred_only || message.summary.starred)
                 && (!args.with_attachments || message.summary.has_attachments)
+                && args.label.as_ref().is_none_or(|label| message.summary.labels.contains(label))
         })
         .collect();
     rows.sort_by_key(|left| std::cmp::Reverse(left.summary.date));
@@ -415,7 +578,7 @@ fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
     let unread = rows.iter().filter(|message| message.summary.unread).count();
     let (limit, offset) = page_bounds(args.limit, args.offset);
     let messages = rows.into_iter().skip(offset).take(limit).map(|message| message.summary.clone()).collect();
-    value(MessagesList { folder: folder.id.clone(), messages, total, unread })
+    value(MessagesList { folder: folder.map(|folder| folder.id.clone()), messages, total, unread })
 }
 
 fn message(engine: &Engine, args: MessageGetArgs) -> Result<Value, OpError> {
@@ -437,6 +600,11 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
         Some(id) => Some(find_folder(engine, id)?),
         None => None,
     };
+    if let Some(label) = &args.label
+        && engine.label(label).is_none()
+    {
+        return Err(OpError::Failed(format!("unknown label {label:?}")));
+    }
 
     let mut rows: Vec<&Message> =
         engine
@@ -446,7 +614,8 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
                 let in_folder = folder.is_none_or(|folder| {
                     if folder.kind == FolderKind::Starred { message.summary.starred } else { message.summary.folder_id == folder.id }
                 });
-                in_folder && matches_query(message, &query)
+                let in_label = args.label.as_ref().is_none_or(|label| message.summary.labels.contains(label));
+                in_folder && in_label && matches_query(message, &query)
             })
             .collect();
     rows.sort_by_key(|left| std::cmp::Reverse(left.summary.date));
@@ -470,12 +639,66 @@ fn matches_query(message: &Message, query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
     use serde_json::json;
 
     use crate::engine::Engine;
+    use crate::model::{Account, Address, Folder, FolderKind, Label, LabelColor, Message, MessageSummary};
 
     fn call(engine: &mut Engine, name: &str, args: serde_json::Value) -> serde_json::Value {
         engine.call(name, args).expect("operation")
+    }
+
+    fn engine_with_search_corpus(count: usize, labelled_index: usize) -> Engine {
+        let now = Utc::now();
+        let account = Account {
+            id: "acc_test".to_owned(),
+            name: "Test".to_owned(),
+            email: "test@example.com".to_owned(),
+            provider: "demo".to_owned(),
+            signature: String::new(),
+        };
+        let folder = Folder {
+            id: "inbox".to_owned(),
+            account_id: "acc_test".to_owned(),
+            name: "Posta in arrivo".to_owned(),
+            kind: FolderKind::Inbox,
+            unread: 0,
+            total: 0,
+        };
+        let messages = (0..count)
+            .map(|index| {
+                let id = format!("msg_{index:03}");
+                let date = now - Duration::minutes(i64::try_from(index).expect("small index"));
+                let mut labels = Vec::new();
+                if index == labelled_index {
+                    labels.push("lbl_1".to_owned());
+                }
+                Message {
+                    summary: MessageSummary {
+                        id: id.clone(),
+                        thread_id: format!("thr_{id}"),
+                        folder_id: "inbox".to_owned(),
+                        from: Address::new("Mittente", "mittente@example.com"),
+                        to: vec![Address::new("Test", "test@example.com")],
+                        subject: "Rapporto mensile".to_owned(),
+                        snippet: "Rapporto mensile completo".to_owned(),
+                        date,
+                        unread: false,
+                        starred: false,
+                        has_attachments: false,
+                        labels,
+                    },
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    body_text: "Rapporto mensile completo".to_owned(),
+                    body_html: None,
+                    attachments: Vec::new(),
+                }
+            })
+            .collect();
+        let labels = vec![Label { id: "lbl_1".to_owned(), name: "Archivio".to_owned(), color: LabelColor::Forest }];
+        Engine::from_parts(vec![account], vec![folder], messages, labels, false)
     }
 
     #[test]
@@ -498,6 +721,9 @@ mod tests {
         assert_eq!(result["folder"], "inbox");
         assert!(result["messages"].as_array().is_some_and(|rows| rows.len() <= 2));
         assert!(result["total"].as_u64().is_some_and(|total| total >= 2));
+
+        let default = call(&mut engine, "messages_list", json!({}));
+        assert_eq!(default["folder"], "inbox", "without folder or label the list still defaults to inbox");
     }
 
     #[test]
@@ -514,6 +740,24 @@ mod tests {
         let mut engine = Engine::demo();
         let result = call(&mut engine, "search", json!({ "query": "postino" }));
         assert!(result["total"].as_u64().is_some_and(|total| total >= 1));
+    }
+
+    #[test]
+    fn search_applies_the_label_before_the_row_limit() {
+        let mut engine = engine_with_search_corpus(250, 249);
+
+        let unfiltered = call(&mut engine, "search", json!({ "query": "rapporto", "limit": 200 }));
+        assert_eq!(unfiltered["total"], 250);
+        let rows = unfiltered["messages"].as_array().expect("rows");
+        assert_eq!(rows.len(), 200);
+        assert!(!rows.iter().any(|row| row["id"] == "msg_249"), "the oldest match is beyond the first 200 rows");
+
+        let filtered = call(&mut engine, "search", json!({ "query": "rapporto", "label": "lbl_1", "limit": 200 }));
+        assert_eq!(filtered["total"], 1);
+        assert_eq!(filtered["messages"][0]["id"], "msg_249");
+
+        let unknown = engine.call("search", json!({ "query": "rapporto", "label": "lbl_missing" })).expect_err("unknown label");
+        assert!(matches!(unknown, crate::OpError::Failed(_)));
     }
 
     #[test]
@@ -609,6 +853,159 @@ mod tests {
             )
             .expect_err("unknown address field");
         assert!(matches!(error, crate::OpError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn labels_list_reports_demo_counts() {
+        let mut engine = Engine::demo();
+        let result = call(&mut engine, "labels_list", json!({}));
+        let labels = result["labels"].as_array().expect("labels");
+        assert_eq!(labels.len(), 3);
+        let lavoro = labels.iter().find(|label| label["name"] == "Lavoro").expect("Lavoro");
+        assert_eq!(lavoro["id"], "lbl_1");
+        assert_eq!(lavoro["color"], "gold");
+        assert_eq!(lavoro["message_count"], 6);
+        assert_eq!(lavoro["unread_count"], 2);
+        let fatture = labels.iter().find(|label| label["name"] == "Fatture").expect("Fatture");
+        assert_eq!(fatture["message_count"], 1);
+        assert_eq!(fatture["unread_count"], 1);
+    }
+
+    #[test]
+    fn label_crud_validates_names_and_colors() {
+        let mut engine = Engine::demo();
+        let created = call(&mut engine, "label_create", json!({ "name": "  Ufficio  ", "color": "forest" }));
+        assert_eq!(created["label"]["name"], "Ufficio", "names are stored trimmed");
+        let id = created["label"]["id"].as_str().expect("id").to_owned();
+        assert_eq!(created["label"]["message_count"], 0);
+
+        let duplicate = engine.call("label_create", json!({ "name": "ufficio", "color": "gold" })).expect_err("duplicate");
+        assert!(matches!(duplicate, crate::OpError::InvalidArgs(_)));
+        let duplicate = engine.call("label_update", json!({ "id": id, "name": "LAVORO" })).expect_err("duplicate on rename");
+        assert!(matches!(duplicate, crate::OpError::InvalidArgs(_)));
+        assert!(matches!(engine.call("label_create", json!({ "name": "Blu", "color": "blue" })), Err(crate::OpError::InvalidArgs(_))));
+        assert!(matches!(engine.call("label_create", json!({ "name": "   ", "color": "gold" })), Err(crate::OpError::InvalidArgs(_))));
+        let long = "x".repeat(49);
+        assert!(matches!(engine.call("label_create", json!({ "name": long, "color": "gold" })), Err(crate::OpError::InvalidArgs(_))));
+        assert!(matches!(engine.call("label_create", json!({ "name": "Ciao\nBcc", "color": "gold" })), Err(crate::OpError::InvalidArgs(_))));
+        assert!(matches!(engine.call("label_update", json!({ "id": id })), Err(crate::OpError::InvalidArgs(_))));
+
+        let updated = call(&mut engine, "label_update", json!({ "id": id, "name": "Ufficio", "color": "muted" }));
+        assert_eq!(updated["label"]["color"], "muted");
+        let deleted = call(&mut engine, "label_delete", json!({ "id": id }));
+        assert_eq!(deleted["label"]["name"], "Ufficio");
+        assert_eq!(deleted["affected"], 0);
+        assert!(engine.label(&id).is_none());
+        assert!(matches!(engine.call("label_update", json!({ "id": id, "name": "X" })), Err(crate::OpError::Failed(_))));
+    }
+
+    #[test]
+    fn deleting_a_label_detaches_it_from_every_message() {
+        let mut engine = Engine::demo();
+        let result = call(&mut engine, "label_delete", json!({ "id": "lbl_1" }));
+        assert_eq!(result["label"]["id"], "lbl_1");
+        assert_eq!(result["affected"], 6);
+        assert!(engine.messages().iter().all(|message| !message.summary.labels.iter().any(|label| label == "lbl_1")));
+        let labels = call(&mut engine, "labels_list", json!({}));
+        assert_eq!(labels["labels"].as_array().expect("labels").len(), 2);
+    }
+
+    #[test]
+    fn label_apply_and_remove_are_idempotent() {
+        let mut engine = Engine::demo();
+        let args = json!({ "id": "lbl_2", "message_ids": ["msg_001"], "apply": true });
+        let first = call(&mut engine, "label_apply", args.clone());
+        assert_eq!(first["changed"], 1);
+        assert!(engine.message("msg_001").is_some_and(|message| message.summary.labels.contains(&"lbl_2".to_owned())));
+        let second = call(&mut engine, "label_apply", args);
+        assert_eq!(second["changed"], 0);
+
+        let remove = json!({ "id": "lbl_2", "message_ids": ["msg_001"], "apply": false });
+        let first = call(&mut engine, "label_apply", remove.clone());
+        assert_eq!(first["changed"], 1);
+        let second = call(&mut engine, "label_apply", remove);
+        assert_eq!(second["changed"], 0);
+        assert!(engine.message("msg_001").is_some_and(|message| !message.summary.labels.iter().any(|label| label == "lbl_2")));
+    }
+
+    #[test]
+    fn label_apply_validates_the_batch_before_mutating() {
+        let mut engine = Engine::demo();
+        let error =
+            engine.call("label_apply", json!({ "id": "lbl_2", "message_ids": ["msg_001", "missing"], "apply": true })).expect_err("unknown message");
+        assert!(matches!(error, crate::OpError::Failed(_)));
+        assert!(
+            engine.message("msg_001").is_some_and(|message| !message.summary.labels.iter().any(|label| label == "lbl_2")),
+            "the valid message must be untouched when the batch fails"
+        );
+        assert!(matches!(
+            engine.call("label_apply", json!({ "id": "lbl_2", "message_ids": [], "apply": true })),
+            Err(crate::OpError::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            engine.call("label_apply", json!({ "id": "missing", "message_ids": ["msg_001"], "apply": true })),
+            Err(crate::OpError::Failed(_))
+        ));
+        let ids = (0..501).map(|index| format!("msg_{index:03}")).collect::<Vec<_>>();
+        let error = engine.call("label_apply", json!({ "id": "lbl_2", "message_ids": ids, "apply": true })).expect_err("cap");
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn messages_can_be_filtered_by_label_and_unknown_labels_fail() {
+        let mut engine = Engine::demo();
+
+        let global = call(&mut engine, "messages_list", json!({ "label": "lbl_1" }));
+        let rows = global["messages"].as_array().expect("rows");
+        assert_eq!(global["folder"], json!(null), "a label without a folder spans every folder");
+        assert_eq!(global["total"], 6);
+        assert_eq!(global["unread"], 2);
+        assert!(rows.iter().all(|row| row["labels"].as_array().is_some_and(|labels| labels.contains(&json!("lbl_1")))));
+        assert!(rows.iter().any(|row| row["folder_id"] == "sent"));
+        assert!(rows.iter().any(|row| row["folder_id"] == "archive"));
+
+        let inbox = call(&mut engine, "messages_list", json!({ "folder": "inbox", "label": "lbl_1" }));
+        assert_eq!(inbox["folder"], "inbox");
+        assert_eq!(inbox["total"], 2, "folder and label intersect");
+        assert_eq!(inbox["unread"], 2);
+
+        let sent = call(&mut engine, "messages_list", json!({ "folder": "sent", "label": "lbl_1" }));
+        assert_eq!(sent["total"], 2);
+        assert_eq!(sent["messages"][0]["id"], "msg_002");
+
+        let starred = call(&mut engine, "messages_list", json!({ "folder": "starred", "label": "lbl_1" }));
+        let rows = starred["messages"].as_array().expect("starred rows");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row["starred"] == json!(true)));
+        assert!(rows.iter().all(|row| row["labels"].as_array().is_some_and(|labels| labels.contains(&json!("lbl_1")))));
+
+        let error = engine.call("messages_list", json!({ "label": "lbl_missing" })).expect_err("unknown label");
+        assert!(matches!(error, crate::OpError::Failed(_)));
+        let error = engine.call("messages_list", json!({ "folder": "inbox", "label": "lbl_missing" })).expect_err("unknown label with folder");
+        assert!(matches!(error, crate::OpError::Failed(_)));
+    }
+
+    #[test]
+    fn label_ids_are_not_reused() {
+        let mut engine = Engine::demo();
+        call(&mut engine, "label_delete", json!({ "id": "lbl_3" }));
+        let created = call(&mut engine, "label_create", json!({ "name": "Quarta", "color": "forest" }));
+        assert_eq!(created["label"]["id"], "lbl_4");
+        let created = call(&mut engine, "label_create", json!({ "name": "Quinta", "color": "muted" }));
+        assert_eq!(created["label"]["id"], "lbl_5");
+    }
+
+    #[test]
+    fn label_names_refuse_bidi_controls_and_accept_accents() {
+        let mut engine = Engine::demo();
+        let bidi = engine.call("label_create", json!({ "name": "A\u{202e}B", "color": "gold" })).expect_err("bidi override");
+        assert!(matches!(bidi, crate::OpError::InvalidArgs(_)));
+        let created = call(&mut engine, "label_create", json!({ "name": "Città", "color": "gold" }));
+        assert_eq!(created["label"]["name"], "Città");
+        let renamed = engine
+            .call("label_update", json!({ "id": created["label"]["id"], "name": "Città \u{2060}studio" }))
+            .expect_err("update validates names through the same rule");
+        assert!(matches!(renamed, crate::OpError::InvalidArgs(_)));
     }
 
     #[test]

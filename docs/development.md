@@ -1,6 +1,6 @@
 # Development
 
-> **Status:** M0 + U0.4 · **Last updated:** 2026-10-24
+> **Status:** M0 + U0.5 labels · **Last updated:** 2026-10-24
 
 ## 1. Toolchain
 
@@ -94,12 +94,14 @@ they have a reason to exist.
 
 ## 8. Testing
 
-- **Core:** operation behaviour, schema validity, pagination, flag counts, draft validation and
-  address parsing.
-- **CLI:** `run` argument parsing, recipient flags, MCP protocol (`initialize`, `tools/list`,
-  `tools/call`, errors, notifications).
-- **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery and
-  composer. The test asserts the shell paints at least one shape.
+- **Core:** operation behaviour, schema validity, pagination, flag counts, draft validation,
+  address parsing, label CRUD/validation/caps and label filtering.
+- **CLI:** `run` argument parsing, recipient flags, label subcommands, `messages --label` with and
+  without `--folder`, `search --label`, MCP protocol (`initialize`, `tools/list`, `tools/call`,
+  errors, notifications).
+- **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery,
+  composer, sidebar label registry, label filter, inline create/rename and the multi-select label
+  undo path. The test asserts the shell paints at least one shape.
 - **Future:** a fake IMAP/SMTP server, MIME fixtures, property tests for parsers, fuzzing for MIME
   and HTML.
 
@@ -125,16 +127,21 @@ Deterministic screenshots render the real shell without mouse or keyboard inject
 cargo run -p postino-app -- --screenshot shell --out docs/images/postino-m0.png
 cargo run -p postino-app -- --screenshot reading --out tmp-reading.png
 cargo run -p postino-app -- --screenshot compose --dark --out tmp-compose-dark.png
+cargo run -p postino-app -- --screenshot labels --out docs/images/postino-u05-labels.png
+cargo run -p postino-app -- --screenshot label_menu --out docs/images/postino-u05-label-menu.png
+cargo run -p postino-app -- --screenshot labels --size 980x600 --out tmp-labels-980.png
 ```
 
 The states are `shell` (demo inbox, no selection), `reading` (first inbox message open), `compose`
-(the composer prefilled with the docs fixture) and `palette` (command palette open). `--dark`
-applies the dark theme.
-The window is 1280 × 720 logical, so at 125% DPI the PNG is 1600 × 900: the process captures its own
-viewport with `ViewportCommand::Screenshot`, writes the PNG and closes. It never injects input,
-never calls `PrintWindow` and does not need an interactive desktop. The images in `docs/images/` are
-generated from this command and never hand-cropped; regenerate them after a layout change. An
-unknown state exits with the list of supported labels instead of opening a window.
+(the composer prefilled with the docs fixture), `palette` (command palette open), `labels` (Lavoro
+filter active, list visible), `label_menu` (a labelled message open with the modal label menu above
+its captured target) and `label_editor` (the inline create editor open under the ETICHETTE header
+with a name typed). `--dark` applies the dark theme. `--size WxH` sets the logical window size; the
+default is 1280 × 720 and the minimum is 980 × 600. At 125% DPI the PNG is 1600 × 900: the process
+captures its own viewport with `ViewportCommand::Screenshot`, writes the PNG and closes. It never
+injects input, never calls `PrintWindow` and does not need an interactive desktop. The images in
+`docs/images/` are generated from this command and never hand-cropped; regenerate them after a
+layout change. An unknown state exits with the list of supported labels instead of opening a window.
 
 ## 10. Style
 

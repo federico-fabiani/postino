@@ -154,7 +154,7 @@ impl<'a> SearchField<'a> {
             }
             frame.show(ui, |ui| {
                 ui.set_width((width - space::LG * 2.0).max(80.0));
-                ui.horizontal_centered(|ui| {
+                ui.horizontal(|ui| {
                     ui.label(icons::icon(icons::SEARCH, 15.0, t.text_faint));
                     let edit = TextEdit::singleline(self.text)
                         .hint_text(self.hint)

@@ -45,6 +45,9 @@ pub struct Tokens {
     pub selected: Color32,
     pub selected_text: Color32,
     pub selected_muted: Color32,
+    /// On-forest variants of the semantic label dots, so a selected label row keeps its colour.
+    pub selected_success: Color32,
+    pub selected_danger: Color32,
     pub hover: Color32,
     pub field: Color32,
     pub gold: Color32,
@@ -67,6 +70,8 @@ pub fn tokens(dark: bool) -> Tokens {
             selected: FOREST_SOFT,
             selected_text: IVORY,
             selected_muted: Color32::from_rgb(0xD6, 0xCA, 0xB2),
+            selected_success: Color32::from_rgb(0x7F, 0xC0, 0x96),
+            selected_danger: Color32::from_rgb(0xE0, 0x7A, 0x64),
             hover: Color32::from_rgb(0x1F, 0x3E, 0x33),
             field: Color32::from_rgb(0x0F, 0x22, 0x1B),
             gold: GOLD,
@@ -87,6 +92,10 @@ pub fn tokens(dark: bool) -> Tokens {
             selected: FOREST,
             selected_text: IVORY,
             selected_muted: Color32::from_rgb(0xD8, 0xCF, 0xBA),
+            // On the forest selection the light-theme success/danger would vanish, so the dots use
+            // the values the dark theme already carries for forest surfaces.
+            selected_success: Color32::from_rgb(0x7F, 0xC0, 0x96),
+            selected_danger: Color32::from_rgb(0xE0, 0x7A, 0x64),
             hover: IVORY_3,
             field: Color32::from_rgb(0xFB, 0xF6, 0xEA),
             gold: GOLD,

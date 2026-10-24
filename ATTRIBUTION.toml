@@ -171,6 +171,26 @@ sha256 = "9ab83e41490dd3583cfd593cf66c32321671b7ee4d0822a0c29052d9f5264b7e"
 usage = "Documentation screenshot of the U0.4 composer in the dark theme"
 
 [[asset]]
+path = "docs/images/postino-u05-labels.png"
+title = "Postino U0.5 labels"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "803b86af0b9453642e972064e516ea456b6bd908adaeaaa090ebc311216b077a"
+usage = "Documentation screenshot of the U0.5 label view, its mailbox-wide scope header and the coloured label rows"
+
+[[asset]]
+path = "docs/images/postino-u05-label-menu.png"
+title = "Postino U0.5 label menu"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "48db8b5fd8e26b728c6220639b4c9ccb8ebaf1bf0cab4db37432301c11b745df"
+usage = "Documentation screenshot of the modal label menu over the message list, with the applied label chip visible in the reading pane"
+
+[[asset]]
 path = "assets/app-icon/postino-256.png"
 title = "Postino application icon"
 author = "Postino contributors"

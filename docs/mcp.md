@@ -50,21 +50,40 @@ agent can read the message and recover.
 | `app_info` | yes | Version, platform, data directory, demo flag, operation count |
 | `accounts_list` | yes | Configured accounts |
 | `folders_list` | yes | Folders with unread and total counts |
-| `messages_list` | yes | Message summaries, paginated, filterable |
+| `messages_list` | yes | Message summaries, paginated; `label` alone spans every folder, `folder` narrows it |
 | `message_get` | yes | One message with body and attachments |
 | `message_flag` | no | Set read/unread and/or starred |
 | `message_move` | no | Move a message to a regular folder |
 | `draft_save` | no | Create or update one draft in place |
 | `draft_send` | no | Demo only: move a draft to Sent, with no SMTP connection |
-| `search` | yes | Case-insensitive search over subjects, people and bodies |
+| `search` | yes | Case-insensitive search over subjects, people and bodies, with optional folder and label filters |
+| `labels_list` | yes | Labels with mailbox-wide total and unread counts |
+| `label_create` | no | Create a local label with a semantic colour |
+| `label_update` | no | Rename and/or recolour a label; the id is stable |
+| `label_delete` | no | Delete a label, detach it from every message, return the affected count |
+| `label_apply` | no | Apply or remove one label on 1–500 messages; idempotent |
 
 Annotations:
 
-- `readOnlyHint`: true for reads; false for `message_flag`, `message_move`, `draft_save` and
-  `draft_send`.
-- `destructiveHint`: false in M0. Sending and deletion will be marked destructive in M6.
-- `idempotentHint`: true for reads and for `message_flag`.
+- `readOnlyHint`: true for reads and `labels_list`; false for every other write.
+- `destructiveHint`: false in M0. `label_delete` removes metadata only, never mail. Sending and
+  deletion will be marked destructive in M6.
+- `idempotentHint`: true for reads, `message_flag`, `label_apply` and `label_update`.
 - `openWorldHint`: false. The server talks to the local engine, not the open internet.
+
+`labels_list`, `label_create`, `label_update`, `label_delete` and `label_apply` are backed by the
+same registry the app and the CLI use. Labels are local metadata held in memory until the M1 store
+exists; they are never sent to a server. Label ids are stable for the life of the label and never
+reused, so an id from a deleted label is dead. Names are trimmed, at most 48 characters, unique
+ignoring case, and refuse control, bidi and format characters (U+061C, U+200B–U+200F, U+202A–U+202E,
+U+2060–U+206F, U+FEFF) that could reorder or hide text.
+
+`messages_list` accepts an optional `label` id. With only `label` it returns every folder; with
+`folder` and `label` it returns their intersection; with neither it defaults to `inbox`. An unknown
+folder or label id is an error instead of an empty list. `search` also accepts `label` and applies it
+before the row limit, so a match outside the first 200 rows is still returned. `label_apply`
+validates every message id before changing anything, caps a call at 500 ids and returns how many
+messages actually changed, so an agent can retry safely.
 
 `draft_save` refuses CR/LF in addresses or the subject, validates every recipient, caps recipients
 and attachments, and returns the draft with a stable id. `draft_send` requires at least one

@@ -15,7 +15,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use postino_core::{
-    AccountsList, Address, AppInfo, DraftSave, DraftSend, Engine, FoldersList, MessageFlag, MessageGet, MessageSummary, MessagesList, SearchResult,
+    AccountsList, Address, AppInfo, DraftSave, DraftSend, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary,
+    LabelUpdate, LabelsList, MessageFlag, MessageGet, MessageSummary, MessagesList, SearchResult,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -61,6 +62,27 @@ enum DraftCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum LabelCommand {
+    /// List labels with mailbox-wide counts.
+    List,
+    /// Create a local label.
+    Create {
+        name: String,
+        /// Semantic colour: gold, forest, success, danger or muted.
+        #[arg(long, default_value = "gold")]
+        color: String,
+    },
+    /// Rename a label without changing its id.
+    Rename { id: String, name: String },
+    /// Delete a label and detach it from every message.
+    Delete { id: String },
+    /// Apply a label to one or more messages.
+    Apply { id: String, message_ids: Vec<String> },
+    /// Remove a label from one or more messages.
+    Remove { id: String, message_ids: Vec<String> },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Version, platform, data directory and demo mode.
     Info,
@@ -75,8 +97,9 @@ enum Command {
         #[arg(long)]
         account: Option<String>,
     },
-    /// List messages in a folder.
+    /// List messages, optionally narrowed by folder or label.
     Messages {
+        /// Folder id. With --label and no --folder, every folder is searched.
         #[arg(long)]
         folder: Option<String>,
         #[arg(long)]
@@ -85,6 +108,9 @@ enum Command {
         starred: bool,
         #[arg(long)]
         attachments: bool,
+        /// Only messages carrying this label id.
+        #[arg(long)]
+        label: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
         #[arg(long, default_value_t = 0)]
@@ -104,6 +130,9 @@ enum Command {
         limit: u32,
         #[arg(long)]
         folder: Option<String>,
+        /// Only messages carrying this label id.
+        #[arg(long)]
+        label: Option<String>,
     },
     /// Change read/starred flags.
     Flag {
@@ -121,6 +150,11 @@ enum Command {
     Draft {
         #[command(subcommand)]
         command: DraftCommand,
+    },
+    /// Create, rename, delete, apply or remove local labels.
+    Label {
+        #[command(subcommand)]
+        command: LabelCommand,
     },
     /// Call any operation with JSON or key=value arguments.
     Run {
@@ -158,6 +192,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
             | Command::Search { .. }
             | Command::Flag { .. }
             | Command::Draft { .. }
+            | Command::Label { .. }
     );
     if needs_mail && engine.accounts().is_empty() {
         bail!("nessun account configurato; riprova con --demo per i dati sintetici");
@@ -224,20 +259,13 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 say(text)?;
             }
         }
-        Command::Messages { folder, unread, starred, attachments, limit, offset } => {
-            let args = json!({
-                "folder": folder,
-                "unread_only": unread,
-                "starred_only": starred,
-                "with_attachments": attachments,
-                "limit": limit,
-                "offset": offset,
-            });
+        Command::Messages { folder, unread, starred, attachments, label, limit, offset } => {
+            let args = messages_args(folder, unread, starred, attachments, label.as_deref(), limit, offset);
             let result: MessagesList = decode(call(engine, "messages_list", args)?)?;
             if json_output {
                 print_json(&result)?;
             } else {
-                let mut text = format!("{} — {} unread / {} total\n\n", result.folder, result.unread, result.total);
+                let mut text = messages_heading(&result, label.as_deref());
                 for message in &result.messages {
                     text.push_str(&format_summary(message));
                 }
@@ -259,8 +287,8 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 }
             }
         }
-        Command::Search { query, limit, folder } => {
-            let result: SearchResult = decode(call(engine, "search", json!({ "query": query, "limit": limit, "folder": folder }))?)?;
+        Command::Search { query, limit, folder, label } => {
+            let result: SearchResult = decode(call(engine, "search", json!({ "query": query, "limit": limit, "folder": folder, "label": label }))?)?;
             if json_output {
                 print_json(&result)?;
             } else {
@@ -334,6 +362,71 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 }
             }
         },
+        Command::Label { command } => match command {
+            LabelCommand::List => {
+                let result: LabelsList = decode(call(engine, "labels_list", json!({}))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    let mut text = String::new();
+                    for label in &result.labels {
+                        text.push_str(&format_label(label));
+                    }
+                    if result.labels.is_empty() {
+                        text.push_str("Nessuna etichetta. Creane una con `label create <nome> --color gold`.\n");
+                    }
+                    text.push_str("\nEtichette locali, in memoria fino a M1: nessun server viene aggiornato.\n");
+                    say(text)?;
+                }
+            }
+            LabelCommand::Create { name, color } => {
+                let color = LabelColor::parse(&color)
+                    .ok_or_else(|| anyhow::anyhow!("colore {color:?} non valido; usa gold, forest, success, danger o muted"))?;
+                let result: LabelCreate = decode(call(engine, "label_create", json!({ "name": name, "color": color }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!(
+                        "Etichetta creata: {} \"{}\" ({})\nEtichette locali, in memoria fino a M1.\n",
+                        result.label.id,
+                        result.label.name,
+                        result.label.color.as_str()
+                    ))?;
+                }
+            }
+            LabelCommand::Rename { id, name } => {
+                let result: LabelUpdate = decode(call(engine, "label_update", json!({ "id": id, "name": name }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Etichetta rinominata: {} \"{}\"\nEtichette locali, in memoria fino a M1.\n", result.label.id, result.label.name))?;
+                }
+            }
+            LabelCommand::Delete { id } => {
+                let result: LabelDelete = decode(call(engine, "label_delete", json!({ "id": id }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format_label_delete(&result))?;
+                }
+            }
+            LabelCommand::Apply { id, message_ids } => {
+                let result: LabelApply = decode(call(engine, "label_apply", json!({ "id": id, "message_ids": message_ids, "apply": true }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format_label_change(&result, true))?;
+                }
+            }
+            LabelCommand::Remove { id, message_ids } => {
+                let result: LabelApply = decode(call(engine, "label_apply", json!({ "id": id, "message_ids": message_ids, "apply": false }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format_label_change(&result, false))?;
+                }
+            }
+        },
         Command::Run { op, args, params } => {
             let object = parse_run_args(args, params)?;
             let result = call(engine, &op, object)?;
@@ -342,6 +435,66 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
         Command::Mcp => mcp::serve(engine)?,
     }
     Ok(())
+}
+
+fn messages_args(folder: Option<String>, unread: bool, starred: bool, attachments: bool, label: Option<&str>, limit: u32, offset: u32) -> Value {
+    json!({
+        "folder": folder,
+        "unread_only": unread,
+        "starred_only": starred,
+        "with_attachments": attachments,
+        "label": label,
+        "limit": limit,
+        "offset": offset,
+    })
+}
+
+fn messages_heading(result: &MessagesList, label: Option<&str>) -> String {
+    let scope = result.folder.as_deref().unwrap_or("tutte le cartelle");
+    let filter = label.map_or(String::new(), |label| format!(" · etichetta {label}"));
+    format!("{scope}{filter} — {} unread / {} total\n\n", result.unread, result.total)
+}
+
+fn count_label(count: u32, singular: &str, plural: &str) -> String {
+    if count == 1 { format!("1 {singular}") } else { format!("{count} {plural}") }
+}
+
+fn format_label_delete(result: &LabelDelete) -> String {
+    format!(
+        "Etichetta eliminata: \"{}\" · rimossa da {}.\nLe mail non sono state toccate; le etichette sono metadati locali in memoria fino a M1.\n",
+        result.label.name,
+        count_label(u32::try_from(result.affected).unwrap_or(u32::MAX), "messaggio", "messaggi")
+    )
+}
+
+fn format_label(label: &LabelSummary) -> String {
+    format!(
+        "{:<8} {:<8} {:<20} {:>18} · {:>16}\n",
+        label.id,
+        label.color.as_str(),
+        label.name,
+        count_label(label.message_count, "messaggio", "messaggi"),
+        count_label(label.unread_count, "non letto", "non letti")
+    )
+}
+
+fn format_label_change(result: &LabelApply, apply: bool) -> String {
+    let message = if result.changed == 0 {
+        format!("Nessuna modifica: l'etichetta \"{}\" è già nello stato richiesto.\n", result.label.name)
+    } else if apply {
+        format!(
+            "Etichetta \"{}\" applicata a {}.\n",
+            result.label.name,
+            count_label(u32::try_from(result.changed).unwrap_or(u32::MAX), "messaggio", "messaggi")
+        )
+    } else {
+        format!(
+            "Etichetta \"{}\" rimossa da {}.\n",
+            result.label.name,
+            count_label(u32::try_from(result.changed).unwrap_or(u32::MAX), "messaggio", "messaggi")
+        )
+    };
+    format!("{message}Etichette locali, in memoria fino a M1.\n")
 }
 
 fn parse_cli_addresses(values: Vec<String>, field: &str) -> Result<Vec<Address>> {
@@ -479,6 +632,123 @@ mod tests {
         let args = parse_run_args(Some(json!({ "id": "one" }).to_string()), vec!["subject=Ciao".to_owned()]).expect("arguments");
         assert_eq!(args["id"], "one");
         assert_eq!(args["subject"], "Ciao");
+    }
+
+    fn cli(command: Command) -> Cli {
+        Cli { demo: true, json: true, command }
+    }
+
+    #[test]
+    fn cli_label_subcommands_reach_the_registry() {
+        let mut engine = Engine::demo();
+        run(cli(Command::Label { command: LabelCommand::List }), &mut engine).expect("label list");
+        run(cli(Command::Label { command: LabelCommand::Create { name: "Ufficio".to_owned(), color: "forest".to_owned() } }), &mut engine)
+            .expect("label create");
+        let id = engine.labels().iter().find(|label| label.name == "Ufficio").expect("created label").id.clone();
+        run(cli(Command::Label { command: LabelCommand::Rename { id: id.clone(), name: "Ufficio clienti".to_owned() } }), &mut engine)
+            .expect("label rename");
+        assert_eq!(engine.label(&id).map(|label| label.name.as_str()), Some("Ufficio clienti"));
+
+        run(cli(Command::Label { command: LabelCommand::Apply { id: id.clone(), message_ids: vec!["msg_001".to_owned()] } }), &mut engine)
+            .expect("label apply");
+        assert!(engine.message("msg_001").is_some_and(|message| message.summary.labels.contains(&id)));
+        run(cli(Command::Label { command: LabelCommand::Remove { id: id.clone(), message_ids: vec!["msg_001".to_owned()] } }), &mut engine)
+            .expect("label remove");
+        assert!(engine.message("msg_001").is_some_and(|message| !message.summary.labels.contains(&id)));
+        run(cli(Command::Label { command: LabelCommand::Delete { id: id.clone() } }), &mut engine).expect("label delete");
+        assert!(engine.label(&id).is_none());
+    }
+
+    #[test]
+    fn cli_label_delete_uses_the_singular_count() {
+        let mut engine = Engine::demo();
+        let value = call(&mut engine, "label_create", json!({ "name": "Una sola", "color": "gold" })).expect("label created");
+        let label = decode::<LabelCreate>(value).expect("label response").label;
+        call(&mut engine, "label_apply", json!({ "id": label.id, "message_ids": ["msg_001"], "apply": true })).expect("label applied");
+        let value = call(&mut engine, "label_delete", json!({ "id": label.id })).expect("label deleted");
+        let result = decode::<LabelDelete>(value).expect("delete response");
+        let text = format_label_delete(&result);
+        assert!(text.contains("rimossa da 1 messaggio."), "{text}");
+    }
+
+    #[test]
+    fn cli_label_create_rejects_an_unknown_colour() {
+        let mut engine = Engine::demo();
+        let error = run(cli(Command::Label { command: LabelCommand::Create { name: "Blu".to_owned(), color: "blue".to_owned() } }), &mut engine)
+            .expect_err("invalid colour");
+        assert!(error.to_string().contains("gold, forest, success, danger o muted"));
+    }
+
+    #[test]
+    fn cli_messages_label_without_folder_spans_every_folder() {
+        let mut engine = Engine::demo();
+        run(
+            cli(Command::Messages {
+                folder: None,
+                unread: false,
+                starred: false,
+                attachments: false,
+                label: Some("lbl_1".to_owned()),
+                limit: 50,
+                offset: 0,
+            }),
+            &mut engine,
+        )
+        .expect("messages --label");
+        let result: MessagesList =
+            decode(call(&mut engine, "messages_list", messages_args(None, false, false, false, Some("lbl_1"), 50, 0)).expect("messages_list"))
+                .expect("messages");
+        assert_eq!(result.folder, None);
+        assert_eq!(result.total, 6);
+        assert!(result.messages.iter().all(|message| message.labels.contains(&"lbl_1".to_owned())));
+        assert!(messages_heading(&result, Some("lbl_1")).starts_with("tutte le cartelle · etichetta lbl_1"));
+        let json = serde_json::to_value(&result).expect("messages JSON");
+        assert!(json["folder"].is_null(), "global label JSON output carries no folder");
+        assert!(json["messages"].as_array().is_some_and(|rows| rows.len() == 6));
+    }
+
+    #[test]
+    fn cli_messages_label_with_folder_narrows_the_scope() {
+        let mut engine = Engine::demo();
+        run(
+            cli(Command::Messages {
+                folder: Some("sent".to_owned()),
+                unread: false,
+                starred: false,
+                attachments: false,
+                label: Some("lbl_1".to_owned()),
+                limit: 50,
+                offset: 0,
+            }),
+            &mut engine,
+        )
+        .expect("messages --label --folder");
+        let result: MessagesList = decode(
+            call(&mut engine, "messages_list", messages_args(Some("sent".to_owned()), false, false, false, Some("lbl_1"), 50, 0))
+                .expect("messages_list"),
+        )
+        .expect("messages");
+        assert_eq!(result.folder.as_deref(), Some("sent"));
+        assert_eq!(result.total, 2);
+        assert_eq!(result.messages[0].id, "msg_002");
+        assert!(messages_heading(&result, Some("lbl_1")).starts_with("sent · etichetta lbl_1"));
+    }
+
+    #[test]
+    fn cli_search_label_flag_reaches_the_operation() {
+        let mut engine = Engine::demo();
+        run(cli(Command::Search { query: "preventivo".to_owned(), limit: 50, folder: None, label: Some("lbl_1".to_owned()) }), &mut engine)
+            .expect("search --label");
+        let result: SearchResult =
+            decode(call(&mut engine, "search", json!({ "query": "preventivo", "limit": 50, "folder": null, "label": "lbl_1" })).expect("search"))
+                .expect("search result");
+        assert!(result.total >= 1);
+        assert!(result.messages.iter().all(|message| message.labels.contains(&"lbl_1".to_owned())));
+
+        let error =
+            run(cli(Command::Search { query: "preventivo".to_owned(), limit: 50, folder: None, label: Some("lbl_missing".to_owned()) }), &mut engine)
+                .expect_err("unknown label");
+        assert!(error.to_string().contains("unknown label"));
     }
 
     #[test]

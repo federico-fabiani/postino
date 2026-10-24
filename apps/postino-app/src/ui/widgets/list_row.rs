@@ -21,6 +21,7 @@ pub struct ListRow<'a> {
     meta: &'a str,
     initials: &'a str,
     leading_icon: Option<&'a str>,
+    dot: Option<Color32>,
     unread: bool,
     starred: bool,
     selected: bool,
@@ -39,6 +40,7 @@ impl<'a> ListRow<'a> {
             meta,
             initials: "",
             leading_icon: None,
+            dot: None,
             unread: false,
             starred: false,
             selected: false,
@@ -57,6 +59,7 @@ impl<'a> ListRow<'a> {
             meta,
             initials: "",
             leading_icon: None,
+            dot: None,
             unread: false,
             starred: false,
             selected: false,
@@ -70,6 +73,20 @@ impl<'a> ListRow<'a> {
     #[must_use]
     pub fn icon(mut self, icon: &'a str) -> Self {
         self.leading_icon = Some(icon);
+        self
+    }
+
+    /// Tooltip detail for a folder or label row; message rows use the snippet instead.
+    #[must_use]
+    pub fn subtitle(mut self, subtitle: &'a str) -> Self {
+        self.subtitle = subtitle;
+        self
+    }
+
+    /// A semantic dot instead of the leading icon. Used for labels.
+    #[must_use]
+    pub fn dot(mut self, color: Color32) -> Self {
+        self.dot = Some(color);
         self
     }
 
@@ -136,13 +153,17 @@ impl<'a> ListRow<'a> {
         let faint = if selected { t.selected_muted } else { t.text_faint };
 
         let mut cursor = rect.left() + space::LG;
-        if self.kind == ListRowKind::Folder
-            && let Some(icon) = self.leading_icon
-        {
-            let color = if selected { t.selected_text } else { t.text_muted };
-            let galley = layout(ui, icon, &icons::font(15.0), color);
-            paint_left(ui, rect, cursor, &galley);
-            cursor += 15.0 + space::SM;
+        if self.kind == ListRowKind::Folder {
+            if let Some(dot) = self.dot {
+                // The caller resolves a selected-safe colour: a label must keep its identity.
+                ui.painter().circle_filled(pos2(cursor + 3.0, rect.center().y), 3.0, dot);
+                cursor += 12.0 + space::SM;
+            } else if let Some(icon) = self.leading_icon {
+                let color = if selected { t.selected_text } else { t.text_muted };
+                let galley = layout(ui, icon, &icons::font(15.0), color);
+                paint_left(ui, rect, cursor, &galley);
+                cursor += 15.0 + space::SM;
+            }
         }
         if self.kind == ListRowKind::Message {
             if self.unread {

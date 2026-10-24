@@ -87,7 +87,7 @@ fn tools_list(engine: &Engine) -> Value {
                 "annotations": {
                     "readOnlyHint": def.read_only,
                     "destructiveHint": def.destructive,
-                    "idempotentHint": def.read_only || def.name == "message_flag",
+                    "idempotentHint": def.read_only || matches!(def.name, "message_flag" | "label_apply" | "label_update"),
                     "openWorldHint": false
                 }
             })
@@ -211,6 +211,97 @@ mod tests {
         )
         .expect("response");
         assert_eq!(sent["result"]["structuredContent"]["message"]["folder_id"], "sent");
+    }
+
+    #[test]
+    fn label_tools_are_exposed_and_round_trip_through_messages_list() {
+        let mut engine = Engine::demo();
+        let tools = request(&mut engine, "tools/list");
+        let definitions = tools["result"]["tools"].as_array().expect("tools");
+        for name in ["labels_list", "label_create", "label_update", "label_delete", "label_apply"] {
+            assert!(definitions.iter().any(|tool| tool["name"] == name), "{name} is missing");
+        }
+        let list = definitions.iter().find(|tool| tool["name"] == "labels_list").expect("labels_list");
+        assert_eq!(list["annotations"]["readOnlyHint"], json!(true));
+        let apply = definitions.iter().find(|tool| tool["name"] == "label_apply").expect("label_apply");
+        assert_eq!(apply["annotations"]["readOnlyHint"], json!(false));
+        assert_eq!(apply["annotations"]["idempotentHint"], json!(true));
+        assert!(
+            apply["description"].as_str().is_some_and(|description| description.contains("local metadata")),
+            "the tool description must say labels are local metadata"
+        );
+
+        let applied = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": { "name": "label_apply", "arguments": { "id": "lbl_2", "message_ids": ["msg_013"], "apply": true } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(applied["result"]["structuredContent"]["changed"], 1);
+
+        let filtered = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": "messages_list", "arguments": { "folder": "trash", "label": "lbl_2" } }
+            }),
+        )
+        .expect("response");
+        let rows = filtered["result"]["structuredContent"]["messages"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "msg_013");
+
+        let removed = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": { "name": "label_apply", "arguments": { "id": "lbl_2", "message_ids": ["msg_013"], "apply": false } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(removed["result"]["structuredContent"]["changed"], 1);
+    }
+
+    #[test]
+    fn unknown_label_filter_is_a_readable_tool_error() {
+        let mut engine = Engine::demo();
+        let response = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": { "name": "messages_list", "arguments": { "label": "lbl_missing" } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(response["result"]["isError"], json!(true));
+        assert!(response["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("unknown label")));
+    }
+
+    #[test]
+    fn unknown_search_label_is_a_readable_tool_error() {
+        let mut engine = Engine::demo();
+        let response = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": { "name": "search", "arguments": { "query": "fattura", "label": "lbl_missing" } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(response["result"]["isError"], json!(true));
+        assert!(response["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("unknown label")));
     }
 
     #[test]

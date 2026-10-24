@@ -44,8 +44,14 @@ interaction model before real mail makes them expensive to change. Full spec:
       demo send, Drafts folder and counts. `draft_save` and `draft_send` are in the CLI/MCP registry;
       attachments are metadata-only until M2. Screenshots: `docs/images/postino-u04.png`,
       `postino-u04-compose.png`, `postino-u04-compose-dark.png`.
-- [ ] **U0.5 Labels and polish** — label create/apply/filter, empty/loading/error states, reduced
-      motion, accessibility pass, final screenshots and docs.
+- [x] **U0.5 Labels** — label registry with counts, create/rename/delete/apply/remove and filter in
+      the engine, GUI, CLI and MCP; inline creation under the ETICHETTE header with a semantic colour
+      row, a modal label menu with captured targets, reading-pane chips, and undo for rename, delete
+      and apply/remove (creating a label is not an undo step). The reading pane is a resizable side
+      pane at 1000 px and wider, and a full-width overlay below it. Labels stay local and in-memory
+      until M1. Screenshots: `docs/images/postino-u05-labels.png`, `postino-u05-label-menu.png`.
+- [ ] **U0.5 Polish** — empty/loading/error states, reduced motion, accessibility pass, final
+      light/dark screenshots and docs.
 - [ ] Verify: every component in the gallery in light/dark; full keyboard-only workflow; no dead
       actions; no ad-hoc literals in screens; `cargo xtask ci` green.
 

@@ -9,10 +9,13 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
     RichText, Sense, Stroke, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType,
 };
-use postino_core::{Account, Address, Attachment, DraftSave, DraftSend, Engine, FolderKind, Message, MessageSummary, MessagesList, SearchResult};
+use postino_core::{
+    Account, Address, Attachment, DraftSave, DraftSend, Engine, FolderKind, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary,
+    LabelUpdate, Message, MessageSummary, MessagesList, SearchResult,
+};
 use serde_json::json;
 
 use crate::theme::{self, GOLD, IVORY, Tokens};
@@ -20,8 +23,8 @@ use crate::ui::icons;
 use crate::ui::tokens::{inset, radius, size as ui_size, space};
 use crate::ui::typography::{self, Role};
 use crate::ui::widgets::{
-    AUTOSAVE_DELAY, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerFocus, ComposerState, EmptyState, IconButton, IconButtonSize, ListRow,
-    Menu, MenuItem, SearchField, SectionHeader, Toast, compose_body, quote_body, signature_body,
+    AUTOSAVE_DELAY, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerFocus, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize,
+    ListRow, Menu, MenuItem, SearchField, SectionHeader, TextField, Toast, compose_body, quote_body, signature_body,
 };
 
 /// The shell scenes `--screenshot` can render. Add a label here and a branch in
@@ -32,6 +35,9 @@ pub enum ScreenshotState {
     Reading,
     Compose,
     Palette,
+    Labels,
+    LabelMenu,
+    LabelEditor,
 }
 
 impl ScreenshotState {
@@ -41,7 +47,12 @@ impl ScreenshotState {
             "reading" => Ok(Self::Reading),
             "compose" => Ok(Self::Compose),
             "palette" => Ok(Self::Palette),
-            other => Err(format!("unknown screenshot state {other:?}; expected one of: shell, reading, compose, palette")),
+            "labels" => Ok(Self::Labels),
+            "label_menu" => Ok(Self::LabelMenu),
+            "label_editor" => Ok(Self::LabelEditor),
+            other => Err(format!(
+                "unknown screenshot state {other:?}; expected one of: shell, reading, compose, palette, labels, label_menu, label_editor"
+            )),
         }
     }
 }
@@ -61,6 +72,18 @@ const SCREENSHOT_SETTLE_FRAMES: u32 = 4;
 /// into an actionable error instead of a hung process.
 const SCREENSHOT_WAIT_FRAMES: u32 = 120;
 
+/// Below this available width a side reading pane leaves no usable list, so reading becomes a
+/// full-width overlay with a back button.
+const READING_PANE_MIN_WIDTH: f32 = 1000.0;
+/// The pane opens at 52% of the window and resizes between 420 px and 62%.
+const READING_PANE_DEFAULT_RATIO: f32 = 0.52;
+const READING_PANE_MAX_RATIO: f32 = 0.62;
+const READING_PANE_MIN_SIZE: f32 = 420.0;
+/// The message list shows avatars only when its column is at least this wide (`docs/ui/plan.md`).
+const AVATAR_MIN_LIST_WIDTH: f32 = 720.0;
+/// `label_apply` accepts at most 500 ids per call; undoing a delete restores in these batches.
+const LABEL_APPLY_CHUNK: usize = 500;
+
 pub struct PostinoApp {
     engine: Engine,
     folder: String,
@@ -70,6 +93,16 @@ pub struct PostinoApp {
     selection: BTreeSet<String>,
     /// Shift-click and Shift+arrow range anchor.
     anchor: Option<String>,
+    /// Active label id. Alone it spans every folder; `label_folder` narrows it to one folder.
+    label_filter: Option<String>,
+    /// Folder the active label is narrowed to, or `None` for every folder.
+    label_folder: Option<String>,
+    /// Cached `labels_list` result. Refreshed after every label or unread mutation, so a frame
+    /// never re-decodes the registry through JSON three times.
+    labels_cache: Vec<LabelSummary>,
+    label_editor: Option<LabelEditor>,
+    label_delete: Option<LabelDeleteState>,
+    label_menu: Option<LabelMenuState>,
     pending_read: Option<PendingRead>,
     toast: Option<ToastState>,
     query: String,
@@ -158,16 +191,52 @@ impl PostinoApp {
                 self.palette_query = "scr".to_owned();
                 self.palette_selected = 0;
             }
+            ScreenshotState::Labels => {
+                // Keep the list visible at every size: the 980×600 shot must be able to prove the
+                // header and "Mostra tutte" are not clipped. The reading-pane chips stay in the
+                // label_menu scene.
+                self.label_filter = self.labels_cache.iter().find(|label| label.name == "Lavoro").map(|label| label.id.clone());
+                self.label_folder = None;
+            }
+            ScreenshotState::LabelEditor => {
+                self.start_label_create();
+                if let Some(editor) = self.label_editor.as_mut() {
+                    editor.text = "Ufficio".to_owned();
+                    editor.focus = true;
+                }
+            }
+            ScreenshotState::LabelMenu => {
+                self.label_filter = self.labels_cache.iter().find(|label| label.name == "Lavoro").map(|label| label.id.clone());
+                self.label_folder = None;
+                let first = self.visible_messages().0.first().map(|message| message.id.clone());
+                if let Some(id) = first {
+                    self.open_message(id.clone());
+                    self.now = 1.0;
+                    self.maybe_complete_read();
+                    self.toast = None;
+                    // The captured targets are the visible message; the Lavoro chip stays visible in
+                    // the reading pane behind the modal scrim.
+                    self.open_label_menu(vec![id]);
+                }
+            }
         }
     }
 
     fn demo(custom_chrome: bool) -> Self {
+        let engine = Engine::demo();
+        let labels_cache = engine.label_summaries();
         Self {
-            engine: Engine::demo(),
+            engine,
             folder: "inbox".to_owned(),
             selected: None,
             selection: BTreeSet::new(),
             anchor: None,
+            label_filter: None,
+            label_folder: None,
+            labels_cache,
+            label_editor: None,
+            label_delete: None,
+            label_menu: None,
             pending_read: None,
             toast: None,
             query: String::new(),
@@ -196,10 +265,307 @@ impl PostinoApp {
 
     fn select_folder(&mut self, folder: impl Into<String>) {
         self.folder = folder.into();
+        // A folder click narrows an active label view to the intersection instead of dropping the
+        // filter; "Mostra tutte" is the explicit way back to the whole mail list.
+        if self.label_filter.is_some() {
+            self.label_folder = Some(self.folder.clone());
+        }
+        self.label_editor = None;
+        self.label_menu = None;
         self.query.clear();
         self.clear_selection();
         self.reading_open = false;
         self.reading_full = false;
+    }
+
+    fn refresh_labels(&mut self) {
+        self.labels_cache = self.engine.label_summaries();
+    }
+
+    fn label_summary(&self, id: &str) -> Option<&LabelSummary> {
+        self.labels_cache.iter().find(|label| label.id == id)
+    }
+
+    /// The search field names the active label, so the placeholder never claims a mailbox-wide
+    /// scope while the list is filtered.
+    fn search_placeholder(&self) -> String {
+        match self.label_filter.as_deref().and_then(|id| self.label_summary(id)) {
+            Some(label) => format!("Cerca in {}…", label.name),
+            None => "Cerca in tutte le mail…".to_owned(),
+        }
+    }
+
+    fn select_label(&mut self, id: String) {
+        self.label_filter = Some(id);
+        self.label_folder = None;
+        self.label_editor = None;
+        self.label_menu = None;
+        self.query.clear();
+        self.unread_only = false;
+        self.attachments_only = false;
+        self.clear_selection();
+        self.reading_open = false;
+        self.reading_full = false;
+    }
+
+    fn clear_label_filter(&mut self) {
+        self.label_filter = None;
+        self.label_folder = None;
+    }
+
+    fn start_label_create(&mut self) {
+        self.start_label_create_for(Vec::new());
+    }
+
+    /// The sidebar `+` action. While the editor is open it only returns focus to the field, so a
+    /// second click cannot silently throw away a half-typed name.
+    fn start_label_create_or_focus(&mut self) {
+        if let Some(editor) = self.label_editor.as_mut() {
+            editor.focus = true;
+            return;
+        }
+        self.start_label_create();
+    }
+
+    /// Create a label and, when the message label menu asked for it, apply it to the targets that
+    /// were captured when the menu opened. Creation itself is not an undo step.
+    fn start_label_create_for(&mut self, apply_to: Vec<String>) {
+        self.label_menu = None;
+        self.label_editor = Some(LabelEditor {
+            mode: LabelEditorMode::Create,
+            text: String::new(),
+            color: LabelColor::Gold,
+            error: None,
+            focus: true,
+            focused: true,
+            swatch_focused: false,
+            apply_to,
+        });
+        self.label_delete = None;
+    }
+
+    fn start_label_rename(&mut self, id: &str) {
+        let Some(label) = self.engine.label(id) else {
+            self.status = format!("Etichetta {id:?} non trovata");
+            return;
+        };
+        self.label_menu = None;
+        self.label_editor = Some(LabelEditor {
+            mode: LabelEditorMode::Rename(id.to_owned()),
+            text: label.name.clone(),
+            color: label.color,
+            error: None,
+            focus: true,
+            focused: true,
+            swatch_focused: false,
+            apply_to: Vec::new(),
+        });
+        self.label_delete = None;
+    }
+
+    fn cancel_label_editor(&mut self) {
+        self.label_editor = None;
+        self.label_menu = None;
+    }
+
+    /// Commit the inline field. A duplicate or invalid name keeps the field open with an Italian
+    /// reason on the field itself and requests focus again.
+    fn commit_label_editor(&mut self) {
+        let Some(editor) = self.label_editor.take() else {
+            return;
+        };
+        let previous = match &editor.mode {
+            LabelEditorMode::Create => None,
+            LabelEditorMode::Rename(id) => self.engine.label(id).map(|label| (label.name.clone(), label.color)),
+        };
+        let color = editor.color.as_str();
+        let result = match &editor.mode {
+            LabelEditorMode::Create => self
+                .engine
+                .call("label_create", json!({ "name": editor.text, "color": color }))
+                .and_then(|value| serde_json::from_value::<LabelCreate>(value).map_err(|error| postino_core::OpError::Failed(error.to_string())))
+                .map(|created| created.label),
+            LabelEditorMode::Rename(id) => self
+                .engine
+                .call("label_update", json!({ "id": id, "name": editor.text, "color": color }))
+                .and_then(|value| serde_json::from_value::<LabelUpdate>(value).map_err(|error| postino_core::OpError::Failed(error.to_string())))
+                .map(|updated| updated.label),
+        };
+        match result {
+            Ok(label) => {
+                self.refresh_labels();
+                match &editor.mode {
+                    LabelEditorMode::Create => {
+                        self.status = format!("Etichetta “{}” creata", label.name);
+                        // Creation is explicitly not undoable: a stale toast from another action
+                        // must not claim it can be reversed.
+                        self.toast = None;
+                        if !editor.apply_to.is_empty() {
+                            self.apply_label(&editor.apply_to, &label.id, true);
+                        }
+                    }
+                    LabelEditorMode::Rename(_) => {
+                        self.status = format!("Etichetta rinominata in “{}”", label.name);
+                        if let Some((name, previous_color)) = previous
+                            && (name != label.name || previous_color != label.color)
+                        {
+                            self.push_toast(
+                                format!("Etichetta rinominata in “{}”", label.name),
+                                UndoAction::LabelRename { id: label.id.clone(), name, color: previous_color },
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                self.label_editor = Some(LabelEditor {
+                    mode: editor.mode,
+                    text: editor.text,
+                    color: editor.color,
+                    error: Some(label_error_message(&error.to_string())),
+                    focus: true,
+                    focused: true,
+                    swatch_focused: false,
+                    apply_to: editor.apply_to,
+                });
+            }
+        }
+    }
+
+    fn request_label_delete(&mut self, id: &str) {
+        let Some(label) = self.engine.label(id) else {
+            self.status = format!("Etichetta {id:?} non trovata");
+            return;
+        };
+        let message_ids = self
+            .engine
+            .messages()
+            .iter()
+            .filter(|message| message.summary.labels.iter().any(|candidate| candidate == id))
+            .map(|message| message.summary.id.clone())
+            .collect::<Vec<_>>();
+        self.label_delete = Some(LabelDeleteState {
+            id: id.to_owned(),
+            name: label.name.clone(),
+            count: u32::try_from(message_ids.len()).unwrap_or(0),
+            message_ids,
+            focus_primary: true,
+        });
+        self.label_editor = None;
+        self.label_menu = None;
+    }
+
+    fn delete_label(&mut self, state: &LabelDeleteState) {
+        match self.engine.call("label_delete", json!({ "id": state.id })) {
+            Ok(value) => match serde_json::from_value::<LabelDelete>(value) {
+                Ok(deleted) => {
+                    self.refresh_labels();
+                    if self.label_filter.as_deref() == Some(state.id.as_str()) {
+                        self.clear_label_filter();
+                    }
+                    let removed = plural(deleted.affected, "messaggio", "messaggi");
+                    let message = format!("Etichetta “{}” eliminata · rimossa da {removed}", deleted.label.name);
+                    self.status = message.clone();
+                    self.push_toast(
+                        message,
+                        UndoAction::LabelDelete { name: deleted.label.name, color: deleted.label.color, message_ids: state.message_ids.clone() },
+                    );
+                }
+                Err(error) => self.status = format!("Errore: {error}"),
+            },
+            Err(error) => self.status = format!("Errore: {error}"),
+        }
+    }
+
+    /// The selection, folder and filters the label menu was opened against. The menu closes rather
+    /// than applying a label to a message the user no longer sees selected.
+    fn label_menu_context(&self, target: Vec<String>) -> LabelMenuContext {
+        LabelMenuContext {
+            target,
+            selection: self.action_ids(),
+            folder: self.folder.clone(),
+            label_filter: self.label_filter.clone(),
+            label_folder: self.label_folder.clone(),
+            query: self.query.clone(),
+            unread_only: self.unread_only,
+            attachments_only: self.attachments_only,
+        }
+    }
+
+    fn label_menu_is_stale(&self) -> bool {
+        let Some(menu) = self.label_menu.as_ref() else {
+            return false;
+        };
+        menu.context.selection != self.action_ids()
+            || menu.context.folder != self.folder
+            || menu.context.label_filter != self.label_filter
+            || menu.context.label_folder != self.label_folder
+            || menu.context.query != self.query
+            || menu.context.unread_only != self.unread_only
+            || menu.context.attachments_only != self.attachments_only
+    }
+
+    fn open_label_menu(&mut self, target: Vec<String>) {
+        if target.is_empty() {
+            self.status = "Seleziona un messaggio per applicare un'etichetta".to_owned();
+            return;
+        }
+        let context = self.label_menu_context(target);
+        self.label_menu = Some(LabelMenuState { context, query: String::new(), focus: true });
+        self.label_editor = None;
+        self.label_delete = None;
+    }
+
+    /// One click applies the label to every target that lacks it; a second removes it everywhere.
+    fn toggle_label_target(&mut self, id: &str) {
+        if self.label_menu_is_stale() {
+            self.label_menu = None;
+            self.status = "La selezione è cambiata: riapri il menu etichetta".to_owned();
+            return;
+        }
+        let Some(menu) = self.label_menu.as_ref() else {
+            return;
+        };
+        let target = menu.context.target.clone();
+        let all = target
+            .iter()
+            .all(|message_id| self.engine.message(message_id).is_some_and(|message| message.summary.labels.iter().any(|label| label == id)));
+        self.apply_label(&target, id, !all);
+    }
+
+    fn apply_label(&mut self, ids: &[String], id: &str, apply: bool) {
+        if ids.is_empty() {
+            return;
+        }
+        let Some(label) = self.engine.label(id).cloned() else {
+            self.status = format!("Etichetta {id:?} non trovata");
+            return;
+        };
+        let before = ids
+            .iter()
+            .filter_map(|message_id| {
+                self.engine.message(message_id).map(|message| (message_id.clone(), message.summary.labels.iter().any(|candidate| candidate == id)))
+            })
+            .filter(|(_, had)| *had != apply)
+            .map(|(message_id, had)| (message_id, id.to_owned(), had))
+            .collect::<Vec<_>>();
+        if before.is_empty() {
+            self.status = if apply { "Etichetta già applicata" } else { "Etichetta non presente" }.to_owned();
+            return;
+        }
+        match self.engine.call("label_apply", json!({ "id": id, "message_ids": ids, "apply": apply })) {
+            Ok(value) => match serde_json::from_value::<LabelApply>(value) {
+                Ok(result) => {
+                    self.refresh_labels();
+                    let count = plural(result.changed, "messaggio", "messaggi");
+                    let message = format!("Etichetta “{}” {} {count}", label.name, if apply { "applicata a" } else { "rimossa da" });
+                    self.status = message.clone();
+                    self.push_toast(message, UndoAction::Labels(before));
+                }
+                Err(error) => self.status = format!("Errore: {error}"),
+            },
+            Err(error) => self.status = format!("Errore: {error}"),
+        }
     }
 
     fn clear_selection(&mut self) {
@@ -347,6 +713,7 @@ impl PostinoApp {
             RowAction::EditDraft => self.edit_draft(id),
             RowAction::MarkRead => self.set_unread_many(&targets, false),
             RowAction::MarkUnread => self.set_unread_many(&targets, true),
+            RowAction::Label => self.open_label_menu(targets),
             RowAction::Star => self.set_starred_many(&targets, true),
             RowAction::Unstar => self.set_starred_many(&targets, false),
             RowAction::Archive => self.move_many(&targets, "archive", "Messaggio archiviato", "Messaggi archiviati"),
@@ -594,6 +961,7 @@ impl PostinoApp {
         };
         self.status = message.clone();
         self.push_toast(message, UndoAction::Unread(changes));
+        self.refresh_labels();
     }
 
     fn mark_read_after_delay(&mut self, id: &str) {
@@ -650,6 +1018,42 @@ impl PostinoApp {
                     error = Some(cause);
                 }
             }
+            UndoAction::Labels(changes) => {
+                for (message_id, label_id, was_applied) in changes {
+                    if let Err(cause) = self.engine.call("label_apply", json!({ "id": label_id, "message_ids": [message_id], "apply": was_applied }))
+                    {
+                        error = Some(cause);
+                        break;
+                    }
+                }
+            }
+            UndoAction::LabelDelete { name, color, message_ids } => match self.engine.call("label_create", json!({ "name": name, "color": color })) {
+                Ok(value) => match serde_json::from_value::<LabelCreate>(value) {
+                    Ok(created) => {
+                        let ids = message_ids.iter().filter(|id| self.engine.message(id).is_some()).cloned().collect::<Vec<_>>();
+                        // A deleted label can carry more assignments than one `label_apply` call
+                        // accepts (500), so restore in chunks instead of failing halfway.
+                        for chunk in ids.chunks(LABEL_APPLY_CHUNK) {
+                            if let Err(cause) =
+                                self.engine.call("label_apply", json!({ "id": created.label.id, "message_ids": chunk, "apply": true }))
+                            {
+                                error = Some(cause);
+                                break;
+                            }
+                        }
+                    }
+                    Err(cause) => error = Some(postino_core::OpError::Failed(cause.to_string())),
+                },
+                Err(cause) => error = Some(cause),
+            },
+            UndoAction::LabelRename { id, name, color } => {
+                if let Err(cause) = self.engine.call("label_update", json!({ "id": id, "name": name, "color": color })) {
+                    error = Some(cause);
+                }
+            }
+        }
+        if error.is_none() {
+            self.refresh_labels();
         }
         match error {
             Some(error) => self.status = format!("Errore: {error}"),
@@ -659,15 +1063,20 @@ impl PostinoApp {
 
     fn visible_messages(&mut self) -> (Vec<MessageSummary>, usize, usize) {
         let searching = !self.query.trim().is_empty();
+        // A label view spans every folder until the user narrows it. A plain view is one folder.
+        let label_scoped = self.label_filter.is_some();
+        let list_folder = if label_scoped { self.label_folder.clone() } else { Some(self.folder.clone()) };
+        let search_folder = if label_scoped { self.label_folder.clone() } else { None };
         let (name, args) = if searching {
-            ("search", json!({ "query": self.query, "limit": 200 }))
+            ("search", json!({ "query": self.query, "label": self.label_filter, "folder": search_folder, "limit": 200 }))
         } else {
             (
                 "messages_list",
                 json!({
-                    "folder": self.folder,
+                    "folder": list_folder,
                     "unread_only": self.unread_only,
                     "with_attachments": self.attachments_only,
+                    "label": self.label_filter,
                     "limit": 200
                 }),
             )
@@ -706,6 +1115,42 @@ impl PostinoApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // The inline label field owns Enter/Escape only while it really has focus. Otherwise a
+        // composer field or the global map keeps the keys instead of a hidden editor swallowing
+        // them.
+        if self.label_editor.as_ref().is_some_and(|editor| editor.focused) {
+            let submit = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+            let cancel = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+            if submit {
+                self.commit_label_editor();
+            }
+            if cancel {
+                self.cancel_label_editor();
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            }
+            return;
+        }
+        // A focused colour swatch keeps Enter/Space/arrows for itself. Escape still cancels.
+        if self.label_editor.as_ref().is_some_and(|editor| editor.swatch_focused) {
+            let cancel = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+            if cancel {
+                self.cancel_label_editor();
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            }
+            return;
+        }
+        // The modal consumes Escape itself; the label menu closes on Escape or its close button.
+        if self.label_delete.is_some() {
+            return;
+        }
+        if self.label_menu.is_some() {
+            let close = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
+            if close {
+                self.label_menu = None;
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            }
+            return;
+        }
         if self.composer.open {
             let send = ctx.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Enter));
             let escape = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
@@ -737,7 +1182,12 @@ impl PostinoApp {
         let mut reply = false;
         let mut reply_all = false;
         let mut forward = false;
-        let typing = ctx.egui_wants_keyboard_input();
+        let mut labels = false;
+        let mut rename_label = false;
+        // Only a real text field may swallow the single-key map. `egui_wants_keyboard_input()`
+        // is also true for a focused row or button, and clicking a label left the app deaf to
+        // F2/L/J/K/? until Esc.
+        let typing = ctx.text_edit_focused();
         ctx.input(|input| {
             palette = input.modifiers.command && input.key_pressed(Key::K);
             escape = input.key_pressed(Key::Escape);
@@ -759,6 +1209,8 @@ impl PostinoApp {
             reply = !typing && !input.modifiers.command && input.key_pressed(Key::R);
             reply_all = !typing && !input.modifiers.command && input.key_pressed(Key::A);
             forward = !typing && !input.modifiers.command && input.key_pressed(Key::F);
+            labels = !typing && !input.modifiers.command && input.key_pressed(Key::L);
+            rename_label = !typing && !input.modifiers.command && input.key_pressed(Key::F2);
         });
         if palette {
             self.show_palette = !self.show_palette;
@@ -790,7 +1242,7 @@ impl PostinoApp {
                 self.show_about = false;
             } else if typing {
                 ctx.memory_mut(|memory| memory.stop_text_input());
-            } else if self.reading_full {
+            } else if self.reading_full && !reading_overlay(ctx.content_rect().width()) {
                 self.reading_full = false;
             } else if self.reading_open {
                 self.close_reading();
@@ -800,6 +1252,9 @@ impl PostinoApp {
         }
         if self.show_palette || self.show_shortcuts || self.show_about {
             return;
+        }
+        if rename_label && let Some(id) = self.label_filter.clone() {
+            self.start_label_rename(&id);
         }
         if focus_search {
             self.focus_search = true;
@@ -818,6 +1273,10 @@ impl PostinoApp {
                 self.reply_to(&id, ComposeMode::Forward);
             }
         }
+        if labels {
+            let ids = self.action_ids();
+            self.open_label_menu(ids);
+        }
         if select_all {
             let (rows, _, _) = self.visible_messages();
             self.select_all(&rows);
@@ -827,7 +1286,9 @@ impl PostinoApp {
         }
         if enter {
             if self.reading_open {
-                self.reading_full = true;
+                if !reading_overlay(ctx.content_rect().width()) {
+                    self.reading_full = true;
+                }
             } else if let Some(id) = self.selected.clone() {
                 self.open_message(id);
             }
@@ -888,6 +1349,7 @@ impl PostinoApp {
         self.show_palette = false;
         self.show_shortcuts = false;
         self.show_about = false;
+        self.label_menu = None;
     }
 
     fn compose_new(&mut self) {
@@ -1242,7 +1704,8 @@ impl PostinoApp {
                     }
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(search_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-                    let _ = SearchField::new(&mut self.query, "Cerca in tutte le mail…").width(search_width).focus(self.focus_search).show(ui);
+                    let placeholder = self.search_placeholder();
+                    let _ = SearchField::new(&mut self.query, &placeholder).width(search_width).focus(self.focus_search).show(ui);
                     if self.focus_search {
                         self.focus_search = false;
                     }
@@ -1270,81 +1733,231 @@ impl PostinoApp {
             .show_separator_line(false)
             .show(ui, |ui| {
                 let footer_height = 42.0;
-                let scroll_height = (ui.available_height() - footer_height).max(80.0);
+                let labels = self.labels_cache.clone();
+                let editor_open = self.label_editor.is_some();
                 let mut folder_action = None;
-                egui::ScrollArea::vertical().max_height(scroll_height).auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    SectionHeader::new("CARTELLE").show(ui);
-                    ui.add_space(space::XS);
-                    let folders = self.engine.folders().to_vec();
-                    for folder in folders {
-                        let meta = if folder.kind == FolderKind::Drafts && folder.total > 0 {
-                            folder.total.to_string()
-                        } else if folder.unread > 0 {
-                            folder.unread.to_string()
-                        } else {
-                            String::new()
-                        };
-                        let row = ListRow::folder(folder.name.as_str(), meta.as_str())
-                            .icon(folder_icon(folder.kind))
-                            .selected(self.folder == folder.id)
-                            .height(32.0);
-                        let response = row.show(ui);
-                        if response.clicked() {
-                            self.select_folder(folder.id.clone());
-                        }
-                        response.context_menu(|ui| {
-                            let items = [
-                                MenuItem::new("Nuova etichetta").enabled(false).reason("Le etichette arrivano in U0.5"),
-                                MenuItem::new("Rinomina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
-                                MenuItem::new("Elimina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
-                                MenuItem::separator(),
-                                menu_item("mark_folder_read"),
-                            ];
-                            if let Some(4) = Menu::new(&items).show(ui) {
-                                folder_action = Some((folder.id.clone(), FolderAction::MarkAllRead));
-                                ui.close();
-                            }
-                        });
-                    }
-                    ui.add_space(space::LG);
-                    SectionHeader::new("ETICHETTE").show(ui);
-                    ui.add_space(space::XS);
-                    for (label, color) in [("Lavoro", theme::GOLD), ("Personale", t.success), ("Fatture", t.danger)] {
-                        label_row(ui, label, color, &t);
-                    }
+                let mut label_action = None;
+                let mut editor_action = LabelEditorAction::None;
+
+                // Footer first so it stays pinned; everything above it is one scroll area. At
+                // 980×600 with the inline editor open the content overflows, and the scroll bar is
+                // the affordance that keeps Cestino and the label rows reachable. Two fixed
+                // sub-panels used to clip the folder list instead of scrolling it.
+                egui::Panel::bottom("sidebar-footer").exact_size(footer_height).frame(Frame::NONE).show_separator_line(false).show(ui, |ui| {
+                    ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                        ui.label(typography::text(Role::Caption, format!("Postino {} · M0 + U0.5", env!("CARGO_PKG_VERSION")), t.text_faint));
+                        ui.label(typography::text(Role::Caption, "Locale · offline", t.text_faint));
+                    });
                 });
+
+                #[cfg(test)]
+                probe::clear_rows(ui);
+                // A visible bar, local to the sidebar: egui's default is a 2 pt floating sliver
+                // that only appears on hover, which at 980×600 hid the overflow instead of
+                // revealing it. Text colour on ivory is 10:1, and on the dark panel 12:1.
+                ui.spacing_mut().scroll = sidebar_scroll_style();
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt("sidebar-scroll")
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                    .show(ui, |ui| {
+                        // Rows sit flush instead of carrying a two-pixel gap each.
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.scope(|ui| {
+                            ui.spacing_mut().interact_size.y = 20.0;
+                            SectionHeader::new("CARTELLE").show(ui);
+                        });
+                        ui.add_space(space::XS);
+                        let folders = self.engine.folders().to_vec();
+                        for folder in folders {
+                            let meta = if folder.kind == FolderKind::Drafts && folder.total > 0 {
+                                folder.total.to_string()
+                            } else if folder.unread > 0 {
+                                folder.unread.to_string()
+                            } else {
+                                String::new()
+                            };
+                            let row = ListRow::folder(folder.name.as_str(), meta.as_str())
+                                .icon(folder_icon(folder.kind))
+                                .selected(if self.label_filter.is_some() {
+                                    self.label_folder.as_deref() == Some(folder.id.as_str())
+                                } else {
+                                    self.folder == folder.id
+                                })
+                                .height(32.0);
+                            let response = row.show(ui);
+                            #[cfg(test)]
+                            probe::row(ui, &folder.name, response.rect);
+                            if response.clicked() {
+                                self.select_folder(folder.id.clone());
+                            }
+                            response.context_menu(|ui| {
+                                let items = [
+                                    menu_item("label_new"),
+                                    MenuItem::new("Rinomina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
+                                    MenuItem::new("Elimina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
+                                    MenuItem::separator(),
+                                    menu_item("mark_folder_read"),
+                                ];
+                                match Menu::new(&items).show(ui) {
+                                    Some(0) => {
+                                        label_action = Some(LabelAction::New);
+                                        ui.close();
+                                    }
+                                    Some(4) => {
+                                        folder_action = Some((folder.id.clone(), FolderAction::MarkAllRead));
+                                        ui.close();
+                                    }
+                                    _ => {}
+                                }
+                            });
+                        }
+
+                        ui.add_space(space::LG);
+                        if ui
+                            .scope(|ui| {
+                                ui.spacing_mut().interact_size.y = 20.0;
+                                SectionHeader::new("ETICHETTE").count(labels.len()).action(icons::PLUS, "Nuova etichetta").show(ui)
+                            })
+                            .inner
+                            .is_some_and(|response| response.clicked())
+                        {
+                            label_action = Some(LabelAction::New);
+                        }
+                        ui.add_space(space::XS);
+                        // The editor lives directly under the ETICHETTE header, before the rows,
+                        // so the field, its error, the palette and the pointer controls stay
+                        // together however long the list grows.
+                        if let Some(editor) = self.label_editor.as_mut() {
+                            let focus = editor.focus;
+                            let editor_scope = ui.scope(|ui| label_editor_widget(ui, editor, &t));
+                            let rect = editor_scope.response.rect;
+                            if focus {
+                                // Opening the editor must reveal it, not leave its controls under
+                                // the footer at the minimum window size.
+                                ui.scroll_to_rect(rect.expand2(Vec2::new(0.0, space::MD)), Some(Align::BOTTOM));
+                            }
+                            editor_action = editor_scope.inner;
+                        }
+                        for label in &labels {
+                            let meta = if label.unread_count > 0 { label.unread_count.to_string() } else { String::new() };
+                            let detail = format!(
+                                "{} · {} · conteggi su tutte le cartelle",
+                                messages_text(label.message_count as usize),
+                                unread_text(label.unread_count as usize)
+                            );
+                            let selected = self.label_filter.as_deref() == Some(label.id.as_str());
+                            let row = ListRow::folder(&label.name, &meta)
+                                .subtitle(&detail)
+                                .dot(label_dot(label.color, &t, selected))
+                                .selected(selected)
+                                .height(32.0);
+                            let id = label.id.clone();
+                            let response = row.show(ui);
+                            #[cfg(test)]
+                            probe::row(ui, &label.name, response.rect);
+                            if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
+                                self.select_label(id.clone());
+                            }
+                            response.context_menu(|ui| {
+                                let items = [menu_item("label_rename"), menu_item("label_delete").danger(true)];
+                                match Menu::new(&items).show(ui) {
+                                    Some(0) => {
+                                        label_action = Some(LabelAction::Rename(id.clone()));
+                                        ui.close();
+                                    }
+                                    Some(1) => {
+                                        label_action = Some(LabelAction::Delete(id.clone()));
+                                        ui.close();
+                                    }
+                                    _ => {}
+                                }
+                            });
+                        }
+                        if labels.is_empty() && !editor_open {
+                            ui.label(typography::text(Role::Caption, "Nessuna etichetta. Usa + per crearne una.", t.text_faint));
+                        }
+                    });
+                #[cfg(test)]
+                probe::scroll(ui, scroll.inner_rect, scroll.content_size);
+                #[cfg(not(test))]
+                let _ = scroll;
+
                 if let Some((folder, FolderAction::MarkAllRead)) = folder_action {
                     self.mark_all_read(&folder);
                 }
-                let remaining = ui.available_height();
-                if remaining > footer_height {
-                    ui.add_space(remaining - footer_height);
+                match label_action {
+                    // `+` while editing only returns focus to the field; the draft stays.
+                    Some(LabelAction::New) => self.start_label_create_or_focus(),
+                    Some(LabelAction::Rename(id)) => self.start_label_rename(&id),
+                    Some(LabelAction::Delete(id)) => self.request_label_delete(&id),
+                    None => {}
                 }
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.label(typography::text(Role::Caption, format!("Postino {} · M0 + U0.4", env!("CARGO_PKG_VERSION")), t.text_faint));
-                    ui.label(typography::text(Role::Caption, "Locale · offline", t.text_faint));
-                });
+                match editor_action {
+                    LabelEditorAction::Save => self.commit_label_editor(),
+                    LabelEditorAction::Cancel => self.cancel_label_editor(),
+                    LabelEditorAction::None => {}
+                }
             });
     }
 
     fn list_panel(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
-        let folder_name =
+        let current_folder_name =
             self.engine.folders().iter().find(|folder| folder.id == self.folder).map_or_else(|| "Posta".to_owned(), |folder| folder.name.clone());
+        let narrowed_folder_name =
+            self.label_folder.as_deref().and_then(|id| self.engine.folders().iter().find(|folder| folder.id == id)).map(|folder| folder.name.clone());
+        let label_filter = self
+            .label_filter
+            .as_deref()
+            .and_then(|id| self.label_summary(id))
+            .map(|label| (label.id.clone(), label.name.clone(), label_color(label.color, &t)));
         let (rows, total, unread) = self.visible_messages();
         self.prune_selection(&rows);
         let searching = !self.query.trim().is_empty();
         let multi = self.selection.len() > 1;
+        let mut clear_filter = false;
+        // The header always names the scope, so the label counts cannot read as folder-local.
+        let scope = label_filter.as_ref().map(|(_, _, _)| match &narrowed_folder_name {
+            Some(name) => format!("in {name}"),
+            None => "in tutte le cartelle".to_owned(),
+        });
+        let meta = match &scope {
+            Some(scope) => format!("{} · {} · {scope}", unread_text(unread), messages_text(total)),
+            None => format!("{} · {}", unread_text(unread), messages_text(total)),
+        };
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
             if multi {
                 self.bulk_bar(ui, &t);
             } else {
-                ui.horizontal(|ui| {
-                    ui.label(typography::strong(Role::Section, folder_name, t.text));
-                    ui.add_space(space::SM);
-                    ui.label(typography::text(Role::Meta, format!("{unread} non letti · {total}"), t.text_muted));
-                });
+                // The action is reserved first so it can never be clipped; the title and the scope
+                // share the remaining width on two lines. At 1280 with the reading pane open the
+                // list is about 375 px wide and the scope would not fit beside the title.
+                let title = label_filter.as_ref().map_or(current_folder_name.clone(), |(_, name, _)| name.clone());
+                Sides::new().height(40.0).shrink_left().show(
+                    ui,
+                    |ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.horizontal(|ui| {
+                                if let Some((_, _, color)) = &label_filter {
+                                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                    ui.painter().circle_filled(rect.center(), 3.0, *color);
+                                    ui.add_space(space::XS);
+                                }
+                                ui.add(egui::Label::new(typography::strong(Role::Section, title.as_str(), t.text)).truncate().selectable(false));
+                            });
+                            let response =
+                                ui.add(egui::Label::new(typography::text(Role::Meta, meta.as_str(), t.text_muted)).truncate().selectable(false));
+                            response.on_hover_text(meta.as_str());
+                        });
+                    },
+                    |ui| {
+                        if label_filter.is_some() && Button::ghost("Mostra tutte").size(ButtonSize::Sm).show(ui).clicked() {
+                            clear_filter = true;
+                        }
+                    },
+                );
                 ui.add_space(space::XS);
                 ui.horizontal(|ui| {
                     if Chip::new("Tutti").selected(!self.unread_only && !self.attachments_only).show(ui).clicked() {
@@ -1372,9 +1985,11 @@ impl PostinoApp {
             if rows.is_empty() {
                 let mut empty_action = None;
                 let background = ui.interact(ui.available_rect_before_wrap(), ui.id().with("empty-list-menu"), Sense::click());
+                let has_label_filter = label_filter.is_some();
                 background.context_menu(|ui| {
                     let items = [
-                        MenuItem::new("Nuova etichetta").enabled(false).reason("Le etichette arrivano in U0.5"),
+                        menu_item("label_new"),
+                        menu_item("label_clear_filter").enabled(has_label_filter).reason("Nessun filtro etichetta attivo"),
                         MenuItem::separator(),
                         menu_item("refresh"),
                         menu_item("select_all").enabled(false).reason("Non ci sono messaggi da selezionare"),
@@ -1382,38 +1997,52 @@ impl PostinoApp {
                         MenuItem::new("Cancella ricerca").icon(icons::CLOSE).enabled(searching).reason("Nessuna ricerca attiva"),
                     ];
                     match Menu::new(&items).show(ui) {
-                        Some(2) => {
+                        Some(0) => {
+                            empty_action = Some(EmptyAction::NewLabel);
+                            ui.close();
+                        }
+                        Some(1) => {
+                            empty_action = Some(EmptyAction::ClearLabel);
+                            ui.close();
+                        }
+                        Some(3) => {
                             empty_action = Some(EmptyAction::Refresh);
                             ui.close();
                         }
-                        Some(4) => {
+                        Some(5) => {
                             empty_action = Some(EmptyAction::Compose);
                             ui.close();
                         }
-                        Some(5) => {
+                        Some(6) => {
                             empty_action = Some(EmptyAction::ClearSearch);
                             ui.close();
                         }
                         _ => {}
                     }
                 });
-                let (icon, title, body, action) = if searching {
-                    (icons::SEARCH, "Nessun risultato", "Nessun messaggio corrisponde alla ricerca.", Some("Cancella ricerca"))
+                let label_name = label_filter.as_ref().map(|(_, name, _)| name.as_str());
+                let (icon, title, body, action) = if let Some(name) = label_name {
+                    let scope = scope.clone().unwrap_or_else(|| "in tutte le cartelle".to_owned());
+                    (icons::TAG, "Nessun messaggio", format!("Nessun messaggio con l'etichetta “{name}” {scope}."), Some("Mostra tutte"))
+                } else if searching {
+                    (icons::SEARCH, "Nessun risultato", "Nessun messaggio corrisponde alla ricerca.".to_owned(), Some("Cancella ricerca"))
                 } else if self.folder == "drafts" {
-                    (icons::DRAFTS, "Nessuna bozza", "Le bozze si salvano da sole mentre scrivi.", Some("Scrivi"))
+                    (icons::DRAFTS, "Nessuna bozza", "Le bozze si salvano da sole mentre scrivi.".to_owned(), Some("Scrivi"))
                 } else if self.folder == "inbox" {
-                    (icons::INBOX, "Nessun messaggio", "La posta in arrivo è vuota.", None)
+                    (icons::INBOX, "Nessun messaggio", "La posta in arrivo è vuota.".to_owned(), None)
                 } else {
-                    (icons::INBOX, "Nessun messaggio", "Questa cartella è vuota.", Some("Vai a Posta in arrivo"))
+                    (icons::INBOX, "Nessun messaggio", "Questa cartella è vuota.".to_owned(), Some("Vai a Posta in arrivo"))
                 };
-                let mut state = EmptyState::new(icon, title, body);
+                let mut state = EmptyState::new(icon, title, &body);
                 if let Some(action) = action {
                     state = state.action(action);
                 }
                 if let Some(response) = state.show(ui)
                     && response.clicked()
                 {
-                    if searching {
+                    if label_name.is_some() {
+                        self.clear_label_filter();
+                    } else if searching {
                         self.query.clear();
                     } else if self.folder == "drafts" {
                         self.compose_new();
@@ -1422,6 +2051,8 @@ impl PostinoApp {
                     }
                 }
                 match empty_action {
+                    Some(EmptyAction::NewLabel) => self.start_label_create(),
+                    Some(EmptyAction::ClearLabel) => self.clear_label_filter(),
                     Some(EmptyAction::Refresh) => self.status = "Dati demo già aggiornati".to_owned(),
                     Some(EmptyAction::Compose) => self.compose_new(),
                     Some(EmptyAction::ClearSearch) => self.query.clear(),
@@ -1435,24 +2066,34 @@ impl PostinoApp {
             let mut context_clicked = None;
             let mut context_action = None;
             let modifiers = ui.input(|input| input.modifiers);
+            let list_width = ui.available_width();
+            let show_avatars = show_list_avatars(list_width);
+            // A list squeezed by the 52% reading pane trades sender/date space for the subject.
+            let sender_width = if list_width < 560.0 { 96.0 } else { 140.0 };
+            let date_width = if list_width < 560.0 { 44.0 } else { 52.0 };
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let mut focus_rect = None;
-                egui_extras::TableBuilder::new(ui)
+                let mut table = egui_extras::TableBuilder::new(ui)
                     .id_salt("message-list")
                     .striped(false)
                     .resizable(false)
                     .sense(Sense::click())
                     .auto_shrink([false, false])
                     .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(egui_extras::Column::exact(12.0))
-                    .column(egui_extras::Column::exact(30.0))
-                    .column(egui_extras::Column::exact(140.0))
-                    .column(egui_extras::Column::exact(52.0))
+                    .column(egui_extras::Column::exact(12.0));
+                if show_avatars {
+                    table = table.column(egui_extras::Column::exact(30.0));
+                }
+                table
+                    .column(egui_extras::Column::exact(sender_width))
+                    .column(egui_extras::Column::exact(date_width))
                     .column(egui_extras::Column::remainder())
                     .column(egui_extras::Column::exact(24.0))
                     .header(24.0, |mut header| {
                         header.col(|_| {});
-                        header.col(|_| {});
+                        if show_avatars {
+                            header.col(|_| {});
+                        }
                         header.col(|ui| {
                             ui.add(egui::Label::new(typography::text(Role::Caption, "MITTENTE", t.text_faint)).selectable(false));
                         });
@@ -1477,15 +2118,17 @@ impl PostinoApp {
                                         ui.painter().circle_filled(rect.center(), 3.0, GOLD);
                                     }
                                 });
-                                row.col(|ui| {
-                                    avatar(
-                                        ui,
-                                        24.0,
-                                        &message.from.initials(),
-                                        if selected { GOLD } else { t.panel_alt },
-                                        if selected { theme::FOREST } else { t.text },
-                                    );
-                                });
+                                if show_avatars {
+                                    row.col(|ui| {
+                                        avatar(
+                                            ui,
+                                            24.0,
+                                            &message.from.initials(),
+                                            if selected { GOLD } else { t.panel_alt },
+                                            if selected { theme::FOREST } else { t.text },
+                                        );
+                                    });
+                                }
                                 row.col(|ui| {
                                     let name =
                                         if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
@@ -1606,22 +2249,32 @@ impl PostinoApp {
                 self.run_row_action(&id, action);
             }
         });
+        if clear_filter {
+            self.clear_label_filter();
+        }
     }
 
-    fn reading_pane(&mut self, ui: &mut Ui) {
+    /// `full` is the overlay/full-screen path: the reading pane covers the list and offers
+    /// "Torna alla posta". It is used for the explicit full-screen mode and below
+    /// [`READING_PANE_MIN_WIDTH`], where a side pane cannot keep a usable list.
+    fn reading_pane(&mut self, ui: &mut Ui, full: bool) {
         if !self.reading_open {
             return;
         }
         let t = theme::tokens(self.dark);
-        if self.reading_full {
+        if full {
             egui::CentralPanel::default()
                 .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::XXL, inset::XL)))
                 .show(ui, |ui| self.reading_content(ui, &t, true));
         } else {
+            let available = ui.ctx().content_rect().width();
+            let default_width = reading_pane_width(available);
+            let max_width = (available * READING_PANE_MAX_RATIO).max(READING_PANE_MIN_SIZE);
             egui::Panel::right("reading")
                 .resizable(true)
-                .default_size(600.0)
-                .min_size(420.0)
+                .default_size(default_width)
+                .min_size(READING_PANE_MIN_SIZE)
+                .max_size(max_width)
                 .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::LG, inset::XL)))
                 .show(ui, |ui| self.reading_content(ui, &t, false));
         }
@@ -1633,6 +2286,8 @@ impl PostinoApp {
             self.close_reading();
             return;
         };
+        #[cfg(test)]
+        probe::clear_actions(ui);
         let is_draft = self
             .engine
             .folders()
@@ -1645,6 +2300,9 @@ impl PostinoApp {
             |ui| {
                 let mut action = None;
                 let compact = ui.available_width() < 560.0;
+                // Below the pane breakpoint the reading view is an overlay with no list behind it,
+                // so it must keep Back and the two triage actions a user reaches for most.
+                let overlay = reading_overlay(ui.ctx().content_rect().width());
                 if full {
                     if Button::ghost(command_label("back", "Torna alla posta"))
                         .icon(command_icon("back", icons::ARROW_LEFT))
@@ -1654,13 +2312,31 @@ impl PostinoApp {
                     {
                         action = Some(ReadingAction::Back);
                     }
+                    #[cfg(test)]
+                    probe::action(ui, "back");
+                    if overlay {
+                        if IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia")).show(ui).clicked() {
+                            action = Some(ReadingAction::Archive);
+                        }
+                        #[cfg(test)]
+                        probe::action(ui, "archive");
+                        if IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina")).danger(true).show(ui).clicked() {
+                            action = Some(ReadingAction::Delete);
+                        }
+                        #[cfg(test)]
+                        probe::action(ui, "delete");
+                    }
                 } else if compact {
                     if IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia")).show(ui).clicked() {
                         action = Some(ReadingAction::Archive);
                     }
+                    #[cfg(test)]
+                    probe::action(ui, "archive");
                     if IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina")).danger(true).show(ui).clicked() {
                         action = Some(ReadingAction::Delete);
                     }
+                    #[cfg(test)]
+                    probe::action(ui, "delete");
                 } else {
                     if Button::new(command_label("archive", "Archivia"))
                         .icon(command_icon("archive", icons::ARCHIVE))
@@ -1670,6 +2346,8 @@ impl PostinoApp {
                     {
                         action = Some(ReadingAction::Archive);
                     }
+                    #[cfg(test)]
+                    probe::action(ui, "archive");
                     if Button::danger(command_label("delete", "Elimina"))
                         .icon(command_icon("delete", icons::TRASH))
                         .shortcut(command_shortcut("delete", "Canc"))
@@ -1678,6 +2356,8 @@ impl PostinoApp {
                     {
                         action = Some(ReadingAction::Delete);
                     }
+                    #[cfg(test)]
+                    probe::action(ui, "delete");
                 }
                 ui.add_space(space::SM);
                 if is_draft {
@@ -1752,6 +2432,24 @@ impl PostinoApp {
                 ui.label(typography::mono(format_when(message.summary.date), 11.0, t.text_faint));
             },
         );
+        let mut chip_filter = None;
+        if !message.summary.labels.is_empty() {
+            let labels = self.labels_cache.clone();
+            ui.add_space(space::SM);
+            ui.horizontal_wrapped(|ui| {
+                for id in &message.summary.labels {
+                    if let Some(label) = labels.iter().find(|label| &label.id == id)
+                        && Chip::new(label.name.as_str()).dot(label_color(label.color, t)).show(ui).clicked()
+                    {
+                        chip_filter = Some(label.id.clone());
+                    }
+                }
+            });
+        }
+        if let Some(id) = chip_filter {
+            self.select_label(id);
+            return;
+        }
         ui.add_space(space::MD);
         ui.separator();
         ui.add_space(space::MD);
@@ -1825,7 +2523,15 @@ impl PostinoApp {
             Some(ReadingAction::Read) => self.toggle_read(),
             Some(ReadingAction::Close) => self.close_reading(),
             Some(ReadingAction::Expand) => self.reading_full = true,
-            Some(ReadingAction::Back) => self.reading_full = false,
+            Some(ReadingAction::Back) => {
+                // In the narrow overlay the back button leaves the reading pane entirely; only the
+                // wide window has a list to return to under the full-screen pane.
+                if reading_overlay(ui.ctx().content_rect().width()) {
+                    self.close_reading();
+                } else {
+                    self.reading_full = false;
+                }
+            }
             None => {}
         }
     }
@@ -1911,7 +2617,7 @@ impl PostinoApp {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Postino").font(FontId::new(22.0, theme::display())).color(t.text));
-                    ui.label(RichText::new(format!("{} · M0 + U0.4", env!("CARGO_PKG_VERSION"))).size(11.0).color(t.text_muted));
+                    ui.label(RichText::new(format!("{} · M0 + U0.5", env!("CARGO_PKG_VERSION"))).size(11.0).color(t.text_muted));
                 });
             });
             ui.add_space(12.0);
@@ -1980,17 +2686,18 @@ impl PostinoApp {
                     if up {
                         self.palette_selected = (self.palette_selected + filtered.len() - 1) % filtered.len();
                     }
-                    let has_message = self.selected.is_some();
-                    if enter {
-                        let command = filtered[self.palette_selected];
-                        if !command.needs_message || has_message {
+                    if enter && let Some(command) = filtered.get(self.palette_selected) {
+                        if self.command_enabled(command) {
                             chosen = Some(command.id);
+                        } else {
+                            // Enter on a disabled command must say why instead of doing nothing.
+                            self.status = format!("{}: {}", command.label, command.rule.disabled_reason());
                         }
                     }
                     ui.add_space(space::SM);
                     egui::ScrollArea::vertical().max_height(330.0).auto_shrink([false, true]).show(ui, |ui| {
                         for (index, command) in filtered.iter().enumerate() {
-                            let enabled = !command.needs_message || has_message;
+                            let enabled = self.command_enabled(command);
                             let selected = index == self.palette_selected;
                             let response = Button::ghost(command.label)
                                 .icon(command.icon)
@@ -1998,9 +2705,9 @@ impl PostinoApp {
                                 .full_width()
                                 .selected(selected)
                                 .enabled(enabled)
-                                .disabled_reason("Seleziona prima un messaggio")
+                                .disabled_reason(command.rule.disabled_reason())
                                 .show(ui);
-                            if response.clicked() {
+                            if chosen.is_none() && response.clicked() {
                                 chosen = Some(command.id);
                             }
                             if selected && navigated {
@@ -2008,6 +2715,15 @@ impl PostinoApp {
                             }
                         }
                     });
+                    // Hover is not a visible affordance on the keyboard path: spell the refusal out
+                    // under the list whenever the selected command is unavailable.
+                    if let Some(command) = filtered.get(self.palette_selected)
+                        && !self.command_enabled(command)
+                        && let Some(reason) = command.rule.reason()
+                    {
+                        ui.add_space(space::XS);
+                        ui.label(typography::text(Role::Meta, reason, t.text_muted));
+                    }
                 }
                 ui.add_space(space::XS);
                 ui.label(typography::text(Role::Caption, "↑↓ scegli · Invio esegue · Esc chiude", t.text_faint));
@@ -2070,6 +2786,156 @@ impl PostinoApp {
         self.show_shortcuts = open;
     }
 
+    /// The searchable checkbox menu opened by `L`, by the row context menu and by the reading
+    /// shortcut. It is modal: a scrim blocks the shell behind it, Escape or an outside click
+    /// closes it, and the targets captured when it opened are the only messages it can touch.
+    fn label_menu_window(&mut self, ui: &mut Ui) {
+        if self.label_menu.is_none() {
+            return;
+        }
+        // The selection, folder or filters changed while the menu was open: the user is no longer
+        // looking at the targets they acted on, so drop the menu instead of labelling blind.
+        if self.label_menu_is_stale() {
+            self.label_menu = None;
+            return;
+        }
+        let t = theme::tokens(self.dark);
+        let labels = self.labels_cache.clone();
+        let Some(state) = self.label_menu.as_ref() else {
+            return;
+        };
+        let target = state.context.target.clone();
+        let mut query = state.query.clone();
+        let mut focus = state.focus;
+        // One pass over the targets, not one scan per label × target.
+        let mut applied_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for message_id in &target {
+            if let Some(message) = self.engine.message(message_id) {
+                for id in &message.summary.labels {
+                    *applied_counts.entry(id.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut toggle = None;
+        let mut create = false;
+        #[cfg(test)]
+        probe::clear_menu_rows(ui);
+        let response = egui::Modal::new(Id::new("postino-label-menu"))
+            // Over the list, not the reading pane: the chips behind stay visible and the menu sits
+            // next to the rows it labels.
+            .area(egui::Modal::default_area(Id::new("postino-label-menu")).anchor(Align2::LEFT_TOP, Vec2::new(ui_size::SIDEBAR + 24.0, 120.0)))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(304.0);
+                ui.label(typography::strong(Role::BodySmall, "Etichetta", t.text));
+                ui.add_space(space::XS);
+                ui.label(typography::text(
+                    Role::Meta,
+                    format!("{} selezionat{}", messages_text(target.len()), if target.len() == 1 { "o" } else { "i" }),
+                    t.text_muted,
+                ));
+                ui.add_space(space::SM);
+                let focus_now = focus;
+                focus = false;
+                SearchField::new(&mut query, "Cerca etichetta…").width(304.0).focus(focus_now).show(ui);
+                ui.add_space(space::SM);
+                let lowercase = query.trim().to_lowercase();
+                let filtered =
+                    labels.iter().filter(|label| lowercase.is_empty() || label.name.to_lowercase().contains(&lowercase)).collect::<Vec<_>>();
+                if labels.is_empty() {
+                    Button::new("Nessuna etichetta")
+                        .enabled(false)
+                        .disabled_reason("Crea la prima etichetta con “Nuova etichetta…”")
+                        .full_width()
+                        .show(ui);
+                } else if filtered.is_empty() {
+                    ui.label(typography::text(Role::BodySmall, "Nessuna etichetta corrisponde.", t.text_muted));
+                } else {
+                    egui::ScrollArea::vertical().max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for label in filtered {
+                            let applied = applied_counts.get(&label.id).copied().unwrap_or(0);
+                            let all = !target.is_empty() && applied == target.len();
+                            let some = applied > 0 && !all;
+                            // The coloured dot carries the label identity, matching the sidebar, the
+                            // header and the reading chips; the trailing glyph carries the state.
+                            let mut row = Button::ghost(label.name.as_str()).dot(label_color(label.color, &t)).full_width();
+                            if all {
+                                row = row.trailing_icon(icons::CHECK_CIRCLE);
+                            } else if some {
+                                row = row.trailing_icon(icons::MINUS);
+                            }
+                            let response = row.show(ui);
+                            #[cfg(test)]
+                            probe::menu_row(ui, &label.id, response.rect);
+                            if response.clicked() {
+                                toggle = Some(label.id.clone());
+                            }
+                        }
+                    });
+                }
+                ui.add_space(space::XS);
+                if Button::ghost("Nuova etichetta…").icon(icons::PLUS).full_width().show(ui).clicked() {
+                    create = true;
+                }
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Caption, "Etichette locali, in memoria fino a M1.", t.text_faint));
+            });
+        if let Some(menu) = self.label_menu.as_mut() {
+            menu.query = query;
+            menu.focus = focus;
+        }
+        if response.should_close() {
+            self.label_menu = None;
+            ui.ctx().memory_mut(|memory| memory.stop_text_input());
+        }
+        if let Some(id) = toggle {
+            self.toggle_label_target(&id);
+        }
+        if create {
+            self.start_label_create_for(target);
+        }
+    }
+
+    fn label_delete_dialog(&mut self, ui: &mut Ui) {
+        let Some(state) = self.label_delete.clone() else {
+            return;
+        };
+        let targets = plural(state.count as usize, "messaggio", "messaggi");
+        let body = format!(
+            "L'etichetta “{}” sarà rimossa da {targets}. Le mail non vengono eliminate; le etichette sono metadati locali in memoria fino a M1. Puoi annullare per 8 secondi.",
+            state.name
+        );
+        let mut confirm = false;
+        let mut cancel = false;
+        // Focus the destructive action on the first frame so Enter confirms and Esc cancels with
+        // no mouse. Later frames keep whatever the user tabbed to.
+        let focus_primary = state.focus_primary;
+        if let Some(state) = self.label_delete.as_mut() {
+            state.focus_primary = false;
+        }
+        let response = egui::Modal::new(egui::Id::new("postino-label-delete")).frame(Frame::NONE).show(ui.ctx(), |ui| {
+            let response =
+                Dialog::new("Eliminare l'etichetta?", &body, "Elimina").secondary("Annulla").danger(true).focus_primary(focus_primary).show(ui);
+            confirm = response.primary;
+            cancel = response.secondary;
+        });
+        if confirm {
+            self.label_delete = None;
+            self.delete_label(&state);
+        } else if cancel || response.should_close() {
+            self.label_delete = None;
+        }
+    }
+
+    fn command_enabled(&self, command: &Command) -> bool {
+        match command.rule {
+            CommandRule::Always => true,
+            CommandRule::Message => self.selected.is_some(),
+            CommandRule::ActiveLabel => self.label_filter.is_some(),
+            CommandRule::LabelFilter => self.label_filter.is_some(),
+        }
+    }
+
     fn execute_command(&mut self, id: &'static str, ctx: &egui::Context) {
         self.show_palette = false;
         ctx.memory_mut(|memory| memory.stop_text_input());
@@ -2117,6 +2983,28 @@ impl PostinoApp {
             "unstar" => self.set_starred(false),
             "archive" => self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati"),
             "delete" => self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            "label_menu" => {
+                let ids = self.action_ids();
+                self.open_label_menu(ids);
+            }
+            "label_new" => self.start_label_create(),
+            "label_rename" => {
+                if let Some(id) = self.label_filter.clone() {
+                    self.start_label_rename(&id);
+                }
+            }
+            "label_delete" => {
+                if let Some(id) = self.label_filter.clone() {
+                    self.request_label_delete(&id);
+                }
+            }
+            "label_clear_filter" => {
+                if self.label_filter.is_some() {
+                    self.clear_label_filter();
+                } else {
+                    self.status = "Nessun filtro etichetta attivo".to_owned();
+                }
+            }
             "inbox" => self.select_folder("inbox"),
             "starred" => self.select_folder("starred"),
             "theme" => {
@@ -2228,15 +3116,21 @@ impl PostinoApp {
         }
         self.toolbar(ui);
         self.sidebar(ui);
-        if self.reading_full && self.reading_open {
-            self.reading_pane(ui);
+        // Below 1000 px the side pane cannot keep a usable list, so reading reuses the full path
+        // as an overlay. At or above it the pane opens at 52% and resizes between 420 and 62%.
+        let overlay = reading_overlay(ui.ctx().content_rect().width());
+        let full = self.reading_open && (self.reading_full || overlay);
+        if full {
+            self.reading_pane(ui, true);
         } else {
-            self.reading_pane(ui);
+            self.reading_pane(ui, false);
             self.list_panel(ui);
         }
         self.about(ui);
         self.command_palette(ui);
         self.shortcuts_sheet(ui);
+        self.label_menu_window(ui);
+        self.label_delete_dialog(ui);
         self.composer_window(ui);
         self.toast_overlay(ui.ctx());
     }
@@ -2281,6 +3175,8 @@ enum FolderAction {
 
 #[derive(Clone, Copy)]
 enum EmptyAction {
+    NewLabel,
+    ClearLabel,
     Refresh,
     Compose,
     ClearSearch,
@@ -2295,6 +3191,7 @@ enum RowAction {
     EditDraft,
     MarkRead,
     MarkUnread,
+    Label,
     Star,
     Unstar,
     Archive,
@@ -2317,6 +3214,103 @@ enum UndoAction {
     Starred(Vec<(String, bool)>),
     Move(Vec<(String, String)>),
     Send(String),
+    /// `(message id, label id, whether the label was applied before the action)`.
+    Labels(Vec<(String, String, bool)>),
+    LabelDelete {
+        name: String,
+        color: LabelColor,
+        message_ids: Vec<String>,
+    },
+    /// Restore the name and colour the label had before the rename.
+    LabelRename {
+        id: String,
+        name: String,
+        color: LabelColor,
+    },
+}
+
+enum LabelEditorMode {
+    Create,
+    Rename(String),
+}
+
+struct LabelEditor {
+    mode: LabelEditorMode,
+    text: String,
+    color: LabelColor,
+    error: Option<String>,
+    /// Request focus on the next render.
+    focus: bool,
+    /// The field actually owns the keyboard, so only then intercept Enter/Escape.
+    focused: bool,
+    /// A colour swatch owns the keyboard, so Enter/Space picks a colour instead of saving.
+    swatch_focused: bool,
+    /// Messages captured by the label menu; a successful creation applies the new label to them.
+    apply_to: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LabelDeleteState {
+    id: String,
+    name: String,
+    count: u32,
+    message_ids: Vec<String>,
+    /// Request keyboard focus on the confirm button on the first frame.
+    focus_primary: bool,
+}
+
+/// The selection, folder and filters the label menu was opened against.
+#[derive(Clone, PartialEq, Eq)]
+struct LabelMenuContext {
+    /// The messages the menu may touch.
+    target: Vec<String>,
+    /// The visible selection at open time; if it changes, the menu closes.
+    selection: Vec<String>,
+    folder: String,
+    label_filter: Option<String>,
+    label_folder: Option<String>,
+    query: String,
+    unread_only: bool,
+    attachments_only: bool,
+}
+
+struct LabelMenuState {
+    context: LabelMenuContext,
+    query: String,
+    focus: bool,
+}
+
+enum LabelAction {
+    New,
+    Rename(String),
+    Delete(String),
+}
+
+/// What a command needs to be enabled. The palette, the context menus and the keyboard map read
+/// the same rule, so a disabled action always explains itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandRule {
+    Always,
+    Message,
+    ActiveLabel,
+    LabelFilter,
+}
+
+impl CommandRule {
+    /// `None` when the command is always available, so a caller can show a reason only when one
+    /// exists instead of matching on an empty string.
+    fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Always => None,
+            Self::Message => Some("Seleziona prima un messaggio"),
+            Self::ActiveLabel => Some("Seleziona prima un'etichetta"),
+            Self::LabelFilter => Some("Nessun filtro etichetta attivo"),
+        }
+    }
+
+    fn disabled_reason(self) -> &'static str {
+        self.reason().unwrap_or("")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2325,42 +3319,77 @@ struct Command {
     label: &'static str,
     icon: &'static str,
     shortcut: &'static str,
-    needs_message: bool,
+    rule: CommandRule,
     in_palette: bool,
 }
 
 const COMMANDS: &[Command] = &[
-    Command { id: "compose", label: "Scrivi", icon: icons::COMPOSE, shortcut: "C", needs_message: false, in_palette: true },
-    Command { id: "open", label: "Apri messaggio", icon: icons::MAIL, shortcut: "Invio", needs_message: true, in_palette: true },
-    Command { id: "reply", label: "Rispondi", icon: icons::REPLY, shortcut: "R", needs_message: true, in_palette: true },
-    Command { id: "reply_all", label: "Rispondi a tutti", icon: icons::REPLY_ALL, shortcut: "A", needs_message: true, in_palette: true },
-    Command { id: "forward", label: "Inoltra", icon: icons::FORWARD, shortcut: "F", needs_message: true, in_palette: true },
-    Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", needs_message: true, in_palette: false },
-    Command { id: "send", label: "Invia (demo)", icon: icons::SEND, shortcut: "Ctrl+Invio", needs_message: false, in_palette: false },
-    Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", needs_message: true, in_palette: true },
-    Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", needs_message: true, in_palette: true },
-    Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", needs_message: true, in_palette: true },
-    Command { id: "star", label: "Aggiungi stella", icon: icons::STAR, shortcut: "S", needs_message: true, in_palette: true },
-    Command { id: "unstar", label: "Togli stella", icon: icons::STAR, shortcut: "S", needs_message: true, in_palette: true },
-    Command { id: "archive", label: "Archivia", icon: icons::ARCHIVE, shortcut: "E", needs_message: true, in_palette: true },
-    Command { id: "delete", label: "Elimina", icon: icons::TRASH, shortcut: "Canc", needs_message: true, in_palette: true },
-    Command { id: "inbox", label: "Vai a Posta in arrivo", icon: icons::INBOX, shortcut: "", needs_message: false, in_palette: true },
-    Command { id: "starred", label: "Vai a Preferiti", icon: icons::STAR, shortcut: "", needs_message: false, in_palette: true },
-    Command { id: "theme", label: "Cambia tema", icon: icons::MOON, shortcut: "", needs_message: false, in_palette: true },
-    Command { id: "about", label: "Informazioni su Postino", icon: icons::INFO, shortcut: "", needs_message: false, in_palette: true },
-    Command { id: "shortcuts", label: "Scorciatoie da tastiera", icon: icons::KEYBOARD, shortcut: "?", needs_message: false, in_palette: true },
-    Command { id: "select_all", label: "Seleziona tutto", icon: icons::LIST, shortcut: "Ctrl+A", needs_message: false, in_palette: true },
-    Command { id: "toggle", label: "Seleziona o deseleziona", icon: icons::CHECK, shortcut: "X / Spazio", needs_message: true, in_palette: true },
-    Command { id: "clear_selection", label: "Deseleziona", icon: icons::X_CIRCLE, shortcut: "Esc", needs_message: false, in_palette: true },
-    Command { id: "focus_search", label: "Cerca nelle mail", icon: icons::SEARCH, shortcut: "/", needs_message: false, in_palette: true },
-    Command { id: "next", label: "Messaggio successivo", icon: icons::CHEVRON_DOWN, shortcut: "J / ↓", needs_message: false, in_palette: false },
-    Command { id: "previous", label: "Messaggio precedente", icon: icons::CHEVRON_UP, shortcut: "K / ↑", needs_message: false, in_palette: false },
+    Command { id: "compose", label: "Scrivi", icon: icons::COMPOSE, shortcut: "C", rule: CommandRule::Always, in_palette: true },
+    Command { id: "open", label: "Apri messaggio", icon: icons::MAIL, shortcut: "Invio", rule: CommandRule::Message, in_palette: true },
+    Command { id: "reply", label: "Rispondi", icon: icons::REPLY, shortcut: "R", rule: CommandRule::Message, in_palette: true },
+    Command { id: "reply_all", label: "Rispondi a tutti", icon: icons::REPLY_ALL, shortcut: "A", rule: CommandRule::Message, in_palette: true },
+    Command { id: "forward", label: "Inoltra", icon: icons::FORWARD, shortcut: "F", rule: CommandRule::Message, in_palette: true },
+    Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", rule: CommandRule::Message, in_palette: false },
+    Command { id: "send", label: "Invia (demo)", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
+    Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", rule: CommandRule::Message, in_palette: true },
+    Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", rule: CommandRule::Message, in_palette: true },
+    Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", rule: CommandRule::Message, in_palette: true },
+    Command { id: "star", label: "Aggiungi stella", icon: icons::STAR, shortcut: "S", rule: CommandRule::Message, in_palette: true },
+    Command { id: "unstar", label: "Togli stella", icon: icons::STAR, shortcut: "S", rule: CommandRule::Message, in_palette: true },
+    Command { id: "archive", label: "Archivia", icon: icons::ARCHIVE, shortcut: "E", rule: CommandRule::Message, in_palette: true },
+    Command { id: "delete", label: "Elimina", icon: icons::TRASH, shortcut: "Canc", rule: CommandRule::Message, in_palette: true },
+    Command { id: "label_menu", label: "Etichetta", icon: icons::TAG, shortcut: "L", rule: CommandRule::Message, in_palette: true },
+    Command { id: "label_new", label: "Nuova etichetta", icon: icons::PLUS, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command {
+        id: "label_rename",
+        label: "Rinomina etichetta",
+        icon: icons::COMPOSE,
+        shortcut: "F2",
+        rule: CommandRule::ActiveLabel,
+        in_palette: true,
+    },
+    Command { id: "label_delete", label: "Elimina etichetta", icon: icons::TRASH, shortcut: "", rule: CommandRule::ActiveLabel, in_palette: true },
+    Command {
+        id: "label_clear_filter",
+        label: "Togli filtro etichetta",
+        icon: icons::FILTER,
+        shortcut: "",
+        rule: CommandRule::LabelFilter,
+        in_palette: true,
+    },
+    Command { id: "inbox", label: "Vai a Posta in arrivo", icon: icons::INBOX, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "starred", label: "Vai a Preferiti", icon: icons::STAR, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "theme", label: "Cambia tema", icon: icons::MOON, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "about", label: "Informazioni su Postino", icon: icons::INFO, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "shortcuts", label: "Scorciatoie da tastiera", icon: icons::KEYBOARD, shortcut: "?", rule: CommandRule::Always, in_palette: true },
+    Command { id: "select_all", label: "Seleziona tutto", icon: icons::LIST, shortcut: "Ctrl+A", rule: CommandRule::Always, in_palette: true },
+    Command {
+        id: "toggle",
+        label: "Seleziona o deseleziona",
+        icon: icons::CHECK,
+        shortcut: "X / Spazio",
+        rule: CommandRule::Message,
+        in_palette: true,
+    },
+    Command { id: "clear_selection", label: "Deseleziona", icon: icons::X_CIRCLE, shortcut: "Esc", rule: CommandRule::Always, in_palette: true },
+    Command { id: "focus_search", label: "Cerca nelle mail", icon: icons::SEARCH, shortcut: "/", rule: CommandRule::Always, in_palette: true },
+    Command {
+        id: "next", label: "Messaggio successivo", icon: icons::CHEVRON_DOWN, shortcut: "J / ↓", rule: CommandRule::Always, in_palette: false
+    },
+    Command {
+        id: "previous",
+        label: "Messaggio precedente",
+        icon: icons::CHEVRON_UP,
+        shortcut: "K / ↑",
+        rule: CommandRule::Always,
+        in_palette: false,
+    },
     Command {
         id: "extend_next",
         label: "Estendi selezione in basso",
         icon: icons::CHEVRON_DOWN,
         shortcut: "Shift+J / Shift+↓",
-        needs_message: false,
+        rule: CommandRule::Always,
         in_palette: false,
     },
     Command {
@@ -2368,22 +3397,22 @@ const COMMANDS: &[Command] = &[
         label: "Estendi selezione in alto",
         icon: icons::CHEVRON_UP,
         shortcut: "Shift+K / Shift+↑",
-        needs_message: false,
+        rule: CommandRule::Always,
         in_palette: false,
     },
-    Command { id: "close", label: "Chiudi lettura", icon: icons::CLOSE, shortcut: "Esc", needs_message: false, in_palette: false },
-    Command { id: "undo", label: "Annulla ultima azione", icon: icons::UNDO, shortcut: "Z", needs_message: false, in_palette: false },
-    Command { id: "palette", label: "Apri i comandi", icon: icons::COMMAND, shortcut: "Ctrl+K", needs_message: false, in_palette: false },
-    Command { id: "refresh", label: "Aggiorna", icon: icons::SYNC, shortcut: "", needs_message: false, in_palette: false },
+    Command { id: "close", label: "Chiudi lettura", icon: icons::CLOSE, shortcut: "Esc", rule: CommandRule::Always, in_palette: false },
+    Command { id: "undo", label: "Annulla ultima azione", icon: icons::UNDO, shortcut: "Z", rule: CommandRule::Always, in_palette: false },
+    Command { id: "palette", label: "Apri i comandi", icon: icons::COMMAND, shortcut: "Ctrl+K", rule: CommandRule::Always, in_palette: false },
+    Command { id: "refresh", label: "Aggiorna", icon: icons::SYNC, shortcut: "", rule: CommandRule::Always, in_palette: false },
     Command {
         id: "mark_folder_read",
         label: "Segna tutto come letto",
         icon: icons::MARK_READ,
         shortcut: "",
-        needs_message: false,
+        rule: CommandRule::Always,
         in_palette: false,
     },
-    Command { id: "back", label: "Torna alla posta", icon: icons::ARROW_LEFT, shortcut: "Esc", needs_message: false, in_palette: false },
+    Command { id: "back", label: "Torna alla posta", icon: icons::ARROW_LEFT, shortcut: "Esc", rule: CommandRule::Always, in_palette: false },
 ];
 
 fn command(id: &str) -> Option<&'static Command> {
@@ -2437,7 +3466,7 @@ fn reading_context_menu(response: egui::Response, subject: String, sender: Strin
             MenuItem::new("Copia oggetto").icon(icons::COPY),
             MenuItem::new("Copia mittente").icon(icons::COPY),
             MenuItem::separator(),
-            MenuItem::new("Apri in finestra").icon(icons::EXTERNAL).enabled(false).reason("La finestra separata arriva in U0.5"),
+            MenuItem::new("Apri in finestra").icon(icons::EXTERNAL).enabled(false).reason("La finestra separata arriva dopo U0.5"),
             MenuItem::new("Mostra originale").icon(icons::EYE).enabled(false).reason("Il sorgente MIME arriva con lo store M1"),
         ];
         match Menu::new(&items).show(ui) {
@@ -2486,8 +3515,8 @@ fn row_context_menu(message: &MessageSummary, is_draft: bool) -> (Vec<MenuItem<'
         items.push(menu_item("star"));
         actions.push(Some(RowAction::Star));
     }
-    items.push(MenuItem::new("Etichetta").icon(icons::TAG).enabled(false).reason("Le etichette arrivano in U0.5"));
-    actions.push(None);
+    items.push(menu_item("label_menu"));
+    actions.push(Some(RowAction::Label));
     items.push(MenuItem::separator());
     actions.push(None);
     items.push(menu_item("archive"));
@@ -2570,12 +3599,183 @@ fn folder_icon(kind: FolderKind) -> &'static str {
     }
 }
 
-fn label_row(ui: &mut Ui, label: &str, color: Color32, t: &Tokens) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-        ui.painter().circle_filled(rect.center(), 3.0, color);
-        ui.label(typography::text(Role::BodySmall, label, t.text_muted));
+/// Italian singular/plural for a count: `plural(1, "messaggio", "messaggi")` → "1 messaggio".
+fn plural(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 { format!("1 {singular}") } else { format!("{count} {plural}") }
+}
+
+fn messages_text(count: usize) -> String {
+    plural(count, "messaggio", "messaggi")
+}
+
+fn unread_text(unread: usize) -> String {
+    plural(unread, "non letto", "non letti")
+}
+
+/// Translate the engine's English label errors into UI copy. A duplicate name is the common case;
+/// the rest keeps the reason category without leaking internal wording.
+fn label_error_message(raw: &str) -> String {
+    let raw = raw.strip_prefix("invalid arguments: ").unwrap_or(raw);
+    if raw.contains("already exists") {
+        "Esiste già un'etichetta con questo nome.".to_owned()
+    } else if raw.contains("1-48") {
+        "Il nome deve avere da 1 a 48 caratteri.".to_owned()
+    } else if raw.contains("control") || raw.contains("bidi") || raw.contains("format") {
+        "Il nome contiene caratteri non consentiti.".to_owned()
+    } else {
+        "Impossibile salvare l'etichetta.".to_owned()
+    }
+}
+
+/// Resolve a stored semantic colour through the active theme. `forest` follows the body text so
+/// the dot stays visible in the dark theme instead of disappearing into the surface. Gold is ink
+/// on ivory (4.99:1) and the light gold only on forest, where the selected dot is drawn.
+fn label_color(color: LabelColor, t: &Tokens) -> Color32 {
+    match color {
+        LabelColor::Gold => t.gold_ink,
+        LabelColor::Forest => t.text,
+        LabelColor::Success => t.success,
+        LabelColor::Danger => t.danger,
+        LabelColor::Muted => t.text_faint,
+    }
+}
+
+/// The same colour on a selected forest row. Forest becomes ivory; the other semantic colours use
+/// their on-forest variants so a label keeps its identity instead of turning gold.
+fn label_dot(color: LabelColor, t: &Tokens, selected: bool) -> Color32 {
+    if !selected {
+        return label_color(color, t);
+    }
+    match color {
+        LabelColor::Gold => t.gold,
+        LabelColor::Forest => t.selected_text,
+        LabelColor::Success => t.selected_success,
+        LabelColor::Danger => t.selected_danger,
+        LabelColor::Muted => t.selected_muted,
+    }
+}
+
+/// The five semantic swatches of the label editor, in palette order.
+const LABEL_COLORS: [(LabelColor, &str); 5] = [
+    (LabelColor::Gold, "Oro"),
+    (LabelColor::Forest, "Bosco"),
+    (LabelColor::Success, "Successo"),
+    (LabelColor::Danger, "Rosso"),
+    (LabelColor::Muted, "Neutro"),
+];
+
+/// What the pointer controls of the inline editor asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LabelEditorAction {
+    None,
+    Save,
+    Cancel,
+}
+
+/// The inline create/rename editor: title, one-line field, error, colour row, hint and the two
+/// pointer controls. It sits directly under the ETICHETTE header so none of those parts can scroll
+/// out of view.
+fn label_editor_widget(ui: &mut Ui, editor: &mut LabelEditor, t: &Tokens) -> LabelEditorAction {
+    let mut action = LabelEditorAction::None;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let title = match &editor.mode {
+            LabelEditorMode::Create => "Nuova etichetta",
+            LabelEditorMode::Rename(_) => "Rinomina etichetta",
+        };
+        ui.label(typography::text(Role::Meta, title, t.text_muted));
+        let focus = editor.focus;
+        editor.focus = false;
+        let error = editor.error.clone();
+        let mut field = TextField::new(&mut editor.text, "Nome etichetta").width(ui.available_width()).focus(focus);
+        if let Some(error) = error.as_deref() {
+            field = field.error(error);
+        }
+        editor.focused = field.show(ui).has_focus();
+        ui.add_space(space::XS);
+        editor.swatch_focused = label_color_swatches(ui, &mut editor.color, t);
+        ui.label(typography::text(Role::Caption, "Invio salva · Esc annulla\nTab poi ←/→ e Invio", t.text_faint));
+        ui.add_space(space::XS);
+        ui.horizontal(|ui| {
+            let save = Button::primary("Salva").size(ButtonSize::Sm).show(ui);
+            #[cfg(test)]
+            probe::editor_save(ui, save.rect);
+            if save.clicked() {
+                action = LabelEditorAction::Save;
+            }
+            let cancel = Button::ghost("Annulla").size(ButtonSize::Sm).show(ui);
+            #[cfg(test)]
+            probe::editor_cancel(ui, cancel.rect);
+            if cancel.clicked() {
+                action = LabelEditorAction::Cancel;
+            }
+        });
     });
+    action
+}
+
+/// A row of five colour swatches. Each target is 28 px with its colour name on hover; click
+/// selects, Tab reaches them, Left/Right move between them and Enter/Space pick the focused one.
+/// The selected swatch carries a ring, not only colour.
+fn label_color_swatches(ui: &mut Ui, selected: &mut LabelColor, t: &Tokens) -> bool {
+    let ids = LABEL_COLORS.iter().enumerate().map(|(index, _)| ui.make_persistent_id(("label-color", index))).collect::<Vec<_>>();
+    let mut focused = false;
+    ui.horizontal(|ui| {
+        for (index, (color, name)) in LABEL_COLORS.iter().enumerate() {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+            let id = ids.get(index).copied().unwrap_or_else(|| ui.make_persistent_id(("label-color", index)));
+            let response = ui.interact(rect, id, Sense::click());
+            let active = *selected == *color;
+            if active {
+                ui.painter().circle_stroke(rect.center(), 10.0, Stroke::new(2.0, t.gold_ink));
+            }
+            ui.painter().circle_filled(rect.center(), 6.5, label_color(*color, t));
+            if response.has_focus() {
+                focused = true;
+                crate::ui::tokens::paint_focus_ring(ui, rect, radius::PILL, t);
+                let left = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowLeft));
+                let right = ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowRight));
+                if left || right {
+                    let step = if right { 1 } else { LABEL_COLORS.len() - 1 };
+                    let next = (index + step) % LABEL_COLORS.len();
+                    if let Some(next) = ids.get(next) {
+                        ui.ctx().memory_mut(|memory| memory.request_focus(*next));
+                    }
+                }
+            }
+            if response.clicked() {
+                *selected = *color;
+                response.request_focus();
+            }
+            response.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, active, *name));
+            response.on_hover_text(*name);
+        }
+    });
+    focused
+}
+
+/// A thin but always-visible scroll bar for the sidebar, where the overflow must be an affordance.
+/// egui's default is a 2 pt sliver with zero dormant opacity: only a hover reveals it, so at
+/// 980×600 the clipped list looked broken. The text colour gives 10:1 on ivory and 12:1 on forest.
+fn sidebar_scroll_style() -> egui::style::ScrollStyle {
+    let mut style = egui::style::ScrollStyle::thin();
+    style.foreground_color = true;
+    style.floating_width = 4.0;
+    style
+}
+
+fn reading_pane_width(available: f32) -> f32 {
+    let max = (available * READING_PANE_MAX_RATIO).max(READING_PANE_MIN_SIZE);
+    (available * READING_PANE_DEFAULT_RATIO).clamp(READING_PANE_MIN_SIZE, max)
+}
+
+fn show_list_avatars(list_width: f32) -> bool {
+    list_width >= AVATAR_MIN_LIST_WIDTH
+}
+
+/// Below the breakpoint the reading pane is a full-width overlay, not a resizable side pane.
+fn reading_overlay(available: f32) -> bool {
+    available < READING_PANE_MIN_WIDTH
 }
 
 fn initials(name: &str) -> String {
@@ -2653,14 +3853,102 @@ fn write_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod probe {
+    //! Deterministic per-frame facts a headless test can assert on: which rows were drawn, where
+    //! they were and which actions the reading toolbar offered. Nothing is recorded in a shipped
+    //! build; the call sites are `#[cfg(test)]` statements.
+
+    use std::collections::BTreeMap;
+
+    use eframe::egui::{Context, Id, Rect, Ui, Vec2};
+
+    fn id(key: &str) -> Id {
+        Id::new(("postino-probe", key))
+    }
+
+    pub fn clear_rows(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("rows"), BTreeMap::<String, Rect>::new()));
+    }
+
+    pub fn row(ui: &Ui, name: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("rows")).insert(name.to_owned(), rect);
+        });
+    }
+
+    pub fn rows(ctx: &Context) -> BTreeMap<String, Rect> {
+        ctx.data(|data| data.get_temp(id("rows"))).unwrap_or_default()
+    }
+
+    pub fn scroll(ui: &Ui, viewport: Rect, content: Vec2) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("scroll-view"), viewport);
+            data.insert_temp(id("scroll-content"), content);
+        });
+    }
+
+    pub fn scroll_view(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("scroll-view")))
+    }
+
+    pub fn scroll_content(ctx: &Context) -> Option<Vec2> {
+        ctx.data(|data| data.get_temp(id("scroll-content")))
+    }
+
+    pub fn clear_menu_rows(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("menu-rows"), BTreeMap::<String, Rect>::new()));
+    }
+
+    pub fn menu_row(ui: &Ui, label_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("menu-rows")).insert(label_id.to_owned(), rect);
+        });
+    }
+
+    pub fn menu_rows(ctx: &Context) -> BTreeMap<String, Rect> {
+        ctx.data(|data| data.get_temp(id("menu-rows"))).unwrap_or_default()
+    }
+
+    pub fn editor_save(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("editor-save"), rect));
+    }
+
+    pub fn saved_at(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("editor-save")))
+    }
+
+    pub fn editor_cancel(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("editor-cancel"), rect));
+    }
+
+    pub fn cancel_at(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("editor-cancel")))
+    }
+
+    pub fn clear_actions(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("actions"), Vec::<&'static str>::new()));
+    }
+
+    pub fn action(ui: &Ui, action: &'static str) {
+        ui.ctx().data_mut(|data| data.get_temp_mut_or_default::<Vec<&'static str>>(id("actions")).push(action));
+    }
+
+    pub fn actions(ctx: &Context) -> Vec<&'static str> {
+        ctx.data(|data| data.get_temp(id("actions"))).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn frame(ctx: &egui::Context, app: &mut PostinoApp, events: Vec<egui::Event>) {
-        let raw =
-            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))), events, ..Default::default() };
+    fn frame_at(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, events: Vec<egui::Event>) {
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
         let mut output = ctx.run_ui(raw, |ui| app.show(ui));
         output.textures_delta.clear();
+    }
+    fn frame(ctx: &egui::Context, app: &mut PostinoApp, events: Vec<egui::Event>) {
+        frame_at(ctx, app, Vec2::new(1200.0, 800.0), events);
     }
 
     fn key(key: Key, modifiers: Modifiers) -> egui::Event {
@@ -2673,6 +3961,43 @@ mod tests {
         theme::apply(&ctx, false);
         let app = PostinoApp::demo(true);
         (ctx, app)
+    }
+
+    fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    /// A real press/release pair on the widget whose rect the last frame recorded. The two events
+    /// arrive in consecutive frames, like a physical mouse, so egui can resolve the click target
+    /// from a settled layout.
+    fn click_at(ctx: &egui::Context, app: &mut PostinoApp, pos: egui::Pos2, size: Vec2) {
+        frame_at(ctx, app, size, vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+        frame_at(ctx, app, size, vec![pointer(pos, false)]);
+    }
+
+    fn click(ctx: &egui::Context, app: &mut PostinoApp, pos: egui::Pos2) {
+        click_at(ctx, app, pos, Vec2::new(1200.0, 800.0));
+    }
+
+    /// Small wheel steps are applied without easing, so one frame scrolls deterministically.
+    fn wheel(pos: egui::Pos2, steps: usize) -> Vec<egui::Event> {
+        wheel_by(pos, steps, -6.0)
+    }
+
+    /// Scroll towards the top of the scroll area.
+    fn wheel_up(pos: egui::Pos2, steps: usize) -> Vec<egui::Event> {
+        wheel_by(pos, steps, 6.0)
+    }
+
+    fn wheel_by(pos: egui::Pos2, steps: usize, step: f32) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        events.extend((0..steps).map(|_| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, step),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        }));
+        events
     }
 
     #[test]
@@ -3030,6 +4355,33 @@ mod tests {
     }
 
     #[test]
+    fn palette_explains_a_disabled_selection_and_enter_is_not_silent() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.show_palette = true;
+        app.palette_query = "rinomina".to_owned();
+        app.palette_selected = 0;
+        frame(&ctx, &mut app, vec![]);
+        let rename = command("label_rename").expect("label_rename is registered");
+        assert!(!app.command_enabled(rename));
+        assert_eq!(rename.rule.reason(), Some("Seleziona prima un'etichetta"), "the palette can paint a visible reason");
+
+        // The line under the list is a real painted galley, not only a hover tooltip.
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        let painted = output.shapes.iter().any(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) => text.galley.text().contains("Seleziona prima un'etichetta"),
+            _ => false,
+        });
+        output.textures_delta.clear();
+        assert!(painted, "the disabled reason must be visible under the palette list");
+
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(app.show_palette, "Enter on a disabled command must not close the palette");
+        assert!(app.status.contains("Seleziona prima un'etichetta"), "Enter must explain the refusal: {}", app.status);
+    }
+
+    #[test]
     fn archiving_closes_the_pane_and_moves_the_message() {
         let mut app = PostinoApp::demo(true);
         let id = app.engine.messages()[0].summary.id.clone();
@@ -3056,11 +4408,614 @@ mod tests {
             ("reading", ScreenshotState::Reading),
             ("compose", ScreenshotState::Compose),
             ("palette", ScreenshotState::Palette),
+            ("labels", ScreenshotState::Labels),
+            ("label_menu", ScreenshotState::LabelMenu),
+            ("label_editor", ScreenshotState::LabelEditor),
         ] {
             assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
         }
-        let error = ScreenshotState::parse("labels").expect_err("labels is not a scene yet");
+        let error = ScreenshotState::parse("nope").expect_err("nope is not a scene");
         assert!(error.contains("unknown screenshot state"), "{error}");
-        assert!(error.contains("shell, reading, compose, palette"), "{error}");
+        assert!(error.contains("shell, reading, compose, palette, labels, label_menu, label_editor"), "{error}");
+    }
+
+    #[test]
+    fn unread_header_is_singular_for_one() {
+        assert_eq!(unread_text(1), "1 non letto");
+        assert_eq!(unread_text(0), "0 non letti");
+        assert_eq!(unread_text(3), "3 non letti");
+        assert_eq!(messages_text(1), "1 messaggio");
+        assert_eq!(messages_text(6), "6 messaggi");
+    }
+
+    #[test]
+    fn label_errors_are_italian_ui_copy() {
+        assert_eq!(
+            label_error_message("invalid arguments: a label named \"lavoro\" already exists; label names are unique ignoring case"),
+            "Esiste già un'etichetta con questo nome."
+        );
+        assert_eq!(label_error_message("invalid arguments: label names are 1-48 characters"), "Il nome deve avere da 1 a 48 caratteri.");
+        assert!(!label_error_message("failed for an unknown reason").contains("failed"));
+    }
+
+    #[test]
+    fn responsive_breakpoints_keep_the_list_usable() {
+        assert_eq!(reading_pane_width(1280.0), 1280.0 * 0.52, "the pane opens at 52%");
+        assert_eq!(reading_pane_width(800.0), READING_PANE_MIN_SIZE, "it never goes below 420");
+        assert!(reading_pane_width(1280.0) <= 1280.0 * READING_PANE_MAX_RATIO);
+        assert!(reading_overlay(980.0), "980x600 must use the overlay");
+        assert!(!reading_overlay(1000.0), "1000 px switches to the side pane");
+        assert!(!show_list_avatars(719.0));
+        assert!(show_list_avatars(720.0));
+    }
+
+    #[test]
+    fn selected_label_dots_keep_their_identity() {
+        let light = theme::tokens(false);
+        assert_eq!(label_dot(LabelColor::Gold, &light, true), light.gold);
+        assert_eq!(label_dot(LabelColor::Forest, &light, true), light.selected_text);
+        let seeded = [LabelColor::Gold, LabelColor::Success, LabelColor::Danger];
+        for (index, color) in seeded.iter().enumerate() {
+            let dot = label_dot(*color, &light, true);
+            assert!(crate::ui::tokens::contrast_ratio(dot, light.selected) >= 3.0, "{color:?} dot is invisible on the selected row");
+            assert!(
+                seeded.iter().enumerate().all(|(other, candidate)| other == index || label_dot(*candidate, &light, true) != dot),
+                "the three seeded label colours must stay distinct on selection"
+            );
+        }
+        assert_eq!(label_dot(LabelColor::Success, &light, false), light.success);
+    }
+
+    #[test]
+    fn every_label_colour_is_legible_on_ivory_and_on_forest() {
+        let light = theme::tokens(false);
+        let dark = theme::tokens(true);
+        for (color, name) in LABEL_COLORS {
+            let on_ivory = crate::ui::tokens::contrast_ratio(label_color(color, &light), theme::IVORY);
+            assert!(on_ivory >= 3.0, "{name} on ivory is {on_ivory:.2}:1");
+            let on_forest = crate::ui::tokens::contrast_ratio(label_dot(color, &light, true), theme::FOREST);
+            assert!(on_forest >= 3.0, "{name} on the selected forest row is {on_forest:.2}:1");
+            let on_dark = crate::ui::tokens::contrast_ratio(label_color(color, &dark), theme::DARK_PANEL);
+            assert!(on_dark >= 3.0, "{name} on the dark panel is {on_dark:.2}:1");
+        }
+        assert_eq!(label_color(LabelColor::Gold, &light), theme::GOLD_INK, "gold uses its ink on a light surface");
+        assert_eq!(label_color(LabelColor::Gold, &dark), theme::GOLD, "the dark theme keeps the light gold");
+    }
+
+    #[test]
+    fn sidebar_shows_the_label_registry_and_filters_the_list() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let labels = app.labels_cache.clone();
+        assert_eq!(labels.len(), 3);
+        assert!(labels.iter().any(|label| label.name == "Lavoro" && label.message_count == 6 && label.unread_count == 2));
+
+        app.select_label("lbl_1".to_owned());
+        let (rows, total, unread) = app.visible_messages();
+        assert_eq!(total, 6, "a label view spans every folder by default");
+        assert_eq!(unread, 2);
+        assert!(rows.iter().all(|message| message.labels.contains(&"lbl_1".to_owned())));
+        app.open_message(rows[0].id.clone());
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.reading_open, "the labelled message opens with its chips");
+
+        app.select_folder("inbox");
+        assert_eq!(app.label_filter.as_deref(), Some("lbl_1"), "a folder click narrows instead of dropping the label");
+        assert_eq!(app.label_folder.as_deref(), Some("inbox"));
+        assert_eq!(app.visible_messages().1, 2, "the intersection with Posta in arrivo is two messages");
+
+        app.clear_label_filter();
+        assert!(app.visible_messages().1 >= 4, "Mostra tutte returns to the folder view");
+    }
+
+    #[test]
+    fn inline_label_create_and_duplicate_errors_keep_the_field_open() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.push_toast("Messaggio archiviato", UndoAction::Move(Vec::new()));
+        assert!(app.toast.is_some(), "the stale toast must exist before the create");
+        app.start_label_create();
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Ufficio".to_owned();
+            editor.color = LabelColor::Forest;
+        }
+        app.commit_label_editor();
+        assert!(app.label_editor.is_none());
+        assert!(app.engine.labels().iter().any(|label| label.name == "Ufficio" && label.color == LabelColor::Forest));
+        assert!(app.status.contains("creata"));
+        assert!(app.toast.is_none(), "creating a label is not undoable and clears a stale toast");
+
+        app.start_label_create();
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "lavoro".to_owned();
+        }
+        app.commit_label_editor();
+        let editor = app.label_editor.as_ref().expect("duplicate keeps the field open");
+        assert_eq!(editor.error.as_deref(), Some("Esiste già un'etichetta con questo nome."));
+        assert!(editor.focus, "focus returns to the field after the error");
+        frame(&ctx, &mut app, vec![]);
+
+        app.start_label_rename("lbl_1");
+        assert_eq!(app.label_editor.as_ref().map(|editor| editor.text.as_str()), Some("Lavoro"));
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Lavoro clienti".to_owned();
+            editor.color = LabelColor::Danger;
+        }
+        app.commit_label_editor();
+        assert_eq!(app.engine.label("lbl_1").map(|label| label.name.as_str()), Some("Lavoro clienti"));
+        assert_eq!(app.engine.label("lbl_1").map(|label| label.color), Some(LabelColor::Danger));
+        assert!(matches!(app.toast.as_ref().map(|toast| &toast.undo), Some(UndoAction::LabelRename { .. })), "rename offers an undo");
+        app.undo_last();
+        assert_eq!(app.engine.label("lbl_1").map(|label| label.name.as_str()), Some("Lavoro"), "undo restores the previous name");
+        assert_eq!(app.engine.label("lbl_1").map(|label| label.color), Some(LabelColor::Gold), "undo restores the previous colour");
+    }
+
+    #[test]
+    fn label_menu_applies_to_a_multi_selection_as_one_undo_step() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        let ids = vec![rows[0].id.clone(), rows[1].id.clone()];
+        app.select_only(rows[0].id.clone());
+        app.toggle_selection(rows[1].id.clone());
+        frame(&ctx, &mut app, vec![key(Key::L, Modifiers::NONE)]);
+        assert_eq!(app.label_menu.as_ref().map(|menu| menu.context.target.len()), Some(2), "L opens the menu for the whole selection");
+        app.open_label_menu(ids.clone());
+        frame(&ctx, &mut app, vec![]);
+        app.toggle_label_target("lbl_2");
+        assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.labels.contains(&"lbl_2".to_owned()))));
+        app.undo_last();
+        assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| !message.summary.labels.contains(&"lbl_2".to_owned()))));
+    }
+
+    #[test]
+    fn deleting_a_label_is_confirmed_and_undoable() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.start_label_create();
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Temporanea".to_owned();
+        }
+        app.commit_label_editor();
+        let id = app.engine.labels().iter().find(|label| label.name == "Temporanea").expect("created").id.clone();
+        app.apply_label(&["msg_001".to_owned()], &id, true);
+        app.request_label_delete(&id);
+        let state = app.label_delete.clone().expect("confirmation dialog");
+        assert_eq!(state.count, 1);
+        frame(&ctx, &mut app, vec![]);
+        app.delete_label(&state);
+        assert!(app.engine.label(&id).is_none());
+        assert!(app.engine.message("msg_001").is_some_and(|message| !message.summary.labels.contains(&id)));
+        app.undo_last();
+        let restored = app.engine.labels().iter().find(|label| label.name == "Temporanea").expect("restored label");
+        assert_ne!(restored.id, id, "a delete undo recreates the label with a fresh id, never the retired one");
+        assert!(app.engine.message("msg_001").is_some_and(|message| message.summary.labels.contains(&restored.id)));
+    }
+
+    #[test]
+    fn delete_dialog_confirms_with_enter_and_cancels_with_escape() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+
+        app.request_label_delete("lbl_2");
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(app.label_delete.is_none(), "Enter closes the dialog");
+        assert!(app.engine.label("lbl_2").is_none(), "Enter confirms the delete");
+
+        app.request_label_delete("lbl_3");
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.label_delete.is_none(), "Esc closes the dialog");
+        assert!(app.engine.label("lbl_3").is_some(), "Esc cancels without deleting");
+    }
+
+    #[test]
+    fn label_menu_removal_from_a_multi_selection_is_one_undo_step() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        let ids = vec![rows[0].id.clone(), rows[1].id.clone()];
+        app.open_label_menu(ids.clone());
+        app.toggle_label_target("lbl_2");
+        assert!(ids.iter().all(|id| has_label(&app, id, "lbl_2")), "the first click applies the label");
+        app.toggle_label_target("lbl_2");
+        assert!(ids.iter().all(|id| !has_label(&app, id, "lbl_2")), "the second click removes it");
+        app.undo_last();
+        assert!(ids.iter().all(|id| has_label(&app, id, "lbl_2")), "one undo restores the whole batch");
+    }
+
+    #[test]
+    fn label_menu_targets_are_captured_and_stale_selection_closes_it() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        app.select_only(rows[0].id.clone());
+        app.open_label_menu(app.action_ids());
+        assert_eq!(app.label_menu.as_ref().map(|menu| menu.context.target.clone()), Some(vec![rows[0].id.clone()]));
+
+        app.select_only(rows[1].id.clone());
+        assert!(app.label_menu_is_stale(), "the menu notices the selection changed");
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.label_menu.is_none(), "a stale menu closes instead of labelling the wrong message");
+    }
+
+    #[test]
+    fn label_menu_row_click_toggles_the_label_through_the_widget() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let target = vec![app.visible_messages().0[0].id.clone()];
+        app.open_label_menu(target.clone());
+        // Two frames: the modal area settles its anchored position on the first one, and egui
+        // resolves a click against the previous frame's widget rects.
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        let row = probe::menu_rows(&ctx).get("lbl_2").copied().expect("the Personale row");
+        click(&ctx, &mut app, row.center());
+        assert!(
+            has_label(&app, &target[0], "lbl_2"),
+            "clicking {row:?} applies the label (status: {}, menu open: {})",
+            app.status,
+            app.label_menu.is_some()
+        );
+        frame(&ctx, &mut app, vec![]);
+        let row = probe::menu_rows(&ctx).get("lbl_2").copied().expect("the menu stays open after a toggle");
+        click(&ctx, &mut app, row.center());
+        assert!(!has_label(&app, &target[0], "lbl_2"), "a second click removes it");
+    }
+
+    #[test]
+    fn label_menu_closes_on_escape_and_on_an_outside_click() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        let target = vec![app.visible_messages().0[0].id.clone()];
+
+        app.open_label_menu(target.clone());
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.label_menu.is_some());
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.label_menu.is_none(), "Escape closes the menu");
+
+        app.open_label_menu(target);
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.label_menu.is_some());
+        click(&ctx, &mut app, egui::pos2(900.0, 700.0));
+        assert!(app.label_menu.is_none(), "a click outside the menu closes it");
+    }
+
+    #[test]
+    fn creating_from_the_label_menu_applies_to_the_captured_targets() {
+        let mut app = PostinoApp::demo(true);
+        let (rows, _, _) = app.visible_messages();
+        let targets = vec![rows[0].id.clone(), rows[1].id.clone()];
+        app.open_label_menu(targets.clone());
+        app.start_label_create_for(targets.clone());
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Cliente".to_owned();
+            editor.color = LabelColor::Forest;
+        }
+        app.commit_label_editor();
+        let created = app.engine.labels().iter().find(|label| label.name == "Cliente").expect("created label");
+        assert_eq!(created.color, LabelColor::Forest);
+        let created_id = created.id.clone();
+        assert!(targets.iter().all(|id| has_label(&app, id, &created_id)), "the new label lands on the captured messages");
+        assert!(matches!(app.toast.as_ref().map(|toast| &toast.undo), Some(UndoAction::Labels(_))), "the apply is one undo step");
+        app.undo_last();
+        assert!(targets.iter().all(|id| !has_label(&app, id, &created_id)));
+        assert!(app.engine.labels().iter().any(|label| label.name == "Cliente"), "undo removes the assignment, not the label");
+    }
+
+    #[test]
+    fn label_menu_renders_with_an_empty_registry() {
+        let (ctx, mut app) = ready_app();
+        for id in ["lbl_1", "lbl_2", "lbl_3"] {
+            app.engine.call("label_delete", json!({ "id": id })).expect("delete seeded label");
+        }
+        app.refresh_labels();
+        assert!(app.labels_cache.is_empty());
+        let (rows, _, _) = app.visible_messages();
+        app.open_label_menu(vec![rows[0].id.clone()]);
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.label_menu.is_some(), "the menu stays open to offer creation");
+    }
+
+    #[test]
+    fn filter_and_search_intersect() {
+        let mut app = PostinoApp::demo(true);
+        app.select_label("lbl_1".to_owned());
+        app.query = "preventivo".to_owned();
+        let (rows, total, unread) = app.visible_messages();
+        assert_eq!(total, 3, "three Lavoro messages mention the quote");
+        assert_eq!(unread, 2);
+        assert!(rows.iter().all(|message| message.labels.contains(&"lbl_1".to_owned())));
+
+        app.select_label("lbl_3".to_owned());
+        app.query = "preventivo".to_owned();
+        assert_eq!(app.visible_messages().1, 0, "the same search under Fatture has no results");
+    }
+
+    #[test]
+    fn the_search_placeholder_names_the_active_label() {
+        let mut app = PostinoApp::demo(true);
+        assert_eq!(app.search_placeholder(), "Cerca in tutte le mail…");
+        app.select_label("lbl_1".to_owned());
+        assert_eq!(app.search_placeholder(), "Cerca in Lavoro…");
+        app.select_label("lbl_3".to_owned());
+        assert_eq!(app.search_placeholder(), "Cerca in Fatture…");
+    }
+
+    #[test]
+    fn label_cache_tracks_auto_read_batch_read_and_undo() {
+        let mut app = PostinoApp::demo(true);
+        app.now = 10.0;
+        assert_eq!(label_unread(&app, "lbl_1"), Some(2));
+        let unread = app
+            .engine
+            .messages()
+            .iter()
+            .find(|message| message.summary.unread && message.summary.labels.iter().any(|id| id == "lbl_1"))
+            .map(|message| message.summary.id.clone())
+            .expect("an unread Lavoro message");
+        app.open_message(unread);
+        app.now = 10.7;
+        app.maybe_complete_read();
+        assert_eq!(label_unread(&app, "lbl_1"), Some(1), "auto-read updates the sidebar counts");
+        app.undo_last();
+        assert_eq!(label_unread(&app, "lbl_1"), Some(2), "undo updates them back");
+
+        let remaining = app
+            .engine
+            .messages()
+            .iter()
+            .filter(|message| message.summary.unread && message.summary.labels.iter().any(|id| id == "lbl_1"))
+            .map(|message| message.summary.id.clone())
+            .collect::<Vec<_>>();
+        app.set_unread_many(&remaining, false);
+        assert_eq!(label_unread(&app, "lbl_1"), Some(0), "a batch read updates the cache once");
+    }
+
+    #[test]
+    fn palette_clear_filter_is_disabled_until_a_label_is_active() {
+        let mut app = PostinoApp::demo(true);
+        let clear = command("label_clear_filter").expect("label_clear_filter is registered");
+        assert_eq!(clear.label, "Togli filtro etichetta");
+        assert!(!app.command_enabled(clear));
+        assert_eq!(clear.rule.disabled_reason(), "Nessun filtro etichetta attivo");
+        let rename = command("label_rename").expect("label_rename is registered");
+        assert!(!app.command_enabled(rename));
+        assert_eq!(rename.rule.disabled_reason(), "Seleziona prima un'etichetta");
+
+        app.select_label("lbl_1".to_owned());
+        assert!(app.command_enabled(clear));
+        assert!(app.command_enabled(rename));
+        let ctx = egui::Context::default();
+        app.execute_command("label_clear_filter", &ctx);
+        assert!(app.label_filter.is_none(), "the enabled command changes the view");
+    }
+
+    #[test]
+    fn f2_renames_the_active_label() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.select_label("lbl_1".to_owned());
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![key(Key::F2, Modifiers::NONE)]);
+        assert!(
+            matches!(app.label_editor.as_ref().map(|editor| &editor.mode), Some(LabelEditorMode::Rename(id)) if id == "lbl_1"),
+            "F2 opens the rename editor on the active label"
+        );
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.label_editor.is_none());
+    }
+
+    #[test]
+    fn shortcuts_survive_a_focused_label_row() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.select_label("lbl_1".to_owned());
+        frame(&ctx, &mut app, vec![]);
+        let row = probe::rows(&ctx).get("Lavoro").copied().expect("the Lavoro row is on screen");
+        click(&ctx, &mut app, row.center());
+        assert!(app.label_editor.is_none());
+        assert!(ctx.memory(|memory| memory.focused()).is_some(), "the clicked row must hold keyboard focus for this test to mean anything");
+        frame(&ctx, &mut app, vec![key(Key::F2, Modifiers::NONE)]);
+        assert!(
+            matches!(app.label_editor.as_ref().map(|editor| &editor.mode), Some(LabelEditorMode::Rename(id)) if id == "lbl_1"),
+            "F2 must still work while a non-text widget has focus"
+        );
+    }
+
+    #[test]
+    fn a_focused_text_field_still_suppresses_the_single_key_map() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.select_label("lbl_1".to_owned());
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![key(Key::Slash, Modifiers::NONE)]);
+        frame(&ctx, &mut app, vec![]);
+        assert!(ctx.text_edit_focused(), "the search field owns the keyboard");
+        frame(&ctx, &mut app, vec![key(Key::F2, Modifiers::NONE)]);
+        assert!(app.label_editor.is_none(), "a focused text field must still swallow F2");
+    }
+
+    #[test]
+    fn plus_while_editing_keeps_the_draft() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.start_label_create();
+        frame(&ctx, &mut app, vec![]);
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Ufficio".to_owned();
+        }
+        app.start_label_create_or_focus();
+        let editor = app.label_editor.as_ref().expect("the editor stays open");
+        assert_eq!(editor.text, "Ufficio", "pressing + must not discard the draft");
+        assert!(editor.focus, "it returns focus to the field");
+    }
+
+    #[test]
+    fn editor_pointer_controls_save_and_cancel() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.start_label_create();
+        frame(&ctx, &mut app, vec![]);
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Da mouse".to_owned();
+        }
+        frame(&ctx, &mut app, vec![]);
+        let save = probe::saved_at(&ctx).expect("the Salva control is on screen");
+        click(&ctx, &mut app, save.center());
+        assert!(app.label_editor.is_none(), "Salva commits the field");
+        assert!(app.labels_cache.iter().any(|label| label.name == "Da mouse"));
+
+        app.start_label_create();
+        frame(&ctx, &mut app, vec![]);
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Scartata".to_owned();
+        }
+        frame(&ctx, &mut app, vec![]);
+        let cancel = probe::cancel_at(&ctx).expect("the Annulla control is on screen");
+        click(&ctx, &mut app, cancel.center());
+        assert!(app.label_editor.is_none(), "Annulla closes the editor");
+        assert!(!app.labels_cache.iter().any(|label| label.name == "Scartata"));
+    }
+
+    #[test]
+    fn inline_editor_enter_commits_and_escape_cancels() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.start_label_create();
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.label_editor.as_ref().is_some_and(|editor| editor.focused), "the field owns the keyboard");
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Da tastiera".to_owned();
+        }
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(app.label_editor.is_none(), "Enter saves");
+        assert!(app.labels_cache.iter().any(|label| label.name == "Da tastiera"));
+
+        app.start_label_create();
+        frame(&ctx, &mut app, vec![]);
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Scartata".to_owned();
+        }
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.label_editor.is_none(), "Esc cancels");
+        assert!(!app.labels_cache.iter().any(|label| label.name == "Scartata"));
+    }
+
+    #[test]
+    fn deleting_a_label_with_more_than_five_hundred_assignments_restores_them_all() {
+        let mut app = PostinoApp::demo(true);
+        let mut ids = Vec::new();
+        for index in 0..501 {
+            let value = app.engine.call("draft_save", json!({ "subject": format!("Bozza bulk {index}"), "body_text": "x" })).expect("draft saved");
+            let saved = serde_json::from_value::<DraftSave>(value).expect("draft response");
+            ids.push(saved.draft.summary.id);
+        }
+        let value = app.engine.call("label_create", json!({ "name": "Bulk", "color": "muted" })).expect("label created");
+        let label = serde_json::from_value::<LabelCreate>(value).expect("label response").label;
+        for chunk in ids.chunks(LABEL_APPLY_CHUNK) {
+            app.engine.call("label_apply", json!({ "id": label.id, "message_ids": chunk, "apply": true })).expect("label applied");
+        }
+        app.refresh_labels();
+        app.request_label_delete(&label.id);
+        let state = app.label_delete.clone().expect("confirmation dialog");
+        assert_eq!(state.count, 501);
+        app.delete_label(&state);
+        assert!(app.engine.label(&label.id).is_none());
+        app.undo_last();
+        let restored = app.engine.labels().iter().find(|candidate| candidate.name == "Bulk").expect("label restored");
+        assert_ne!(restored.id, label.id, "the recreated label gets a new id");
+        assert!(ids.iter().all(|id| has_label(&app, id, &restored.id)), "undo restores all 501 assignments through the 500-id chunk cap");
+        assert!(ids.iter().all(|id| !has_label(&app, id, &label.id)), "the retired id carries no assignment");
+        assert_eq!(app.labels_cache.iter().find(|candidate| candidate.id == restored.id).map(|candidate| candidate.message_count), Some(501));
+    }
+
+    #[test]
+    fn narrow_window_uses_the_reading_overlay_and_returns_to_the_list() {
+        let (ctx, mut app) = ready_app();
+        let narrow = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let id = app.visible_messages().0[0].id.clone();
+        app.open_message(id.clone());
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        assert!(app.reading_open, "clicking a row opens the overlay");
+        assert!(!app.reading_full, "the overlay is derived from the width, not a separate mode");
+        frame_at(&ctx, &mut app, narrow, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.reading_open, "Esc returns to the list");
+        assert_eq!(app.selected.as_deref(), Some(id.as_str()), "the row stays selected");
+    }
+
+    #[test]
+    fn narrow_reading_overlay_keeps_triage_actions() {
+        let (ctx, mut app) = ready_app();
+        let narrow = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let id = app.visible_messages().0[0].id.clone();
+        app.open_message(id);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let actions = probe::actions(&ctx);
+        assert!(actions.contains(&"back"), "the overlay keeps Back: {actions:?}");
+        assert!(actions.contains(&"archive"), "the overlay keeps Archivia: {actions:?}");
+        assert!(actions.contains(&"delete"), "the overlay keeps Elimina: {actions:?}");
+
+        app.close_reading();
+        frame(&ctx, &mut app, vec![]);
+        let wide = app.visible_messages().0[0].id.clone();
+        app.open_message(wide);
+        frame(&ctx, &mut app, vec![]);
+        let actions = probe::actions(&ctx);
+        assert!(actions.contains(&"archive") && actions.contains(&"delete"), "the wide pane keeps its triage actions: {actions:?}");
+    }
+
+    #[test]
+    fn narrow_sidebar_keeps_cestino_reachable_with_the_editor_open() {
+        let (ctx, mut app) = ready_app();
+        let narrow = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        app.start_label_create();
+        for _ in 0..20 {
+            frame_at(&ctx, &mut app, narrow, vec![]);
+        }
+
+        let view = probe::scroll_view(&ctx).expect("the sidebar scroll area");
+        let save = probe::saved_at(&ctx).expect("the editor save button");
+        assert!(
+            save.top() >= view.top() && save.bottom() <= view.bottom(),
+            "opening the editor must reveal its controls, not clip them under the footer: {save:?} vs {view:?}"
+        );
+        let content = probe::scroll_content(&ctx).expect("the scroll content size");
+        assert!(content.y > view.height(), "with the editor open the sidebar overflows and shows a scroll bar");
+        let style = sidebar_scroll_style();
+        assert_eq!(style.dormant_handle_opacity, 1.0, "the sidebar bar must be drawn without hovering");
+        assert!(style.foreground_color, "its handle must use the text colour, not the panel fill");
+        assert!(style.floating_width >= 4.0, "it must be more than a hairline");
+
+        frame_at(&ctx, &mut app, narrow, wheel_up(view.center(), 40));
+        // The scroll offset applies to the next frame's layout, like any egui input.
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let rows = probe::rows(&ctx);
+        let trash = rows.get("Cestino").copied().expect("Cestino is in the sidebar");
+        assert!(
+            trash.top() >= view.top() - 1.0 && trash.bottom() <= view.bottom() + 1.0,
+            "a wheel scroll reaches Cestino while the editor stays open: {trash:?} vs {view:?}"
+        );
+        let last = rows.get("Fatture").copied().expect("the last label row");
+        assert!(last.bottom() > view.bottom(), "the label rows sit below the fold, so only the scroll bar reaches them");
+
+        frame_at(&ctx, &mut app, narrow, wheel(view.center(), 80));
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let scrolled = probe::rows(&ctx);
+        let fatture = scrolled.get("Fatture").copied().expect("the last label row is still drawn");
+        assert!(fatture.bottom() <= view.bottom() + 1.0, "a wheel scroll brings the last label row into view: {fatture:?} vs {view:?}");
+    }
+
+    fn label_unread(app: &PostinoApp, id: &str) -> Option<u32> {
+        app.labels_cache.iter().find(|label| label.id == id).map(|label| label.unread_count)
+    }
+
+    fn has_label(app: &PostinoApp, message_id: &str, label_id: &str) -> bool {
+        app.engine.message(message_id).is_some_and(|message| message.summary.labels.iter().any(|candidate| candidate == label_id))
     }
 }

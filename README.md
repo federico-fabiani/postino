@@ -25,16 +25,25 @@ MCP      ─┘
 - Compose window with To/Cc/Bcc, subject, signature, Markdown formatting, drag-and-drop attachment
   metadata, autosaved drafts and reply/reply-all/forward prefill. Send is demo-only until M2 and is
   undoable.
-- Ten typed operations with JSON Schemas: `app_info`, `accounts_list`, `folders_list`,
+- Local labels with a semantic colour palette: create, rename and delete from the sidebar; apply and
+  remove from the message menu (`L`), the command palette, the CLI and MCP; filter the list by label
+  and see label chips in the reading pane. A label view spans every folder by default and a folder
+  narrows it; ids are stable and never reused. Rename, delete and apply/remove are undoable in the
+  app; creating a label is not an undo step. Labels are in-memory metadata until M1.
+- Fifteen typed operations with JSON Schemas: `app_info`, `accounts_list`, `folders_list`,
   `messages_list`, `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_send`,
-  `search`.
-- `postino` CLI for humans and scripts, including friendly `draft save --send` and `postino run`
-  for any operation.
+  `search`, `labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`.
+- `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
+  `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
-- Headless rendering tests of the shell, gallery and composer, operation-schema tests, MCP protocol
-  tests.
+- Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
+  MCP protocol tests.
 
 ![Postino composer: recipients, subject, Markdown formatting bar, body and attachment, with the draft save state in the footer](docs/images/postino-u04-compose.png)
+
+![Postino labels: the Lavoro view with the mailbox-wide scope in the header, the filtered message list and the coloured label rows in the ETICHETTE sidebar](docs/images/postino-u05-labels.png)
+
+![Postino label menu: the modal label picker with its scrim over the list, Lavoro already applied and visible in the reading-pane chip](docs/images/postino-u05-label-menu.png)
 
 Everything below the UI is headless and has no egui dependency.
 
@@ -54,6 +63,11 @@ cargo run -p postino-cli -- --demo read msg_001
 cargo run -p postino-cli -- --demo search fattura
 cargo run -p postino-cli -- --demo run messages_list folder=inbox limit=2
 cargo run -p postino-cli -- --demo draft save --to "Giulia <giulia.ferri@example.com>" --subject "Ciao" --body "Ci sentiamo domani." --send
+cargo run -p postino-cli -- --demo label list
+cargo run -p postino-cli -- --demo label create "Ufficio" --color forest
+cargo run -p postino-cli -- --demo messages --label lbl_1
+cargo run -p postino-cli -- --demo messages --label lbl_1 --folder sent
+cargo run -p postino-cli -- --demo search preventivo --label lbl_1
 ```
 
 The app is `postino-app`; the command is `postino`. The product name stays Postino.

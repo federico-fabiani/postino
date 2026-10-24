@@ -86,7 +86,7 @@ impl GalleryApp {
                 ui.add_space(space::HUGE);
                 ui.label(typography::text(
                     Role::Caption,
-                    "Phosphor Regular (MIT) · Inter e JetBrains Mono (OFL) · Postino UI kit, U0.4",
+                    "Phosphor Regular (MIT) · Inter e JetBrains Mono (OFL) · Postino UI kit, U0.5",
                     t.text_faint,
                 ));
                 ui.add_space(space::XXXL);
@@ -101,7 +101,7 @@ impl GalleryApp {
                 ui.add_space(space::SM);
                 ui.vertical(|ui| {
                     ui.label(typography::text(Role::Page, "Postino UI kit", t.text));
-                    ui.label(typography::text(Role::Meta, "Componenti, stati e token · U0.4", t.text_muted));
+                    ui.label(typography::text(Role::Meta, "Componenti, stati e token · U0.5", t.text_muted));
                 });
             });
             ui.add_space(space::XL);
@@ -320,6 +320,7 @@ impl GalleryApp {
     fn dialogs(&self, ui: &mut Ui, t: &Tokens) {
         section(ui, "Dialogo", t);
         Dialog::new("Eliminare il messaggio?", "Il messaggio verrà spostato nel cestino. Puoi annullare per qualche secondo.", "Elimina")
+            .danger(true)
             .secondary("Annulla")
             .show(ui);
     }

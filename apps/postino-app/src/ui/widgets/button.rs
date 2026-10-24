@@ -40,11 +40,14 @@ impl ButtonSize {
     }
 }
 
-/// A labelled button. It can carry an icon, a shortcut hint and a reason when disabled.
+/// A labelled button. It can carry an icon, a semantic dot, a trailing state glyph, a shortcut
+/// hint and a reason when disabled.
 #[derive(Clone, Copy)]
 pub struct Button<'a> {
     label: &'a str,
     icon: Option<&'a str>,
+    dot: Option<Color32>,
+    trailing_icon: Option<&'a str>,
     shortcut: Option<&'a str>,
     kind: ButtonKind,
     size: ButtonSize,
@@ -60,6 +63,8 @@ impl<'a> Button<'a> {
         Self {
             label,
             icon: None,
+            dot: None,
+            trailing_icon: None,
             shortcut: None,
             kind: ButtonKind::Secondary,
             size: ButtonSize::Md,
@@ -103,6 +108,21 @@ impl<'a> Button<'a> {
         self
     }
 
+    /// A semantic dot in the leading slot, where an icon would go. Used by the label menu so the
+    /// row keeps the same colour identity as the sidebar, the header and the reading chips.
+    #[must_use]
+    pub fn dot(mut self, color: Color32) -> Self {
+        self.dot = Some(color);
+        self
+    }
+
+    /// A state glyph at the far right, such as the applied check of a label row.
+    #[must_use]
+    pub fn trailing_icon(mut self, icon: &'a str) -> Self {
+        self.trailing_icon = Some(icon);
+        self
+    }
+
     #[must_use]
     pub fn shortcut(mut self, shortcut: &'a str) -> Self {
         self.shortcut = Some(shortcut);
@@ -141,9 +161,10 @@ impl<'a> Button<'a> {
         let shortcut_font = FontId::new(type_size::META, FontFamily::Monospace);
 
         let label_width = layout(ui, self.label, &font, t.text).size().x;
-        let icon_width = if self.icon.is_some() { icon_size + space::SM } else { 0.0 };
+        let icon_width = if self.icon.is_some() || self.dot.is_some() { icon_size + space::SM } else { 0.0 };
+        let trailing_width = self.trailing_icon.map_or(0.0, |icon| layout(ui, icon, &icons::font(icon_size), t.text).size().x + space::SM);
         let shortcut_width = self.shortcut.map_or(0.0, |shortcut| layout(ui, shortcut, &shortcut_font, t.text_faint).size().x + space::LG);
-        let content_width = padding * 2.0 + icon_width + label_width + shortcut_width;
+        let content_width = padding * 2.0 + icon_width + label_width + shortcut_width + trailing_width;
         let width = if self.full_width { ui.available_width().max(content_width) } else { content_width };
 
         let sense = if self.enabled { Sense::click() } else { Sense::hover() };
@@ -169,17 +190,27 @@ impl<'a> Button<'a> {
         }
 
         let mut cursor = rect.left() + padding;
-        if let Some(icon) = self.icon {
+        if let Some(dot) = self.dot {
+            ui.painter().circle_filled(eframe::egui::pos2(cursor + 3.0, rect.center().y), 3.5, dot);
+            cursor += icon_size + space::SM;
+        } else if let Some(icon) = self.icon {
             let galley = layout(ui, icon, &icons::font(icon_size), foreground);
             paint_left(ui, rect, cursor, &galley);
             cursor += icon_size + space::SM;
         }
         let galley = layout(ui, self.label, &font, foreground);
         paint_left(ui, rect, cursor, &galley);
+        let mut right = rect.right() - padding;
+        if let Some(icon) = self.trailing_icon {
+            let color = if self.enabled { t.text } else { t.text_faint };
+            let galley = layout(ui, icon, &icons::font(icon_size), color);
+            paint_right(ui, rect, right, &galley);
+            right -= galley.size().x + space::SM;
+        }
         if let Some(shortcut) = self.shortcut {
             let shortcut_color = if self.selected { t.selected_muted } else { t.text_faint };
             let galley = layout(ui, shortcut, &shortcut_font, shortcut_color);
-            paint_right(ui, rect, rect.right() - padding, &galley);
+            paint_right(ui, rect, right, &galley);
         }
 
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label));

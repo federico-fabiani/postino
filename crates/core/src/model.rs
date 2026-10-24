@@ -170,6 +170,61 @@ pub struct Folder {
     pub total: u32,
 }
 
+/// The closed semantic label palette. Names resolve through the theme; a label never stores a
+/// colour value, so the theme can change without touching stored data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelColor {
+    Gold,
+    Forest,
+    Success,
+    Danger,
+    Muted,
+}
+
+impl LabelColor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gold => "gold",
+            Self::Forest => "forest",
+            Self::Success => "success",
+            Self::Danger => "danger",
+            Self::Muted => "muted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "gold" => Some(Self::Gold),
+            "forest" => Some(Self::Forest),
+            "success" => Some(Self::Success),
+            "danger" => Some(Self::Danger),
+            "muted" => Some(Self::Muted),
+            _ => None,
+        }
+    }
+}
+
+/// A local label. `id` is stable for the life of the label and is never reused after deletion;
+/// messages hold ids, never a copy of the name. Labels are in-memory demo metadata until the M1
+/// store exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Label {
+    pub id: String,
+    pub name: String,
+    pub color: LabelColor,
+}
+
+/// A label with its mailbox-wide message counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelSummary {
+    pub id: String,
+    pub name: String,
+    pub color: LabelColor,
+    pub message_count: u32,
+    pub unread_count: u32,
+}
+
 /// The list-row shape. Bodies are fetched separately so a mailbox list stays cheap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSummary {
@@ -184,6 +239,9 @@ pub struct MessageSummary {
     pub unread: bool,
     pub starred: bool,
     pub has_attachments: bool,
+    /// Label ids. The engine owns the registry; a row never carries a copy of the name.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -262,5 +320,19 @@ mod tests {
         assert!(text.contains("Giulia <giulia@example.com>"));
         assert!(text.contains("marco@example.com"));
         assert_eq!(Address::parse_list(&text).expect("round trip").len(), 2);
+    }
+
+    #[test]
+    fn every_label_color_round_trips_through_serde_and_parse() {
+        for color in [LabelColor::Gold, LabelColor::Forest, LabelColor::Success, LabelColor::Danger, LabelColor::Muted] {
+            let name = color.as_str();
+            assert_eq!(LabelColor::parse(name), Some(color));
+            let encoded = serde_json::to_string(&color).expect("serialize a label colour");
+            assert_eq!(encoded, format!("\"{name}\""));
+            let decoded: LabelColor = serde_json::from_str(&encoded).expect("deserialize a label colour");
+            assert_eq!(decoded, color);
+        }
+        assert_eq!(LabelColor::parse("Gold"), None);
+        assert_eq!(LabelColor::parse("blue"), None);
     }
 }

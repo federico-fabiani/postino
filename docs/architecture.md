@@ -43,9 +43,11 @@ This is the same contract as the Crafting Apps, with one improvement: schemas ar
 types, so a handler and its public schema cannot drift.
 
 Current operations: `app_info`, `accounts_list`, `folders_list`, `messages_list`, `message_get`,
-`message_flag`, `message_move`, `draft_save`, `draft_send`, `search`. They are enough to prove the
-path through all three clients. `draft_save` updates one draft in place and `draft_send` is a local
-demo until SMTP arrives in M2; neither opens a network connection.
+`message_flag`, `message_move`, `draft_save`, `draft_send`, `search`, `labels_list`, `label_create`,
+`label_update`, `label_delete`, `label_apply`. They are enough to prove the path through all three
+clients. `draft_save` updates one draft in place and `draft_send` is a local demo until SMTP arrives
+in M2; neither opens a network connection. Labels live in the demo engine's memory, count their
+messages on read and are not synced anywhere until the M1 store.
 
 ## 3. The target shape
 

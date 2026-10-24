@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1 foundations, U0.2 frame, U0.3 interaction and U0.4 compose implemented; U0.5 labels and polish is next · **Last updated:** 2026-10-24
+> **Status:** U0.1 foundations, U0.2 frame, U0.3 interaction, U0.4 compose and U0.5 labels implemented; U0.5 polish is next · **Last updated:** 2026-10-24
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
@@ -213,8 +213,32 @@ when emptied; the drop zone is shown only while there are no attachments. Screen
 - One label model, shown as chips in the sidebar and in the reading pane.
 - `+` next to **Etichette** opens an inline field; Enter creates, Esc cancels.
 - Right-click a message → **Etichetta** opens a type-ahead with checkboxes. `L` opens the same.
-- Clicking a label filters the list; the header says the label name and offers "Mostra tutte".
+- Clicking a label filters the list across every folder by default; choosing a folder narrows it to
+  the intersection. The header states the label name, the scope and offers "Mostra tutte".
 - M0 implements create/apply/filter in the demo engine; server sync arrives with M3.
+
+Shipped in U0.5: the engine owns the label registry (`lbl_*`, one of `gold`, `forest`, `success`,
+`danger`, `muted`) with mailbox-wide total and unread counts. A label view spans every folder by
+default; choosing a folder narrows it to the intersection, so scope and counts agree, and the header
+names the scope in words. Ids are stable and never reused. The sidebar reads the cached
+`labels_list` result, so there is no second hardcoded list; the inline create/rename editor sits
+directly under the ETICHETTE header, with a five-swatch colour row (keyboard reachable, default
+gold), Enter to save and Esc to cancel. The message menu and `L` open a modal, searchable checkbox
+menu with a scrim; its targets are captured when it opens, it closes on Esc or an outside click, and
+it closes if the selection or the filters change, so a multi-selection applies one label in one undo
+step and never touches a message the user cannot see selected. "Nuova etichetta…" in that menu
+creates the label and applies it to the captured targets. Right-click, the palette (`label_rename`,
+`label_delete`, "Togli filtro etichetta") and `F2` cover rename, delete and clearing the filter; the
+delete dialog focuses its confirm button. Rename and delete are undoable, delete restores assignments
+in batches of 500, and creation is explicitly not an undo step. Everything is local and in-memory
+until M1. Screenshots: `docs/images/postino-u05-labels.png`,
+`docs/images/postino-u05-label-menu.png`.
+
+Reading adapts to the window: at 1000 px and wider it is a 52% side pane that resizes between 420 px
+and 62%; below 1000 px it is a full-width overlay with "Torna alla posta" and Esc returns to the
+list. Message-list avatars appear only when the list column is at least 720 px. The 980 × 600
+minimum window is part of the screenshot pass: `--size 980x600` renders the same scenes at that
+size.
 
 ## 9. States, motion, accessibility
 
@@ -256,8 +280,7 @@ when emptied; the drop zone is shown only while there are no attachments. Screen
 
 Shipped in `apps/postino-app/src/app.rs`: click/Ctrl-click/Shift-click selection, Shift+arrow
 extension, `X`/Space toggle, `Ctrl+A`, batch undo, row/folder/empty/reading context menus, and a
-searchable shortcut sheet. Reply/forward arrived in U0.4; labels stay explicitly disabled with a
-reason until U0.5.
+searchable shortcut sheet. Reply/forward arrived in U0.4; labels arrived in U0.5.
 
 ### U0.4 Compose and drafts — done
 
@@ -269,9 +292,16 @@ Shipped in `apps/postino-app/src/ui/widgets/composer.rs` and `apps/postino-app/s
 `draft_save` creates or updates one draft in place; `draft_send` is demo-only, moves the draft to
 Sent and is undoable. Attachments are metadata-only in M0, as is the send itself.
 
-### U0.5 Labels and polish
+### U0.5 Labels — done
 
-- Label create/apply/filter in the demo engine.
+- Label registry with counts, create/rename/delete/apply/remove in the demo engine.
+- Sidebar registry, inline create/rename, modal label menu, filtering, reading-pane chips and undo.
+- CLI and MCP parity through `labels_list`, `label_create`, `label_update`, `label_delete` and
+  `label_apply`; screenshots `docs/images/postino-u05-labels.png` and
+  `docs/images/postino-u05-label-menu.png`.
+
+### U0.5 Polish — next
+
 - Empty/loading/error states, reduced motion, accessibility pass.
 - Final screenshots, gallery review, docs update (`design.md`, `AGENTS.md` if rules changed).
 
