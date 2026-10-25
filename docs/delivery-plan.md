@@ -73,7 +73,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P3b | Store schema + keyring | platform keyring seam, schema v2, repository API, no-plaintext tests | done |
 | P3c | Engine wiring | engine reads/writes the encrypted store; demo path unchanged; reopen test | done |
 | P4a | MIME crate | parse/serialize, sanitized HTML allowlist, text alternative, bounds and fixtures | done |
-| P4b | Attachment blobs | content-addressed encrypted blobs, engine/store plumbing, reopen test | todo |
+| P4b | Attachment blobs | content-addressed encrypted blobs, engine/store plumbing, reopen test | done |
 | P5a | IMAP client | CAPABILITY/LOGIN/LIST/SELECT/FETCH/IDLE, TLS, bounds, scripted fake server | done |
 | P5b | Sync and cache | reconciliation, offline cache, sync status operations, 10k/kill-resume tests | todo |
 | P6 | M1 onboarding | autodiscovery, Aruba app-password flow, multi-account model, real folder tree | todo |

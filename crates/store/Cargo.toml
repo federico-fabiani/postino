@@ -4,17 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Encrypted local store: SQLCipher schema, migrations and repository"
+description = "Encrypted local store: SQLCipher schema, migrations, repository and attachment blobs"
 
 [dependencies]
+postino-crypto.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
-getrandom.workspace = true
 tempfile.workspace = true
 
 [lints]

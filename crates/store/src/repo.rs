@@ -517,6 +517,39 @@ impl Store {
         }
         Ok(attachments)
     }
+
+    /// One attachment row by its globally unique id, paired with the id of the message it belongs
+    /// to. The engine reads attachment bytes through this lookup.
+    pub fn find_attachment(&self, id: &str) -> Result<Option<(String, Attachment)>, StoreError> {
+        self.conn
+            .query_row(&format!("SELECT message_id, {ATTACHMENT_COLUMNS} FROM attachments WHERE id = ?1"), [id], |row| {
+                Ok((row.get(0)?, row_to_attachment_at(row, 1)?))
+            })
+            .optional()
+            .map_err(|error| corrupt_on_decode("attachments", error))
+    }
+
+    /// Point an attachment at stored blob bytes and record the exact size of those bytes.
+    ///
+    /// The blob store hashes the plaintext, so `blob_hash` is both the file name and the integrity
+    /// check. The size is written in the same statement because the read path uses it to cap the
+    /// blob: a MIME-declared size can disagree with the bytes a caller stored, and the bytes are the
+    /// canonical content. `None` clears the pointer without deleting the deduplicated blob.
+    ///
+    /// The attachment must belong to `message_id`: another message's row is
+    /// [`StoreError::AttachmentOwnedByOther`], never a silent no-op.
+    pub fn set_attachment_blob_hash(&self, message_id: &str, attachment_id: &str, blob_hash: Option<&str>, size: u64) -> Result<(), StoreError> {
+        let size = to_i64(size, "attachment size")?;
+        let owner: Option<String> =
+            self.conn.query_row("SELECT message_id FROM attachments WHERE id = ?1", [attachment_id], |row| row.get(0)).optional()?;
+        match owner {
+            Some(owner) if owner == message_id => {}
+            Some(owner) => return Err(StoreError::AttachmentOwnedByOther { id: attachment_id.to_owned(), owner }),
+            None => return Err(StoreError::NotFound { entity: "attachment", id: attachment_id.to_owned() }),
+        }
+        self.conn.execute("UPDATE attachments SET blob_hash = ?1, size = ?2 WHERE id = ?3", params![blob_hash, size, attachment_id])?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -727,13 +760,28 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message) -> Resu
 }
 
 /// Replace attachment rows and `has_attachments` inside an open transaction.
+///
+/// A draft re-save carries no blob hash (the core attachment is metadata only), so the hash of an
+/// attachment id that survives the replacement is kept: the bytes are still on disk and the row
+/// would otherwise point at nothing. Dropping an attachment id drops its pointer; the blob itself
+/// stays because another message may reference the same content.
 fn replace_attachments_in_tx(tx: &rusqlite::Transaction<'_>, message_id: &str, attachments: &[Attachment]) -> Result<(), StoreError> {
+    let mut kept: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT id, blob_hash FROM attachments WHERE message_id = ?1 AND blob_hash IS NOT NULL")?;
+        let rows = stmt.query_map([message_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, hash) = row?;
+            kept.insert(id, hash);
+        }
+    }
     tx.execute("DELETE FROM attachments WHERE message_id = ?1", [message_id])?;
     for attachment in attachments {
         let size = to_i64(attachment.size, "attachment size")?;
+        let blob_hash = attachment.blob_hash.clone().or_else(|| kept.get(&attachment.id).cloned());
         tx.execute(
             "INSERT INTO attachments(id, message_id, filename, mime, size, blob_hash) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![attachment.id, message_id, attachment.filename, attachment.mime, size, attachment.blob_hash],
+            params![attachment.id, message_id, attachment.filename, attachment.mime, size, blob_hash],
         )?;
     }
     tx.execute("UPDATE messages SET has_attachments = ?1 WHERE id = ?2", params![!attachments.is_empty(), message_id])?;

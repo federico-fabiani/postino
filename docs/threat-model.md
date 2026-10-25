@@ -1,7 +1,8 @@
 # Postino threat model
 
-> **Status:** M0 + M1 MIME parser (P4a) · **Last updated:** 2026-10-25 · **Review:** before every
-> release that touches networking, storage, HTML rendering or MCP.
+> **Status:** M0 + M1 MIME parser (P4a) + encrypted attachment blobs (P4b) · **Last updated:**
+> 2026-10-25 · **Review:** before every release that touches networking, storage, HTML rendering or
+> MCP.
 
 ## 1. What we protect
 
@@ -102,11 +103,61 @@
 
 ### 4.3 Local disk theft
 
-- SQLCipher (or equivalent AEAD page encryption) for the metadata DB.
-- Each blob is encrypted with XChaCha20-Poly1305 under a key derived from the master key.
-- The master key is random, 256-bit, created on first run and stored in the keyring. A recovery
-  phrase is an explicit, documented export, not a default.
-- Swap and crash dumps are outside our control; the threat model says so.
+Exactly what is encrypted, and with what:
+
+- **The database** (`<path>`): SQLCipher encrypts every page and WAL frame, and the temp store is
+  configured in memory so temp tables never reach disk. Subjects, addresses, bodies, flags, labels,
+  folder names, draft revisions, attachment names/types/sizes and their blob hashes are ciphertext on
+  disk. The file begins with a random per-database salt, not `SQLite format 3`.
+- **Attachment bytes** (`<db parent>/blobs/<xx>/<hash>.blob`): XChaCha20-Poly1305 under a subkey
+  derived with HKDF-SHA256 (salt `postino.v1`, label `blob`) from the same 256-bit store key. The file
+  is `PSTB`, version 1: magic, version, flags, original length, a 24-byte random nonce, and the
+  ciphertext with a 16-byte tag. The AAD binds magic, version, flags, plaintext length and the BLAKE3
+  hash of the plaintext, so a file cannot be renamed to another hash, swapped with another blob,
+  truncated or extended. zstd compression happens before sealing and is authenticated by the flags
+  byte; decompression is bounded by the declared length, which is checked against the caller's cap
+  before decryption.
+- **The master key**: 32 random bytes, generated on first run and kept in the OS keyring (Windows
+  Credential Manager under service `postino`). Postino never writes it to a file, a config or a log.
+  `StoreKey` and the derived `Subkey` redact `Debug` and zeroise on drop. The store crate never reads
+  the keyring; a wrong key fails closed as `WrongKeyOrCorrupt` (database) or `CorruptBlob` (blob),
+  with no plaintext fallback.
+- **Explicit clearing.** A recovery phrase is an exportable feature, not a default; there is none
+  yet, which means a lost keyring entry is lost mail. Key rotation does not exist: rotating the store
+  key would leave every existing blob unreadable.
+
+What is **not** encrypted, and the consequence:
+
+- **The blob header.** Magic, version, flags, original length and nonce are clear so a reader can
+  validate and bound a file before it allocates or asks for the key. Someone who can list the folder
+  learns the approximate size of each attachment, the fact that compression was used, and how many
+  distinct attachment contents exist. They learn no names, types, addresses or content.
+- **The blob file name.** It is the BLAKE3 hash of the plaintext. That leaks equality (the same
+  content stored once is visibly one file, shared by every message that carries it) and allows a
+  *content-confirmation* attack: an attacker holding a candidate document can hash it and learn
+  whether that exact document is in the mailbox. It does not reveal the content or the key. Encrypting
+  the name too would break dedup and directory listing, which is a deliberate trade.
+- **Swap and crash dumps.** Keys and decrypted content are in process memory while Postino runs. The
+  OS may page that memory, include it in a hibernation image or write a crash dump, and a disk thief
+  can read that. Postino does not lock pages, disable paging or promise to. Full-disk encryption and
+  an OS that does not dump secrets are the mitigations, and they are the user's.
+- **SQLCipher's internal key copy.** The connection keeps its own key schedule and page cache; Rust
+  code cannot zeroise it. `postino-crypto`'s cipher also expands the subkey for the duration of a
+  call, and a *rejected* ciphertext leaves a transient decrypted buffer to the allocator before the
+  tag check fails. Neither is written to disk by Postino, logged or returned, and closing them would
+  mean a custom in-place AEAD construction.
+- **Orphaned blobs.** A crash between writing a blob and committing the attachment row leaves an
+  encrypted, deduplicated file with no row pointing at it. There is no garbage collector yet; a
+  deleted message also leaves its blob because another message may share the content.
+- **Backups.** A backup of the folder copies the database and the blobs. It is unreadable without the
+  keyring entry, and there is no passphrase export yet, so the keyring entry is a single point of
+  failure for restores.
+
+The disk-level guarantee is therefore: **no message content and no key material is recoverable from
+the files Postino writes** (the database and the blob files), while metadata shape (attachment size
+class, content equality, file count) is visible to someone who can read the folder without the key.
+The guarantee does not extend to memory the operating system may have paged out; see the swap and
+crash-dump entry above.
 
 ### 4.4 Malicious agent
 

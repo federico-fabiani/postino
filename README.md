@@ -4,15 +4,17 @@
 registry shared by the desktop app, the CLI and an MCP server.
 
 > **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
-> the MIME crate (P4a) + the IMAP client (P5a).** The shell, the operation registry, the CLI and the
-> MCP server work against a synthetic demo mailbox, and `postino --store <path>` can now run the same
-> operations on the encrypted SQLCipher database: accounts, folders, messages, labels, drafts and
-> flags survive a restart. The desktop app still boots on the demo until onboarding (P6). MIME
-> parsing, sanitization and serialization exist as `postino-mime` but are not wired into the engine
-> yet; `postino-net` is an IMAP4rev1 client that can log in over TLS, list folders, select, fetch
-> envelopes and `BODY.PEEK[]` bodies, store flags and idle, but no sync loop calls it yet. SMTP and
-> the background daemon land in M2-M4. No real account is configured, no mail leaves the machine,
-> and the composer's send is a local move to Sent, never an SMTP submission.
+> the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a).** The shell, the
+> operation registry, the CLI and the MCP server work against a synthetic demo mailbox, and
+> `postino --store <path>` can now run the same operations on the encrypted SQLCipher database:
+> accounts, folders, messages, labels, drafts and flags survive a restart. The desktop app still
+> boots on the demo until onboarding (P6). MIME parsing, sanitization and serialization exist as
+> `postino-mime` but are not wired into the engine yet; `postino-net` is an IMAP4rev1 client that can
+> log in over TLS, list folders, select, fetch envelopes and `BODY.PEEK[]` bodies, store flags and
+> idle, but no sync loop calls it yet. Attachment bytes are encrypted at rest in a content-addressed
+> blob directory next to the database; the app does not ingest real mail yet, so nothing writes them
+> automatically. SMTP and the background daemon land in M2-M4. No real account is configured, no mail
+> leaves the machine, and the composer's send is a local move to Sent, never an SMTP submission.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -54,6 +56,12 @@ MCP      ─┘
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
   guards and `Bcc` kept in the envelope. It is not wired into the engine or the app yet, so the
   shell still shows demo mail.
+- Encrypted attachment bytes (P4b): `postino-crypto` derives an HKDF-SHA256 `blob` subkey from the
+  store key and seals bytes with XChaCha20-Poly1305; `postino-store` keeps each distinct attachment
+  content once under `<db parent>/blobs/<xx>/<hash>.blob` (BLAKE3 name, zstd only when it helps,
+  bounded reads, atomic writes), and `attachments.blob_hash` finally points at something. The engine
+  exposes `attachment_bytes` and `store_attachment_bytes`, with tests across a reopen; sync (P5b)
+  and the reading pane (P6) are the consumers, so no operation, CLI command or screen uses it yet.
 - The M1 network foundation as a crate (`postino-net`, P5a): an IMAP4rev1 client over implicit TLS
   or STARTTLS, with the operating system's certificate verifier and no way to switch verification
   off. It logs in with `AUTHENTICATE PLAIN` or `LOGIN`, lists folders with special-use and modified

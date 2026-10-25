@@ -55,6 +55,37 @@ pub(crate) fn read_error(error: StoreError) -> OpError {
     ))
 }
 
+/// A failed blob read while the engine returns attachment bytes.
+///
+/// Corruption, a missing file and an oversized declared length are storage failures, not caller
+/// mistakes: the message is readable and stays untouched, only its bytes are unavailable.
+pub(crate) fn blob_read_error(error: StoreError) -> OpError {
+    match &error {
+        StoreError::CorruptBlob { .. } => OpError::Failed(format!(
+            "the attachment's stored bytes could not be authenticated: {error}. Nothing was returned and the message is untouched; re-sync the attachment to recover it."
+        )),
+        StoreError::BlobMissing { .. } => OpError::Failed(format!(
+            "the attachment's bytes are missing from the local blob store: {error}. The message itself is intact; re-sync the attachment to recover it."
+        )),
+        StoreError::BlobTooLarge { .. } => OpError::Failed(format!(
+            "the attachment's stored length is larger than this read allows: {error}. The bytes were not returned; the message is untouched."
+        )),
+        StoreError::BadHash { .. } => {
+            OpError::Failed(format!("the attachment metadata holds an invalid blob hash: {error}. The bytes were not read."))
+        }
+        _ => OpError::Failed(format!(
+            "the local blob store could not be read: {error}. Check that the blob directory next to the database is readable and on a disk with free space, then retry."
+        )),
+    }
+}
+
+/// A failed blob write while the engine stores attachment bytes. The metadata write never ran.
+pub(crate) fn blob_write_error(error: StoreError) -> OpError {
+    OpError::Failed(format!(
+        "the attachment bytes could not be stored: {error}. The attachment metadata was not changed; check free disk space and that the blob directory next to the database is writable, then retry."
+    ))
+}
+
 /// A failed repair of draft rows that had no display row.
 pub(crate) fn repair_error(error: StoreError) -> OpError {
     OpError::Failed(format!(
@@ -155,7 +186,8 @@ pub(crate) fn attachment_rows(attachments: &[Attachment]) -> Vec<store::Attachme
             filename: attachment.filename.clone(),
             mime: attachment.mime.clone(),
             size: attachment.size,
-            // Attachment bytes arrive with P4; the store only records metadata today.
+            // The store preserves the hash of an attachment id that survives a draft re-save (P4b),
+            // so a metadata-only mapping cannot silently detach already stored bytes.
             blob_hash: None,
         })
         .collect()

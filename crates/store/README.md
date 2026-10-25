@@ -1,21 +1,29 @@
 # postino-store
 
-**Layer:** foundation. Depends on no other workspace crate; no UI toolkit.
+**Layer:** foundation. Depends on `postino-crypto` (the blob subkey) and on no other workspace crate;
+no UI toolkit.
 
 The encrypted local store. One SQLCipher database with schema **v3**, a migration runner on
-`PRAGMA user_version`, and a typed repository for the M1 mailbox. The engine drives it through
-`Engine::open` (P3c): the store stays independent of `postino-core` and never reads a keyring.
+`PRAGMA user_version`, a typed repository for the M1 mailbox, and a content-addressed encrypted blob
+store for attachment bytes. The engine drives it through `Engine::open` (P3c) and the attachment
+seam (P4b): the store stays independent of `postino-core` and never reads a keyring.
 
-`docs/architecture.md` describes the schema and key flow; `docs/store-spike.md` records why SQLCipher.
+`docs/architecture.md` §4.1-§4.5 describe the schema, key flow and blob format;
+`docs/store-spike.md` records why SQLCipher and how the blobs were added.
 
 ## Contract
 
 - **The key is handed in.** `Store::open(path, &StoreKey)` takes 32 bytes. This crate never reads the
   OS keyring, the environment or a config file. `postino-platform` owns the keyring; tests use a
   random in-memory key, so they cannot touch the Windows Credential Manager.
-- **`StoreKey` never leaks.** `Debug` is `<redacted>`, the bytes are zeroised on drop, and the
-  SQLCipher pragma is built in a zeroising string. The key is not on disk: a test scans the database,
-  WAL and SHM for the key bytes.
+- **The key never leaks.** `Debug` is `<redacted>`, the bytes are zeroised on drop, and the SQLCipher
+  pragma is built in a zeroising string. The key is not on disk: a test scans the database, WAL and
+  SHM for the key bytes.
+- **Blobs are a sibling directory.** `Store::open` creates and opens `<db parent>/blobs` and derives
+  the blob subkey with HKDF-SHA256 (salt `postino.v1`, label `blob`). A directory that cannot be
+  created fails the open instead of losing attachments later. Every store in the same folder shares
+  the directory, which is what makes dedup work across accounts; two databases with different keys in
+  one folder therefore see each other's blobs as `CorruptBlob`, so keep one key per folder.
 - **Fail closed.** A missing codec is `NotEncrypted`; a wrong key or damaged file is
   `WrongKeyOrCorrupt`; a database from a newer build is `SchemaTooNew`. There is no plaintext mode.
 - **Pragmas on open:** `foreign_keys = ON`, `journal_mode = WAL`, `synchronous = FULL`, 5 s busy
@@ -32,7 +40,40 @@ The encrypted local store. One SQLCipher database with schema **v3**, a migratio
   assignments and attachment rows survive a sync refresh. `save_draft_row` keeps the stored
   `in_reply_to` when the update passes `None`; clearing it needs an explicit field, which does not
   exist yet. `replace_attachments` is the explicit replacement and keeps
-  `messages.has_attachments` in step.
+  `messages.has_attachments` in step; it also keeps the `blob_hash` of an attachment id that
+  survives the replacement, so a draft re-save cannot detach bytes that are already on disk.
+
+## Blobs
+
+The full format is in `docs/architecture.md` §4.5. The essentials:
+
+```
+blobs/<first two hex chars>/<64 lowercase hex>.blob
+  PSTB | version 1 | flags | original_len u64 LE | 24-byte nonce | ciphertext || tag
+```
+
+- `BlobStore::open(root, &StoreKey)` derives the subkey; `put(bytes)` returns the lowercase BLAKE3
+  hex of the plaintext and writes nothing when that file already exists (dedup). `get(hash,
+  max_bytes)` authenticates and returns `Zeroizing<Vec<u8>>`; `has` and `remove` are the other two
+  operations.
+- The hash is validated as exactly 64 lowercase hex characters before any path is built. `..`,
+  separators, uppercase hex and short/long values are `BadHash`; no path is ever assembled from an
+  unvalidated value.
+- The AAD is `magic || version || flags || original_len || hash bytes`. A blob cannot be renamed to
+  another hash, truncated, extended or swapped with another. A wrong key is the same
+  `CorruptBlob` as a flipped byte, because an attacker must not learn which one they achieved.
+- zstd level 3 is used only when the compressed frame is smaller than the plaintext (flag bit 0).
+  Reads check the declared length against the caller's `max_bytes` **before** decryption, cap it at
+  `MAX_BLOB_BYTES` (64 MiB), and decompress with `zstd::bulk::Decompressor` into a buffer of exactly
+  the declared length. `decompress_all` is never used.
+- Writes go through `.tmp-<random>` with `create_new`, `sync_all` and a rename in the shard
+  directory. A failed write removes its temp. A concurrent put of the same content is a no-op
+  success: the content is the name.
+- Errors: `BadHash`, `BlobMissing`, `CorruptBlob`, `BlobTooLarge`, `BlobRoot`, `Io`, `Compression`,
+  `Random`, `Crypto`. None carries plaintext or key material.
+- Recovery: `put` deduplicates on the file's existence, so a damaged file has to be removed with
+  `remove(hash)` before the same bytes can be written again. The engine's read path never deletes
+  anything.
 
 ## Schema v3
 
@@ -44,7 +85,7 @@ v3 is additive from v2: it adds `draft_seq`, the draft revision high-water mark,
 | `accounts` | id, name, email, provider, signature, created_at |
 | `folders` | account, name, kind, cached unread/total, `uid_validity`, `uid_next`, `last_sync_at` |
 | `messages` | envelope, JSON recipient lists, flags, body text/HTML, size, optional IMAP uid |
-| `attachments` | metadata only: filename, mime, size, optional blob hash |
+| `attachments` | metadata: filename, mime, size, optional blob hash; the bytes live in `blobs/` |
 | `labels` | account-scoped or mailbox-wide, name, semantic colour name |
 | `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |
 | `drafts` | revision, updated_at, body, recipients, subject, in_reply_to |
@@ -68,7 +109,10 @@ Plain data structs in `model.rs` (no `postino-core` dependency), methods in `rep
   `delete_message`.
 - labels: `create_label`, `update_label`, `delete_label`, `get_label`, `list_labels` (live counts),
   `apply_label`, `remove_label`, `messages_by_label`, `labels_for`.
-- attachments: `replace_attachments`, `attachments`, `list_all_attachments`.
+- attachments: `replace_attachments`, `attachments`, `list_all_attachments`, `find_attachment`
+  (one row plus its message id) and `set_attachment_blob_hash(message, attachment, hash, size)`,
+  which the engine calls after a blob write. `replace_attachments` preserves the hash of an id that
+  survives the replacement; clearing it is explicit.
 - hydration: `list_all_messages` plus `list_all_attachments` load a whole mailbox in one query per
   table, with labels and attachments grouped by message; `Engine::open` uses exactly this pair.
 - drafts: `save_draft_message` is the whole-draft API. It writes the message row, its attachments,
@@ -96,6 +140,12 @@ cargo test -p postino-store
 ```
 
 - `tests/encryption.rs`: keyless reads, wrong key, reopen, no plaintext in DB or WAL.
+- `tests/blobs.rs`: blob round trip and reopen, dedup (one file for identical bytes), wrong key,
+  tampered ciphertext/tag/nonce, a swapped file, an oversized declared length, non-hex and traversal
+  hashes, temp cleanup on success and on a failed rename, eight concurrent puts of the same content,
+  compression only when it helps, the header layout and hexdump, remove/has, a no-plaintext scan of
+  the database and every blob file (including the key bytes), blob-directory creation and failure,
+  and the attachment-row pointer behaviour.
 - `tests/migrations.rs`: additive v1 → v3 upgrade with meta preserved, v2 → v3 `draft_seq`
   seeding, idempotent reopen, `SchemaTooNew`, foreign-key enforcement and cascade.
 - `tests/repository.rs`: the full round trip (account, folders, message, two recipients, attachment,
@@ -108,9 +158,10 @@ cargo test -p postino-store
 
 ## Not here yet
 
-Desktop-app wiring (P6 onboarding), IMAP sync writers, MIME parsing, FTS5, encrypted attachment blobs
-(P4), outbox (P7), daemon (M4). `sync_state` has its table but no repository writer until P5. The
-engine (P3c) is a client of this crate; this crate never depends on it.
+Desktop-app wiring (P6 onboarding), IMAP sync writers, MIME parsing, FTS5, body/raw-message blobs
+(P9), outbox (P7), daemon (M4), key rotation and blob garbage collection. `sync_state` has its table
+but no repository writer until P5. The engine (P3c, P4b) is a client of this crate; this crate never
+depends on it.
 
 ## Build prerequisite (Windows GNU)
 
@@ -123,3 +174,5 @@ $env:MAKEFLAGS = "-j$env:NUMBER_OF_PROCESSORS"
 ```
 
 Without `MAKEFLAGS`, `openssl-src` builds serially on Windows: ~14 min cold instead of ~4.5 min.
+The blob layer adds `zstd-sys` (bundled C zstd) and blake3's assembly; both use the same MSYS2 gcc
+and add about 19 s to a dev rebuild of this crate.

@@ -82,10 +82,12 @@ fn layers() -> Result<()> {
         // The engine sits above the foundation: it owns the domain types and drives the encrypted
         // repository. The store never depends back on it.
         ("postino-core", &["postino-store"][..]),
+        ("postino-crypto", &[][..]),
         ("postino-mime", &[][..]),
         ("postino-net", &[][..]),
         ("postino-platform", &[][..]),
-        ("postino-store", &[][..]),
+        // The store encrypts attachment blobs with a subkey from the crypto crate.
+        ("postino-store", &["postino-crypto"][..]),
         ("postino-app", &["postino-core"][..]),
         ("postino-cli", &["postino-core", "postino-store", "postino-platform"][..]),
         ("xtask", &[][..]),

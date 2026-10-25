@@ -1,8 +1,8 @@
 # Postino architecture
 
-> **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c) + MIME
-> crate (P4a) · **Last updated:** 2026-10-25 · **Target:** a local-first, agent-first mail client
-> that is fast on every desktop.
+> **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c/P3d) + MIME
+> crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) · **Last updated:** 2026-10-25 ·
+> **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
 ## 1. Shape today
 
@@ -11,9 +11,10 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | Path | Role |
 |---|---|
 | `crates/core` | Domain types, the engine (demo or store-backed), the operation registry and its JSON Schemas |
+| `crates/crypto` | HKDF-SHA256 subkeys and XChaCha20-Poly1305 sealing; the blob subkey (P4b) |
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/platform` | OS seams; today the store key in the Windows Credential Manager |
-| `crates/store` | SQLCipher schema v3, migrations and the repository; the engine's persistence layer since P3c |
+| `crates/store` | SQLCipher schema v3, migrations, the repository and the encrypted blob store (P3b, P4b) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
 | `apps/postino-cli` | `postino` command line and the opt-in MCP server |
 | `xtask` | `ci`, `layers`, `assets` |
@@ -100,8 +101,9 @@ decision and the migration path.
 
 | Crate | Responsibility |
 |---|---|
-| `postino-store` | SQLCipher schema, migrations, repository (P3b); FTS5 and encrypted blobs later |
-| `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blobs P4b) |
+| `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
+| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 later |
+| `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
 | `postino-net` | IMAP4rev1 client (P5a): TLS, bounded responses, testable against a scripted server. SMTP submission, autodiscovery, QRESYNC later |
 | `postino-sync` | reconciliation, outbox with idempotency keys, drafts, flags, threading |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
@@ -134,8 +136,10 @@ sync_state(account, folder, uidvalidity, last_uid, modseq)
 ```
 
 - The **server is the source of truth**. The local database is a cache plus an operation log.
-- Bodies are content-addressed blobs (`blake3`), zstd-compressed and encrypted with
-  XChaCha20-Poly1305. Large attachments live outside the DB.
+- Attachment bytes are content-addressed blobs: BLAKE3 of the plaintext names the file, zstd
+  compresses it when that helps, and XChaCha20-Poly1305 seals it with a subkey of the store key. They
+  live in `blobs/` next to the database, never in SQLCipher pages. Message bodies stay in the
+  encrypted database in M1; §4.5 explains why.
 - FTS5 indexes subject, people and extracted body text. Tokenization is Unicode-aware.
 - Threading uses `References`/`In-Reply-To` with a JWZ-style fallback, plus provider thread ids
   when available.
@@ -259,17 +263,18 @@ cache; the engine is authoritative for it.
 
 **Residual windows.** Each engine mutation is one repository transaction, so a crash or disk
 failure cannot leave the store one step ahead of memory within an operation. Activations and the
-app are still demo-only, attachment bytes, IMAP `uid`/`Message-ID` and `size` are not written by the
-engine yet (P4/P5), and the keyring lock protects first-run key creation, not the store file itself.
-There is no cross-process locking story beyond SQLite's WAL, busy timeout and the keyring lock: one
-process owns the store until the daemon (M4), and the desktop app does not open it yet. The
-repository returns folders and labels ordered by name, so a store engine sees alphabetical order
-where the demo saw creation order; P6 decides the real folder-tree order when onboarding writes it.
+app are still demo-only; the engine writes attachment bytes only through the P4b seam (sync does not
+call it yet) and IMAP `uid`/`Message-ID` and `size` are not written by the engine yet (P5), and the
+keyring lock protects first-run key creation, not the store file itself. There is no cross-process
+locking story beyond SQLite's WAL, busy timeout and the keyring lock: one process owns the store
+until the daemon (M4), and the desktop app does not open it yet. The repository returns folders and
+labels ordered by name, so a store engine sees alphabetical order where the demo saw creation order;
+P6 decides the real folder-tree order when onboarding writes it.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
 a store. **Still missing:** onboarding and the default store path (P6), IMAP writers for
-`sync_state` (P5), MIME wiring into the engine and encrypted attachment blobs (P4b), FTS5 (P9),
-outbox (P7), the daemon (M4).
+`sync_state` (P5), MIME wiring into the engine and the sync call that feeds the P4b attachment seam
+(P5b), FTS5 (P9), outbox (P7), the daemon (M4).
 
 ### 4.3 Implemented in P4a: the MIME crate
 
@@ -301,10 +306,10 @@ quoted-printable, base64, RFC 2231 continuations, deterministic boundaries from 
 the generated `Message-ID`. Header injection is `MimeError::HeaderInjection`, never a strip. `Bcc`
 is validated, deduplicated into `Envelope.recipients`, and never appears in `raw`.
 
-**Next.** P4b stores the bounded attachment bytes as encrypted blobs and maps `ParsedMessage` onto
-the core `Address`/`Attachment` shapes; P5 supplies the IMAP bytes and P7 uses `serialize` for
-submission. The crate has no dependency on `postino-core`, so the mapping stays in the engine
-layer.
+**Next.** P4b stores the bounded attachment bytes as encrypted blobs and exposes the engine seam;
+mapping `ParsedMessage` onto the core `Address`/`Attachment` shapes and feeding those bytes is P5b.
+P5 supplies the IMAP bytes and P7 uses `serialize` for submission. The crate has no dependency on
+`postino-core`, so the mapping stays in the engine layer.
 
 ### 4.4 Implemented in P5a: the IMAP client
 
@@ -357,6 +362,99 @@ QRESYNC/CONDSTORE beyond reading `HIGHESTMODSEQ` when the server volunteers it, 
 METADATA, ACL, SIEVE, NOTIFY, ESEARCH, `BODYSTRUCTURE` and per-part fetches, OAuth/SASL XOAUTH2 and
 any mechanism other than PLAIN, SMTP, autodiscovery and MIME parsing. The fake server lives in
 `crates/net/tests/support/`; it is promoted to `postino-testkit` only when SMTP needs it.
+
+### 4.5 Implemented in P4b: encrypted attachment blobs
+
+Attachment bytes are the largest and most sensitive payload in a mailbox and they are write-once.
+They do not belong in SQLCipher pages: `postino-store` keeps one file per distinct content next to
+the database and seals it with a subkey derived from the same store key.
+
+```
+D:\mail\mail.db                      SQLCipher: metadata, subjects, bodies, rows
+D:\mail\blobs\0a\0a3f…c9.blob        XChaCha20-Poly1305: one attachment content, once
+```
+
+**Layout.** `Store::open` creates and opens `<db parent>/blobs` after the schema is readable and
+before the engine sees the store; a directory that cannot be created fails the open instead of
+losing attachments later. Every blob is `blobs/<first two hex chars>/<hash>.blob`, where the hash is
+the lowercase BLAKE3 hex of the **plaintext**. One directory is shared by every store in the same
+folder, which is what lets dedup work across accounts and keeps a folder backup self-contained. The
+hash is validated as exactly 64 lowercase hex characters before any path is assembled, so `..`,
+separators, uppercase hex and short/long values are `BadHash` and never reach the filesystem.
+A relative database path resolves to `./blobs`. Two databases with **different** keys in one folder
+therefore share a directory neither can fully read (the other's blobs are `CorruptBlob`): keep one
+key per folder.
+
+**Header, version 1.**
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `PSTB` |
+| 4 | 1 | version `1` |
+| 5 | 1 | flags: bit 0 = the payload is zstd-compressed; every other bit must be zero |
+| 6 | 8 | `original_len`, `u64` little-endian: the plaintext length, never the payload length |
+| 14 | 24 | XChaCha20-Poly1305 nonce |
+| 38 | n | ciphertext with a 16-byte Poly1305 tag |
+
+**Associated data.** `magic || version || flags || original_len || hash bytes`. The hash binds the
+file to its name, so a blob cannot be renamed to another hash or swapped with another attachment;
+the length binds the plaintext size, so a truncated or extended file is rejected instead of being
+decrypted with the wrong size. The flags byte is in the AAD even though a minimal AAD could omit it:
+flags decide whether the payload is decompressed, and authenticating the length but not the
+interpretation would let a local attacker flip one clear byte and change what the reader returns.
+
+**Compression.** zstd level 3, used only when the compressed frame is smaller than the plaintext
+(flag bit 0). Decompression always goes through `zstd::bulk::Decompressor` with a buffer of exactly
+the declared plaintext length; `decompress_all` is never used. A blob that declares more than the
+caller's `max_bytes` is refused **before** decryption, and `MAX_BLOB_BYTES` (64 MiB) is a hard
+ceiling whatever the caller passes. The engine reads with `recorded size + 1 MiB`, so a corrupted
+length field cannot become an allocation.
+
+**Keys.** The blob key is `HKDF-SHA256(salt = "postino.v1", ikm = store key, info = "blob")`, held
+in `postino_crypto::Subkey`: no `Clone`, redacted `Debug`, zeroised on drop. A nonce is 24 random
+bytes from the OS RNG for every seal. A different store key, a different label or a different AAD is
+`CorruptBlob`; the error never says which, and it never contains plaintext or key bytes. Key
+rotation does not exist yet: rotating the store key makes every existing blob unreadable, and that
+is recorded in `docs/threat-model.md`.
+
+**Writes.** A put writes `.tmp-<random>` in the target shard with `create_new`, `sync_all`s it and
+renames it over `<hash>.blob`. A failed write removes its temp. A rename that loses a race against
+an identical put is a success because the name is the content; eight concurrent puts of the same
+bytes leave one file and no temp. Identical bytes are stored once (dedup), and a put of existing
+bytes writes nothing.
+
+**What is encrypted where.**
+
+- The database: pages, WAL frames and temp store through SQLCipher. Subjects, addresses, bodies,
+  flags, labels, attachment names/types/sizes and their hashes are ciphertext.
+- The blob: everything after the header. The header (magic, version, flags, original length, nonce)
+  and the file name are clear by design: a reader has to bound the file before it allocates or asks
+  for the key, and the hash has to be the name for dedup to work. A local attacker therefore learns
+  an attachment's size class and can confirm whether a candidate file is in the mailbox; they do not
+  learn the content.
+- **Message bodies stay in the encrypted database in M1.** A body is small (kilobytes to a few
+  hundred kilobytes), is read in random order by the list and reading paths, and is about to feed
+  FTS5. Moving it into a blob would add an open/seek/decrypt round trip and a second failure mode
+  without a size win. Only the write-once, streamed payloads leave the page store; P9 may move raw
+  messages for index rebuilds, and §4.5 would then grow a second context label.
+- Not recoverable by Postino, and documented rather than hidden: swap and crash dumps, SQLCipher's
+  internal key copy, the cipher's expanded key during a call, the transient buffer of a rejected
+  ciphertext and orphaned blob files. `docs/threat-model.md` §4.3 is the authoritative list.
+
+**Engine seam (no operation).** `Engine::attachment_bytes(attachment_id)` reads through the store
+(P6 reading pane), capped at the recorded size plus 1 MiB. `Engine::store_attachment_bytes` takes
+`(message_id, attachment_id, bytes)` and is repository-first, memory-second: put the blob, update the
+attachment row's `blob_hash` and exact `size`, then the in-memory size and the engine's hash map. A
+failed row write leaves the row and the message untouched; the blob file may remain as an
+unreferenced, deduplicated file. `has_attachments` never changes on this path because the row
+already exists. The demo engine and a store-less engine answer with a readable `OpError::Failed`.
+Consumers: sync (P5b) calls the write for every ingested attachment; the reading pane (P6) calls the
+read to preview or save.
+
+**Recovery.** `put` deduplicates on the file's existence, so a damaged file has to be removed with
+`BlobStore::remove(hash)` before the same content can be written again. The engine's read path never
+mutates. There is no garbage collection yet: deleting a message leaves its blob file, because
+another message may reference the same content; P9 or the daemon will sweep unreferenced hashes.
 
 ## 5. Synchronization
 
@@ -413,7 +511,8 @@ ADR-0001.
 - TLS only; certificate validation cannot be disabled from the UI. The IMAP client verifies with
   the operating system's verifier, refuses STARTTLS downgrades, and has no plaintext mode at all.
 - Credentials in the OS keyring; OAuth2 PKCE with a loopback redirect for providers that require it.
-- Store encrypted at rest; the key is generated on first run and kept in the keyring.
+- Store encrypted at rest: SQLCipher for the database, XChaCha20-Poly1305 under an HKDF subkey for
+  attachment blobs; the key is generated on first run and kept in the keyring.
 - HTML sanitized with an allowlist; remote images and tracking pixels blocked by default; no
   scripts.
 - Header injection rejected at compose time (no CR/LF in addresses or subjects).
@@ -442,4 +541,5 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P3c: engine loads the store once and writes through; CLI `--store`; demo unchanged |
 | 2026-10-25 | major | P3d: schema v3 (`draft_seq`, `label_seq`), atomic draft save/send, draft patch semantics, per-account Sent, orphan repair, keyring first-run lock, categorised store errors |
 | 2026-10-25 | major | P4a: `postino-mime` parses, sanitizes and serializes MIME with bounds, warnings and injection guards |
+| 2026-10-25 | major | P4b: `postino-crypto` derives HKDF subkeys and seals with XChaCha20-Poly1305; `postino-store` gains a deduplicated, compressed, encrypted blob directory for attachment bytes and the engine gains the attachment read/write seam |
 | 2026-10-25 | major | P5a: `postino-net` speaks IMAP4rev1 over implicit TLS or STARTTLS with OS verification, bounded lines/literals/commands, typed errors and a scripted hostile-server corpus; the sync loop and store writes are still missing |

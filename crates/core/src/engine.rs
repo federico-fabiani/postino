@@ -46,6 +46,11 @@ const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_LABEL_NAME_CHARS: usize = 48;
 const MAX_LABEL_MESSAGES: usize = 500;
 
+/// Slack added to an attachment's recorded size when its bytes are read back. A stored blob that is
+/// larger than the metadata plus this slack is refused before it is decrypted: a corrupt or swapped
+/// row must not turn into a multi-gigabyte allocation.
+const ATTACHMENT_READ_SLACK: u64 = 1024 * 1024;
+
 /// Why an operation failed. The message is meant for a person or an agent to read and act on.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OpError {
@@ -66,12 +71,28 @@ pub struct Engine {
     demo: bool,
     /// `None` for the demo and the empty engine; every mutation is memory-only there.
     store: Option<Store>,
+    /// Attachment id → BLAKE3 hex hash of its stored blob bytes, for attachments that have bytes.
+    ///
+    /// Core's `Attachment` deliberately carries no `blob_hash`: it is part of the `message_get`
+    /// output and of the draft flow, and a storage detail does not belong in that surface. The engine
+    /// keeps the in-memory half of the mapping (hydrated by [`Engine::open`], updated after a blob
+    /// write) and the repository row stays the source of truth.
+    blob_hashes: HashMap<String, String>,
 }
 
 impl Engine {
     /// An engine with no accounts. Every list is empty until a store or demo data is attached.
     pub fn empty() -> Self {
-        Self { accounts: Vec::new(), folders: Vec::new(), messages: Vec::new(), labels: Vec::new(), next_label_seq: 1, demo: false, store: None }
+        Self {
+            accounts: Vec::new(),
+            folders: Vec::new(),
+            messages: Vec::new(),
+            labels: Vec::new(),
+            next_label_seq: 1,
+            demo: false,
+            store: None,
+            blob_hashes: HashMap::new(),
+        }
     }
 
     /// The M0 walking skeleton: a synthetic account with realistic mail, held in memory only.
@@ -96,13 +117,19 @@ impl Engine {
         let accounts = store.list_accounts().map_err(store_map::read_error)?.into_iter().map(store_map::account).collect::<Vec<_>>();
         let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
         repair_orphan_drafts(&store, &accounts, &folders)?;
-        let mut attachments = store.list_all_attachments().map_err(store_map::read_error)?;
+        let mut attachment_rows = store.list_all_attachments().map_err(store_map::read_error)?;
+        let mut blob_hashes = HashMap::new();
         let messages = store
             .list_all_messages()
             .map_err(store_map::read_error)?
             .into_iter()
             .map(|row| {
-                let rows = attachments.remove(&row.summary.id).unwrap_or_default();
+                let rows = attachment_rows.remove(&row.summary.id).unwrap_or_default();
+                for attachment in &rows {
+                    if let Some(hash) = &attachment.blob_hash {
+                        blob_hashes.insert(attachment.id.clone(), hash.clone());
+                    }
+                }
                 store_map::message(row, rows)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -111,6 +138,7 @@ impl Engine {
 
         let mut engine = Self::from_parts(accounts, folders, messages, labels, false, Some(store));
         engine.next_label_seq = label_seq.saturating_add(1);
+        engine.blob_hashes = blob_hashes;
         Ok(engine)
     }
 
@@ -123,7 +151,7 @@ impl Engine {
         store: Option<Store>,
     ) -> Self {
         let next_label_seq = labels.iter().filter_map(label_number).max().unwrap_or(0).saturating_add(1);
-        let mut engine = Self { accounts, folders, messages, labels, next_label_seq, demo, store };
+        let mut engine = Self { accounts, folders, messages, labels, next_label_seq, demo, store, blob_hashes: HashMap::new() };
         engine.recount();
         engine
     }
@@ -448,6 +476,12 @@ impl Engine {
             .collect::<Vec<_>>();
         validate_unique_attachment_ids(&attachments)?;
         let has_attachments = !attachments.is_empty();
+        // The ids this draft carries *now*: an id that disappears from the list must stop resolving
+        // to a stored blob, because the repository deletes its row.
+        let replaced_ids = index
+            .and_then(|index| self.messages.get(index))
+            .map(|message| message.attachments.iter().map(|attachment| attachment.id.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
         let summary_snippet = snippet(&draft.body_text);
         // An update keeps what the draft form does not own: its thread, starred flag, labels and
         // HTML body. The composer patches `body_text`; a subject-only save must not destroy the
@@ -491,6 +525,13 @@ impl Engine {
                 *message = saved.clone();
             }
             None => self.messages.push(saved.clone()),
+        }
+        // A kept attachment id keeps its in-memory hash (the repository preserves the row's
+        // `blob_hash` when the model carries none); a dropped id loses its hash with its row.
+        for id in &replaced_ids {
+            if !saved.attachments.iter().any(|attachment| attachment.id == *id) {
+                self.blob_hashes.remove(id);
+            }
         }
         self.recount();
         Ok(saved)
@@ -578,6 +619,92 @@ impl Engine {
     /// Call any operation by name with JSON arguments. This is the only door a frontend uses.
     pub fn call(&mut self, name: &str, args: Value) -> Result<Value, OpError> {
         ops::dispatch(self, name, args)
+    }
+
+    /// Read the stored bytes of one attachment through the encrypted blob store.
+    ///
+    /// The read is capped at the attachment's recorded size plus [`ATTACHMENT_READ_SLACK`], so a
+    /// damaged or swapped blob that declares a huge length is refused before it is decrypted. An
+    /// unknown attachment id is a caller mistake; a demo or store-less engine has no bytes at all.
+    ///
+    /// Consumed by the reading pane (P6) when it previews or saves an attachment.
+    pub fn attachment_bytes(&self, attachment_id: &str) -> Result<Vec<u8>, OpError> {
+        let store = self.attachment_store()?;
+        let attachment = self.find_attachment(attachment_id)?;
+        let Some(hash) = self.blob_hashes.get(attachment_id) else {
+            return Err(OpError::Failed(format!(
+                "attachment {attachment_id:?} has no stored bytes; sync ingests attachment bytes in P5b and the engine only stores bytes a caller hands to store_attachment_bytes"
+            )));
+        };
+        let max_bytes = attachment.size.saturating_add(ATTACHMENT_READ_SLACK);
+        let bytes = store.blobs().get(hash, max_bytes).map_err(store_map::blob_read_error)?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Store the bytes of one attachment of one message in the encrypted blob store.
+    ///
+    /// The order is repository first, memory second: the blob file is written, then the attachment
+    /// row receives the hash and the exact byte length, then memory reflects both. A failed row write
+    /// leaves the row and the message exactly as they were; the blob file may stay behind as an
+    /// unreferenced, deduplicated file, which is harmless. `has_attachments` never changes here: the
+    /// attachment row already exists, so the flag was already true.
+    ///
+    /// Consumed by sync (P5b) when it ingests real attachments and by the reading pane (P6) when it
+    /// saves one.
+    pub fn store_attachment_bytes(&mut self, message_id: &str, attachment_id: &str, bytes: &[u8]) -> Result<(), OpError> {
+        let store = self.attachment_store()?;
+        let size = bytes.len() as u64;
+        if size > MAX_ATTACHMENT_BYTES {
+            return Err(OpError::InvalidArgs(format!(
+                "attachment bytes are {size} bytes; this build stores at most {MAX_ATTACHMENT_BYTES} bytes per attachment"
+            )));
+        }
+        let Some(message_index) = self.messages.iter().position(|message| message.summary.id == message_id) else {
+            return Err(unknown_message(message_id));
+        };
+        let Some(attachment_index) =
+            self.messages.get(message_index).and_then(|message| message.attachments.iter().position(|attachment| attachment.id == attachment_id))
+        else {
+            return Err(OpError::InvalidArgs(format!(
+                "attachment {attachment_id:?} is not on message {message_id:?}; each attachment id belongs to exactly one message"
+            )));
+        };
+        let hash = store.blobs().put(bytes).map_err(store_map::blob_write_error)?;
+        store.set_attachment_blob_hash(message_id, attachment_id, Some(&hash), size).map_err(store_map::write_error)?;
+        // Only now, after both durable writes, does memory change.
+        self.blob_hashes.insert(attachment_id.to_owned(), hash);
+        if let Some(attachment) = self.messages.get_mut(message_index).and_then(|message| message.attachments.get_mut(attachment_index)) {
+            attachment.size = size;
+        }
+        Ok(())
+    }
+
+    /// The BLAKE3 hash of an attachment's stored bytes, when this engine knows one.
+    ///
+    /// `Attachment` carries no storage detail (see the `blob_hashes` field), so this is the readable
+    /// half of the in-memory mapping. It is not an operation and has no JSON schema.
+    pub fn attachment_hash(&self, attachment_id: &str) -> Option<&str> {
+        self.blob_hashes.get(attachment_id).map(String::as_str)
+    }
+
+    /// The store, or a readable reason why this engine cannot touch attachment bytes.
+    fn attachment_store(&self) -> Result<&Store, OpError> {
+        match &self.store {
+            Some(store) => Ok(store),
+            None if self.demo => Err(OpError::Failed(
+                "the demo mailbox has no attachment bytes; open a local store (postino --store <path>) to use attachments".to_owned(),
+            )),
+            None => Err(OpError::Failed("this engine has no local store, so attachment bytes are unavailable; open it with Engine::open".to_owned())),
+        }
+    }
+
+    /// One attachment by its globally unique id, with a readable error when it does not exist.
+    fn find_attachment(&self, attachment_id: &str) -> Result<&Attachment, OpError> {
+        self.messages
+            .iter()
+            .flat_map(|message| message.attachments.iter())
+            .find(|attachment| attachment.id == attachment_id)
+            .ok_or_else(|| OpError::InvalidArgs(format!("unknown attachment {attachment_id:?}; attachment ids come from message_get")))
     }
 
     /// The operation catalogue, with JSON Schemas. CLI and MCP share it.

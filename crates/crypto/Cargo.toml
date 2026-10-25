@@ -1,0 +1,18 @@
+[package]
+name = "postino-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Postino cryptography: HKDF-SHA256 subkeys and XChaCha20-Poly1305 sealing"
+
+[dependencies]
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

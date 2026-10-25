@@ -55,8 +55,11 @@ The current workspace is deliberately small:
 apps/postino-app   egui shell                     L3
 apps/postino-cli   CLI + MCP server               L3
 crates/core        domain + engine + operations   L2
+crates/net         IMAP client (TLS, bounds)      L1.5 network
 crates/store       encrypted store, repository    L1
+crates/crypto      HKDF subkeys, XChaCha20-Poly1305 L1
 crates/platform    keyring seam                   L1
+crates/mime        MIME, HTML sanitizer, RFC 5322 L1
 xtask              build/quality tasks            tooling
 ```
 
@@ -64,6 +67,8 @@ Rules enforced by `cargo xtask layers`:
 
 - `postino-core` may depend only on `postino-store` (the foundation it drives) and never on a UI
   toolkit (`egui`, `eframe`, `winit`, `rfd`). The store never depends back on core.
+- `postino-crypto`, `postino-mime`, `postino-platform` and `postino-store` are foundation: no
+  workspace dependency and no UI. `postino-net` is network: it depends on no other workspace crate.
 - `postino-app` and `postino-cli` may depend on `postino-core` and on libraries, never on each other.
 - New crates need a layer and a README before they need code. Planned crates are listed in
   `docs/architecture.md`; do not create speculative stubs.

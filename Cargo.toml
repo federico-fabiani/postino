@@ -13,6 +13,7 @@ repository = "https://github.com/federicopostino/postino"
 [workspace.dependencies]
 # internal
 postino-core = { path = "crates/core", version = "0.1.0" }
+postino-crypto = { path = "crates/crypto", version = "0.1.0" }
 postino-mime = { path = "crates/mime", version = "0.1.0" }
 postino-net = { path = "crates/net", version = "0.1.0" }
 postino-platform = { path = "crates/platform", version = "0.1.0" }
@@ -63,7 +64,15 @@ png = "0.18"
 # build tooling
 cargo_metadata = "0.23"
 toml = "0.9"
-sha2 = "0.10"
+
+# cryptography and blob storage. chacha20poly1305 0.10.1, hkdf 0.12.4 and sha2 0.10.9 share the
+# crypto-common 0.1 / digest 0.10 generation already in the lockfile, so the sealed-blob layer adds
+# one AEAD stack, not a second copy of the hashing traits.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+blake3 = "=1.8.7"
+zstd = "=0.14.3"
 
 # test-only
 tempfile = "3"

@@ -1,7 +1,7 @@
 # Development
 
-> **Status:** M0 + U0.5 labels + P3c engine on the encrypted store + P4a MIME crate ·
-> **Last updated:** 2026-10-25
+> **Status:** M0 + U0.5 labels + P3c engine on the encrypted store + P4a MIME crate + P4b encrypted
+> attachment blobs · **Last updated:** 2026-10-25
 
 ## 1. Toolchain
 
@@ -50,9 +50,10 @@ cargo xtask assets --write                    # regenerate ATTRIBUTION.md
 
 ```
 crates/core/        domain, engine (demo or store-backed), operation registry, store_map
+crates/crypto/      HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type
 crates/mime/        MIME parse/serialize, HTML sanitization, HTML-to-text, header guards
 crates/platform/    OS seams: the store key in the Windows Credential Manager
-crates/store/       encrypted SQLCipher store, schema v3, repository
+crates/store/       encrypted SQLCipher store, schema v3, repository, encrypted blob directory
 apps/postino-app/   egui shell (demo data until P6)
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks
@@ -76,6 +77,17 @@ Writes are write-through: the repository commits first, the engine updates memor
 failed write returns `OpError::Failed` without changing memory. Moving, flagging, labelling,
 renaming labels and saving/sending drafts all survive a restart.
 
+Attachment bytes live next to the database, not in it: `Store::open` also creates and opens
+`<db parent>/blobs`, one encrypted file per distinct content
+(`blobs/<xx>/<BLAKE3>.blob`, see `docs/architecture.md` §4.5). The blob key is derived from the same
+store key with HKDF-SHA256 (label `blob`), so a store without its keyring entry loses its attachments
+too. Back up the folder (database plus `blobs/`), not just the `.db` file. A damaged blob is
+`CorruptBlob`; the engine reports it as `OpError::Failed` and leaves the message intact. `put`
+deduplicates on the file's existence, so a corrupt file has to be removed before the same content can
+be written again. There is no garbage collector yet: deleting a message leaves its blob, because the
+same content may belong to another message. Nothing in the CLI, the app or the operations calls the
+seam yet; sync (P5b) and the reading pane (P6) will.
+
 What is still demo or missing:
 
 - The desktop app always boots `Engine::demo_at`; the store is CLI-only until P6 onboarding chooses
@@ -87,8 +99,9 @@ What is still demo or missing:
 - One process owns the store. There is no daemon, no pipe and no second writer (M4); the CLI and a
   future app must not open the same file at once. Do not run two `postino --store` commands against
   one database.
-- No IMAP, MIME, SMTP, FTS5, attachment bytes or scheduled send. `draft_send` is still a local
-  demo move to Sent and contacts no server.
+- No IMAP, MIME, SMTP, FTS5, attachment bytes in the UI or operations, or scheduled send.
+  `draft_send` is still a local demo move to Sent and contacts no server. Attachment bytes have a
+  storage seam and tests but no caller yet.
 - `uid`, `Message-ID`, RFC 822 size and `in_reply_to` are not written by the engine; the columns
   exist for P4/P5.
 - The database file lives wherever `--store` points; Postino does not create the parent directory.
@@ -98,6 +111,7 @@ A quick manual check that persistence works (unit level, no keyring):
 ```sh
 cargo test -p postino-cli cli_store_keeps_a_draft_across_a_reopen -- --nocapture
 cargo test -p postino-core --test engine_store -- --nocapture
+cargo test -p postino-core --test engine_blobs -- --nocapture
 ```
 
 ## 4. Adding an operation
@@ -159,6 +173,12 @@ they have a reason to exist.
   read/move/delete, atomic batches, draft revisions across reopen, wrong key, schema-too-new and a
   no-plaintext scan over the database, WAL and SHM; plus the one-query-per-table mailbox hydration
   used by `Engine::open`.
+- **Blobs:** round trip and reopen, dedup, wrong key, tampered ciphertext/tag/nonce, a swapped file,
+  an oversized declared length, traversal and non-hex hashes, temp cleanup, eight concurrent puts,
+  compression only when it helps, header layout, remove/has and a no-plaintext scan over the
+  database and every blob file (including the key bytes). `cargo test -p postino-store --test blobs`.
+- **Crypto:** HKDF subkeys, seal/open round trip, tampered values, wrong key and AAD, nonce
+  uniqueness, redacted `Debug`. `cargo test -p postino-crypto`.
 - **MIME:** ten synthetic fixtures (plain, alternative, HTML newsletter, nested mixed, RFC 2047,
   RFC 2231, quoted-printable, XSS, malformed, injection), the allowlist scheme/attribute rules,
   serializer round trip and injection rejection, Bcc absence, deterministic bytes, bounds and a
@@ -168,6 +188,11 @@ they have a reason to exist.
   (draft revision, send, label apply/remove, move, read/star), a repository failure surfacing as
   `OpError` with memory unchanged, and a no-plaintext scan of the engine's own writes. The CLI test
   creates a draft in a temp store, reopens and lists it.
+- **Engine attachment seam:** one message with two attachments, bytes stored for one, engine dropped
+  and reopened, bytes read back and compared, `blob_hash` and `has_attachments` intact; a one-byte
+  corruption surfaces as `OpError::Failed` without poisoning the message; the demo engine, an unknown
+  attachment and an attachment without bytes are readable errors; a 4 MiB blob exercises the bounded
+  path without a timing assertion.
 - **Platform:** keyring load-or-create against `keyring_core::mock` only; the native vault is a
   manual, tagged smoke test and never part of the default suite.
 - **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery,

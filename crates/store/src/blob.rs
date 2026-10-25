@@ -1,0 +1,445 @@
+//! Content-addressed, encrypted attachment blobs.
+//!
+//! Attachment bytes are the largest payload in a mailbox and they are write-once: they do not belong
+//! in SQLCipher pages. This module keeps them as one file per distinct content, named by the BLAKE3
+//! hash of the **plaintext**, under `<root>/<first two hex chars>/<hash>.blob`.
+//!
+//! # File format, version 1
+//!
+//! ```text
+//! offset  size  field
+//!      0     4  magic "PSTB"
+//!      4     1  version (1)
+//!      5     1  flags (bit 0: the payload is zstd-compressed)
+//!      6     8  original_len, u64 little-endian: the plaintext length, never the payload length
+//!     14    24  XChaCha20-Poly1305 nonce
+//!     38     n  ciphertext || Poly1305 tag
+//! ```
+//!
+//! The associated data is `magic || version || flags || original_len || hash bytes`. The hash is in
+//! the AAD, so a blob cannot be renamed to another hash, and the length is in it, so a truncated or
+//! extended file is rejected instead of being decrypted with the wrong plaintext size. The flags
+//! byte is in the AAD too: it decides whether the payload is decompressed, so leaving it out would
+//! authenticate the length but not the interpretation.
+//!
+//! # Compression
+//!
+//! zstd level 3, used **only** when the compressed frame is smaller than the plaintext (flag bit 0).
+//! Decompression always goes through [`zstd::bulk::Decompressor`] with a capacity of exactly the
+//! declared plaintext length. A blob that claims 10 GiB fails against the caller's `max_bytes`
+//! before a byte is decrypted, and a payload that decodes to more than the declared length is a
+//! `CorruptBlob`, never an allocation.
+//!
+//! # Writes
+//!
+//! A put writes `.tmp-<random>` in the target shard with `create_new`, `sync_all`s it, then renames
+//! it over `<hash>.blob`. A rename that loses a race against an identical put is a success: the
+//! content is the name, so both files are byte-identical. A failed write removes its temp file.
+//!
+//! A blob is never modified in place, so a reader either sees the previous complete file or the new
+//! one. Blobs are content-addressed and deduplicated: the same bytes are stored once even when ten
+//! messages carry them.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use postino_crypto::Subkey;
+use zeroize::Zeroizing;
+
+use crate::{StoreError, StoreKey};
+
+/// File magic: `Postino STored Blob`.
+pub const MAGIC: &[u8; 4] = b"PSTB";
+
+/// File format version understood by this build.
+pub const VERSION: u8 = 1;
+
+/// Flag bit 0: the sealed payload is zstd-compressed.
+pub const FLAG_COMPRESSED: u8 = 0b0000_0001;
+
+/// Offset of the version byte.
+const VERSION_OFFSET: usize = MAGIC.len();
+/// Offset of the flags byte.
+const FLAGS_OFFSET: usize = VERSION_OFFSET + 1;
+/// Offset of the little-endian `u64` plaintext length.
+const LENGTH_OFFSET: usize = FLAGS_OFFSET + 1;
+/// Offset of the 24-byte nonce: 14.
+const NONCE_OFFSET: usize = LENGTH_OFFSET + 8;
+/// Bytes before the ciphertext: magic, version, flags, original length and nonce.
+pub const HEADER_LEN: usize = NONCE_OFFSET + postino_crypto::NONCE_LEN;
+
+/// Length of a content hash in hex characters (BLAKE3, 32 bytes).
+pub const HASH_HEX_LEN: usize = 64;
+
+/// Hard ceiling for one blob, on write and on read. The engine caps a single attachment at 50 MiB;
+/// this is the storage backstop that keeps a hand-written file from asking for a gigabyte.
+pub const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// zstd level. Attachments are mostly documents and images; level 3 is the speed/size knee.
+const ZSTD_LEVEL: i32 = 3;
+
+/// How many temp names a put tries before giving up on a random collision.
+const TEMP_ATTEMPTS: usize = 4;
+
+/// The HKDF context label for blob subkeys. Changing it makes every existing blob unreadable.
+const KEY_CONTEXT: &str = "blob";
+
+/// The directory name created next to the database.
+pub const BLOB_DIR_NAME: &str = "blobs";
+
+/// The encrypted blob store: one directory tree plus the subkey derived from the store key.
+///
+/// `Debug` is safe: the subkey redacts itself.
+#[derive(Debug)]
+pub struct BlobStore {
+    root: PathBuf,
+    key: Subkey,
+}
+
+impl BlobStore {
+    /// Create or open the blob directory and derive the blob subkey from the store key.
+    ///
+    /// A root that cannot be created, or exists as a file, is an error: silently falling back to
+    /// in-memory or plaintext storage would lose attachments on the next open.
+    pub fn open(root: impl Into<PathBuf>, key: &StoreKey) -> Result<Self, StoreError> {
+        let root = root.into();
+        // Distinguish "a file is in the way" from "the directory does not exist yet"; `create_dir_all`
+        // reports both as an I/O error and only the first is a configuration mistake worth naming.
+        match fs::metadata(&root) {
+            Ok(metadata) if !metadata.is_dir() => return Err(StoreError::BlobRoot { path: root.display().to_string() }),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&root).map_err(|error| io_error(&root, error))?;
+                let metadata = fs::metadata(&root).map_err(|error| io_error(&root, error))?;
+                if !metadata.is_dir() {
+                    return Err(StoreError::BlobRoot { path: root.display().to_string() });
+                }
+            }
+            Err(error) => return Err(io_error(&root, error)),
+        }
+        let subkey = postino_crypto::derive_key(key.as_bytes(), KEY_CONTEXT)?;
+        Ok(Self { root, key: subkey })
+    }
+
+    /// The directory every blob lives under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Store `bytes` and return their lowercase BLAKE3 hex hash.
+    ///
+    /// Identical bytes return the same hash and write nothing (dedup). The hash is the file name, so
+    /// it is computed over the plaintext and reveals nothing about the key or the payload.
+    pub fn put(&self, bytes: &[u8]) -> Result<String, StoreError> {
+        // usize -> u64 is lossless on every target Rust supports (usize is at most 64 bits).
+        let original_len = bytes.len() as u64;
+        if original_len > MAX_BLOB_BYTES {
+            return Err(StoreError::BlobTooLarge { declared: original_len, allowed: MAX_BLOB_BYTES });
+        }
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let path = self.path_for(&hash)?;
+        if path.is_file() {
+            return Ok(hash);
+        }
+        let Some(directory) = path.parent() else {
+            return Err(StoreError::BlobRoot { path: self.root.display().to_string() });
+        };
+        fs::create_dir_all(directory).map_err(|error| io_error(directory, error))?;
+        let (flags, payload) = encode(bytes)?;
+        let aad = associated_data(&hash, flags, original_len)?;
+        let sealed = postino_crypto::seal(&self.key, &aad, &payload)?;
+        let Some((nonce, ciphertext)) = sealed.split_at_checked(postino_crypto::NONCE_LEN) else {
+            // `seal` always returns nonce || ciphertext; this is a defence against a future refactor.
+            return Err(StoreError::CorruptBlob { hash, detail: "sealing produced a value shorter than its nonce" });
+        };
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(MAGIC);
+        header.push(VERSION);
+        header.push(flags);
+        header.extend_from_slice(&original_len.to_le_bytes());
+        header.extend_from_slice(nonce);
+        write_atomic(&path, &header, ciphertext)?;
+        Ok(hash)
+    }
+
+    /// Read and authenticate one blob, refusing anything that would decode to more than `max_bytes`.
+    ///
+    /// `max_bytes` is the caller's cap on the *plaintext* length, normally the attachment's recorded
+    /// size plus a small slack. The check happens against the declared length before decryption, and
+    /// the allocation is bounded by it; [`MAX_BLOB_BYTES`] is an additional hard ceiling.
+    pub fn get(&self, hash: &str, max_bytes: u64) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        let path = self.path_for(hash)?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::BlobMissing { hash: hash.to_owned() }),
+            Err(error) => return Err(io_error(&path, error)),
+        };
+        if !metadata.is_file() {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the blob path is not a regular file" });
+        }
+        let file_len = metadata.len();
+        if file_len < (HEADER_LEN + postino_crypto::TAG_LEN) as u64 {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the file is shorter than a header and a tag" });
+        }
+        let mut file = File::open(&path).map_err(|error| io_error(&path, error))?;
+        let mut header = [0u8; HEADER_LEN];
+        file.read_exact(&mut header).map_err(|error| io_error(&path, error))?;
+
+        if header.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the file does not start with the PSTB magic" });
+        }
+        let Some(version) = header.get(VERSION_OFFSET).copied() else {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "no version byte" });
+        };
+        if version != VERSION {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "unsupported blob version" });
+        }
+        let Some(flags) = header.get(FLAGS_OFFSET).copied() else {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "no flags byte" });
+        };
+        if flags & !FLAG_COMPRESSED != 0 {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "unknown flag bits" });
+        }
+        let Some(length_bytes) = header.get(LENGTH_OFFSET..NONCE_OFFSET).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok()) else {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "no plaintext length" });
+        };
+        let original_len = u64::from_le_bytes(length_bytes);
+        let allowed = max_bytes.min(MAX_BLOB_BYTES);
+        if original_len > allowed {
+            return Err(StoreError::BlobTooLarge { declared: original_len, allowed });
+        }
+        // A writer only keeps the compressed payload when it is smaller than the plaintext, so no
+        // valid file is longer than header + original length + tag. Checking this before allocating
+        // is what makes the read bounded by `max_bytes`.
+        let longest = (HEADER_LEN as u64).saturating_add(original_len).saturating_add(postino_crypto::TAG_LEN as u64);
+        if file_len > longest {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the file is longer than its declared length" });
+        }
+        let Some(original_len_usize) = usize::try_from(original_len).ok() else {
+            return Err(StoreError::BlobTooLarge { declared: original_len, allowed });
+        };
+        let Some(ciphertext_len) = usize::try_from(file_len - HEADER_LEN as u64).ok() else {
+            return Err(StoreError::BlobTooLarge { declared: original_len, allowed });
+        };
+        // Read the nonce and ciphertext as one buffer: `postino_crypto::open` takes `nonce || ct`.
+        let mut sealed = vec![0u8; postino_crypto::NONCE_LEN.saturating_add(ciphertext_len)];
+        file.seek(SeekFrom::Start(NONCE_OFFSET as u64)).map_err(|error| io_error(&path, error))?;
+        file.read_exact(&mut sealed).map_err(|error| io_error(&path, error))?;
+
+        let aad = associated_data(hash, flags, original_len)?;
+        let plaintext = postino_crypto::open(&self.key, &aad, &sealed).map_err(|_| StoreError::CorruptBlob {
+            hash: hash.to_owned(),
+            detail: "the ciphertext did not authenticate: wrong key, wrong hash or damaged bytes",
+        })?;
+        let plaintext = if flags & FLAG_COMPRESSED == 0 {
+            plaintext
+        } else {
+            let mut decompressor = zstd::bulk::Decompressor::new().map_err(StoreError::Compression)?;
+            let decoded = decompressor.decompress(&plaintext[..], original_len_usize).map_err(|_| StoreError::CorruptBlob {
+                hash: hash.to_owned(),
+                detail: "the compressed payload does not decode within its declared length",
+            })?;
+            Zeroizing::new(decoded)
+        };
+        if plaintext.len() != original_len_usize {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the decrypted length does not match the header" });
+        }
+        Ok(plaintext)
+    }
+
+    /// True when a blob file exists for `hash`.
+    pub fn has(&self, hash: &str) -> Result<bool, StoreError> {
+        let path = self.path_for(hash)?;
+        match fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error(&path, error)),
+        }
+    }
+
+    /// Delete one blob. Returns `false` when it was already gone. The shard directory is removed
+    /// when it becomes empty; a failure to do so is ignored because it only costs an empty folder.
+    ///
+    /// Removing bytes does not remove attachment rows: the caller decides whether a metadata row
+    /// still points at the hash.
+    pub fn remove(&self, hash: &str) -> Result<bool, StoreError> {
+        let path = self.path_for(hash)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(directory) = path.parent() {
+                    let _ = fs::remove_dir(directory);
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error(&path, error)),
+        }
+    }
+
+    /// Validate `hash` and build its path. The hash is checked before any path is assembled, so
+    /// `..`, separators, uppercase hex, short and long values never reach the filesystem.
+    fn path_for(&self, hash: &str) -> Result<PathBuf, StoreError> {
+        decode_hash(hash)?;
+        let Some(shard) = hash.get(..2) else {
+            return Err(StoreError::BadHash { hash: echo(hash) });
+        };
+        Ok(self.root.join(shard).join(format!("{hash}.blob")))
+    }
+}
+
+/// zstd-compress `bytes` when that actually saves space, and return the flags plus the payload to
+/// seal. The payload is zeroising: compressed bytes still derive from the plaintext.
+fn encode(bytes: &[u8]) -> Result<(u8, Zeroizing<Vec<u8>>), StoreError> {
+    // A zstd frame is at least a header and a block header; below that it can never win.
+    if bytes.len() > 64 {
+        let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL).map_err(StoreError::Compression)?;
+        if compressed.len() < bytes.len() {
+            return Ok((FLAG_COMPRESSED, Zeroizing::new(compressed)));
+        }
+    }
+    Ok((0, Zeroizing::new(bytes.to_vec())))
+}
+
+/// Write a blob through a temp file in the destination shard.
+fn write_atomic(path: &Path, header: &[u8], ciphertext: &[u8]) -> Result<(), StoreError> {
+    let Some(directory) = path.parent() else {
+        return Err(StoreError::BlobRoot { path: path.display().to_string() });
+    };
+    let (temp, mut file) = create_temp(directory)?;
+    let written = (|| -> std::io::Result<()> {
+        file.write_all(header)?;
+        file.write_all(ciphertext)?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(io_error(&temp, error));
+    }
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            // Windows refuses to replace an existing file; POSIX replaces it atomically. A file at
+            // the destination already holds these exact bytes (the name is the content hash), so a
+            // concurrent put of the same content is a no-op success.
+            if path.is_file() { Ok(()) } else { Err(io_error(path, error)) }
+        }
+    }
+}
+
+/// Create a fresh `.tmp-<random>` file in `directory` with `create_new`.
+fn create_temp(directory: &Path) -> Result<(PathBuf, File), StoreError> {
+    for _ in 0..TEMP_ATTEMPTS {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)?;
+        let path = directory.join(format!(".tmp-{}", hex(&random)));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error(&path, error)),
+        }
+    }
+    Err(StoreError::TempName { path: directory.display().to_string() })
+}
+
+/// `magic || version || flags || original_len || hash`, the AAD of every v1 blob.
+fn associated_data(hash: &str, flags: u8, original_len: u64) -> Result<Vec<u8>, StoreError> {
+    let hash_bytes = decode_hash(hash)?;
+    let mut aad = Vec::with_capacity(MAGIC.len() + 2 + 8 + hash_bytes.len());
+    aad.extend_from_slice(MAGIC);
+    aad.push(VERSION);
+    aad.push(flags);
+    aad.extend_from_slice(&original_len.to_le_bytes());
+    aad.extend_from_slice(&hash_bytes);
+    Ok(aad)
+}
+
+/// Decode 64 lowercase hex characters into the 32 hash bytes.
+fn decode_hash(hash: &str) -> Result<[u8; 32], StoreError> {
+    let bytes = hash.as_bytes();
+    if bytes.len() != HASH_HEX_LEN {
+        return Err(StoreError::BadHash { hash: echo(hash) });
+    }
+    let mut out = [0u8; 32];
+    // 64 bytes -> 32 exact pairs; the length check above guarantees the zip visits every slot.
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for (slot, pair) in out.iter_mut().zip(pairs) {
+        let Some(high) = pair.first().copied().and_then(nibble) else {
+            return Err(StoreError::BadHash { hash: echo(hash) });
+        };
+        let Some(low) = pair.get(1).copied().and_then(nibble) else {
+            return Err(StoreError::BadHash { hash: echo(hash) });
+        };
+        *slot = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// A bounded, escaped form of a rejected hash for the error message.
+fn echo(hash: &str) -> String {
+    let mut echoed = hash.chars().take(80).collect::<String>();
+    if hash.chars().count() > 80 {
+        echoed.push('…');
+    }
+    echoed
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn io_error(path: &Path, source: std::io::Error) -> StoreError {
+    StoreError::Io { path: path.display().to_string(), source }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_header_layout_matches_the_documented_offsets() {
+        assert_eq!(HEADER_LEN, 38);
+        assert_eq!(HEADER_LEN - postino_crypto::NONCE_LEN, 14, "the nonce starts after the length");
+        assert_eq!(MAGIC, b"PSTB");
+        assert_eq!(FLAG_COMPRESSED, 1);
+    }
+
+    #[test]
+    fn a_hash_must_be_64_lowercase_hex_characters() {
+        let valid = "0".repeat(64);
+        assert!(decode_hash(&valid).is_ok());
+        for invalid in [
+            String::new(),
+            "A".repeat(64),
+            "g".repeat(64),
+            "0".repeat(63),
+            "0".repeat(65),
+            format!("../{}", "0".repeat(61)),
+            format!("..\\{}", "0".repeat(61)),
+            format!("{}/{}", "0".repeat(31), "0".repeat(32)),
+        ] {
+            assert!(matches!(decode_hash(&invalid), Err(StoreError::BadHash { .. })), "{invalid:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_rejected_hash_is_echoed_without_its_control_bytes() {
+        let rendered = StoreError::BadHash { hash: echo("a\nb\u{0007}") }.to_string();
+        assert!(!rendered.contains('\n'), "the error carries a raw line break");
+    }
+}

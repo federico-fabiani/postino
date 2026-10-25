@@ -31,17 +31,26 @@
 //! apply/remove, label delete plus detach, attachment replacement, message move, draft save and the
 //! flag batch. A draft save writes the display message, its attachments, the revision row and the
 //! folder counts together, so a failure leaves no half-saved draft.
+//!
+//! # Blobs
+//!
+//! Attachment bytes are not rows. `Store::open` also opens `<db parent>/blobs`, a content-addressed
+//! directory of XChaCha20-Poly1305 files sealed with an HKDF subkey of the same store key (see
+//! [`BlobStore`] and `docs/architecture.md` §4.5). The database keeps only the hash, and the hash is
+//! computed over the plaintext, so identical attachments are stored once.
 
+mod blob;
 mod model;
 mod repo;
 
+pub use blob::{BLOB_DIR_NAME, BlobStore};
 pub use model::{
     Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, Label, LabelCount, Message, MessageCounts, MessageFilter,
     MessagePage, MessageSummary,
 };
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
@@ -248,6 +257,30 @@ pub enum StoreError {
     Encode(#[from] serde_json::Error),
     #[error("{field} does not fit the store's 64-bit integer range")]
     OutOfRange { field: &'static str },
+    #[error("blob hash {hash:?} is not 64 lowercase hex characters")]
+    BadHash { hash: String },
+    #[error("blob {hash} is not in the blob store")]
+    BlobMissing { hash: String },
+    #[error("blob {hash} is corrupt: {detail}")]
+    CorruptBlob { hash: String, detail: &'static str },
+    #[error("a blob declares {declared} bytes but this read allows {allowed}; it was not decrypted")]
+    BlobTooLarge { declared: u64, allowed: u64 },
+    #[error("the blob directory {path} exists but is not a directory")]
+    BlobRoot { path: String },
+    #[error("could not create a temporary file in {path}")]
+    TempName { path: String },
+    #[error("blob store I/O failed at {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("blob compression failed: {0}")]
+    Compression(#[source] std::io::Error),
+    #[error("the OS random source failed: {0}")]
+    Random(#[from] getrandom::Error),
+    #[error("blob cryptography failed: {0}")]
+    Crypto(#[from] postino_crypto::CryptoError),
 }
 
 fn translate(error: rusqlite::Error) -> StoreError {
@@ -257,13 +290,33 @@ fn translate(error: rusqlite::Error) -> StoreError {
     }
 }
 
-/// An open, migrated store. One connection in WAL mode; the daemon will own it in M4.
+/// An open, migrated store. One connection in WAL mode plus the sibling blob directory; the daemon
+/// will own both in M4.
 pub struct Store {
     conn: Connection,
+    blobs: BlobStore,
+}
+
+/// The blob directory that belongs to a database file: `<db parent>/blobs`.
+///
+/// Every store in the same folder shares it, which is what makes dedup work across accounts and
+/// what keeps a backup of the folder self-contained. A relative database path without a parent
+/// resolves to `./blobs`.
+pub fn blob_root(path: &Path) -> PathBuf {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    parent.join(BLOB_DIR_NAME)
 }
 
 impl Store {
-    /// Open or create the database at `path` and apply pending migrations.
+    /// Open or create the database at `path`, apply pending migrations and open the sibling blob
+    /// directory.
+    ///
+    /// The database has to be readable before the blob directory is created, so a wrong key cannot
+    /// leave a stray `blobs/` next to somebody else's database. A blob directory that cannot be
+    /// created fails the open: losing attachments later is worse than failing now.
     pub fn open(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
         let mut conn = Connection::open(path)?;
         conn.execute_batch(&key.pragma()).map_err(translate)?;
@@ -286,25 +339,14 @@ impl Store {
              PRAGMA synchronous = FULL;",
         )
         .map_err(translate)?;
-        let mut store = Self { conn };
-        store.migrate()?;
-        Ok(store)
+        migrate(&mut conn)?;
+        let blobs = BlobStore::open(blob_root(path), key)?;
+        Ok(Self { conn, blobs })
     }
 
-    fn migrate(&mut self) -> Result<(), StoreError> {
-        // The first real read is also the key check: a wrong key fails here with NotADatabase.
-        let current: u32 = self.conn.pragma_query_value(None, "user_version", |row| row.get(0)).map_err(translate)?;
-        if current > SCHEMA_VERSION {
-            return Err(StoreError::SchemaTooNew { found: current, supported: SCHEMA_VERSION });
-        }
-        for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-            let version = index as u32 + 1;
-            let tx = self.conn.transaction()?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", version)?;
-            tx.commit()?;
-        }
-        Ok(())
+    /// The encrypted attachment blob store that lives next to this database.
+    pub fn blobs(&self) -> &BlobStore {
+        &self.blobs
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {
@@ -323,6 +365,23 @@ impl Store {
     pub fn get_meta(&self, name: &str) -> Result<Option<String>, StoreError> {
         Ok(self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [name], |row| row.get(0)).optional()?)
     }
+}
+
+/// Apply every pending migration, one transaction each.
+fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    // The first real read is also the key check: a wrong key fails here with NotADatabase.
+    let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).map_err(translate)?;
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::SchemaTooNew { found: current, supported: SCHEMA_VERSION });
+    }
+    for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+        let version = index as u32 + 1;
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

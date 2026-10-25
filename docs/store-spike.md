@@ -248,3 +248,48 @@ second. SQLCipher/OpenSSL still dominate a cold build, exactly as measured above
 - **Keyring lock.** The whole load-or-create now runs under the OS file lock, including the first
   read. A read-back mismatch adopts the key the vault actually holds when it is a valid 32-byte key;
   an unstable vault fails closed after one retry.
+
+## P4b outcome
+
+> **Package:** P4b · **Date:** 2026-10-25 · **Verdict:** attachment bytes leave SQLCipher for a
+> content-addressed, AEAD-sealed blob directory; dedup is one file per distinct content, and the
+> database keeps only a hash and a size.
+
+**Why outside the database.** SQLCipher pages are read and re-read by the mailbox list, the reading
+pane and (later) FTS5. Attachments are the opposite workload: written once, read rarely, up to tens of
+megabytes, identical across messages. One file per distinct content gives dedup for free (the name is
+the BLAKE3 hash), keeps the database small, and makes a save a plain file copy later. Bodies stay in
+the database because they are small and part of the hot read path; `docs/architecture.md` §4.5
+records the reasoning.
+
+**What shipped.**
+
+- `crates/crypto`: HKDF-SHA256 subkeys (`salt = postino.v1`, `info = "blob"`) and XChaCha20-Poly1305
+  with a random 24-byte nonce. `Subkey` has no `Clone`, redacts `Debug` and zeroises on drop.
+- `crates/store`: `BlobStore` under `<db parent>/blobs/<xx>/<hash>.blob`, header `PSTB` v1, AAD
+  `magic || version || flags || original_len || hash`, zstd 3 only when it shrinks the payload,
+  bounded decompression, atomic temp + fsync + rename, specific errors. `Store::open` creates the
+  directory and fails if it cannot. `attachments.blob_hash` finally points at something.
+- `crates/core`: `Engine::attachment_bytes` and `Engine::store_attachment_bytes` (repository first,
+  memory second), hydrated across a reopen, with a readable error on the demo engine. No operation,
+  CLI or UI change: P5b feeds the write, P6 calls the read.
+
+**Dependencies and build cost.** `chacha20poly1305` 0.10.1, `hkdf` 0.12.4, `sha2` 0.10.9 (already in
+the lockfile for `xtask`), `blake3` 1.8.7 and `zstd` 0.14.3, all pinned. A cold `cargo check` of the
+two new crates took **4m57s** on this host, but that was a workspace rebuild including the existing
+vendored OpenSSL/SQLCipher (nothing was cached). The blob stack alone — zstd's C library, blake3's
+assembly and the Rust AEAD crates — rebuilds in **18.9 s** in the dev profile; the Rust parts are
+small and reuse `crypto-common`/`digest` 0.10 from `sha2`. The only new C build is zstd-sys, which
+uses the same MSYS2 gcc that the vendored OpenSSL already requires.
+
+**No plaintext, proven.** `crates/store/tests/blobs.rs` stores a compressed canary, an uncompressed
+random payload and a database canary, then scans the database, its WAL and every blob file for the
+canary, for the store key and for the canary in any path. `crates/core/tests/engine_blobs.rs` proves
+the seam survives a reopen and that a one-byte flip is `CorruptBlob` → `OpError::Failed` without
+poisoning the message.
+
+**Remaining gaps.** No key rotation (rotating the store key would orphan every blob), no garbage
+collection for unreferenced blobs, no passphrase recovery for the keyring entry, and a corrupt blob
+must be removed before the same bytes can be stored again (`put` dedups on the file's existence).
+The header, the file name and the size class are visible without the key, and swap/crash dumps are
+still outside our control; `docs/threat-model.md` §4.3 lists all of it.

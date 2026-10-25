@@ -244,6 +244,9 @@ pub struct MessageSummary {
     pub labels: Vec<String>,
 }
 
+/// Attachment metadata. The bytes live outside the database, in the encrypted blob store next to
+/// it, and the engine exposes them through `Engine::attachment_bytes`; a `Message` never carries
+/// multi-megabyte payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Attachment {
