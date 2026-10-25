@@ -126,3 +126,28 @@ async fn select_quotes_and_escapes_the_mailbox_name() {
     session.logout().await.expect("logout");
     server.finish().await;
 }
+
+/// RFC 3501 reports a read-only mailbox with `OK [READ-ONLY]` on the tagged response. A client that
+/// only looks at untagged responses misses it and offers writes the server will refuse.
+#[tokio::test]
+async fn select_honors_the_tagged_read_only_code() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"Archive\"").await;
+        conn.send_line("* 5 EXISTS").await;
+        conn.send_line("* 0 RECENT").await;
+        conn.send_line("* OK [UIDVALIDITY 9] UIDs valid").await;
+        conn.send_line("A0003 OK [READ-ONLY] SELECT completed").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("login");
+    let status = session.select("Archive").await.expect("select");
+    assert!(status.read_only, "the tagged READ-ONLY code was ignored");
+    assert_eq!(status.uid_validity, 9);
+    assert_eq!(status.exists, 5);
+    session.logout().await.expect("logout");
+    server.finish().await;
+}

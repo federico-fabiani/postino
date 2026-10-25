@@ -66,7 +66,7 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [ ] Account onboarding with autodiscovery and Aruba app-password flow.
 - [x] IMAP: CAPABILITY, LOGIN/AUTH, LIST, SELECT, UID FETCH envelope/flags/body, IDLE, as the
       `postino-net` client crate (P5a): TLS-only, bounded, typed errors, scripted TLS server and a
-      53-case hostile corpus. The sync loop, cache and offline mode are still open.
+      54-case hostile corpus. The sync loop, cache and offline mode are still open.
 - [ ] Local cache and offline mode; folder tree from special-use attributes.
 - [ ] Message list and reading pane fed by the store, not demo data.
 - [ ] Sync status and errors the user can act on.

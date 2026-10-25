@@ -180,3 +180,125 @@ async fn fetching_a_body_for_uid_zero_is_refused_locally() {
     drop(session);
     server.finish().await;
 }
+
+/// A bound error stops in the middle of a response. The session must say so, and the server must
+/// see no further command, because a second read would start inside the abandoned literal.
+#[tokio::test]
+async fn a_bound_error_closes_the_session_and_stops_the_wire() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"INBOX\"").await;
+        conn.send_line("* 0 EXISTS").await;
+        conn.send_line("* OK [UIDVALIDITY 1] ok").await;
+        conn.send_line("A0003 OK selected").await;
+        conn.expect("A0004 UID FETCH 1 (BODY.PEEK[])").await;
+        // A literal over `max_literal`, with more responses queued behind it.
+        conn.send_line("* 1 FETCH (UID 1 BODY[] {100}").await;
+        conn.send_line("* 2 EXPUNGE").await;
+        conn.send_line("A0004 OK done").await;
+        // The client may not send anything else: wait for a command or for the socket to close.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), conn.read_line_opt()).await;
+        assert!(matches!(next, Err(_) | Ok(None)), "the client kept talking after TooLarge: {next:?}");
+    })
+    .await;
+
+    let mut config = server.config(&tls);
+    config.limits.max_literal = 8;
+    let mut session = Session::connect(config).await.expect("connect");
+    session.login().await.expect("login");
+    session.select("INBOX").await.expect("select");
+    let error = session.fetch_body(1).await.expect_err("the literal is over the limit");
+    assert!(matches!(error, NetError::TooLarge { what: "literal", .. }), "{error:?}");
+    let error = session.noop().await.expect_err("the session is closed");
+    assert!(matches!(error, NetError::Closed { phase: "noop" }), "{error:?}");
+    drop(session);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn fetch_body_refuses_a_body_with_another_uid() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"INBOX\"").await;
+        conn.send_line("* 0 EXISTS").await;
+        conn.send_line("* OK [UIDVALIDITY 1] ok").await;
+        conn.send_line("A0003 OK selected").await;
+        conn.expect("A0004 UID FETCH 1 (BODY.PEEK[])").await;
+        conn.send_bytes(&support::fetch_body_response(1, 2, b"the wrong message")).await;
+        conn.send_line("A0004 OK done").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("login");
+    session.select("INBOX").await.expect("select");
+    let error = session.fetch_body(1).await.expect_err("UID 2 is not UID 1");
+    match &error {
+        NetError::Protocol { reason } => assert!(reason.contains("UID 2") && reason.contains("UID 1"), "{reason}"),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    // The body was consumed completely, but a lying server is a protocol failure: stop here.
+    let error = session.noop().await.expect_err("closed");
+    assert!(matches!(error, NetError::Closed { .. }), "{error:?}");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn fetch_envelopes_refuses_a_uid_outside_the_requested_set() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"INBOX\"").await;
+        conn.send_line("* 0 EXISTS").await;
+        conn.send_line("* OK [UIDVALIDITY 1] ok").await;
+        conn.send_line("A0003 OK selected").await;
+        conn.expect("A0004 UID FETCH 5 (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)").await;
+        conn.send_line("* 1 FETCH (UID 6 FLAGS () INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" RFC822.SIZE 10 ENVELOPE (NIL \"wrong\" NIL NIL NIL NIL NIL NIL NIL NIL))")
+            .await;
+        conn.send_line("A0004 OK done").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("login");
+    session.select("INBOX").await.expect("select");
+    let error = session.fetch_envelopes(UidSet::parse("5").expect("uid")).await.expect_err("UID 6 was not requested");
+    match &error {
+        NetError::Protocol { reason } => assert!(reason.contains("UID 6"), "{reason}"),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+    server.finish().await;
+}
+
+/// A literal that arrived in the same socket read as its header must still be charged to the
+/// response budget, or `max_response_bytes` bounds only the socket reads.
+#[tokio::test]
+async fn a_buffered_literal_counts_against_the_response_budget() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"INBOX\"").await;
+        conn.send_line("* 0 EXISTS").await;
+        conn.send_line("* OK [UIDVALIDITY 1] ok").await;
+        conn.send_line("A0003 OK selected").await;
+        conn.expect("A0004 UID FETCH 1 (BODY.PEEK[])").await;
+        // One write, so the literal is already in the client's read buffer when the line is parsed.
+        conn.send_bytes(&support::fetch_body_response(1, 1, &[b'x'; 40])).await;
+        conn.send_line("A0004 OK done").await;
+    })
+    .await;
+
+    let mut config = server.config(&tls);
+    // Every exchange before the fetch is well under this; the fetch line plus its 40-byte literal
+    // is not.
+    config.limits.max_response_bytes = 65;
+    let mut session = Session::connect(config).await.expect("connect");
+    session.login().await.expect("login");
+    session.select("INBOX").await.expect("select");
+    let error = session.fetch_body(1).await.expect_err("line plus literal is over 65 bytes");
+    assert!(matches!(error, NetError::TooLarge { what: "response", limit: 65 }), "{error:?}");
+    drop(session);
+    server.finish().await;
+}

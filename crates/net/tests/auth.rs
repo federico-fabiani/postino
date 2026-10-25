@@ -99,3 +99,36 @@ async fn preauth_skips_login_entirely() {
     drop(session);
     server.finish().await;
 }
+
+/// The SASL exchange has its own reads and writes; a timeout there must close the session so a
+/// retry cannot send a second `AUTHENTICATE` into a stream that is missing its continuation.
+#[tokio::test]
+async fn sasl_continuation_timeout_closes_the_session() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.send_line("* OK ready").await;
+        conn.expect("A0001 CAPABILITY").await;
+        conn.send_line("* CAPABILITY IMAP4rev1 AUTH=PLAIN").await;
+        conn.send_line("A0001 OK done").await;
+        conn.expect("A0002 AUTHENTICATE PLAIN").await;
+        // No continuation; the client must not retry on this connection.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(700), conn.read_line_opt()).await;
+        assert!(matches!(next, Err(_) | Ok(None)), "a retry reached the server: {next:?}");
+        assert_eq!(
+            conn.received().iter().filter(|line| line.contains("AUTHENTICATE")).count(),
+            1,
+            "exactly one AUTHENTICATE, got {:?}",
+            conn.received()
+        );
+    })
+    .await;
+
+    let config = server.config(&tls).with_timeout(std::time::Duration::from_millis(250));
+    let mut session = Session::connect(config).await.expect("connect");
+    let error = session.login().await.expect_err("no challenge");
+    assert!(matches!(error, NetError::Timeout { phase: "auth", .. }), "{error:?}");
+    let error = session.login().await.expect_err("the session is closed");
+    assert!(matches!(error, NetError::Closed { phase: "auth" }), "{error:?}");
+    drop(session);
+    server.finish().await;
+}

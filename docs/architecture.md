@@ -342,6 +342,9 @@ TLS, so a server cannot downgrade what it claims.
 `NOOP`, `IDLE` with a single `DONE` cycle, `LOGOUT`. Tags are `A0001`… and an unexpected tag is a
 `Protocol` error. Bodies are never fetched with `BODY[]`: `BODY.PEEK[]` keeps reading from mutating
 `\Seen`. Modified UTF-7 is decoded for display and the wire name is kept for subsequent commands.
+A FETCH is checked back against the request: a body whose UID differs is refused, as is an envelope
+whose UID is outside the requested set, so a confused server cannot hand over the wrong message.
+`SELECT` reads `READ-ONLY`/`READ-WRITE` from the tagged response as well as from untagged ones.
 
 **Bounds.** A response line is at most 64 KiB, a literal 25 MiB by default (configurable, hard
 ceiling 64 MiB), untagged responses per command 10 000, folders per `LIST` 5 000, a command line
@@ -350,12 +353,17 @@ parser limits cap nesting at 32 levels, literals per response at 4 096, atoms an
 1 KiB, and numbers at 20 digits; a number is parsed, never wrapped. Exceeding a bound is
 `TooLarge` or `Protocol`, never a hang or an unbounded allocation. Every phase has a timeout
 (DNS, connect, TLS handshake, greeting, each command, `DONE`); a timeout closes the session and the
-next call fails as `Closed` instead of reading a half-command.
+next call fails as `Closed` instead of reading a half-command. A bound or parse error is a
+desynchronisation too — the client stopped inside a response — so it closes the session and drops the
+socket rather than reading the next command from the middle of the previous one. `IDLE` ends normally
+only when the wait expires with a quiet socket: a missing `+`, a half-read line or literal, a
+malformed response and a bound error all close it, and its `DONE` half enforces the same untagged cap.
 
 **Security.** The password is a `Secret` that zeroises on drop and prints `[redacted]`, and it is
 dropped after a successful login. The SASL payload and the `LOGIN` line are built in `Zeroizing`
-buffers. Logs carry the tag and the command verb, never arguments, addresses, bodies or
-credentials. Server text in errors is cut to printable ASCII.
+buffers. `ImapConfig`'s `Debug` keeps the transport and redacts the username as well, because an
+address is personal data. Logs carry the tag and the command verb, never arguments, addresses,
+bodies or credentials. Server text in errors is cut to printable ASCII.
 
 **Not implemented.** Sync loops, store writes, engine operations, `APPEND`/`COPY`/`MOVE`/`EXPUNGE`,
 QRESYNC/CONDSTORE beyond reading `HIGHESTMODSEQ` when the server volunteers it, SORT/THREAD,

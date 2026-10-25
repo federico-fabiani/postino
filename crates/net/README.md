@@ -33,7 +33,10 @@ session.logout().await?;
 
 Tags are `A0001`, `A0002`, ...; a response with any other tag is a `Protocol` error and closes the
 session. `BODY.PEEK[]` is used for bodies, never `BODY[]`: reading a message never sets `\Seen`.
-`UID STORE` is always `UID` and always silent.
+`UID STORE` is always `UID` and always silent. `fetch_body` refuses a body whose UID is not the one
+it asked for, and `fetch_envelopes` refuses a UID outside the requested set: a server that returns
+the wrong message must not be believed. `select` honours `OK [READ-ONLY]` on the tagged response,
+not only on an untagged one.
 
 `RemoteFolder` carries both the decoded `name` (modified UTF-7 resolved) and the exact `wire_name`:
 pass `wire_name` back to `select`/`examine`, because re-encoding a decoded name can change bytes the
@@ -77,6 +80,15 @@ greeting, each command and the `DONE` half of `IDLE`. A timeout closes the sessi
 `Closed` instead of a half-read command. `IDLE`'s *wait* is not a timeout: it ends with `DONE` and the
 tagged `OK`, and is clamped to 29 minutes (RFC 2177 asks servers to hold at least 30).
 
+A bound or a parse error is a desynchronisation: the client stopped in the middle of a response, so
+it closes the session, drops the socket (a server must not keep a dead `IDLE`) and refuses every later
+call as `Closed`. A complete tagged `NO`/`BAD` — including an authentication rejection — leaves the
+session usable; so does a request refused locally before anything was written (an empty UID set, an
+over-long flag list). For `IDLE` that means
+only a quiet expiry of the wait ends the cycle normally; a timeout waiting for the `+`, a timeout
+while a line or literal is half-read, a malformed response and a bound error all close the session,
+and the `DONE` half enforces the same untagged-response cap as every other command.
+
 When a host resolves to several addresses, each attempt gets a fair share of the connect budget,
 capped at five seconds, so a black-holed IPv6 route cannot consume the timeout the IPv4 address
 needs.
@@ -84,7 +96,8 @@ needs.
 ## Security
 
 - The password lives in `Secret`: zeroised on drop, `Debug`/`Display` print `[redacted]`. It is
-  dropped (and zeroised) after a successful login.
+  dropped (and zeroised) after a successful login. `ImapConfig`'s `Debug` prints the host, port and
+  TLS mode, and redacts both the username and the password: an address is personal data.
 - Logs (`log::debug!`) carry the tag and the command verb only: no arguments, no bodies, no
   credentials.
 - The SASL payload and the `LOGIN` line are built in `Zeroizing` buffers.
@@ -103,7 +116,7 @@ needs.
   (`extra_roots`), real sockets, exact command assertions, literals split across reads, delays,
   disconnects and STARTTLS mid-session:
   `connection.rs`, `auth.rs`, `mailbox.rs`, `fetch.rs`, `idle.rs`, `tls.rs`, `failures.rs` and a
-  53-case hostile corpus in `hostile.rs` (bad tags, missing `*`, unterminated literals, huge and
+  54-case hostile corpus in `hostile.rs` (bad tags, missing `*`, unterminated literals, huge and
   negative numbers, `NIL` where a number belongs, deep nesting, oversized lines and more). Every
   corpus case must return a typed error within three seconds.
 

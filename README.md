@@ -68,7 +68,7 @@ MCP      ─┘
   UTF-7 names, selects and examines, fetches envelopes and whole bodies with `BODY.PEEK[]` (never
   setting `\Seen`), stores flags by UID, runs one `IDLE` cycle and logs out. Every line, literal,
   command and response is bounded, the password is zeroised and redacted, and a scripted TLS server
-  with a 53-case hostile corpus proves each path. It is tested against that fake server only and is
+  with a 54-case hostile corpus proves each path. It is tested against that fake server only and is
   not wired into the engine, the app or a sync loop yet.
 - Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
   MCP protocol tests, and store round-trip tests at both the repository and engine level.

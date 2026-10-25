@@ -110,6 +110,28 @@ impl UidSet {
         }
         Ok(self.to_string())
     }
+
+    /// Whether `uid` falls inside one of the ranges.
+    ///
+    /// A `*` end is open-ended: `1:*` accepts every UID from 1 up. Used to reject a FETCH response
+    /// that carries a message the caller never asked for.
+    pub(crate) fn contains(&self, uid: u32) -> bool {
+        uid != 0 && self.ranges.iter().any(|range| range.contains(uid))
+    }
+}
+
+impl Range {
+    fn contains(&self, uid: u32) -> bool {
+        let after_start = match self.start {
+            Bound::Uid(start) => uid >= start,
+            Bound::Star => true,
+        };
+        let before_end = match self.end {
+            Bound::Uid(end) => uid <= end,
+            Bound::Star => true,
+        };
+        after_start && before_end
+    }
 }
 
 impl fmt::Display for UidSet {
@@ -205,5 +227,27 @@ mod tests {
         assert!(matches!(UidSet::parse(&long), Err(NetError::TooLarge { .. })));
         let many = (1..=MAX_RANGES + 1).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
         assert!(matches!(UidSet::parse(&many), Err(NetError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn membership_respects_ranges_and_star() {
+        let range = UidSet::parse("10:20,42").unwrap_or_else(|error| panic!("{error}"));
+        assert!(range.contains(10));
+        assert!(range.contains(15));
+        assert!(range.contains(20));
+        assert!(range.contains(42));
+        assert!(!range.contains(9));
+        assert!(!range.contains(21));
+        assert!(!range.contains(0));
+
+        let open = UidSet::parse("100:*").unwrap_or_else(|error| panic!("{error}"));
+        assert!(!open.contains(99));
+        assert!(open.contains(100));
+        assert!(open.contains(u32::MAX));
+
+        let star = UidSet::parse("*").unwrap_or_else(|error| panic!("{error}"));
+        assert!(star.contains(1));
+        assert!(star.contains(u32::MAX));
+        assert!(!star.contains(0));
     }
 }

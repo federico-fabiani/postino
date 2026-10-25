@@ -21,8 +21,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Everything needed to open one session.
 ///
 /// The password is a [`Secret`]: cloning the config clones a zeroising buffer, and the `Debug`
-/// representation is `[redacted]`.
-#[derive(Debug, Clone)]
+/// representation prints `[redacted]` for both the username and the password, because an address is
+/// personal data that has no business in a log.
+#[derive(Clone)]
 pub struct ImapConfig {
     /// Server host name, also used for TLS name verification.
     pub host: String,
@@ -84,16 +85,37 @@ impl ImapConfig {
     }
 }
 
+impl std::fmt::Debug for ImapConfig {
+    /// Print the transport and the bounds, never the identity: a username is an address, and an
+    /// address in a log is personal data.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImapConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("username", &"[redacted]")
+            .field("password", &self.password)
+            .field("timeout", &self.timeout)
+            .field("limits", &self.limits)
+            .field("extra_roots", &self.extra_roots.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn debug_redacts_the_password() {
+    fn debug_keeps_the_transport_and_redacts_the_identity() {
         let config = ImapConfig::new("imap.example.com", 993, TlsMode::Implicit, "user@example.com", Secret::new("pw-123"));
         let text = format!("{config:?}");
         assert!(!text.contains("pw-123"), "{text}");
-        assert!(text.contains("imap.example.com"));
-        assert!(text.contains("Implicit"));
+        assert!(!text.contains("user@example.com"), "{text}");
+        assert!(text.contains("imap.example.com"), "{text}");
+        assert!(text.contains("993"), "{text}");
+        assert!(text.contains("Implicit"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
     }
 }

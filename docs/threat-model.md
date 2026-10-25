@@ -76,7 +76,7 @@
   responses per command at 10 000, folders at 5 000, command lines at 8 KiB and the response for
   one command at 64 MiB. Nesting, atoms, flags, addresses and numeric digits have fixed caps; a
   number is parsed, never wrapped. A truncated literal, a missing `*`, a bad tag, `NIL` where a
-  number is required and a negative number are typed errors, and a 53-case corpus runs in CI with a
+  number is required and a negative number are typed errors, and a 54-case corpus runs in CI with a
   three-second bound per case. A timeout closes the session, so the next call cannot read the tail
   of a half-command. Whole bodies are fetched with `BODY.PEEK[]`, so a read never sets `\Seen`.
 - IMAP commands (`postino-net`, P5a): mailbox names, user names and passwords are quoted with `"`

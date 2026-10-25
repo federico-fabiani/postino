@@ -1,8 +1,8 @@
 //! A deterministic corpus of malformed server responses.
 //!
 //! Each case is a real scripted conversation: the server sends the payload at a specific phase and
-//! the client must return a typed [`NetError`] quickly. A case that panics, hangs or is accepted
-//! fails the test.
+//! the client must return the expected class of [`NetError`] quickly. A case that panics, hangs,
+//! returns the wrong class or is accepted fails the test.
 
 mod support;
 
@@ -20,20 +20,40 @@ enum Phase {
     Fetch,
 }
 
+/// The error class a case must produce. Asserting the class, not merely "some error", catches a
+/// parser that silently reclassifies a malformed response as a timeout or a disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Protocol,
+    TooLarge,
+    Closed,
+    Timeout,
+    Auth,
+    ServerNo,
+    Unsupported,
+}
+
 struct Case {
     name: &'static str,
     phase: Phase,
     payload: Vec<u8>,
     close: bool,
+    expect: Class,
 }
 
 impl Case {
     fn new(name: &'static str, phase: Phase, payload: impl Into<Vec<u8>>) -> Self {
-        Self { name, phase, payload: payload.into(), close: false }
+        Self { name, phase, payload: payload.into(), close: false, expect: Class::Protocol }
     }
 
-    fn closing(name: &'static str, phase: Phase, payload: impl Into<Vec<u8>>) -> Self {
-        Self { name, phase, payload: payload.into(), close: true }
+    fn expect(mut self, class: Class) -> Self {
+        self.expect = class;
+        self
+    }
+
+    fn closing(mut self) -> Self {
+        self.close = true;
+        self
     }
 }
 
@@ -108,20 +128,35 @@ async fn run(case: &Case, tls: &TlsFixture) -> Result<(), NetError> {
     result
 }
 
+fn class_of(error: &NetError) -> Class {
+    match error {
+        NetError::Protocol { .. } => Class::Protocol,
+        NetError::TooLarge { .. } => Class::TooLarge,
+        NetError::Closed { .. } => Class::Closed,
+        NetError::Timeout { .. } => Class::Timeout,
+        NetError::Auth { .. } => Class::Auth,
+        NetError::ServerNo { .. } => Class::ServerNo,
+        NetError::Unsupported { .. } => Class::Unsupported,
+        NetError::ServerBad { .. } | NetError::Dns { .. } | NetError::Connect { .. } | NetError::Tls { .. } => {
+            panic!("the corpus never provokes {error:?}")
+        }
+    }
+}
+
 fn corpus() -> Vec<Case> {
     let deep = format!("* 1 FETCH (UID 1 X {}{})\r\nA0001 OK done\r\n", "(".repeat(40), ")".repeat(40));
     let cases = vec![
         // Greeting.
         Case::new("greeting garbage", Phase::Greeting, "* hello there\r\n"),
-        Case::new("greeting bye", Phase::Greeting, "* BYE maintenance\r\n"),
+        Case::new("greeting bye", Phase::Greeting, "* BYE maintenance\r\n").expect(Class::Closed),
         Case::new("greeting tagged", Phase::Greeting, "A0001 OK hello\r\n"),
-        Case::new("greeting silent", Phase::Greeting, ""),
+        Case::new("greeting silent", Phase::Greeting, "").expect(Class::Timeout),
         Case::new("greeting bare lf", Phase::Greeting, "* OK hi\n\r\n"),
         Case::new("greeting bad status", Phase::Greeting, "* MAYBE ready\r\n"),
         // Capability.
         Case::new("capability unknown status", Phase::Capability, "* CAPABILITY IMAP4rev1\r\nA0001 MAYBE done\r\n"),
         Case::new("capability wrong tag", Phase::Capability, "* CAPABILITY IMAP4rev1\r\nB0001 OK done\r\n"),
-        Case::new("capability missing rev1", Phase::Capability, "* CAPABILITY UIDPLUS\r\nA0001 OK done\r\n"),
+        Case::new("capability missing rev1", Phase::Capability, "* CAPABILITY UIDPLUS\r\nA0001 OK done\r\n").expect(Class::Unsupported),
         Case::new("capability control character", Phase::Capability, "* CAPABILITY IMAP4rev1 \u{1}X\r\nA0001 OK done\r\n"),
         Case::new("capability literal where an atom belongs", Phase::Capability, "* CAPABILITY IMAP4rev1 {5}\r\nhello\r\nA0001 OK done\r\n"),
         Case::new("capability huge literal marker", Phase::Capability, "* CAPABILITY {999999999999999999999}\r\n"),
@@ -139,10 +174,10 @@ fn corpus() -> Vec<Case> {
         Case::new("capability list missing name", Phase::Capability, "* LIST (\\Sent) \"/\"\r\nA0001 OK done\r\n"),
         Case::new("capability list unterminated attributes", Phase::Capability, "* LIST (\\Sent \"/\" \"X\"\r\nA0001 OK done\r\n"),
         Case::new("capability unterminated quoted", Phase::Capability, "* LIST (\\Sent) \"/\" \"X\r\nA0001 OK done\r\n"),
-        Case::new("capability line too long", Phase::Capability, format!("* CAPABILITY {}\r\n", "A".repeat(70_000))),
+        Case::new("capability line too long", Phase::Capability, format!("* CAPABILITY {}\r\n", "A".repeat(70_000))).expect(Class::TooLarge),
         // Login.
-        Case::new("login no", Phase::Login, "A0002 NO [AUTHENTICATIONFAILED] nope\r\n"),
-        Case::new("login bad", Phase::Login, "A0002 BAD bad command\r\n"),
+        Case::new("login no", Phase::Login, "A0002 NO [AUTHENTICATIONFAILED] nope\r\n").expect(Class::Auth),
+        Case::new("login bad", Phase::Login, "A0002 BAD bad command\r\n").expect(Class::Auth),
         Case::new("login unexpected continuation", Phase::Login, "+ weird\r\n"),
         Case::new("login garbage", Phase::Login, "garbage\r\n"),
         // Select.
@@ -151,12 +186,13 @@ fn corpus() -> Vec<Case> {
         Case::new("select uidvalidity zero", Phase::Select, "* 1 EXISTS\r\n* OK [UIDVALIDITY 0] x\r\nA0003 OK done\r\n"),
         Case::new("select uidvalidity overflow", Phase::Select, "* 1 EXISTS\r\n* OK [UIDVALIDITY 4294967296] x\r\nA0003 OK done\r\n"),
         Case::new("select negative exists", Phase::Select, "* -1 EXISTS\r\nA0003 OK done\r\n"),
+        Case::new("select nil exists", Phase::Select, "* NIL EXISTS\r\nA0003 OK done\r\n"),
         Case::new("select unterminated code", Phase::Select, "* OK [UIDVALIDITY 4 x\r\nA0003 OK done\r\n"),
         Case::new("select unknown system flag", Phase::Select, "* OK [PERMANENTFLAGS (\\Bogus)] x\r\nA0003 OK done\r\n"),
         Case::new("select wrong tag", Phase::Select, "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] x\r\nA9999 OK done\r\n"),
-        Case::new("select no", Phase::Select, "A0003 NO [NONEXISTENT] gone\r\n"),
+        Case::new("select no", Phase::Select, "A0003 NO [NONEXISTENT] gone\r\n").expect(Class::ServerNo),
         // Fetch.
-        Case::closing("fetch literal without terminator", Phase::Fetch, "* 1 FETCH (UID 1 BODY[] {50}\r\nshort"),
+        Case::new("fetch literal without terminator", Phase::Fetch, "* 1 FETCH (UID 1 BODY[] {50}\r\nshort").closing().expect(Class::Closed),
         Case::new("fetch unterminated list", Phase::Fetch, "* 1 FETCH (UID 1\r\nA0004 OK done\r\n"),
         Case::new("fetch envelope arity", Phase::Fetch, "* 1 FETCH (UID 1 ENVELOPE (\"a\" \"b\"))\r\nA0004 OK done\r\n"),
         Case::new("fetch negative size", Phase::Fetch, "* 1 FETCH (UID 1 RFC822.SIZE -1)\r\nA0004 OK done\r\n"),
@@ -188,6 +224,7 @@ async fn malformed_responses_are_typed_errors_not_panics() {
             Ok(Ok(())) => panic!("{} was accepted by the client", case.name),
             Ok(Err(error)) => {
                 let text = error.to_string();
+                assert_eq!(class_of(&error), case.expect, "{} gave {error:?}", case.name);
                 assert!(text.is_ascii(), "{} produced a non-ASCII error: {text}", case.name);
                 assert!(text.len() < 400, "{} produced an unbounded error: {text}", case.name);
             }

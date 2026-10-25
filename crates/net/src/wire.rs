@@ -94,11 +94,14 @@ pub(crate) struct Connection {
     position: usize,
     limits: Limits,
     timeout: Duration,
+    /// Whether the response being read is half-received: a line without CRLF, or a literal that is
+    /// still short. A timeout with this set is not a clean end of an idle window.
+    partial: bool,
 }
 
 impl Connection {
     pub(crate) fn new(stream: Stream, limits: Limits, timeout: Duration) -> Self {
-        Self { stream, buffer: Vec::new(), position: 0, limits, timeout }
+        Self { stream, buffer: Vec::new(), position: 0, limits, timeout, partial: false }
     }
 
     pub(crate) fn take_stream(&mut self) -> Stream {
@@ -122,6 +125,25 @@ impl Connection {
         self.position = 0;
     }
 
+    /// Drop the stream immediately.
+    ///
+    /// A session that has closed because the stream is at an unknown position must not keep the
+    /// socket open: the server would hold a dead connection, and an `IDLE` would never end.
+    pub(crate) fn abandon(&mut self) {
+        self.stream = Stream::Placeholder;
+        self.buffer.clear();
+        self.position = 0;
+        self.partial = false;
+    }
+
+    /// Whether bytes of the current response were received without completing it.
+    ///
+    /// `IDLE` uses this to tell "the wait expired and the socket is quiet" — a normal end — from
+    /// "the server started a line or a literal and stalled", which is a broken connection.
+    pub(crate) fn has_partial_input(&self) -> bool {
+        self.partial
+    }
+
     pub(crate) async fn write_all(&mut self, bytes: &[u8], phase: &'static str, deadline: Instant) -> Result<(), NetError> {
         let write = self.stream.write_all(bytes);
         match timeout_at(deadline, write).await {
@@ -140,6 +162,7 @@ impl Connection {
     pub(crate) async fn read_response(&mut self, phase: &'static str, deadline: Instant, budget: &mut Budget) -> Result<Vec<Segment>, NetError> {
         let mut segments = Vec::new();
         let mut literals = 0usize;
+        self.partial = false;
         loop {
             let line = self.read_line(phase, deadline, budget).await?;
             let Some((marker_at, size)) = trailing_literal(&line) else {
@@ -155,6 +178,8 @@ impl Connection {
             }
             let text = line.get(..marker_at).ok_or_else(|| protocol("literal marker is not at a character boundary"))?;
             segments.push(Segment::Text(text.to_owned()));
+            // The marker line was consumed: from here on the response is half-read.
+            self.partial = true;
             segments.push(Segment::Literal(self.read_exact(size, phase, deadline, budget).await?));
         }
     }
@@ -179,6 +204,9 @@ impl Connection {
             if available.len() > self.limits.max_line + 2 {
                 return Err(NetError::TooLarge { what: "line", limit: self.limits.max_line });
             }
+            if !available.is_empty() {
+                self.partial = true;
+            }
             let mut chunk = [0u8; CHUNK];
             let read = timeout_at(deadline, self.stream.read(&mut chunk)).await;
             let count = match read {
@@ -197,11 +225,15 @@ impl Connection {
         let mut out = Vec::with_capacity(size.min(CHUNK));
         let buffered = self.buffer.len().saturating_sub(self.position).min(size);
         if buffered > 0 {
+            // The bytes were read from the socket earlier but belong to this literal: charge them
+            // now, or a fully buffered literal would cost nothing against the response budget.
+            budget.spend(buffered)?;
             out.extend_from_slice(self.buffer.get(self.position..self.position + buffered).unwrap_or_default());
             self.position += buffered;
             self.compact();
         }
         while out.len() < size {
+            self.partial = true;
             let want = (size - out.len()).min(CHUNK);
             let mut chunk = [0u8; CHUNK];
             let target = chunk.get_mut(..want).unwrap_or_default();

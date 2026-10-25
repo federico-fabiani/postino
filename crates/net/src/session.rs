@@ -122,6 +122,9 @@ impl Session {
     /// `[CAPABILITY ...]` that list replaces the current one; otherwise the pre-login list stands,
     /// because a server that does not volunteer the new list has not claimed anything changed.
     pub async fn login(&mut self) -> Result<(), NetError> {
+        if self.closed {
+            return Err(NetError::Closed { phase: "auth" });
+        }
         if self.authenticated {
             return Ok(());
         }
@@ -164,6 +167,8 @@ impl Session {
     /// `UID FETCH` of UID, flags, `INTERNALDATE`, size and `ENVELOPE` for each UID in the set.
     ///
     /// A response without an envelope (an unsolicited flag change from another client) is skipped.
+    /// A returned envelope whose UID is outside the requested set is refused: it is the wrong
+    /// message, and storing it would corrupt the folder.
     pub async fn fetch_envelopes(&mut self, uids: UidSet) -> Result<Vec<Envelope>, NetError> {
         let set = uids.to_wire()?;
         let arguments = format!("{set} (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)");
@@ -176,6 +181,9 @@ impl Session {
             let FetchData { uid: Some(uid), envelope: Some(envelope), flags, internal_date, size, .. } = *data else {
                 continue;
             };
+            if !uids.contains(uid) {
+                return Err(protocol(format!("the server returned UID {uid}, outside the requested set")));
+            }
             envelopes.push(Envelope {
                 uid,
                 flags,
@@ -199,7 +207,8 @@ impl Session {
     /// `UID FETCH <uid> (BODY.PEEK[])`: the whole message, bounded by [`crate::Limits::max_literal`].
     ///
     /// `BODY.PEEK` is not decoration: it stops the server from setting `\Seen`, so reading a message
-    /// never changes its state behind the user's back.
+    /// never changes its state behind the user's back. A body that arrives with another UID is
+    /// refused instead of being handed back as the message the caller asked for.
     pub async fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, NetError> {
         if uid == 0 {
             return Err(protocol("UID 0 does not exist"));
@@ -210,9 +219,16 @@ impl Session {
             let Untagged::Fetch(data) = item else {
                 continue;
             };
-            if let FetchData { body: Some(body), .. } = *data {
-                return Ok(body);
+            let FetchData { body: Some(body), uid: returned, .. } = *data else {
+                continue;
+            };
+            if returned != Some(uid) {
+                return Err(protocol(match returned {
+                    Some(other) => format!("the server returned UID {other} for a fetch of UID {uid}"),
+                    None => format!("the server returned a body without a UID for a fetch of UID {uid}"),
+                }));
             }
+            return Ok(body);
         }
         Err(protocol("the server returned no BODY[] for the message"))
     }
@@ -243,41 +259,57 @@ impl Session {
     /// The wait is clamped to 29 minutes, below the server's 30-minute limit; [`Duration::ZERO`]
     /// sends `DONE` immediately. A mailbox must be selected. A server `BYE` is returned as
     /// [`IdleEvent::Bye`] and closes the session; a silent disconnect is [`NetError::Closed`].
+    ///
+    /// Only a quiet expiry of the wait ends the cycle normally. A timeout while a line or a literal
+    /// is half-read, a malformed response, a bound error and a timeout waiting for the `+`
+    /// continuation all close the session, because the stream is no longer at a command boundary.
     pub async fn idle(&mut self, wait: Duration) -> Result<Vec<IdleEvent>, NetError> {
         if self.closed {
             return Err(NetError::Closed { phase: "idle" });
         }
+        // Local misuse is not a protocol failure: refuse before touching the wire, and leave the
+        // session usable.
         if self.selected.is_none() {
             return Err(protocol("IDLE requires a selected mailbox"));
         }
         if !self.capabilities.idle() {
             return Err(NetError::Unsupported { feature: "IDLE" });
         }
+        let result = self.idle_inner(wait).await;
+        if let Err(error) = &result {
+            self.note_failure(error);
+        }
+        result
+    }
 
+    async fn idle_inner(&mut self, wait: Duration) -> Result<Vec<IdleEvent>, NetError> {
         let tag = self.next_tag();
         let command = Zeroizing::new(format!("{tag} IDLE\r\n"));
         log::debug!("imap: {tag} IDLE");
         let deadline = self.deadline();
-        if let Err(error) = self.conn.write_all(command.as_bytes(), "idle", deadline).await {
-            self.closed = true;
-            return Err(error);
-        }
+        self.conn.write_all(command.as_bytes(), "idle", deadline).await?;
 
         let mut budget = self.budget();
         let limit = self.config.limits.max_untagged;
+        // Waiting for the continuation is a command exchange, not the idle window: a timeout here
+        // means the server never entered IDLE, and the session must close.
+        let mut pending = 0usize;
         loop {
             let segments = self.conn.read_response("idle", deadline, &mut budget).await?;
             match parse_response(&segments)? {
                 Response::Continuation(_) => break,
                 Response::Untagged(item) => {
-                    if matches!(&item, Untagged::Status(status) if status.status == Status::Bye) {
+                    pending += 1;
+                    if pending > limit {
+                        return Err(NetError::TooLarge { what: "untagged responses", limit });
+                    }
+                    if is_bye(&item) {
                         self.closed = true;
                         return Err(NetError::Closed { phase: "idle" });
                     }
                 }
                 Response::Tagged { tag: got, .. } => {
                     self.check_tag(&got, &tag)?;
-                    self.closed = true;
                     return Err(protocol("IDLE was answered without a continuation"));
                 }
             }
@@ -309,46 +341,38 @@ impl Session {
                         self.check_tag(&got, &tag)?;
                         return match response.status {
                             Status::Ok => Ok(events),
-                            _ => {
-                                self.closed = true;
-                                Err(response.into_error("IDLE"))
-                            }
+                            _ => Err(response.into_error("IDLE")),
                         };
                     }
                 },
-                // The wait expired: this is the normal way out of the idle window.
-                Err(NetError::Timeout { .. }) => break,
-                Err(error) => {
-                    self.closed = true;
-                    return Err(error);
-                }
+                // The wait is over only when the socket is quiet. A half line or a half literal
+                // means the connection stalled in the middle of a response.
+                Err(NetError::Timeout { .. }) if !self.conn.has_partial_input() => break,
+                Err(error) => return Err(error),
             }
         }
 
         let done_deadline = self.deadline();
-        if let Err(error) = self.conn.write_all(b"DONE\r\n", "idle", done_deadline).await {
-            self.closed = true;
-            return Err(error);
-        }
+        self.conn.write_all(b"DONE\r\n", "idle", done_deadline).await?;
         loop {
             let segments = self.conn.read_response("idle", done_deadline, &mut budget).await?;
             match parse_response(&segments)? {
                 Response::Untagged(item) => {
-                    if matches!(&item, Untagged::Status(status) if status.status == Status::Bye) {
+                    if is_bye(&item) {
                         self.closed = true;
                         return Err(NetError::Closed { phase: "idle" });
                     }
                     events.push(idle_event(item));
+                    if events.len() > limit {
+                        return Err(NetError::TooLarge { what: "idle events", limit });
+                    }
                 }
                 Response::Continuation(text) => return Err(protocol(format!("unexpected continuation after DONE: {text}"))),
                 Response::Tagged { tag: got, response } => {
                     self.check_tag(&got, &tag)?;
                     return match response.status {
                         Status::Ok => Ok(events),
-                        _ => {
-                            self.closed = true;
-                            Err(response.into_error("IDLE"))
-                        }
+                        _ => Err(response.into_error("IDLE")),
                     };
                 }
             }
@@ -375,19 +399,12 @@ impl Session {
             match item {
                 Untagged::Exists(count) => status.exists = count,
                 Untagged::Recent(count) => status.recent = count,
-                Untagged::Status(response) => match response.code {
-                    Some(StatusCode::UidValidity(value)) => uid_validity = Some(value),
-                    Some(StatusCode::UidNext(value)) => status.uid_next = Some(value),
-                    Some(StatusCode::Unseen(value)) => status.unseen = Some(value),
-                    Some(StatusCode::HighestModSeq(value)) => status.highest_modseq = Some(value),
-                    Some(StatusCode::ReadOnly) => status.read_only = true,
-                    Some(StatusCode::ReadWrite) => status.read_only = false,
-                    Some(StatusCode::PermanentFlags(flags)) => status.permanent_flags = flags,
-                    _ => {}
-                },
+                Untagged::Status(response) => apply_status_code(&mut status, &mut uid_validity, response.code.as_ref()),
                 _ => {}
             }
         }
+        // `A0003 OK [READ-ONLY] ...` is the normal RFC 3501 way to report a read-only mailbox.
+        apply_status_code(&mut status, &mut uid_validity, outcome.code.as_ref());
         let uid_validity = uid_validity.ok_or_else(|| protocol("the SELECT response has no UIDVALIDITY"))?;
         status.uid_validity = uid_validity;
         if verb == "EXAMINE" {
@@ -398,6 +415,17 @@ impl Session {
     }
 
     async fn authenticate_plain(&mut self) -> Result<(), NetError> {
+        let result = self.authenticate_plain_inner().await;
+        if let Err(error) = &result {
+            self.note_failure(error);
+        }
+        result
+    }
+
+    /// The SASL exchange, with the same failure accounting the tagged commands get through
+    /// [`Session::execute`]: a timeout, a close, a bound error or a malformed response closes the
+    /// session, so a retry cannot send a second `AUTHENTICATE` down a desynchronised stream.
+    async fn authenticate_plain_inner(&mut self) -> Result<(), NetError> {
         let phase = "auth";
         let tag = self.next_tag();
         let command = Zeroizing::new(format!("{tag} AUTHENTICATE PLAIN\r\n"));
@@ -641,10 +669,21 @@ impl Session {
         }
     }
 
-    /// A timeout or a lost connection makes the session unusable; say so immediately next time.
+    /// A failure that leaves the stream at an unknown position makes the session unusable; say so
+    /// immediately next time, and drop the socket so the server does not keep a dead connection or a
+    /// stuck `IDLE` alive.
+    ///
+    /// `Timeout` and `Closed` lose the socket, `Tls` never established one, and `Protocol` and
+    /// `TooLarge` mean the client stopped mid-response (an unread literal, an over-long line, a
+    /// number it refused): the next read would start in the middle of someone else's response. A
+    /// `ServerNo`/`ServerBad` reply is complete, so those do not close the session.
     fn note_failure(&mut self, error: &NetError) {
-        if matches!(error, NetError::Timeout { .. } | NetError::Closed { .. } | NetError::Tls { .. }) {
+        if matches!(
+            error,
+            NetError::Timeout { .. } | NetError::Closed { .. } | NetError::Tls { .. } | NetError::Protocol { .. } | NetError::TooLarge { .. }
+        ) {
             self.closed = true;
+            self.conn.abandon();
         }
     }
 
@@ -659,6 +698,20 @@ impl Session {
 
     fn budget(&self) -> Budget {
         Budget::new(self.config.limits.max_response_bytes)
+    }
+}
+
+/// Copy one response code into the mailbox status being assembled.
+fn apply_status_code(status: &mut MailboxStatus, uid_validity: &mut Option<u32>, code: Option<&StatusCode>) {
+    match code {
+        Some(StatusCode::UidValidity(value)) => *uid_validity = Some(*value),
+        Some(StatusCode::UidNext(value)) => status.uid_next = Some(*value),
+        Some(StatusCode::Unseen(value)) => status.unseen = Some(*value),
+        Some(StatusCode::HighestModSeq(value)) => status.highest_modseq = Some(*value),
+        Some(StatusCode::ReadOnly) => status.read_only = true,
+        Some(StatusCode::ReadWrite) => status.read_only = false,
+        Some(StatusCode::PermanentFlags(flags)) => status.permanent_flags = flags.clone(),
+        _ => {}
     }
 }
 
@@ -691,6 +744,10 @@ fn auth_error(error: NetError) -> NetError {
         NetError::ServerNo { reason, .. } | NetError::ServerBad { reason, .. } => NetError::Auth { reason },
         other => other,
     }
+}
+
+fn is_bye(item: &Untagged) -> bool {
+    matches!(item, Untagged::Status(status) if status.status == Status::Bye)
 }
 
 fn idle_event(item: Untagged) -> IdleEvent {
@@ -777,16 +834,61 @@ async fn connect_any(host: &str, port: u16, addresses: &[SocketAddr], timeout: D
 mod tests {
     use super::*;
 
-    #[test]
-    fn tags_are_zero_padded_and_keep_growing() {
+    fn detached_session() -> Session {
         let config = ImapConfig::new("imap.example.com", 993, TlsMode::Implicit, "user", Secret::new("pw"));
         let conn = Connection::new(Stream::Placeholder, config.limits.clamped(), config.timeout);
-        let mut session =
-            Session { conn, tag: 0, capabilities: Capabilities::default(), authenticated: false, selected: None, config, closed: false };
+        Session { conn, tag: 0, capabilities: Capabilities::default(), authenticated: false, selected: None, config, closed: false }
+    }
+
+    #[test]
+    fn tags_are_zero_padded_and_keep_growing() {
+        let mut session = detached_session();
         assert_eq!(session.next_tag(), "A0001");
         assert_eq!(session.next_tag(), "A0002");
         session.tag = 9_999;
         assert_eq!(session.next_tag(), "A10000");
+    }
+
+    #[test]
+    fn errors_that_desynchronise_the_stream_close_the_session() {
+        let mut session = detached_session();
+        for error in [
+            NetError::Protocol { reason: "bad".to_owned() },
+            NetError::TooLarge { what: "literal", limit: 8 },
+            NetError::Timeout { phase: "list", after: Duration::from_millis(1) },
+            NetError::Closed { phase: "list" },
+            NetError::Tls { host: "imap.example.com".to_owned(), reason: "bad".to_owned() },
+        ] {
+            session.closed = false;
+            session.note_failure(&error);
+            assert!(session.closed, "{error:?} must close the session");
+        }
+        // A complete tagged NO leaves the stream at a command boundary: the caller may try again.
+        session.closed = false;
+        session.note_failure(&NetError::ServerNo { command: "SELECT", reason: "nope".to_owned() });
+        assert!(!session.closed);
+        session.note_failure(&NetError::Auth { reason: "nope".to_owned() });
+        assert!(!session.closed);
+    }
+
+    #[test]
+    fn a_closed_session_refuses_to_login_again() {
+        let mut session = detached_session();
+        session.closed = true;
+        let error = poll_once(session.login()).expect_err("closed");
+        assert!(matches!(error, NetError::Closed { phase: "auth" }), "{error:?}");
+    }
+
+    /// Poll one immediately-ready future without a runtime: `login` returns before its first await
+    /// when the session is already closed.
+    fn poll_once<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("the future was expected to be ready"),
+        }
     }
 
     #[test]

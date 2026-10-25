@@ -149,3 +149,27 @@ async fn starttls_rejects_plaintext_pipelined_after_the_ok() {
     assert!(matches!(error, NetError::Protocol { .. }), "{error:?}");
     server.finish().await;
 }
+
+/// Trusting one test CA must not trust another: a valid chain to a CA outside `extra_roots` is
+/// refused, exactly as the platform store would refuse a stranger.
+#[tokio::test]
+async fn a_ca_outside_extra_roots_is_refused() {
+    let trusted = TlsFixture::generate();
+    let stranger = TlsFixture::generate();
+    let acceptor = stranger.acceptor();
+    let server = FakeServer::start(move |mut conn| async move {
+        let _ = conn.accept_tls(acceptor).await;
+        conn.delay(Duration::from_millis(100)).await;
+    })
+    .await;
+
+    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::Implicit, USER, Secret::new(support::PASSWORD))
+        .with_timeout(Duration::from_secs(2))
+        .with_extra_root(trusted.ca());
+    let error = Session::connect(config).await.expect_err("the signing CA is not trusted");
+    match &error {
+        NetError::Tls { host, .. } => assert_eq!(host, "localhost"),
+        other => panic!("expected Tls, got {other:?}"),
+    }
+    server.finish().await;
+}

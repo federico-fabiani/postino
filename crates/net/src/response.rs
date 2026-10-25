@@ -246,6 +246,9 @@ fn parse_code(cursor: &mut Cursor<'_>) -> Result<StatusCode, NetError> {
 fn parse_untagged(cursor: &mut Cursor<'_>) -> Result<Untagged, NetError> {
     cursor.skip_ws();
     match cursor.peek() {
+        // A count is a non-negative number, never `-1` and never `NIL`. Both used to be drained as
+        // unknown extension data, which hid a server that had lost track of the protocol.
+        Some(b'-') => Err(protocol("negative number where a count is required")),
         Some(byte) if byte.is_ascii_digit() => {
             let number = cursor.number()?;
             let count = u32::try_from(number).map_err(|_| protocol("untagged count is out of range"))?;
@@ -288,6 +291,9 @@ fn parse_untagged(cursor: &mut Cursor<'_>) -> Result<Untagged, NetError> {
         }
         Some(_) => {
             let word = cursor.atom()?;
+            if word.eq_ignore_ascii_case("NIL") {
+                return Err(protocol("NIL where a count is required"));
+            }
             if let Ok(status) = status_from_word(&word) {
                 return Ok(Untagged::Status(parse_status_tail(cursor, status)?));
             }
@@ -445,6 +451,15 @@ mod tests {
         assert!(parse("* 3 EXISTS junk").is_err());
         assert!(parse("* LIST (\\Sent) \"/\" \"A\" extra").is_err());
         assert!(parse("* 1 FETCH (UID 1) extra").is_err());
+    }
+
+    #[test]
+    fn refuses_negative_and_nil_counts() {
+        for text in ["* -1 EXISTS", "* -5 FETCH (UID 1)", "* NIL EXISTS", "* NIL RECENT", "* NIL"] {
+            assert!(parse(text).is_err(), "{text:?} must be refused");
+        }
+        // A keyword that merely contains NIL is still extension data, not a count.
+        assert!(matches!(parse("* NIL-ISH data").ok(), Some(Response::Untagged(Untagged::Other))));
     }
 
     #[test]
