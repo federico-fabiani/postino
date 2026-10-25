@@ -12,7 +12,7 @@ use postino_core::{Engine, LabelColor, MailTls, OpError, Provider, SyncPhase};
 use postino_store::{AccountServer, Address, FolderKind, Message, MessageSummary};
 use postino_testkit::{FailPoint, MailboxScript, TestFolder, TestMessage, USER, synthetic_message, synthetic_message_with_attachment};
 use serde_json::json;
-use support::{ACCOUNT_ID, Harness, MemoryVault, RunningServer, account_setup, reject_login, seed_account, start_handler};
+use support::{ACCOUNT_ID, Harness, MemoryVault, RunningServer, account_setup, refuse_list_with_secret, reject_login, seed_account, start_handler};
 use zeroize::Zeroizing;
 
 const ATTACHMENT_BYTES: &[u8] = b"postino p6a attachment";
@@ -345,6 +345,79 @@ fn sync_now_requires_an_id_when_several_accounts_exist_and_status_lists_them_all
     let statuses = engine.sync_statuses(None).expect("status lists every account");
     assert_eq!(statuses.len(), 2);
     assert!(statuses.iter().all(|view| view.status.is_none()));
+}
+
+#[test]
+fn a_server_that_echoes_the_password_in_a_list_response_leaks_nothing() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    let server = start_handler(|conn| async move {
+        refuse_list_with_secret(conn, postino_testkit::PASSWORD.to_owned()).await;
+    });
+    let mut engine = Engine::open_with_vault(harness.open(), vault.clone()).expect("engine");
+
+    let error = engine.add_account(account_setup(&server)).expect_err("the LIST refusal must fail the add");
+    server.finish();
+    let text = error.to_string();
+    assert!(matches!(error, OpError::Network(_)), "{error}");
+    assert!(text.contains("listing folders"), "the phase is not named: {text}");
+    assert!(text.contains("custom"), "the provider is not named: {text}");
+    assert!(!text.contains(postino_testkit::PASSWORD), "the server text leaked into the error: {text}");
+    assert!(!text.contains("A0003 NO"), "the raw response leaked into the error: {text}");
+    assert!(engine.accounts().is_empty());
+    assert_eq!(vault.len(), 0);
+}
+
+#[test]
+fn a_damaged_sync_status_is_a_warning_and_does_not_block_listing_or_removal() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    let store = harness.open();
+    seed_account(&store, &vault, ACCOUNT_ID, 993, &[("inbox", "INBOX", FolderKind::Inbox)]);
+    store.set_meta(&format!("sync_status:{ACCOUNT_ID}"), "{not-json").expect("damaged status");
+    let mut engine = Engine::open_with_vault(harness.open(), vault.clone()).expect("engine");
+
+    let (views, warnings) = engine.account_views_report().expect("a damaged status must not fail the listing");
+    assert_eq!(views.len(), 1);
+    assert!(views.first().is_some_and(|view| view.sync.is_none()));
+    assert!(warnings.iter().any(|warning| warning.contains(ACCOUNT_ID)), "{warnings:?}");
+    let listed = engine.call("accounts_list", json!({})).expect("accounts_list");
+    assert!(listed["accounts"][0]["sync"].is_null());
+    assert!(!listed["warnings"].as_array().expect("warnings").is_empty());
+
+    let removed = engine.remove_account(ACCOUNT_ID, true).expect("a damaged status must not block removal");
+    assert_eq!(removed.account.id, ACCOUNT_ID);
+    assert!(engine.accounts().is_empty());
+    assert!(!vault.contains(ACCOUNT_ID));
+}
+
+#[test]
+fn a_failed_account_transaction_removes_the_just_stored_credential_and_writes_no_rows() {
+    let harness = Harness::new();
+    {
+        let store = harness.open();
+        // `Engine::open` repairs the label sequence; seed the value so the read-only open below does
+        // not need a write.
+        store.set_meta(postino_store::LABEL_SEQ_KEY, "0").expect("label sequence");
+    }
+    let vault = MemoryVault::new();
+    let server = RunningServer::start(mailbox(), 1);
+    let mut engine = Engine::open_with_vault(harness.read_only(), vault.clone()).expect("engine");
+    engine.set_test_extra_roots(vec![server.ca()]);
+
+    let error = engine.add_account(account_setup(&server)).expect_err("the read-only store must refuse the account transaction");
+    server.finish();
+    let text = error.to_string();
+    assert!(text.contains("the local store refused the account"), "{text}");
+    assert!(text.contains("credential was removed again"), "the cleanup did not run: {text}");
+    assert_eq!(vault.len(), 0, "the credential survived a failed account transaction");
+    let deletions = vault.deletions();
+    assert_eq!(deletions.len(), 1, "the credential deletion was not recorded");
+
+    let store = harness.open();
+    assert!(store.list_accounts().expect("accounts").is_empty());
+    assert!(store.list_folders(None).expect("folders").is_empty());
+    assert!(store.get_account_server(&deletions[0]).expect("server").is_none());
 }
 
 #[test]

@@ -371,6 +371,39 @@ mod tests {
     }
 
     #[test]
+    fn account_test_does_not_forward_a_server_echo_of_the_password() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mail.db");
+        let mut key_bytes = [0u8; 32];
+        getrandom::fill(&mut key_bytes).expect("OS random source");
+        let store = postino_store::Store::open(&path, &postino_store::StoreKey::from_bytes(key_bytes)).expect("store");
+        let vault = crate::test_support::MemoryVault::new();
+        let server = crate::test_support::RunningServer::start_handler(|conn| async move {
+            crate::test_support::refuse_list_with_secret(conn, postino_testkit::PASSWORD.to_owned()).await;
+        });
+        crate::test_support::seed_account(&store, &vault, "acc_mcp", server.port());
+        let mut engine = Engine::open_with_vault(store, vault).expect("engine");
+        engine.set_test_extra_roots(vec![server.ca()]);
+
+        let response = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 30,
+                "method": "tools/call",
+                "params": { "name": "account_test", "arguments": { "id": "acc_mcp" } }
+            }),
+        )
+        .expect("response");
+        server.finish();
+        assert_eq!(response["result"]["isError"], json!(true));
+        let text = response["result"]["content"][0]["text"].as_str().expect("text");
+        assert!(text.contains("listing folders"), "the phase is not named: {text}");
+        assert!(!text.contains(postino_testkit::PASSWORD), "the server echo leaked into the MCP result: {text}");
+        assert!(!text.contains("A0003 NO"), "the raw response leaked into the MCP result: {text}");
+    }
+
+    #[test]
     fn sync_now_and_sync_status_work_over_mcp_without_a_secret_in_the_response() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("mail.db");

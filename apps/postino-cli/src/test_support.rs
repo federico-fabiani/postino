@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use postino_core::{CredentialVault, VaultError};
 use postino_net::CertificateDer;
 use postino_store::{Account, AccountServer, AccountTls, Store};
-use postino_testkit::{FakeServer, TestFolder, USER, serve_mailbox};
+use postino_testkit::{Conn, FakeServer, TestFolder, USER, serve_mailbox};
 use zeroize::Zeroizing;
 
 #[derive(Default)]
@@ -89,6 +89,27 @@ impl RunningServer {
         self.ca.clone()
     }
 
+    /// One connection with a custom handler, for a hostile or broken server.
+    pub fn start_handler<F, Fut>(handler: F) -> Self
+    where
+        F: FnOnce(Conn) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let tls = postino_testkit::TlsFixture::generate();
+        let ca = tls.ca();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("server runtime");
+            runtime.block_on(async move {
+                let server = FakeServer::start_tls(&tls, handler).await;
+                sender.send(server.port()).expect("send the server port");
+                server.finish().await;
+            });
+        });
+        let port = receiver.recv().expect("server port");
+        Self { port, ca, handle: Some(handle) }
+    }
+
     pub fn finish(mut self) {
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
@@ -96,6 +117,14 @@ impl RunningServer {
             panic!("the fake mailbox thread panicked");
         }
     }
+}
+
+/// Accept the login and answer `LIST` with `NO <secret>`: the hostile server from the security
+/// review that repeats the password it just received.
+pub async fn refuse_list_with_secret(mut conn: Conn, secret: String) {
+    conn.prepare_sasl().await;
+    conn.expect_prefix("A0003 LIST").await;
+    conn.send_line(&format!("A0003 NO {secret}")).await;
 }
 
 /// Seed the account and endpoint `sync_now`/MCP need. The sync run discovers the folders itself.

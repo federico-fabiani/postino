@@ -7,9 +7,11 @@ registry shared by the desktop app, the CLI and an MCP server.
 > the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
 > store (P5b) + accounts, credentials and sync operations (P6a).** The shell, the operation registry,
 > the CLI and the MCP server work against a synthetic demo mailbox; `postino --store <path>` (or the
-> default `%LOCALAPPDATA%\Postino\mail.db`) runs the same operations on the encrypted SQLCipher
-> database, and the CLI can now add a real Aruba or Gmail account with an app password, test it, sync
-> it and remove it. Passwords live only in the OS keyring. The desktop app still boots on the demo
+> default `%LOCALAPPDATA%\Postino\mail.db` on Windows) runs the same operations on the encrypted
+> SQLCipher database, and the CLI can now add a real Aruba or Gmail account with an app password, test
+> it, sync it and remove it. Passwords live only in the OS keyring; **Windows Credential Manager is
+> the only keyring backend in this build**, and macOS/Linux fail at the platform seam until their
+> keychains land with packaging. The desktop app still boots on the demo
 > until onboarding (P6b). MIME parsing, sanitization and serialization exist as `postino-mime`;
 > `postino-net` is an IMAP4rev1 client that logs in over TLS, lists folders, selects, fetches
 > envelopes and `BODY.PEEK[]` bodies, stores flags and idles; and `postino-sync` reconciles one
@@ -141,17 +143,25 @@ cargo run -p postino-cli -- account remove acc_0123456789abcdef --yes
 The app is `postino-app`; the command is `postino`. The product name stays Postino.
 
 Without `--store` and without `--demo`, the CLI uses the default encrypted store at
-`%LOCALAPPDATA%\Postino\mail.db` (or the platform equivalent) and takes the key from the OS keyring
-(service `postino`, scope `default`). `--store` picks another SQLCipher database; `--demo` and
-`--store` are mutually exclusive. First-run key creation is serialised with
-`<app local data>/Postino/keyring.lock` and verified by reading the key back. An IMAP credential is
-stored under `account:<id>:imap` in the same keyring, never in the database; the CLI's prompt does not
-echo and there is no `--password` argument. One process owns the database: do not point two
-`postino --store` commands at the same file.
+`%LOCALAPPDATA%\Postino\mail.db` on Windows and takes the key from the OS keyring (service
+`postino`, scope `default`). **Windows is the only keyring backend in this build**: macOS and Linux
+fail at the `postino-platform` seam with `PlatformError::Unsupported` until their native keychains
+land with packaging, so there is no platform-equivalent default store yet. `--store` picks another
+SQLCipher database; `--demo` and `--store` are mutually exclusive. First-run key creation is
+serialised with `<app local data>/Postino/keyring.lock` and verified by reading the key back. An IMAP
+credential is stored under `account:<id>:imap` in the same keyring, never in the database; the CLI's
+prompt does not echo and there is no `--password` argument. One process owns the database: do not
+point two `postino --store` commands at the same file.
 
-Exit codes are 0 for success, 1 for an operation failure and 2 for a usage error. The `add | test |
-list | remove` account commands and `sync run | status` are real, but the desktop app itself is still
-on the demo until P6b; Gmail OAuth is P12 and no SMTP connection is opened.
+Read-only commands (`info`, `tools`, `schema`, `account list`, `account test`, `sync status`, mail
+reads) never create a missing default store and never touch the keyring for it: they report that no
+account is configured. An explicit `--store` on a read-only command must already exist, otherwise it
+is a usage error. Mutations (`account add`, `sync run`, account removal, draft/label/flag writes) may
+create the default store. Exit codes are 0 for success, 1 for an operation failure and 2 for a usage
+error, including `OpError::InvalidArgs` (missing `--yes`, an invalid address/name/endpoint, an unknown
+id) and malformed `postino run` arguments. The `add | test | list | remove` account commands and
+`sync run | status` are real, but the desktop app itself is still on the demo until P6b; Gmail OAuth
+is P12 and no SMTP connection is opened.
 
 ### MCP
 

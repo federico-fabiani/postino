@@ -14,7 +14,9 @@ postino --store <path> mcp
 - It opens no port, starts nothing else, and stops at EOF.
 - Logs, if any, go to stderr. stdout carries protocol messages only.
 - Without `--demo` and `--store`, `postino mcp` opens the default encrypted store at
-  `%LOCALAPPDATA%\Postino\mail.db` (or the platform equivalent). `--store` picks another database;
+  `%LOCALAPPDATA%\Postino\mail.db` on Windows. Windows Credential Manager is the only keyring backend
+  in this build; macOS and Linux fail at the platform seam until their native keychains land with
+  packaging, so there is no platform-equivalent default store yet. `--store` picks another database;
   one process owns it. `--demo` stays synthetic and never touches the store.
 - The process needs the store key from the OS keyring. It never prints it.
 

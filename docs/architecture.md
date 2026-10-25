@@ -183,6 +183,13 @@ never reads the keyring, which is what lets its tests run with a random in-memor
 platform crate install `keyring_core::mock`, pass a temporary lock path and never touch the real
 vault or `%LOCALAPPDATA%\Postino`.
 
+**Platform note.** Windows Credential Manager is the only native keyring backend in this build
+(`windows-native-keyring-store`). On macOS and Linux `install_native_store` returns
+`PlatformError::Unsupported`: the store key and every account credential fail closed at the seam,
+there is no weaker file fallback, and there is no platform-equivalent default store yet. Native
+macOS/Linux keychains land with the packaging milestone. `postino-platform` owns both scopes:
+`default` for the store key and `account:<id>:imap` for an IMAP credential.
+
 **Schema v3** (`crates/store/src/lib.rs`): v2 plus `draft_seq(message_id PRIMARY KEY, revision)`,
 which holds the draft revision high-water mark independently from the draft row. Migration v3 seeds
 it from `drafts.revision`, so an existing store keeps its revision numbers.
@@ -716,21 +723,29 @@ committed before the stop and never loses a cached one. `account_test` is the sa
 sync and without any write.
 
 **Operations and annotations.** `accounts_list` returns `AccountView { account, server, sync }`:
-provider, address, host/port/TLS/username and the persisted status, never a secret. `account_add` and
-`account_remove` are **sensitive** (`OpDef.sensitive`); the MCP server filters them out of
+provider, address, host/port/TLS/username and the persisted status, never a secret. The status is a
+cache: a malformed `sync_status` value is returned as `sync: null` with a warning (the operation's
+`warnings` array; the CLI prints it), and it never blocks listing or `account_remove`. `account_add`
+and `account_remove` are **sensitive** (`OpDef.sensitive`); the MCP server filters them out of
 `tools/list` and refuses `tools/call` for them before parsing the arguments, so a password cannot
-appear in a refusal. The CLI can call them and reads the password from a no-echo prompt or one
-`--password-stdin` line; there is no `--password` argv flag. `read_only` is set on `accounts_list`,
-`account_test` and `sync_status`; `destructive` on `account_remove`. `sync_now` and `account_add` are
-writes. `sync_status` is offline. MCP marks `account_test` and `sync_now` as `openWorldHint: true`;
-everything else is local.
+appear in a refusal. The CLI validates the account request and the engine before it reads a secret;
+`--password-stdin` is refused when stdin is a terminal (the no-echo prompt is the interactive path),
+there is no `--password` argv flag, and `postino run` refuses sensitive operations. `read_only` is set
+on `accounts_list`, `account_test` and `sync_status`; `destructive` on `account_remove`. `sync_now` and
+`account_add` are writes. `sync_status` is offline. MCP marks `account_test` and `sync_now` as
+`openWorldHint: true`; everything else is local. Read-only CLI commands with no default store report
+no account without creating the file or touching the keyring; `Store::open_read_only` is the
+deterministic read seam (an old schema must be opened read-write once), and an explicit `--store`
+that does not exist is a usage error for them.
 
 **Tests and limits.** The fake server gained `FakeServer::start_tls_many` so one stored port can serve
 add, test and several sync runs; `postino-sync` exposes `probe`, `plan_folders` and
 `read_status_for` without making the store or net APIs public. The engine test
-suite covers add success, wrong password, unreachable host, duplicate address, broken credential on
-test, a 3-folder initial sync with an attachment, incremental sync with a surviving label, a failed
-sync that keeps the cache, remove isolation, the remove failure window and the demo errors. No test
+suite covers add success, wrong password, unreachable host, duplicate address, a hostile server
+echoing the password in `LIST`, broken credential on test, a damaged status that still lists and
+removes, a 3-folder initial sync with an attachment, incremental sync with a surviving label, a
+failed sync that keeps the cache, remove isolation, the remove failure window, a failed account
+transaction that rolls the credential back, the read-only store seam and the demo errors. No test
 uses a real vault, a real account or `%LOCALAPPDATA%\Postino`.
 
 ## 5. Synchronization

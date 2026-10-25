@@ -23,9 +23,9 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use postino_core::{
-    AccountAdd, AccountRemove, AccountTest, AccountView, AccountsList, Address, AppInfo, CredentialVault, DraftSave, DraftSend, Engine, FoldersList,
-    LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary,
-    MessagesList, Provider, SearchResult, SyncNow, SyncReport, SyncStatusReport, VaultError,
+    AccountAdd, AccountRemove, AccountRequest, AccountTest, AccountView, AccountsList, Address, AppInfo, CredentialVault, DraftSave, DraftSend,
+    Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet,
+    MessageSummary, MessagesList, OpError, Provider, SearchResult, SyncNow, SyncReport, SyncStatusReport, VaultError,
 };
 use postino_platform::Keyring;
 use serde::Serialize;
@@ -305,15 +305,40 @@ fn main() -> ExitCode {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("postino: {error:#}");
-            return ExitCode::FAILURE;
+            return error_exit_code(&error);
         }
     };
     match run(cli, &mut engine) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("postino: {error:#}");
-            ExitCode::FAILURE
+            error_exit_code(&error)
         }
+    }
+}
+
+/// A command-line usage mistake: exit code 2, like clap. Operations that reject their arguments with
+/// [`OpError::InvalidArgs`] are also usage errors; everything else is an operation failure (1).
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+fn usage(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UsageError(message.into()))
+}
+
+fn error_exit_code(error: &anyhow::Error) -> ExitCode {
+    if error.downcast_ref::<UsageError>().is_some() || matches!(error.downcast_ref::<OpError>(), Some(OpError::InvalidArgs(_))) {
+        ExitCode::from(2)
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -322,22 +347,58 @@ fn main() -> ExitCode {
 /// The store key never leaves this function except inside the store connection. The credential vault
 /// is the OS keyring; account operations never print what they read from it.
 fn open_engine(cli: &Cli) -> Result<Engine> {
+    let data_dir = Engine::data_dir();
+    open_engine_in(cli, data_dir.as_deref(), open_store)
+}
+
+/// The opener with the profile directory and the store factory injected.
+///
+/// A read-only command never creates a missing default store and never constructs the keyring: it
+/// gets an empty engine and reports that no account is configured. A mutation may create it. An
+/// explicit `--store` that does not exist is a usage error for a read-only command. Tests pass a
+/// temporary profile and a factory that fails if it is called.
+fn open_engine_in<F>(cli: &Cli, data_dir: Option<&Path>, open: F) -> Result<Engine>
+where
+    F: FnOnce(&Path) -> Result<Engine>,
+{
+    let reads_only = command_reads_only(&cli.command);
     match (&cli.store, cli.demo) {
-        (Some(_), true) => bail!("--demo e --store non possono essere usati insieme: scegli la mailbox sintetica o il database cifrato"),
-        (Some(path), false) => open_store(path),
+        (Some(_), true) => Err(usage("--demo e --store non possono essere usati insieme: scegli la mailbox sintetica o il database cifrato")),
+        (Some(path), false) => {
+            if reads_only && !path.exists() {
+                return Err(usage(format!("the store at {} does not exist; create it with a write command or omit --store", path.display())));
+            }
+            open(path)
+        }
         (None, true) => Ok(Engine::demo()),
         (None, false) => {
-            let path = default_store_path()?;
-            open_store(&path)
+            let Some(dir) = data_dir else {
+                if reads_only {
+                    return Ok(Engine::empty());
+                }
+                bail!("the platform data directory is unavailable, so the default store cannot be placed");
+            };
+            let path = default_store_path_in(dir);
+            if reads_only && !path.exists() { Ok(Engine::empty()) } else { open(&path) }
         }
     }
 }
 
-/// `%LOCALAPPDATA%\Postino\mail.db` (or the platform equivalent), created on first use.
-fn default_store_path() -> Result<PathBuf> {
-    let dir =
-        Engine::data_dir().ok_or_else(|| anyhow::anyhow!("the platform data directory is unavailable, so the default store cannot be placed"))?;
-    Ok(default_store_path_in(&dir))
+/// Whether a command only reads. Those commands must not create the default store or take the
+/// keyring when the file is absent; a mutation may create it.
+fn command_reads_only(command: &Command) -> bool {
+    match command {
+        Command::Info | Command::Tools | Command::Schema { .. } | Command::Accounts => true,
+        Command::Account { command } => matches!(command, AccountCommand::List | AccountCommand::Test { .. }),
+        Command::Sync { command } => matches!(command, SyncCommand::Status { .. }),
+        Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } => true,
+        Command::Read { mark_read, .. } => !mark_read,
+        Command::Label { command } => matches!(command, LabelCommand::List),
+        // An unknown operation stays read-only so a typo cannot create a store; a sensitive
+        // operation is refused before dispatch and must not create one either.
+        Command::Run { op, .. } => postino_core::op_defs().iter().find(|def| def.name == op).is_none_or(|def| def.read_only || def.sensitive),
+        Command::Flag { .. } | Command::Draft { .. } | Command::Mcp => false,
+    }
 }
 
 fn default_store_path_in(dir: &Path) -> PathBuf {
@@ -433,29 +494,39 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             if json_output {
                 print_json(&accounts)?;
             } else {
-                say(format_accounts(&accounts.accounts))?;
+                say(format_accounts(&accounts.accounts, &accounts.warnings))?;
             }
         }
         Command::Account { command } => match command {
             AccountCommand::Add { provider, email, name, host, port, tls, password_stdin } => {
                 let provider =
-                    Provider::parse(&provider).ok_or_else(|| anyhow::anyhow!("provider {provider:?} non valido; usa aruba, gmail o custom"))?;
+                    Provider::parse(&provider).ok_or_else(|| usage(format!("provider {provider:?} is not valid; use aruba, gmail or custom")))?;
                 let tls = match tls {
                     Some(value) => {
-                        Some(MailTls::parse(&value).ok_or_else(|| anyhow::anyhow!("modalità TLS {value:?} non valida; usa implicit o starttls"))?)
+                        Some(MailTls::parse(&value).ok_or_else(|| usage(format!("TLS mode {value:?} is not valid; use implicit or starttls")))?)
                     }
                     None => None,
                 };
+                // The engine validates everything that does not need the secret before stdin is
+                // touched, so a bad command or a store that cannot accept the account fails without
+                // consuming the password.
+                let request = AccountRequest { provider, email: email.clone(), name: name.clone(), host: host.clone(), port, tls };
+                engine.check_account_request(&request)?;
+                if password_stdin && interactive {
+                    return Err(usage(
+                        "stdin is a terminal: omit --password-stdin to use the no-echo prompt, or pipe the password from a file or script",
+                    ));
+                }
                 let password = if password_stdin {
                     read_password_stdin(input)?
                 } else if interactive {
                     let password = rpassword::prompt_password("Password IMAP: ").context("reading the password from the terminal")?;
                     if password.is_empty() {
-                        bail!("the password must not be empty");
+                        return Err(usage("the password must not be empty"));
                     }
                     Zeroizing::new(password)
                 } else {
-                    bail!("no terminal is available to prompt for the password; use --password-stdin and pipe one line into postino")
+                    return Err(usage("no terminal is available to prompt for the password; use --password-stdin and pipe one line into postino"));
                 };
                 let view = account_add(engine, AccountAddRequest { provider, email, name, host, port, tls, password })?;
                 if json_output {
@@ -477,7 +548,7 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 if json_output {
                     print_json(&accounts)?;
                 } else {
-                    say(format_accounts(&accounts.accounts))?;
+                    say(format_accounts(&accounts.accounts, &accounts.warnings))?;
                 }
             }
             AccountCommand::Remove { id, yes } => {
@@ -680,9 +751,9 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
         },
         Command::Run { op, args, params } => {
             if engine.tools().into_iter().any(|def| def.name == op && def.sensitive) {
-                bail!(
+                return Err(usage(format!(
                     "operation {op:?} is sensitive and cannot be called through `postino run`; use `postino account add` or `postino account remove`, which read the password without an argv flag"
-                );
+                )));
             }
             let object = parse_run_args(args, params)?;
             let result = call(engine, &op, object)?;
@@ -729,18 +800,21 @@ fn read_password_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<Zeroizing
     reader.read_line(&mut line).context("reading the password from stdin")?;
     let password = line.trim_end_matches(['\r', '\n']).to_owned();
     if password.is_empty() {
-        bail!("the password read from stdin is empty");
+        return Err(usage("the password read from stdin is empty"));
     }
     Ok(Zeroizing::new(password))
 }
 
-fn format_accounts(accounts: &[AccountView]) -> String {
-    if accounts.is_empty() {
-        return "Nessun account. Aggiungine uno con `postino account add --provider aruba --email me@example.it`.\n".to_owned();
-    }
+fn format_accounts(accounts: &[AccountView], warnings: &[String]) -> String {
     let mut text = String::new();
+    if accounts.is_empty() {
+        text.push_str("Nessun account. Aggiungine uno con `postino account add --provider aruba --email me@example.it`.\n");
+    }
     for view in accounts {
         text.push_str(&format_account_line(view));
+    }
+    for warning in warnings {
+        text.push_str(&format!("! {warning}\n"));
     }
     text
 }
@@ -975,20 +1049,20 @@ fn parse_cli_addresses(values: Vec<String>, field: &str) -> Result<Vec<Address>>
 fn parse_run_args(args: Option<String>, params: Vec<String>) -> Result<Value> {
     let mut object = match args {
         Some(text) => {
-            let value: Value = serde_json::from_str(&text).with_context(|| format!("--args is not JSON: {text}"))?;
+            let value: Value = serde_json::from_str(&text).map_err(|error| usage(format!("--args is not JSON: {error}")))?;
             if !value.is_object() {
-                bail!("--args must be a JSON object");
+                return Err(usage("--args must be a JSON object"));
             }
             value
         }
         None => json!({}),
     };
     let Some(map) = object.as_object_mut() else {
-        bail!("--args must be a JSON object");
+        return Err(usage("--args must be a JSON object"));
     };
     for param in params {
         let Some((key, raw)) = param.split_once('=') else {
-            bail!("argument {param:?} is not KEY=VALUE");
+            return Err(usage(format!("argument {param:?} is not KEY=VALUE")));
         };
         let value = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
         map.insert(key.to_owned(), value);
@@ -1605,6 +1679,166 @@ mod tests {
     }
 
     #[test]
+    fn a_tty_password_stdin_is_a_usage_error_and_reads_nothing() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        let mut input = std::io::Cursor::new(b"secret\n".to_vec());
+        let error = run_with_input(
+            cli(Command::Account {
+                command: AccountCommand::Add {
+                    provider: "custom".to_owned(),
+                    email: "user@example.com".to_owned(),
+                    name: None,
+                    host: Some("localhost".to_owned()),
+                    port: Some(1),
+                    tls: Some("implicit".to_owned()),
+                    password_stdin: true,
+                },
+            }),
+            &mut engine,
+            &mut input,
+            true,
+        )
+        .expect_err("a TTY cannot use --password-stdin");
+        assert!(error.downcast_ref::<UsageError>().is_some(), "{error}");
+        assert_eq!(input.position(), 0, "the TTY refusal consumed stdin");
+    }
+
+    #[test]
+    fn a_failing_engine_rejects_the_account_before_reading_stdin() {
+        let mut engine = Engine::demo();
+        let mut input = std::io::Cursor::new(b"secret\n".to_vec());
+        let error = run_with_input(
+            cli(Command::Account {
+                command: AccountCommand::Add {
+                    provider: "custom".to_owned(),
+                    email: "user@example.com".to_owned(),
+                    name: None,
+                    host: Some("localhost".to_owned()),
+                    port: Some(1),
+                    tls: Some("implicit".to_owned()),
+                    password_stdin: true,
+                },
+            }),
+            &mut engine,
+            &mut input,
+            false,
+        )
+        .expect_err("the demo engine cannot accept an account");
+        assert!(error.to_string().contains("demo"), "{error}");
+        assert_eq!(input.position(), 0, "the engine failure consumed stdin");
+    }
+
+    #[test]
+    fn read_only_commands_do_not_create_a_missing_default_store() {
+        let commands = [
+            Command::Info,
+            Command::Tools,
+            Command::Schema { op: "app_info".to_owned() },
+            Command::Account { command: AccountCommand::List },
+            Command::Accounts,
+            Command::Run { op: "account_add".to_owned(), args: None, params: Vec::new() },
+        ];
+        for command in commands {
+            let dir = tempfile::tempdir().expect("profile");
+            let cli = Cli { demo: false, store: None, json: true, command };
+            // `open_store` is the only place that constructs a Keyring, so an opener that fails if
+            // called proves the read-only path neither creates a store nor touches the vault.
+            let engine = open_engine_in(&cli, Some(dir.path()), |_| Err(anyhow::anyhow!("the store must not be opened")))
+                .expect("a read-only command must not open a missing store");
+            assert!(!engine.is_persistent(), "a missing default store was opened");
+            assert!(engine.accounts().is_empty());
+            assert_eq!(std::fs::read_dir(dir.path()).expect("profile dir").count(), 0, "a read-only command wrote to the profile");
+        }
+    }
+
+    #[test]
+    fn a_read_only_command_refuses_a_missing_explicit_store_and_does_not_create_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("missing.db");
+        let cli = Cli { demo: false, store: Some(path.clone()), json: true, command: Command::Info };
+        let error = open_engine_in(&cli, None, |_| Err(anyhow::anyhow!("the store must not be opened")))
+            .map(|_| ())
+            .expect_err("a missing explicit store is a usage error");
+        assert!(error.downcast_ref::<UsageError>().is_some(), "{error}");
+        assert!(!path.exists(), "the read-only command created the missing explicit store");
+    }
+
+    #[test]
+    fn a_mutation_may_create_the_default_store() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cli = Cli {
+            demo: false,
+            store: None,
+            json: true,
+            command: Command::Account { command: AccountCommand::Remove { id: "acc_missing".to_owned(), yes: true } },
+        };
+        let opened = std::cell::Cell::new(false);
+        let expected = dir.path().join("mail.db");
+        let engine = open_engine_in(&cli, Some(dir.path()), |path| {
+            assert_eq!(path, expected.as_path());
+            opened.set(true);
+            Ok(Engine::empty())
+        })
+        .expect("a mutation may open the default store");
+        assert!(opened.get(), "the mutation did not open the default store");
+        assert!(!engine.is_persistent());
+    }
+
+    #[test]
+    fn cli_account_add_does_not_forward_a_server_echo_of_the_password() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        let server = crate::test_support::RunningServer::start_handler(|conn| async move {
+            crate::test_support::refuse_list_with_secret(conn, postino_testkit::PASSWORD.to_owned()).await;
+        });
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        engine.set_test_extra_roots(vec![server.ca()]);
+        let mut input = std::io::Cursor::new(format!("{}\n", postino_testkit::PASSWORD).into_bytes());
+        let error = run_with_input(
+            cli(Command::Account {
+                command: AccountCommand::Add {
+                    provider: "custom".to_owned(),
+                    email: postino_testkit::USER.to_owned(),
+                    name: Some("Postino Test".to_owned()),
+                    host: Some("localhost".to_owned()),
+                    port: Some(server.port()),
+                    tls: Some("implicit".to_owned()),
+                    password_stdin: true,
+                },
+            }),
+            &mut engine,
+            &mut input,
+            false,
+        )
+        .expect_err("the hostile LIST refusal must fail the command");
+        server.finish();
+        let text = format!("{error:#}");
+        assert!(text.contains("listing folders"), "the phase is not named: {text}");
+        assert!(!text.contains(postino_testkit::PASSWORD), "the server echo leaked into the CLI error: {text}");
+        assert!(engine.accounts().is_empty());
+    }
+
+    #[test]
+    fn account_list_surfaces_a_cache_warning_beside_a_null_status() {
+        let view = AccountView {
+            account: postino_core::Account {
+                id: "acc_1".to_owned(),
+                name: "Test".to_owned(),
+                email: "test@example.com".to_owned(),
+                provider: "custom".to_owned(),
+                signature: String::new(),
+            },
+            server: None,
+            sync: None,
+        };
+        let text = format_accounts(&[view], &["the sync status for account \"acc_1\" is unreadable; showing it as never synced".to_owned()]);
+        assert!(text.contains("mai sincronizzato"), "{text}");
+        assert!(text.contains("! the sync status for account"), "{text}");
+    }
+
+    #[test]
     fn cli_account_add_test_sync_status_and_remove_never_print_the_password() {
         let fixture = TempStore::new();
         let vault = crate::test_support::MemoryVault::new();
@@ -1636,7 +1870,8 @@ mod tests {
         assert!(added.contains("portachiavi"), "{added}");
         assert!(!added.contains(postino_testkit::PASSWORD), "{added}");
 
-        let listed = format_accounts(&engine.account_views().expect("views"));
+        let (views, warnings) = engine.account_views_report().expect("views");
+        let listed = format_accounts(&views, &warnings);
         assert!(listed.contains(&view.account.id), "{listed}");
         assert!(!listed.contains(postino_testkit::PASSWORD), "{listed}");
 

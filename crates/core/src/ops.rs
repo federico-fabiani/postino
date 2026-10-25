@@ -62,7 +62,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "accounts_list",
             "List accounts",
-            "Every configured account with its IMAP provider, address, server host/port/TLS and last sync status. Never includes a password or a credential: account_add and account_remove are sensitive operations available only from the CLI and the desktop app.",
+            "Every configured account with its IMAP provider, address, server host/port/TLS and last sync status. A damaged sync_status value is reported as null with a warning, never as a listing failure. Never includes a password or a credential: account_add and account_remove are sensitive operations available only from the CLI and the desktop app.",
             AccountsListArgs,
             true,
             false
@@ -436,6 +436,9 @@ pub struct AppInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsList {
     pub accounts: Vec<AccountView>,
+    /// Cache warnings, for example an unreadable `sync_status` value that was shown as null.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,7 +591,8 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "accounts_list" => {
             let _: AccountsListArgs = parse(args)?;
-            value(AccountsList { accounts: engine.account_views()? })
+            let (accounts, warnings) = engine.account_views_report()?;
+            value(AccountsList { accounts, warnings })
         }
         "folders_list" => {
             let args: FoldersListArgs = parse(args)?;

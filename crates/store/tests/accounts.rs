@@ -234,6 +234,32 @@ fn deleting_an_unknown_account_changes_nothing() {
 }
 
 #[test]
+fn a_read_only_store_refuses_writes_and_rejects_an_old_schema() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    store.upsert_account(&account(ACCOUNT_A, "a@example.com")).expect("seed");
+    drop(store);
+
+    let read_only = Store::open_read_only(&fixture.path(), &fixture.key).expect("read-only open");
+    assert_eq!(read_only.schema_version().expect("version"), 4);
+    assert_eq!(read_only.list_accounts().expect("read").len(), 1);
+    let error = read_only.upsert_account(&account(ACCOUNT_B, "b@example.com")).expect_err("a write must fail on a read-only store");
+    assert!(error.to_string().contains("readonly") || error.to_string().contains("read-only"), "{error}");
+    assert_eq!(read_only.list_accounts().expect("read after the refused write").len(), 1);
+
+    // A store that still needs a migration cannot be opened read-only: the caller must open it
+    // read-write once rather than get a half-migrated reader.
+    drop(read_only);
+    {
+        let connection = rusqlite::Connection::open(fixture.path()).expect("raw connection");
+        let hex = fixture.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\"; PRAGMA user_version = 3;")).expect("forge v3");
+    }
+    let error = Store::open_read_only(&fixture.path(), &fixture.key).err().expect("an old schema must be refused read-only");
+    assert!(matches!(error, postino_store::StoreError::SchemaTooOld { found: 3, supported: 4 }), "{error}");
+}
+
+#[test]
 fn the_schema_has_no_password_column() {
     let fixture = Fixture::new();
     let store = fixture.open();

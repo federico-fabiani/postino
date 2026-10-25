@@ -35,6 +35,96 @@ fn a_missing_required_argument_is_a_usage_error() {
 }
 
 #[test]
+fn invalid_arguments_and_unknown_ids_are_usage_errors() {
+    // Missing --yes: the operation rejects confirm=false.
+    let (code, _, stderr) = run(&["--demo", "account", "remove", "acc_demo"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("confirm"), "{stderr}");
+
+    // An invalid address is rejected before any password is read (stdin is null).
+    let (code, _, stderr) = run(
+        &[
+            "--demo",
+            "account",
+            "add",
+            "--provider",
+            "custom",
+            "--email",
+            "not-an-address",
+            "--host",
+            "localhost",
+            "--port",
+            "1",
+            "--tls",
+            "implicit",
+            "--password-stdin",
+        ],
+        None,
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("email"), "{stderr}");
+
+    // Control characters in the display name.
+    let (code, _, stderr) = run(
+        &[
+            "--demo",
+            "account",
+            "add",
+            "--provider",
+            "custom",
+            "--email",
+            "me@example.com",
+            "--name",
+            "bad\nname",
+            "--host",
+            "localhost",
+            "--port",
+            "1",
+            "--tls",
+            "implicit",
+            "--password-stdin",
+        ],
+        None,
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("name"), "{stderr}");
+
+    // An empty custom host is refused before the store is consulted.
+    let (code, _, stderr) = run(
+        &[
+            "--demo",
+            "account",
+            "add",
+            "--provider",
+            "custom",
+            "--email",
+            "me@example.com",
+            "--host",
+            "",
+            "--port",
+            "1",
+            "--tls",
+            "implicit",
+            "--password-stdin",
+        ],
+        None,
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("host"), "{stderr}");
+
+    let (code, _, stderr) = run(&["--demo", "account", "test", "acc_missing"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("unknown account"), "{stderr}");
+}
+
+#[test]
+fn malformed_run_arguments_are_a_usage_error() {
+    let (code, _, stderr) = run(&["--demo", "run", "messages_list", "--args", "{bad"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("--args is not JSON"), "{stderr}");
+}
+
+#[test]
 fn conflicting_mode_flags_are_a_usage_error() {
     let (code, _, stderr) = run(&["--demo", "--store", "somewhere.db", "info"], None);
     assert_eq!(code, 2, "{stderr}");

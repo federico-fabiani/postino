@@ -41,6 +41,11 @@ impl Harness {
     pub fn open(&self) -> Store {
         Store::open(&self.path(), &self.key).expect("open the store")
     }
+
+    /// Open the same database read-only after it has been created and migrated by [`Harness::open`].
+    pub fn read_only(&self) -> Store {
+        Store::open_read_only(&self.path(), &self.key).expect("open the store read-only")
+    }
 }
 
 /// The credential seam used by every test. Nothing here can reach the real vault.
@@ -48,6 +53,7 @@ impl Harness {
 pub struct MemoryVault {
     secrets: Mutex<HashMap<String, Vec<u8>>>,
     fail_delete: AtomicBool,
+    deletions: Mutex<Vec<String>>,
 }
 
 impl MemoryVault {
@@ -71,6 +77,11 @@ impl MemoryVault {
         self.secrets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
     }
 
+    /// Every account id whose credential deletion was attempted, in order.
+    pub fn deletions(&self) -> Vec<String> {
+        self.deletions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
     /// Make every later delete fail, to prove the `account_remove` failure window.
     pub fn fail_deletes(&self) {
         self.fail_delete.store(true, Ordering::SeqCst);
@@ -88,6 +99,7 @@ impl CredentialVault for MemoryVault {
     }
 
     fn delete_imap_password(&self, account_id: &str) -> Result<(), VaultError> {
+        self.deletions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(account_id.to_owned());
         if self.fail_delete.load(Ordering::SeqCst) {
             return Err(VaultError::new("the mock keyring refuses deletes"));
         }
@@ -228,6 +240,16 @@ pub async fn reject_login(mut conn: Conn) {
     // The wrong password is still a secret: the test asserts it is never echoed, not what it is.
     assert!(!payload.is_empty());
     conn.send_line("A0002 NO [AUTHENTICATIONFAILED] invalid credentials").await;
+}
+
+/// A server that accepts the login and then answers `LIST` with `NO <secret>`.
+///
+/// This models the review's hostile server: it has just received the password and repeats it in a
+/// tagged response. The engine must not forward the response text.
+pub async fn refuse_list_with_secret(mut conn: Conn, secret: String) {
+    conn.prepare_sasl().await;
+    conn.expect_prefix("A0003 LIST").await;
+    conn.send_line(&format!("A0003 NO {secret}")).await;
 }
 
 /// A one-connection server with a custom handler.

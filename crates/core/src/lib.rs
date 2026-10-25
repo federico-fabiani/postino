@@ -18,7 +18,7 @@ pub mod ops;
 mod store_map;
 pub mod vault;
 
-pub use engine::{AccountSetup, Engine, OpError};
+pub use engine::{AccountRequest, AccountSetup, Engine, OpError};
 pub use model::{
     Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
     Provider, ServerSettings,

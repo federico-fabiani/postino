@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
-use postino_net::{CertificateDer, ImapConfig, Secret};
+use postino_net::{CertificateDer, ImapConfig, NetError, Secret};
 use postino_store::{FlagUpdate, Store};
 use postino_sync::{SyncError, SyncLimits};
 use serde_json::Value;
@@ -94,6 +94,32 @@ pub struct AccountSetup {
     pub tls: Option<MailTls>,
     /// Extra certificate authorities. Empty in production; tests pass the fake server's CA.
     pub extra_roots: Vec<CertificateDer<'static>>,
+}
+
+/// Everything `account_add` needs **except** the password.
+///
+/// The CLI validates this with [`Engine::check_account_request`] before it reads the secret, so an
+/// unknown provider, a bad address, a missing store or a duplicate account fails without consuming
+/// stdin and without a keyring read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRequest {
+    pub provider: Provider,
+    pub email: String,
+    pub name: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub tls: Option<MailTls>,
+}
+
+/// A fully validated account request, before the password is read or the server is contacted.
+struct ResolvedAccount {
+    id: String,
+    provider: Provider,
+    email: String,
+    name: String,
+    host: String,
+    port: u16,
+    tls: MailTls,
 }
 
 pub struct Engine {
@@ -307,39 +333,69 @@ impl Engine {
     }
 
     /// Every configured account with its IMAP server and last sync status. The demo account has
-    /// neither, and no view ever contains a credential.
+    /// neither, and no view ever contains a credential. A damaged status is reported as `null`; use
+    /// [`Engine::account_views_report`] to also receive the warning.
     pub fn account_views(&self) -> Result<Vec<AccountView>, OpError> {
-        self.accounts.iter().map(|account| self.account_view(account)).collect()
+        self.account_views_report().map(|(views, _warnings)| views)
     }
 
-    /// One account with its server settings and persisted sync status.
-    pub fn account_view(&self, account: &Account) -> Result<AccountView, OpError> {
-        let (server, sync) = match &self.store {
-            Some(store) => {
-                let server = store.get_account_server(&account.id).map_err(store_map::read_error)?.map(store_map::server_settings);
-                let sync = postino_sync::read_status_for(store, &account.id).map_err(store_map::read_error)?;
-                (server, sync)
-            }
-            None => (None, None),
-        };
-        Ok(AccountView { account: account.clone(), server, sync })
-    }
-
-    /// Add an IMAP account: validate, prove the login on the real server, store the credential,
-    /// then write the account, its server row and its folder tree in one store transaction.
+    /// Every account view plus one warning per damaged `sync_status` value.
     ///
-    /// Nothing is written before the server accepts the login. The credential is written **first**
-    /// on purpose: a crash between the two durable writes leaves an unreferenced keyring entry,
-    /// which a retry with the same address reuses, instead of an account whose password was never
-    /// stored and can therefore never sync. If the store transaction fails, the credential is
-    /// deleted again before the error is returned; memory is untouched either way.
-    pub fn add_account(&mut self, setup: AccountSetup) -> Result<AccountView, OpError> {
-        let email = validate_account_email(&setup.email)?;
-        validate_account_password(&setup.password)?;
-        let name = validate_account_name(setup.name.as_deref(), &email)?;
-        let (host, port, tls) = resolve_server(setup.provider, setup.host.as_deref(), setup.port, setup.tls)?;
-        let store = self.require_store("account_add")?;
-        let vault = self.require_vault("account_add")?;
+    /// Status is a cache: a malformed JSON value makes that account look never-synced and produces a
+    /// warning, but it never fails the listing. Removal uses the same tolerant view, so a broken
+    /// status cannot block cleanup.
+    pub fn account_views_report(&self) -> Result<(Vec<AccountView>, Vec<String>), OpError> {
+        let mut views = Vec::with_capacity(self.accounts.len());
+        let mut warnings = Vec::new();
+        for account in &self.accounts {
+            let (view, warning) = self.account_view_with_warning(account)?;
+            views.push(view);
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+        }
+        Ok((views, warnings))
+    }
+
+    /// One account with its server settings and persisted sync status. A damaged status is `None`.
+    pub fn account_view(&self, account: &Account) -> Result<AccountView, OpError> {
+        self.account_view_with_warning(account).map(|(view, _warning)| view)
+    }
+
+    fn account_view_with_warning(&self, account: &Account) -> Result<(AccountView, Option<String>), OpError> {
+        let Some(store) = &self.store else {
+            return Ok((AccountView { account: account.clone(), server: None, sync: None }, None));
+        };
+        let server = store.get_account_server(&account.id).map_err(store_map::read_error)?.map(store_map::server_settings);
+        let (sync, warning) = match postino_sync::read_status_for(store, &account.id) {
+            Ok(status) => (status, None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "the sync status for account {:?} is unreadable ({error}); showing it as never synced. Run a sync or remove the stale sync_status key.",
+                    account.id
+                )),
+            ),
+        };
+        Ok((AccountView { account: account.clone(), server, sync }, warning))
+    }
+
+    /// Validate everything `account_add` can check without the password or the network.
+    ///
+    /// The CLI calls this before reading the secret, so an unknown provider, a bad address or name,
+    /// a missing store/vault or a duplicate account fails without consuming stdin or touching the
+    /// keyring. It performs no I/O.
+    pub fn check_account_request(&self, request: &AccountRequest) -> Result<(), OpError> {
+        self.resolve_account(request).map(|_| ())
+    }
+
+    /// Shared validation for [`Engine::check_account_request`] and [`Engine::add_account`].
+    fn resolve_account(&self, request: &AccountRequest) -> Result<ResolvedAccount, OpError> {
+        let email = validate_account_email(&request.email)?;
+        let name = validate_account_name(request.name.as_deref(), &email)?;
+        let (host, port, tls) = resolve_server(request.provider, request.host.as_deref(), request.port, request.tls)?;
+        self.require_store("account_add")?;
+        self.require_vault("account_add")?;
         if let Some(existing) = self.accounts.iter().find(|account| account.email.eq_ignore_ascii_case(&email)) {
             return Err(OpError::InvalidArgs(format!(
                 "an account for {email:?} already exists ({:?}); remove it with account_remove before adding it again",
@@ -352,6 +408,31 @@ impl Engine {
                 "account id {id:?} is already taken by a different address; remove that account before adding {email:?}"
             )));
         }
+        Ok(ResolvedAccount { id, provider: request.provider, email, name, host, port, tls })
+    }
+
+    /// Add an IMAP account: validate, prove the login on the real server, store the credential,
+    /// then write the account, its server row and its folder tree in one store transaction.
+    ///
+    /// Nothing is written before the server accepts the login. The credential is written **first**
+    /// on purpose: a crash between the two durable writes leaves an unreferenced keyring entry,
+    /// which a retry with the same address reuses, instead of an account whose password was never
+    /// stored and can therefore never sync. If the store transaction fails, the credential is
+    /// deleted again before the error is returned; memory is untouched either way.
+    pub fn add_account(&mut self, setup: AccountSetup) -> Result<AccountView, OpError> {
+        let request = AccountRequest {
+            provider: setup.provider,
+            email: setup.email.clone(),
+            name: setup.name.clone(),
+            host: setup.host.clone(),
+            port: setup.port,
+            tls: setup.tls,
+        };
+        let resolved = self.resolve_account(&request)?;
+        validate_account_password(&setup.password)?;
+        let store = self.require_store("account_add")?;
+        let vault = self.require_vault("account_add")?;
+        let ResolvedAccount { id, provider, email, name, host, port, tls } = resolved;
 
         let mut config = ImapConfig::new(host.clone(), port, store_map::net_tls(tls), email.clone(), Secret::new(setup.password.as_str().to_owned()));
         let mut extra_roots = self.extra_roots.clone();
@@ -360,7 +441,14 @@ impl Engine {
             config = config.with_extra_root(root);
         }
         let probe = postino_sync::probe(&config).map_err(|error| {
-            account_error(error, setup.provider, &host, "Nothing was written; check the address, host, password and TLS mode and retry.")
+            account_error(
+                error,
+                provider,
+                &id,
+                &host,
+                "checking the connection",
+                "Nothing was written; check the address, host, password and TLS mode and retry.",
+            )
         })?;
         if probe.folders.iter().all(|folder| !folder.is_selectable()) {
             return Err(OpError::Failed(format!(
@@ -372,8 +460,14 @@ impl Engine {
             return Err(OpError::Failed(format!("the server {host} listed no usable folder; nothing was written")));
         }
         let created_at = Utc::now().timestamp_millis();
-        let provider = setup.provider.as_str().to_owned();
-        let account_row = postino_store::Account { id: id.clone(), name, email: email.clone(), provider, signature: String::new(), created_at };
+        let account_row = postino_store::Account {
+            id: id.clone(),
+            name,
+            email: email.clone(),
+            provider: provider.as_str().to_owned(),
+            signature: String::new(),
+            created_at,
+        };
         let server_row = postino_store::AccountServer {
             account_id: id.clone(),
             host: host.clone(),
@@ -420,8 +514,9 @@ impl Engine {
         let password = self.load_password(&account.id, "account_test")?;
         let config = imap_config(&server, &password, self.extra_roots.clone());
         let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
-        let probe = postino_sync::probe(&config)
-            .map_err(|error| account_error(error, provider, &server.host, "The account and its cached mail are unchanged."))?;
+        let probe = postino_sync::probe(&config).map_err(|error| {
+            account_error(error, provider, &account.id, &server.host, "checking the connection", "The account and its cached mail are unchanged.")
+        })?;
         let folders = u32::try_from(probe.folders.iter().filter(|folder| folder.is_selectable()).count()).unwrap_or(u32::MAX);
         Ok(crate::ops::AccountTest { account: account.id.clone(), folders, capabilities: probe.capabilities })
     }
@@ -480,18 +575,18 @@ impl Engine {
         let password = self.load_password(&account.id, "sync_now")?;
         let config = imap_config(&server, &password, self.extra_roots.clone());
         let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
-        let result = postino_sync::sync_account(store, &row, &config, &SyncLimits::default(), &AtomicBool::new(false));
-        let reloaded = self.reload_mailbox();
-        let outcome = result.map_err(|error| {
+        let result = postino_sync::sync_account(store, &row, &config, &SyncLimits::default(), &AtomicBool::new(false)).map_err(|error| {
             account_error(
                 error,
                 provider,
+                &account.id,
                 &server.host,
+                "syncing",
                 "Messages committed before the stop are kept; the next run resumes from the last committed message.",
             )
         });
-        reloaded?;
-        outcome.map(crate::ops::SyncReport::from)
+        let reload = self.reload_mailbox();
+        finish_sync(result, reload).map(crate::ops::SyncReport::from)
     }
 
     /// The persisted status of one account, or of every account.
@@ -1251,21 +1346,107 @@ fn imap_config(server: &postino_store::AccountServer, password: &Zeroizing<Strin
 }
 
 /// Turn a sync/probe failure into an actionable operation error with a tail that states what was and
-/// was not written. The password never appears: neither [`SyncError`] nor [`OpError`] carries it.
-fn account_error(error: SyncError, provider: Provider, host: &str, tail: &str) -> OpError {
+/// was not written.
+///
+/// **No server-originated text is forwarded.** A hostile server has just received the credential and
+/// can repeat it (or the SASL payload) in a tagged `NO`/`BAD` or a malformed response; the sentence
+/// names the provider, account id, configured host and a fixed phase instead. `Auth` keeps the
+/// provider advice but not the server's reason.
+fn account_error(error: SyncError, provider: Provider, account_id: &str, host: &str, phase: &'static str, tail: &str) -> OpError {
     match error {
-        // The server's own text is deliberately dropped: a hostile or broken server can echo the
-        // credential in a tagged NO, and this sentence is shown to a person, a log and an agent.
         SyncError::Auth(_) => OpError::Auth(format!(
-            "the server {host} rejected the credential for the {} account. {}. {tail}",
+            "the {} server {host} rejected the credential for account {account_id:?} while authenticating. {}. {tail}",
             provider.as_str(),
             provider.login_advice()
         )),
-        SyncError::Connect(source) => OpError::Network(format!("could not reach {host}: {source}. {tail}")),
+        SyncError::Connect(source) => OpError::Network(format!(
+            "could not talk to the {} server {host} for account {account_id:?} while {}. {tail}",
+            provider.as_str(),
+            net_phase(&source)
+        )),
+        SyncError::Protocol(_) => OpError::Failed(format!(
+            "the {} server {host} sent a response this client could not use for account {account_id:?} while {phase}. {tail}",
+            provider.as_str()
+        )),
         SyncError::Store(error) => OpError::Failed(format!("sync could not use the local store: {error}. {tail}")),
         SyncError::Cancelled => OpError::Failed("the sync was cancelled; messages written before the stop are kept".to_owned()),
         SyncError::NoAccount(id) => OpError::Failed(format!("account {id:?} is not in the local store")),
-        SyncError::Protocol(reason) => OpError::Failed(format!("sync cannot proceed: {reason}. {tail}")),
+    }
+}
+
+/// A fixed phase for a network failure. Never includes the server's response text.
+fn net_phase(error: &NetError) -> &'static str {
+    match error {
+        NetError::Dns { .. } => "resolving the server name",
+        NetError::Connect { .. } => "opening the connection",
+        NetError::Tls { .. } => "the TLS handshake",
+        NetError::Auth { .. } => "authenticating",
+        NetError::Timeout { phase, .. } | NetError::Closed { phase } => phase_name(phase),
+        NetError::Protocol { .. } => "reading a response",
+        NetError::ServerNo { command, .. } | NetError::ServerBad { command, .. } => command_phase(command),
+        NetError::TooLarge { .. } => "reading a response that exceeded a bound",
+        NetError::Unsupported { .. } => "negotiating a required capability",
+    }
+}
+
+fn phase_name(phase: &str) -> &'static str {
+    match phase {
+        "dns" => "resolving the server name",
+        "connect" => "opening the connection",
+        "tls" => "the TLS handshake",
+        "greeting" => "waiting for the greeting",
+        "capability" => "reading capabilities",
+        "auth" | "login" => "authenticating",
+        "list" => "listing folders",
+        "select" | "examine" => "opening a folder",
+        "fetch" | "fetch flags" | "fetch body" => "fetching mail",
+        "store" => "changing flags",
+        "idle" => "waiting for new mail",
+        "logout" => "closing the connection",
+        _ => "a network step",
+    }
+}
+
+fn command_phase(command: &str) -> &'static str {
+    // The network crate passes the wire verb (uppercase) and sometimes "UID FETCH"; match both.
+    match command.to_ascii_lowercase().as_str() {
+        "list" => "listing folders",
+        "select" | "examine" => "opening a folder",
+        "uid fetch" | "fetch" => "fetching mail",
+        "uid store" | "store" => "changing flags",
+        "capability" => "reading capabilities",
+        "authenticate" | "login" => "authenticating",
+        "logout" => "closing the connection",
+        _ => "running a command",
+    }
+}
+
+/// Finish a sync so a reload failure cannot hide the sync cause.
+///
+/// On success a reload error is the operation error (there is no cause to preserve). On failure the
+/// sync error wins and the reload failure is appended to it, so a person or agent sees the auth,
+/// network or store reason that actually stopped the run.
+fn finish_sync(result: Result<postino_sync::SyncOutcome, OpError>, reload: Result<(), OpError>) -> Result<postino_sync::SyncOutcome, OpError> {
+    match result {
+        Ok(outcome) => {
+            reload?;
+            Ok(outcome)
+        }
+        Err(error) => match reload {
+            Ok(()) => Err(error),
+            Err(reload) => Err(with_reload_note(error, reload)),
+        },
+    }
+}
+
+fn with_reload_note(error: OpError, reload: OpError) -> OpError {
+    let note = format!(" The local cache could not be reloaded after the failed run: {reload}");
+    match error {
+        OpError::UnknownOp(message) => OpError::UnknownOp(format!("{message}{note}")),
+        OpError::InvalidArgs(message) => OpError::InvalidArgs(format!("{message}{note}")),
+        OpError::Auth(message) => OpError::Auth(format!("{message}{note}")),
+        OpError::Network(message) => OpError::Network(format!("{message}{note}")),
+        OpError::Failed(message) => OpError::Failed(format!("{message}{note}")),
     }
 }
 
@@ -1413,6 +1594,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_reload_failure_does_not_hide_the_sync_cause() {
+        let cause = OpError::Auth("the server rejected the credential".to_owned());
+        let error = finish_sync(Err(cause), Err(OpError::Failed("the local store could not be read".to_owned()))).expect_err("both fail");
+        assert!(matches!(error, OpError::Auth(_)), "{error}");
+        assert!(error.to_string().contains("rejected the credential"), "{error}");
+        assert!(error.to_string().contains("could not be reloaded"), "the reload failure is not mentioned: {error}");
+    }
 
     #[test]
     fn demo_engine_has_accounts_and_mail() {

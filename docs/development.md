@@ -72,8 +72,11 @@ assets/brand/       Postino mark and the original sketch
 mailbox into the engine. The key is `postino_platform::load_or_create_key("default")`: 32 random
 bytes created on first use and kept in the OS keyring under service `postino`, user `default`. The
 key is never printed, logged or written to disk by Postino; a different scope or a different key
-cannot read the file. The keyring is the only secret seam, and tests never touch it: every store
-test uses a random `StoreKey` over a temp directory.
+cannot read the file. The keyring is the only secret seam (store key and `account:<id>:imap`
+credentials), and tests never touch it: every store test uses a random `StoreKey` over a temp
+directory. **Windows Credential Manager is the only native keyring backend in this build**; on macOS
+and Linux the platform seam returns `PlatformError::Unsupported` until native keychains land with
+packaging.
 
 What is persisted today: accounts, folders with their cached counts, messages with recipients,
 bodies, flags and labels, attachment metadata, labels, message/label links and draft revisions.

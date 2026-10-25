@@ -54,7 +54,7 @@ pub use model::{
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
@@ -259,6 +259,8 @@ pub enum StoreError {
     WrongKeyOrCorrupt,
     #[error("store schema version {found} is newer than this build ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
+    #[error("store schema version {found} is older than this build ({supported}); open it read-write once to migrate")]
+    SchemaTooOld { found: u32, supported: u32 },
     #[error("{entity} {id:?} does not exist")]
     NotFound { entity: &'static str, id: String },
     #[error("folder {folder_id:?} belongs to account {folder_account:?}, not {message_account:?}")]
@@ -367,6 +369,35 @@ impl Store {
     /// The encrypted attachment blob store that lives next to this database.
     pub fn blobs(&self) -> &BlobStore {
         &self.blobs
+    }
+
+    /// Open an existing, already-migrated store **without** write access.
+    ///
+    /// This is the seam for read-only commands and for deterministic write-failure tests: the
+    /// connection is opened with SQLite's read-only flag, the key is applied, the cipher version and
+    /// schema version are checked, and every write then fails with `SQLITE_READONLY`. It never runs a
+    /// migration or a `PRAGMA` that writes; an old schema is [`StoreError::SchemaTooOld`] and must be
+    /// opened read-write once. The blob directory next to the database is opened through the normal
+    /// blob seam (which may create it if it is missing), but no blob is written by this call.
+    pub fn open_read_only(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
+        let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.execute_batch(&key.pragma()).map_err(translate)?;
+        let cipher: Option<String> = conn.query_row("PRAGMA cipher_version", [], |row| row.get(0)).optional().map_err(translate)?;
+        if cipher.as_deref().unwrap_or_default().is_empty() {
+            return Err(StoreError::NotEncrypted);
+        }
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(translate)?;
+        let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).map_err(translate)?;
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooNew { found: version, supported: SCHEMA_VERSION });
+        }
+        if version < SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooOld { found: version, supported: SCHEMA_VERSION });
+        }
+        let blobs = BlobStore::open(blob_root(path), key)?;
+        Ok(Self { conn, blobs })
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {

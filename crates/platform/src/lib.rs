@@ -239,8 +239,10 @@ impl Keyring {
         let _lock = lock_first_run(&self.lock_path)?;
         entry.set_secret(secret).map_err(|error| vault_error(scope, &error))?;
         match entry.get_secret() {
-            Ok(read_back) if read_back == secret => Ok(()),
-            Ok(_) => Err(PlatformError::ReadBackMismatch { scope: scope.to_owned() }),
+            Ok(read_back) => {
+                let read_back = Zeroizing::new(read_back);
+                if read_back.as_slice() == secret { Ok(()) } else { Err(PlatformError::ReadBackMismatch { scope: scope.to_owned() }) }
+            }
             Err(error) => Err(vault_error(scope, &error)),
         }
     }
@@ -776,6 +778,29 @@ mod tests {
         keyring.delete_secret(&scope).expect("delete");
         assert!(keyring.load_secret(&scope).expect("load after delete").is_none());
         keyring.delete_secret(&scope).expect("deleting a missing secret is a success");
+    }
+
+    #[test]
+    fn two_account_scopes_are_independent() {
+        let _guard = vault();
+        install_mock();
+        let (_dir, lock) = temp_lock();
+        let keyring = Keyring::at(&lock);
+        let first = account_scope("a").expect("scope a");
+        let second = account_scope("b").expect("scope b");
+
+        keyring.store_secret(&first, b"secret-for-a").expect("store a");
+        keyring.store_secret(&second, b"secret-for-b").expect("store b");
+        assert_eq!(keyring.load_secret(&first).expect("load a").as_deref().map(Vec::as_slice), Some(b"secret-for-a".as_slice()));
+        assert_eq!(keyring.load_secret(&second).expect("load b").as_deref().map(Vec::as_slice), Some(b"secret-for-b".as_slice()));
+
+        keyring.delete_secret(&first).expect("delete a");
+        assert!(keyring.load_secret(&first).expect("load a after delete").is_none());
+        assert_eq!(
+            keyring.load_secret(&second).expect("load b after deleting a").as_deref().map(Vec::as_slice),
+            Some(b"secret-for-b".as_slice()),
+            "the two account scopes are not independent"
+        );
     }
 
     #[test]
