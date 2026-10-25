@@ -54,7 +54,7 @@ mod ingest;
 mod status;
 mod warnings;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,6 +63,10 @@ use postino_store as store;
 use thiserror::Error;
 
 pub use status::{STATUS_KEY_PREFIX, SyncPhase, SyncStatus, read_status, status_key};
+
+/// UIDs requested per liveness/flags window. The network client caps untagged responses at 10 000;
+/// 1 000 keeps every window small and a 50 000-message folder to fifty round trips.
+const FLAG_SCAN_BATCH: u32 = 1_000;
 
 /// One run's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +183,17 @@ pub(crate) struct Context<'a> {
     pub(crate) cancel: &'a AtomicBool,
 }
 
+/// Mutable state shared by every folder of one run.
+struct RunProgress {
+    /// Messages this run may still ingest before `max_messages` stops it.
+    remaining: usize,
+    /// Every local id touched this run, in any folder. A missing UID whose id was seen elsewhere is
+    /// a move, never a deletion.
+    seen: HashSet<String>,
+    /// Local ids whose server flags disagree with the local read/star state, deduplicated per run.
+    drifted: HashSet<String>,
+}
+
 /// Reconcile one account from IMAP into `store`.
 ///
 /// The function blocks the calling thread, owns no store connection of its own, and starts and
@@ -286,27 +301,35 @@ async fn run_session(
     log::info!("sync: account {}: {} folders to reconcile", account.id, outcome.folders);
 
     let context = Context { store, account, limits, cancel };
-    let mut remaining = limits.max_messages;
+    let mut progress = RunProgress { remaining: limits.max_messages, seen: HashSet::new(), drifted: HashSet::new() };
     let mut exhausted = false;
     let mut done = 0u32;
+    let mut all_scanned = true;
+    let mut deferred: Vec<(String, Vec<String>)> = Vec::new();
     for target in &targets {
         if cancel.load(Ordering::Relaxed) {
             return Err(SyncError::Cancelled);
         }
-        if remaining == 0 {
+        if progress.remaining == 0 {
             exhausted = true;
             break;
         }
-        let stats = sync_folder(&context, &mut session, target, &mut warnings, &mut remaining, state).await?;
+        let stats = sync_folder(&context, &mut session, target, &mut warnings, &mut progress, state).await?;
         outcome.fetched = outcome.fetched.saturating_add(stats.fetched);
-        outcome.updated_flags = outcome.updated_flags.saturating_add(stats.updated_flags);
-        outcome.removed = outcome.removed.saturating_add(stats.removed);
         outcome.attachments_stored = outcome.attachments_stored.saturating_add(stats.attachments_stored);
+        let missing_count = stats.missing.len();
+        if stats.scan_complete {
+            if !stats.missing.is_empty() {
+                deferred.push((target.row.id.clone(), stats.missing));
+            }
+        } else {
+            all_scanned = false;
+        }
         done = done.saturating_add(1);
         state.folders_done = done;
         state.messages = outcome.fetched;
         status::write_status(store, account, state)?;
-        log::debug!("sync: folder {}: {} fetched, {} removed, {} drift", target.row.id, stats.fetched, stats.removed, stats.updated_flags);
+        log::debug!("sync: folder {}: {} fetched, {} missing", target.row.id, stats.fetched, missing_count);
         if stats.exhausted {
             exhausted = true;
             break;
@@ -318,6 +341,27 @@ async fn run_session(
             limits.max_messages
         ));
     }
+
+    // Deletion is a whole-account decision. Only after every folder has been scanned can a UID that
+    // disappeared from one folder be told apart from a message that moved to another; a partial run
+    // deletes nothing.
+    let complete = !exhausted && usize::try_from(done).unwrap_or(usize::MAX) == targets.len() && all_scanned;
+    if complete {
+        for (folder_id, missing) in deferred {
+            let ids = missing.into_iter().filter(|id| !progress.seen.contains(id)).collect::<Vec<_>>();
+            if ids.is_empty() {
+                continue;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(SyncError::Cancelled);
+            }
+            outcome.removed = outcome.removed.saturating_add(store.delete_synced_messages(&folder_id, &ids)?);
+        }
+    } else if !deferred.is_empty() {
+        warnings.push("the deletion pass was skipped because the run stopped before every folder was scanned".to_owned());
+    }
+
+    outcome.updated_flags = u32::try_from(progress.drifted.len()).unwrap_or(u32::MAX);
     if outcome.updated_flags > 0 {
         warnings.push(format!(
             "{} messages differ from the server's read/starred flags; local flags were kept (M1 flags are local-only)",
@@ -342,10 +386,12 @@ async fn run_session(
 #[derive(Default)]
 struct FolderStats {
     fetched: u32,
-    updated_flags: u32,
-    removed: u32,
     attachments_stored: u32,
     exhausted: bool,
+    /// Whether the full UID/flags scan finished. Only such a folder may propose deletions.
+    scan_complete: bool,
+    /// Cached ids whose UID is gone from the server. Applied at the end of a complete run.
+    missing: Vec<String>,
 }
 
 async fn sync_folder(
@@ -353,7 +399,7 @@ async fn sync_folder(
     session: &mut Session,
     target: &folder::TargetFolder,
     warnings: &mut warnings::Warnings,
-    remaining: &mut usize,
+    progress: &mut RunProgress,
     state: &mut SyncStatus,
 ) -> Result<FolderStats, SyncError> {
     let store = context.store;
@@ -369,7 +415,7 @@ async fn sync_folder(
         Err(error) => return Err(SyncError::from(error)),
     };
     let uid_validity = selected.uid_validity;
-    let horizon = selected.uid_next.map(|next| next.saturating_sub(1)).filter(|highest| *highest > 0);
+    let hint = selected.uid_next;
 
     // UIDVALIDITY is the folder's identity: a change means every cached UID is about some other
     // mailbox state, so the messages are dropped and the folder starts from UID 1.
@@ -394,34 +440,45 @@ async fn sync_folder(
     // Read the row again after a possible reset: the counts in the discovery snapshot are stale.
     let mut row = store.get_folder(&target.row.id)?.unwrap_or_else(|| target.row.clone());
     row.uid_validity = Some(uid_validity);
-    row.uid_next = selected.uid_next;
+    row.uid_next = hint;
     store.upsert_folder(&row)?;
 
-    // New mail: bounded UID windows. `UID FETCH n:*` would include the last message even when it is
-    // below `n` (RFC 3501 §6.4.8), so the end of each window is explicit. A mailbox the server just
-    // reported as empty is skipped: a large `UIDNEXT` after a mass deletion must not turn into a
-    // loop over a billion empty windows.
-    let empty_mailbox = selected.exists == 0;
-    let mut drifted = std::collections::HashSet::new();
-    'batches: while !empty_mailbox && horizon.is_none_or(|highest| cursor <= highest) {
+    // One query for the folder's cached identities and local flags: duplicate-Message-ID
+    // disambiguation, drift comparison and deletion candidates all read this snapshot.
+    let snapshot = store.folder_message_flags(&row.id)?;
+    let mut index = ingest::FolderIndex::new(&snapshot);
+
+    // UIDNEXT is a hint, never truth: a stale or low value hides mail above it, and EXISTS/RECENT
+    // are counts, not liveness. One `<hint>:*` probe returns the last live UID. UIDs below the hint
+    // are the RFC 3501 §6.4.8 `*` artifact; they do not extend the new-mail range.
+    let probe_hint = cursor.max(hint.unwrap_or(cursor));
+    if context.cancel.load(Ordering::Relaxed) {
+        return Err(SyncError::Cancelled);
+    }
+    let probe_set = UidSet::parse(&format!("{probe_hint}:*")).map_err(SyncError::from)?;
+    let probe = session.fetch_uid_flags(probe_set).await.map_err(SyncError::from)?;
+    let probe_max = probe.iter().map(|entry| entry.uid).max();
+    let true_max = match probe_max {
+        Some(max) => max,
+        None if probe_hint > cursor => probe_hint - 1,
+        None => cursor.saturating_sub(1),
+    };
+
+    // New mail: explicit windows below the true maximum. `UID FETCH n:*` would include the last
+    // message even when it is below `n`, so every window has an explicit end.
+    'batches: while cursor <= true_max {
         if context.cancel.load(Ordering::Relaxed) {
             return Err(SyncError::Cancelled);
         }
-        if *remaining == 0 {
+        if progress.remaining == 0 {
             stats.exhausted = true;
             break;
         }
-        let end = match horizon {
-            Some(highest) => cursor.saturating_add(batch.saturating_sub(1)).min(highest),
-            None => cursor.saturating_add(batch.saturating_sub(1)),
-        };
+        let end = cursor.saturating_add(batch.saturating_sub(1)).min(true_max);
         let set = UidSet::range(cursor, end).map_err(SyncError::from)?;
         let mut envelopes = session.fetch_envelopes(set).await.map_err(SyncError::from)?;
         envelopes.sort_by_key(|envelope| envelope.uid);
         if envelopes.is_empty() {
-            if horizon.is_none() {
-                break;
-            }
             cursor = end.saturating_add(1);
             if cursor == 0 {
                 break;
@@ -432,11 +489,11 @@ async fn sync_folder(
             if context.cancel.load(Ordering::Relaxed) {
                 return Err(SyncError::Cancelled);
             }
-            if *remaining == 0 {
+            if progress.remaining == 0 {
                 stats.exhausted = true;
                 break 'batches;
             }
-            *remaining = (*remaining).saturating_sub(1);
+            progress.remaining = progress.remaining.saturating_sub(1);
             let uid = envelope.uid;
             if usize::try_from(envelope.size).unwrap_or(usize::MAX) > context.limits.max_message_bytes {
                 warnings.push(format!(
@@ -444,15 +501,20 @@ async fn sync_folder(
                     envelope.size, context.limits.max_message_bytes
                 ));
             } else {
-                let raw = session.fetch_body(uid).await.map_err(SyncError::from)?;
-                if let Some(ingested) = ingest::ingest(context, &row, uid_validity, &envelope, &raw, warnings)? {
-                    stats.fetched = stats.fetched.saturating_add(1);
-                    stats.attachments_stored = stats.attachments_stored.saturating_add(ingested.attachments_stored);
-                    if ingested.drift {
-                        drifted.insert(ingested.message_id.clone());
+                match session.fetch_body_opt(uid).await.map_err(SyncError::from)? {
+                    Some(raw) => {
+                        if let Some(ingested) = ingest::ingest(context, &row, &mut index, uid_validity, &envelope, &raw, warnings)? {
+                            stats.fetched = stats.fetched.saturating_add(1);
+                            stats.attachments_stored = stats.attachments_stored.saturating_add(ingested.attachments_stored);
+                            if ingested.drift {
+                                progress.drifted.insert(ingested.message_id.clone());
+                            }
+                            progress.seen.insert(ingested.message_id.clone());
+                            state.messages = state.messages.saturating_add(1);
+                            log::debug!("sync: message {} stored (new: {})", ingested.message_id, ingested.new);
+                        }
                     }
-                    state.messages = state.messages.saturating_add(1);
-                    log::debug!("sync: message {} stored (new: {})", ingested.message_id, ingested.new);
+                    None => warnings.push(format!("message UID {uid} vanished before its body could be fetched; it was skipped")),
                 }
             }
             cursor = cursor.max(uid.saturating_add(1));
@@ -470,42 +532,55 @@ async fn sync_folder(
         }
     }
 
-    // Deletions are computed from a complete UID list. A run that hit the message limit does not
-    // have one, so it never deletes: a truncated pass must not be able to empty the cache. The
-    // network client has no flags-only FETCH, so the list uses the envelope items it exposes and the
-    // extra fields are discarded.
-    if !stats.exhausted {
-        let server = if empty_mailbox { HashMap::new() } else { fetch_server_flags(session, horizon, batch).await? };
-        let cached = store.list_uids(&row.id)?;
-        let mut missing = Vec::new();
-        for entry in &cached {
-            match server.get(&entry.uid) {
-                Some(flags) => {
-                    if let Some(local) = store.message_flags(&entry.message_id)? {
-                        let unread = !flags.contains(&Flag::Seen);
-                        let starred = flags.contains(&Flag::Flagged);
-                        if local.unread != unread || local.starred != starred {
-                            drifted.insert(entry.message_id.clone());
-                        }
-                    }
-                }
-                None => missing.push(entry.message_id.clone()),
-            }
-        }
-        stats.removed = store.delete_synced_messages(&row.id, &missing)?;
+    // Counts are a cache refreshed once per folder, not once per message. A run that hit the
+    // message limit has no complete UID list, so it proposes no deletion.
+    if stats.exhausted {
+        let counts = store.recount_folder(&row.id)?;
+        let mut updated = store.get_folder(&row.id)?.unwrap_or_else(|| row.clone());
+        updated.unread = counts.unread;
+        updated.total = counts.total;
+        updated.uid_validity = Some(uid_validity);
+        updated.uid_next = hint;
+        store.upsert_folder(&updated)?;
+        store.set_sync_state(&store::SyncState {
+            folder_id: row.id.clone(),
+            uid_next: cursor.max(1),
+            highest_modseq: selected.highest_modseq,
+            last_error: None,
+        })?;
+        return Ok(stats);
     }
-    stats.updated_flags = u32::try_from(drifted.len()).unwrap_or(u32::MAX);
+    cursor = cursor.max(true_max.saturating_add(1));
 
-    // Counts are a cache refreshed once per folder, not once per message.
+    // Full UID/flags scan: the only source of liveness. A folder whose scan did not finish proposes
+    // no deletion, and the whole run aborts before any deletion anyway.
+    let live = scan_flags(session, context.cancel, true_max).await?;
+    let mut missing = Vec::new();
+    for cached in &snapshot {
+        let Some(uid) = cached.uid else {
+            continue;
+        };
+        match live.get(&uid) {
+            Some(flags) => {
+                let unread = !flags.contains(&Flag::Seen);
+                let starred = flags.contains(&Flag::Flagged);
+                if cached.unread != unread || cached.starred != starred {
+                    progress.drifted.insert(cached.message_id.clone());
+                }
+            }
+            None => missing.push(cached.message_id.clone()),
+        }
+    }
+    stats.missing = missing;
+    stats.scan_complete = true;
+
     let counts = store.recount_folder(&row.id)?;
     let mut updated = store.get_folder(&row.id)?.unwrap_or_else(|| row.clone());
     updated.unread = counts.unread;
     updated.total = counts.total;
     updated.uid_validity = Some(uid_validity);
-    updated.uid_next = selected.uid_next;
-    if !stats.exhausted {
-        updated.last_sync_at = Some(now_ms());
-    }
+    updated.uid_next = hint;
+    updated.last_sync_at = Some(now_ms());
     store.upsert_folder(&updated)?;
     store.set_sync_state(&store::SyncState {
         folder_id: row.id.clone(),
@@ -516,41 +591,28 @@ async fn sync_folder(
     Ok(stats)
 }
 
-/// Fetch every server UID and its flags, in bounded windows.
-async fn fetch_server_flags(session: &mut Session, horizon: Option<u32>, batch: u32) -> Result<HashMap<u32, Vec<Flag>>, SyncError> {
-    let mut server: HashMap<u32, Vec<Flag>> = HashMap::new();
+/// Fetch every server UID and its flags in bounded windows, aborting between windows on cancel.
+async fn scan_flags(session: &mut Session, cancel: &AtomicBool, max_uid: u32) -> Result<HashMap<u32, Vec<Flag>>, SyncError> {
+    let mut live: HashMap<u32, Vec<Flag>> = HashMap::new();
+    if max_uid == 0 {
+        return Ok(live);
+    }
     let mut start = 1u32;
-    loop {
-        if let Some(highest) = horizon
-            && start > highest
-        {
-            break;
+    while start <= max_uid {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SyncError::Cancelled);
         }
-        let end = match horizon {
-            Some(highest) => start.saturating_add(batch.saturating_sub(1)).min(highest),
-            None => start.saturating_add(batch.saturating_sub(1)),
-        };
+        let end = start.saturating_add(FLAG_SCAN_BATCH.saturating_sub(1)).min(max_uid);
         let set = UidSet::range(start, end).map_err(SyncError::from)?;
-        let envelopes = session.fetch_envelopes(set).await.map_err(SyncError::from)?;
-        if envelopes.is_empty() {
-            if horizon.is_none() {
-                break;
-            }
-            start = end.saturating_add(1);
-            if start == 0 {
-                break;
-            }
-            continue;
+        for entry in session.fetch_uid_flags(set).await.map_err(SyncError::from)? {
+            live.insert(entry.uid, entry.flags);
         }
-        for envelope in envelopes {
-            server.insert(envelope.uid, envelope.flags);
+        if end == u32::MAX {
+            break;
         }
         start = end.saturating_add(1);
-        if start == 0 {
-            break;
-        }
     }
-    Ok(server)
+    Ok(live)
 }
 
 /// Refresh every folder count of one account, best effort. A sync that stops on a network error can

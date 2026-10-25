@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::responses::{
-    EnvelopeAddress, EnvelopeFields, SelectStatus, fetch_body_response, fetch_envelope_line, idle_continuation, list_line, select_lines,
+    EnvelopeAddress, EnvelopeFields, SelectStatus, fetch_body_response, fetch_envelope_line, fetch_uid_flags_line, idle_continuation, list_line,
+    select_lines,
 };
 use crate::server::Conn;
 use crate::synthetic::SyntheticMessage;
@@ -62,6 +63,34 @@ impl TestMessage {
     pub fn with_flags(mut self, flags: &[&str]) -> Self {
         self.flags = flags.iter().map(|flag| (*flag).to_owned()).collect();
         self
+    }
+
+    /// Replace the `Message-ID` header and the envelope value with `message_id`.
+    ///
+    /// Used by the duplicate-identity test: two distinct bodies must carry the same header.
+    #[must_use]
+    pub fn with_message_id(mut self, message_id: &str) -> Self {
+        let raw = String::from_utf8_lossy(&self.raw).into_owned();
+        let mut rewritten = String::with_capacity(raw.len() + message_id.len());
+        for line in raw.split_inclusive("\r\n") {
+            if line.starts_with("Message-ID:") || line.starts_with("Message-Id:") {
+                rewritten.push_str("Message-ID: ");
+                rewritten.push_str(message_id);
+                rewritten.push_str("\r\n");
+            } else {
+                rewritten.push_str(line);
+            }
+        }
+        self.raw = rewritten.into_bytes();
+        self.message_id = Some(message_id.to_owned());
+        self
+    }
+
+    /// The `FETCH` line this message answers a UID/FLAGS-only fetch with.
+    #[must_use]
+    pub fn flags_line(&self, sequence: u32) -> String {
+        let flags = self.flags.iter().map(String::as_str).collect::<Vec<_>>();
+        fetch_uid_flags_line(sequence, self.uid, &flags)
     }
 
     /// The `FETCH` line this message answers with.
@@ -163,6 +192,8 @@ pub enum FailPoint {
     OnBody(u32),
     /// Close the connection instead of answering the Nth envelope fetch (1-based).
     OnEnvelopeFetch(u32),
+    /// Close the connection instead of answering the Nth UID/FLAGS-only fetch (1-based).
+    OnFlagsFetch(u32),
 }
 
 /// What a scripted mailbox should do beyond answering commands.
@@ -173,6 +204,16 @@ pub struct MailboxScript {
     /// Set the flag when the Nth body fetch arrives, before it is answered (1-based). The client
     /// commits that message and stops before the next one.
     pub cancel_after_body: Option<(u32, Arc<AtomicBool>)>,
+    /// Set the flag when the Nth UID/FLAGS-only fetch arrives, before it is answered (1-based).
+    pub cancel_after_flags: Option<(u32, Arc<AtomicBool>)>,
+    /// UIDs whose body is answered with a bare `OK` and no `FETCH`: the message vanished.
+    pub vanish_bodies: Vec<u32>,
+    /// Omit `UIDNEXT` from `SELECT`.
+    pub omit_uidnext: bool,
+    /// Advertise this `UIDNEXT` instead of the real one, to fake a stale or low hint.
+    pub uid_next_hint: Option<u32>,
+    /// Advertise this `EXISTS` instead of the real count, to fake a wrong liveness hint.
+    pub exists_hint: Option<u32>,
 }
 
 impl MailboxScript {
@@ -183,10 +224,45 @@ impl MailboxScript {
         self
     }
 
-    /// Set `cancel` right after the client has received the `after`th body.
+    /// Set `cancel` when the `after`th body fetch arrives.
     #[must_use]
     pub fn cancel_after_body(mut self, after: u32, cancel: Arc<AtomicBool>) -> Self {
         self.cancel_after_body = Some((after, cancel));
+        self
+    }
+
+    /// Set `cancel` when the `after`th UID/FLAGS-only fetch arrives.
+    #[must_use]
+    pub fn cancel_after_flags(mut self, after: u32, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel_after_flags = Some((after, cancel));
+        self
+    }
+
+    /// Answer this UID's body fetch with no body.
+    #[must_use]
+    pub fn vanish_body(mut self, uid: u32) -> Self {
+        self.vanish_bodies.push(uid);
+        self
+    }
+
+    /// Do not advertise `UIDNEXT`.
+    #[must_use]
+    pub fn without_uidnext(mut self) -> Self {
+        self.omit_uidnext = true;
+        self
+    }
+
+    /// Advertise a fake `UIDNEXT`.
+    #[must_use]
+    pub fn with_uid_next_hint(mut self, uid_next: u32) -> Self {
+        self.uid_next_hint = Some(uid_next);
+        self
+    }
+
+    /// Advertise a fake `EXISTS`.
+    #[must_use]
+    pub fn with_exists_hint(mut self, exists: u32) -> Self {
+        self.exists_hint = Some(exists);
         self
     }
 }
@@ -206,6 +282,7 @@ pub async fn serve_mailbox_with(mut conn: Conn, folders: Vec<TestFolder>, script
     let mut selects = 0u32;
     let mut bodies = 0u32;
     let mut envelopes = 0u32;
+    let mut flags_fetches = 0u32;
     loop {
         let Some(line) = conn.read_line_opt().await else { return conn };
         let Some((tag, rest)) = line.split_once(' ') else { return conn };
@@ -247,12 +324,9 @@ pub async fn serve_mailbox_with(mut conn: Conn, folders: Vec<TestFolder>, script
                     continue;
                 };
                 let folder = &folders[index];
-                let status = SelectStatus {
-                    exists: u32::try_from(folder.messages.len()).unwrap_or(u32::MAX),
-                    recent: 0,
-                    uid_validity: folder.uid_validity,
-                    uid_next: Some(folder.uid_next()),
-                };
+                let exists = script.exists_hint.unwrap_or_else(|| u32::try_from(folder.messages.len()).unwrap_or(u32::MAX));
+                let uid_next = if script.omit_uidnext { None } else { Some(script.uid_next_hint.unwrap_or_else(|| folder.uid_next())) };
+                let status = SelectStatus { exists, recent: 0, uid_validity: folder.uid_validity, uid_next };
                 for response in select_lines(&status) {
                     conn.send_line(&response).await;
                 }
@@ -293,8 +367,38 @@ pub async fn serve_mailbox_with(mut conn: Conn, folders: Vec<TestFolder>, script
                     {
                         cancel.store(true, Ordering::SeqCst);
                     }
+                    if script.vanish_bodies.contains(&uid) {
+                        // A real server answers a fetch of an expunged UID with a bare OK.
+                        conn.send_line(&format!("{tag} OK done")).await;
+                        continue;
+                    }
                     let sequence = u32::try_from(sequence).unwrap_or(u32::MAX).saturating_add(1);
                     conn.send_bytes(&fetch_body_response(sequence, uid, &message.raw)).await;
+                    conn.send_line(&format!("{tag} OK done")).await;
+                    continue;
+                }
+                if items.trim() == "(UID FLAGS)" {
+                    flags_fetches = flags_fetches.saturating_add(1);
+                    if script.fail == Some(FailPoint::OnFlagsFetch(flags_fetches)) {
+                        return conn;
+                    }
+                    // Set the flag before answering, so the client's next window check sees it.
+                    if let Some((after, cancel)) = &script.cancel_after_flags
+                        && *after == flags_fetches
+                    {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                    let Some(ranges) = parse_ranges(set) else {
+                        conn.send_line(&format!("{tag} BAD invalid UID set")).await;
+                        continue;
+                    };
+                    for (index, message) in folder.messages.iter().enumerate() {
+                        if !ranges.iter().any(|(start, end)| message.uid >= *start && message.uid <= *end) {
+                            continue;
+                        }
+                        let sequence = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
+                        conn.send_line(&message.flags_line(sequence)).await;
+                    }
                     conn.send_line(&format!("{tag} OK done")).await;
                     continue;
                 }

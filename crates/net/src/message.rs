@@ -116,6 +116,17 @@ pub struct Address {
     pub host: Option<String>,
 }
 
+/// One message's UID and flags from a UID/FLAGS-only fetch.
+///
+/// This is the liveness scan of a folder: no envelope, no body, one small response per message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UidFlags {
+    /// UID, stable for the lifetime of the folder's `UIDVALIDITY`.
+    pub uid: u32,
+    /// Flags the server reports.
+    pub flags: Vec<Flag>,
+}
+
 /// One message's headers as IMAP reports them, with no MIME parsing.
 ///
 /// `references` and `list_id` are always empty at this layer: RFC 3501's `ENVELOPE` has no slot for

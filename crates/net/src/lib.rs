@@ -50,7 +50,7 @@ pub use error::NetError;
 pub use folder::{MailboxStatus, RemoteFolder, SpecialUse};
 pub use limits::Limits;
 pub use mailbox::{decode_utf7, encode_utf7};
-pub use message::{Address, Envelope, Flag, FlagMode, IdleEvent};
+pub use message::{Address, Envelope, Flag, FlagMode, IdleEvent, UidFlags};
 pub use rustls::pki_types::CertificateDer;
 pub use secret::Secret;
 pub use session::Session;

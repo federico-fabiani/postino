@@ -10,8 +10,8 @@ use rusqlite::types::{Type, Value};
 use rusqlite::{ErrorCode, OptionalExtension, Row, params, params_from_iter};
 
 use crate::model::{
-    Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, Label, LabelCount, Message, MessageCounts, MessageFilter,
-    MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
+    Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label, LabelCount, Message, MessageCounts,
+    MessageFilter, MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
 };
 use crate::{Store, StoreError};
 
@@ -333,6 +333,21 @@ impl Store {
         require_folder(&self.conn, folder_id)?;
         let mut stmt = self.conn.prepare("SELECT id, uid FROM messages WHERE folder_id = ?1 AND uid IS NOT NULL ORDER BY uid, id")?;
         let rows = stmt.query_map([folder_id], |row| Ok(UidEntry { message_id: row.get(0)?, uid: get_u32(row, 1)? }))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("messages", error))
+    }
+
+    /// Every message row of one folder with its UID and local read/star flags, in one query.
+    ///
+    /// This is the sync snapshot: duplicate `Message-ID` disambiguation, drift comparison and the
+    /// deletion candidates all read from it, so a folder pass costs one statement instead of one
+    /// lookup per message. Rows without a UID (local drafts and locally sent mail) are included so
+    /// the caller can protect them; they are never deletion candidates.
+    pub fn folder_message_flags(&self, folder_id: &str) -> Result<Vec<FolderMessageFlags>, StoreError> {
+        require_folder(&self.conn, folder_id)?;
+        let mut stmt = self.conn.prepare("SELECT id, uid, unread, starred FROM messages WHERE folder_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([folder_id], |row| {
+            Ok(FolderMessageFlags { message_id: row.get(0)?, uid: get_opt_u32(row, 1)?, unread: row.get(2)?, starred: row.get(3)? })
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("messages", error))
     }
 

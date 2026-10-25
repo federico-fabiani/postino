@@ -44,10 +44,12 @@ fn two_thousand_messages() {
 }
 
 #[test]
+#[ignore = "slow: set POSTINO_SLOW_TESTS=1 and run cargo test -p postino-sync --test scale -- --ignored ten_thousand_messages"]
 fn ten_thousand_messages() {
-    if std::env::var("POSTINO_SLOW_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipped the 10 000-message sync; set POSTINO_SLOW_TESTS=1 to run it");
-        return;
-    }
+    assert_eq!(
+        std::env::var("POSTINO_SLOW_TESTS").as_deref(),
+        Ok("1"),
+        "the ignored 10 000-message test needs POSTINO_SLOW_TESTS=1; see crates/sync/README.md"
+    );
     run_scale(10_000, TEN_THOUSAND_BUDGET);
 }

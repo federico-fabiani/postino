@@ -147,6 +147,19 @@ pub struct MessageFlags {
     pub starred: bool,
 }
 
+/// One folder's cached identity and local flags, read in a single query.
+///
+/// Sync uses this snapshot for duplicate-Message-ID disambiguation, drift comparison and the
+/// deletion candidates, so a folder-sized pass costs one statement, not one per message. `uid` is
+/// `None` for a row that was never on the server (a local draft or locally sent mail).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderMessageFlags {
+    pub message_id: String,
+    pub uid: Option<u32>,
+    pub unread: bool,
+    pub starred: bool,
+}
+
 /// The per-folder sync cursor.
 ///
 /// `uid_next` is the next UID the reconciler still has to fetch: the highest committed UID plus one,

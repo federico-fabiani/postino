@@ -4,6 +4,8 @@
 //! body, the decoded headers and the attachment bytes. When a header is missing from the parse the
 //! envelope is the fallback, so a message with no `Date` header still gets its `INTERNALDATE`.
 
+use std::collections::HashMap;
+
 use postino_mime::ParsedMessage;
 use postino_net::{Address as EnvelopeAddress, Envelope, Flag};
 use postino_store as store;
@@ -24,6 +26,37 @@ pub(crate) struct Ingested {
     pub(crate) attachments_stored: u32,
 }
 
+/// The cached identity and flags of one folder, plus the ids inserted earlier in this run.
+///
+/// One folder-wide query supplies [`FolderIndex::cached`]; [`FolderIndex::inserted`] records what
+/// this run has already written, so a second message with the same `Message-ID` in the same folder
+/// sees the first one and gets a disambiguated id.
+pub(crate) struct FolderIndex {
+    cached: HashMap<String, CachedRow>,
+    inserted: HashMap<String, u32>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRow {
+    uid: Option<u32>,
+    unread: bool,
+    starred: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Existing {
+    unread: bool,
+    starred: bool,
+}
+
+impl FolderIndex {
+    /// Build the snapshot from the repository's one-query folder read.
+    pub(crate) fn new(rows: &[store::FolderMessageFlags]) -> Self {
+        let cached = rows.iter().map(|row| (row.message_id.clone(), CachedRow { uid: row.uid, unread: row.unread, starred: row.starred })).collect();
+        Self { cached, inserted: HashMap::new() }
+    }
+}
+
 /// Parse and store one message. `Ok(None)` means the message was skipped and a warning explains why.
 ///
 /// The message row, every attachment row and `has_attachments` are one transaction. Blob files are
@@ -32,6 +65,7 @@ pub(crate) struct Ingested {
 pub(crate) fn ingest(
     context: &Context<'_>,
     folder: &store::Folder,
+    index: &mut FolderIndex,
     uid_validity: u32,
     envelope: &Envelope,
     raw: &[u8],
@@ -50,15 +84,22 @@ pub(crate) fn ingest(
     };
 
     let normalised = normalise_id(&parsed, envelope, uid, warnings);
-    let id = ids::message_id(&account.id, &folder.id, uid_validity, uid, normalised.as_deref());
+    let Some((id, existing)) = choose_identity(store, folder, index, &account.id, normalised.as_deref(), uid, uid_validity)? else {
+        warnings.push(format!("message UID {uid} was skipped: every stable id candidate is taken by another message"));
+        return Ok(None);
+    };
+    // MIME warnings are the honest record of a body or attachment list that was cut: part limits,
+    // depth limits, truncated bodies, sanitizer strips and blocked remote content all land here.
+    for warning in &parsed.warnings {
+        warnings.push(format!("message {id}: {warning}"));
+    }
     // A reply points at a Message-ID, so a root's thread id must be its own Message-ID for children
     // to link to it. Only a message without one falls back to the local id.
     let thread = ids::thread_id(&parsed.references, parsed.in_reply_to.as_deref(), normalised.as_deref().unwrap_or(&id));
 
     let server_unread = !envelope.flags.contains(&Flag::Seen);
     let server_starred = envelope.flags.contains(&Flag::Flagged);
-    let existing = store.message_flags(&id)?;
-    let (unread, starred, new, drift) = match &existing {
+    let (unread, starred, new, drift) = match existing {
         Some(local) => (local.unread, local.starred, false, local.unread != server_unread || local.starred != server_starred),
         None => (server_unread, server_starred, true, false),
     };
@@ -136,7 +177,55 @@ pub(crate) fn ingest(
         size: Some(size),
     };
     store.upsert_synced_message(&row, &attachments).map_err(SyncError::Store)?;
+    index.inserted.insert(id.clone(), uid);
     Ok(Some(Ingested { message_id: id, new, drift, attachments_stored: stored }))
+}
+
+/// Pick the stable local id for one message.
+///
+/// The plain `msg_<hash>` is the mailbox-wide identity. If it is already cached in **this** folder
+/// with a different UID, the message is a second copy with the same `Message-ID`: try
+/// `msg_<hash>_<uid>`, then `msg_<hash>_<uid>_<uidvalidity>`. If the plain id exists in another
+/// folder it is a move, so the id and the local flags are reused. `None` means every candidate is
+/// taken; the caller skips the message rather than overwrite another row.
+fn choose_identity(
+    store: &store::Store,
+    folder: &store::Folder,
+    index: &FolderIndex,
+    account_id: &str,
+    message_id: Option<&str>,
+    uid: u32,
+    uid_validity: u32,
+) -> Result<Option<(String, Option<Existing>)>, SyncError> {
+    let Some(message_id) = message_id else {
+        let id = ids::message_id(account_id, &folder.id, uid_validity, uid, None);
+        let existing = index.cached.get(&id).map(|row| Existing { unread: row.unread, starred: row.starred });
+        return Ok(Some((id, existing)));
+    };
+    let variants = ids::message_id_variants(account_id, message_id, uid, uid_validity);
+    for (position, variant) in variants.iter().enumerate() {
+        if let Some(row) = index.cached.get(variant) {
+            if row.uid == Some(uid) {
+                return Ok(Some((variant.clone(), Some(Existing { unread: row.unread, starred: row.starred }))));
+            }
+            continue;
+        }
+        if let Some(other) = index.inserted.get(variant) {
+            if *other == uid {
+                return Ok(Some((variant.clone(), None)));
+            }
+            continue;
+        }
+        if let Some(existing) = store.message_flags(variant)? {
+            if position == 0 && existing.folder_id != folder.id {
+                // The same Message-ID in another folder is a move: keep the row and its labels.
+                return Ok(Some((variant.clone(), Some(Existing { unread: existing.unread, starred: existing.starred }))));
+            }
+            continue;
+        }
+        return Ok(Some((variant.clone(), None)));
+    }
+    Ok(None)
 }
 
 /// The MIME bounds for a sync run: the per-message cap and the per-attachment cap, both clamped.

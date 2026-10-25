@@ -435,7 +435,7 @@ fn a_drop_mid_batch_keeps_the_committed_prefix_and_resumes() {
 fn a_drop_after_the_new_mail_pass_keeps_every_committed_message() {
     let harness = Harness::new();
     let store = seeded(&harness);
-    let server = RunningServer::start_with(one_inbox(10, messages(1..=3)), MailboxScript::default().fail(FailPoint::OnEnvelopeFetch(2)));
+    let server = RunningServer::start_with(one_inbox(10, messages(1..=3)), MailboxScript::default().fail(FailPoint::OnFlagsFetch(2)));
     let error = sync(&store, &server).expect_err("the deletion pass lost the connection");
     assert!(matches!(error, SyncError::Connect(_)), "{error:?}");
     server.finish();

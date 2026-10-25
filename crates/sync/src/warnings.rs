@@ -1,21 +1,28 @@
 //! A bounded warning collector for one sync run.
 
+use std::collections::HashSet;
+
 /// How many individual warnings a run keeps before it summarises the rest.
 const MAX_WARNINGS: usize = 100;
 
 /// Warnings for one run, bounded so a hostile or broken server cannot make a run allocate without
-/// limit. The caller sees the first [`MAX_WARNINGS`] messages and one summary line.
+/// limit. The caller sees the first [`MAX_WARNINGS`] distinct messages and one summary line.
 #[derive(Debug, Default)]
 pub struct Warnings {
     messages: Vec<String>,
+    seen: HashSet<String>,
     omitted: usize,
 }
 
 impl Warnings {
-    /// Record one warning.
+    /// Record one warning, ignoring an exact duplicate from earlier in the same run.
     pub fn push(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if !self.seen.insert(message.clone()) {
+            return;
+        }
         if self.messages.len() < MAX_WARNINGS {
-            self.messages.push(message.into());
+            self.messages.push(message);
         } else {
             self.omitted = self.omitted.saturating_add(1);
         }
@@ -58,5 +65,14 @@ mod tests {
         let warnings = Warnings::default();
         assert!(warnings.is_empty());
         assert!(warnings.into_vec().is_empty());
+    }
+
+    #[test]
+    fn duplicate_warnings_are_recorded_once() {
+        let mut warnings = Warnings::default();
+        warnings.push("same");
+        warnings.push("same");
+        warnings.push("other");
+        assert_eq!(warnings.into_vec(), vec!["same".to_owned(), "other".to_owned()]);
     }
 }

@@ -16,7 +16,7 @@ use crate::error::{protocol, sanitize_reason};
 use crate::fetch::FetchData;
 use crate::folder::{MailboxStatus, RemoteFolder};
 use crate::mailbox::astring;
-use crate::message::{Envelope, Flag, FlagMode, IdleEvent};
+use crate::message::{Envelope, Flag, FlagMode, IdleEvent, UidFlags};
 use crate::response::{Response, Status, StatusCode, Untagged, parse_response};
 use crate::secret::Secret;
 use crate::tls;
@@ -204,12 +204,38 @@ impl Session {
         Ok(envelopes)
     }
 
-    /// `UID FETCH <uid> (BODY.PEEK[])`: the whole message, bounded by [`crate::Limits::max_literal`].
+    /// `UID FETCH <set> (UID FLAGS)`: the UID and flags of every message in the set.
     ///
-    /// `BODY.PEEK` is not decoration: it stops the server from setting `\Seen`, so reading a message
-    /// never changes its state behind the user's back. A body that arrives with another UID is
-    /// refused instead of being handed back as the message the caller asked for.
-    pub async fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, NetError> {
+    /// This is the folder liveness scan: no envelope and no body, so one response per message stays
+    /// small and a whole folder fits in bounded windows. A response without a UID (an unsolicited
+    /// update) is skipped; a UID outside the requested set is refused, exactly as for envelopes.
+    pub async fn fetch_uid_flags(&mut self, uids: UidSet) -> Result<Vec<UidFlags>, NetError> {
+        let set = uids.to_wire()?;
+        let arguments = format!("{set} (UID FLAGS)");
+        let outcome = self.execute("fetch flags", "UID FETCH", Some(&arguments)).await?;
+        let mut entries = Vec::new();
+        for item in outcome.untagged {
+            let Untagged::Fetch(data) = item else {
+                continue;
+            };
+            let FetchData { uid: Some(uid), flags, .. } = *data else {
+                continue;
+            };
+            if !uids.contains(uid) {
+                return Err(protocol(format!("the server returned UID {uid}, outside the requested set")));
+            }
+            entries.push(UidFlags { uid, flags });
+        }
+        Ok(entries)
+    }
+
+    /// `UID FETCH <uid> (BODY.PEEK[])`, returning `None` when the UID no longer exists.
+    ///
+    /// A compliant server answers a fetch of an expunged UID with a tagged `OK` and no untagged
+    /// `FETCH`. That is a vanished message, not a protocol failure: the caller can skip it and keep
+    /// the rest of the run. A body that arrives for another UID, or a body without a UID, is still a
+    /// protocol error. `BODY.PEEK` keeps reading from setting `\Seen`.
+    pub async fn fetch_body_opt(&mut self, uid: u32) -> Result<Option<Vec<u8>>, NetError> {
         if uid == 0 {
             return Err(protocol("UID 0 does not exist"));
         }
@@ -219,18 +245,27 @@ impl Session {
             let Untagged::Fetch(data) = item else {
                 continue;
             };
-            let FetchData { body: Some(body), uid: returned, .. } = *data else {
-                continue;
-            };
-            if returned != Some(uid) {
-                return Err(protocol(match returned {
-                    Some(other) => format!("the server returned UID {other} for a fetch of UID {uid}"),
-                    None => format!("the server returned a body without a UID for a fetch of UID {uid}"),
-                }));
+            let FetchData { body, uid: returned, .. } = *data;
+            match (returned, body) {
+                (Some(other), Some(_)) if other != uid => {
+                    return Err(protocol(format!("the server returned UID {other} for a fetch of UID {uid}")));
+                }
+                (None, Some(_)) => return Err(protocol(format!("the server returned a body without a UID for a fetch of UID {uid}"))),
+                (_, Some(body)) => return Ok(Some(body)),
+                // A bodyless FETCH may be an unsolicited flag update for this or another UID.
+                _ => {}
             }
-            return Ok(body);
         }
-        Err(protocol("the server returned no BODY[] for the message"))
+        Ok(None)
+    }
+
+    /// `UID FETCH <uid> (BODY.PEEK[])`: the whole message, or a protocol error when it vanishes.
+    ///
+    /// Callers that must tolerate a message expunged between the envelope and the body use
+    /// [`Session::fetch_body_opt`] instead. `BODY.PEEK` is not decoration: it stops the server from
+    /// setting `\Seen`, so reading a message never changes its state behind the user's back.
+    pub async fn fetch_body(&mut self, uid: u32) -> Result<Vec<u8>, NetError> {
+        self.fetch_body_opt(uid).await?.ok_or_else(|| protocol("the server returned no BODY[] for the message"))
     }
 
     /// `UID STORE`, always silent and always with `UID`.

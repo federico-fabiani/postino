@@ -183,6 +183,24 @@ fn the_uid_list_ignores_rows_without_a_uid() {
 }
 
 #[test]
+fn one_query_reads_a_folders_identities_and_local_flags() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    store.upsert_message(&message("msg_one", INBOX, Some(3))).expect("message");
+    store.upsert_message(&message("msg_local", INBOX, None)).expect("local row");
+    store.set_flags(&["msg_one".to_owned()], FlagUpdate { unread: Some(false), starred: Some(true) }).expect("flags");
+
+    let rows = store.folder_message_flags(INBOX).expect("snapshot");
+    assert_eq!(rows.len(), 2);
+    let synced = rows.iter().find(|row| row.message_id == "msg_one").expect("synced row");
+    assert_eq!((synced.uid, synced.unread, synced.starred), (Some(3), false, true));
+    let local = rows.iter().find(|row| row.message_id == "msg_local").expect("local row");
+    assert_eq!((local.uid, local.unread, local.starred), (None, true, false));
+    assert!(store.folder_message_flags("fld_missing").is_err());
+}
+
+#[test]
 fn a_deletion_pass_removes_messages_and_assignments_but_never_a_local_draft() {
     let fixture = Fixture::new();
     let store = fixture.open();

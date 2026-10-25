@@ -1,6 +1,6 @@
 //! FETCH parsing: literals, split reads, unsolicited responses, bounds and malformed replies.
 
-use postino_net::{NetError, Session, UidSet};
+use postino_net::{Flag, NetError, Session, UidFlags, UidSet};
 use postino_testkit::{FakeServer, TlsFixture, fetch_body_response};
 
 #[tokio::test]
@@ -298,5 +298,59 @@ async fn a_buffered_literal_counts_against_the_response_budget() {
     let error = session.fetch_body(1).await.expect_err("line plus literal is over 65 bytes");
     assert!(matches!(error, NetError::TooLarge { what: "response", limit: 65 }), "{error:?}");
     drop(session);
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn a_uid_flags_fetch_returns_pairs_without_envelopes() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"INBOX\"").await;
+        conn.send_line("* 2 EXISTS").await;
+        conn.send_line("* OK [UIDVALIDITY 1] ok").await;
+        conn.send_line("A0003 OK selected").await;
+        conn.expect("A0004 UID FETCH 1:2 (UID FLAGS)").await;
+        conn.send_line("* 1 FETCH (UID 1 FLAGS (\\Seen))").await;
+        conn.send_line("* 2 FETCH (UID 2 FLAGS (\\Flagged $Forwarded))").await;
+        conn.send_line("A0004 OK done").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("login");
+    session.select("INBOX").await.expect("select");
+    let entries = session.fetch_uid_flags(UidSet::parse("1:2").expect("uid set")).await.expect("fetch flags");
+    assert_eq!(
+        entries,
+        vec![UidFlags { uid: 1, flags: vec![Flag::Seen] }, UidFlags { uid: 2, flags: vec![Flag::Flagged, Flag::Keyword("$Forwarded".to_owned())] },]
+    );
+    session.logout().await.expect("logout");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn a_vanished_body_is_none_and_the_strict_fetch_body_still_refuses_it() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"INBOX\"").await;
+        conn.send_line("* 0 EXISTS").await;
+        conn.send_line("* OK [UIDVALIDITY 1] ok").await;
+        conn.send_line("A0003 OK selected").await;
+        conn.expect("A0004 UID FETCH 7 (BODY.PEEK[])").await;
+        conn.send_line("A0004 OK done").await;
+        conn.expect("A0005 UID FETCH 7 (BODY.PEEK[])").await;
+        conn.send_line("A0005 OK done").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("login");
+    session.select("INBOX").await.expect("select");
+    assert_eq!(session.fetch_body_opt(7).await.expect("a vanished body is not an error"), None);
+    let error = session.fetch_body(7).await.expect_err("the strict wrapper keeps its old contract");
+    assert!(matches!(error, NetError::Protocol { .. }), "{error:?}");
+    session.logout().await.expect("logout");
     server.finish().await;
 }

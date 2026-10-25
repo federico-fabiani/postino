@@ -46,6 +46,20 @@ pub(crate) fn attachment_id(message_id: &str, index: usize) -> String {
     format!("att_{message_id}_{index}")
 }
 
+/// The three stable candidates for a message that has a `Message-ID`, in preference order.
+///
+/// 1. `msg_<hash>`: the mailbox-wide identity.
+/// 2. `msg_<hash>_<uid>`: a second message with the same `Message-ID` in the same folder.
+/// 3. `msg_<hash>_<uid>_<uidvalidity>`: the second candidate was already taken by another folder.
+///
+/// The caller tries them in order against the cached identity and the global message table. The
+/// UID makes the choice deterministic while envelopes are processed in ascending UID order.
+#[must_use]
+pub(crate) fn message_id_variants(account_id: &str, message_id: &str, uid: u32, uid_validity: u32) -> [String; 3] {
+    let hash = short_hash(&[account_id, message_id]);
+    [format!("msg_{hash}"), format!("msg_{hash}_{uid}"), format!("msg_{hash}_{uid}_{uid_validity}")]
+}
+
 /// The threading placeholder: the first `References` entry, else `In-Reply-To`, else `fallback`.
 ///
 /// `fallback` is the message's own header Message-ID when it has one, so a reply that references it
@@ -65,29 +79,23 @@ pub(crate) fn thread_id(references: &[String], in_reply_to: Option<&str>, fallba
     fallback.to_owned()
 }
 
-/// Reduce one header value to a bare Message-ID, or `None` when it is not one.
+/// Reduce one header value to the exact trimmed Message-ID, or `None` when it is unusable.
 ///
-/// Angle brackets are stripped; when a malformed header carries several ids the first `<...>` wins.
-/// A value longer than 998 characters, or one containing whitespace or a control character, is not a
-/// Message-ID and is refused rather than hashed: identity must not be built from junk.
+/// One pair of angle brackets is removed and the surrounding whitespace is trimmed; nothing else is
+/// changed. There is no case-folding and no character substitution, so two raw values that differ
+/// produce two different identities. An empty value, one over 998 characters and one containing a
+/// control character are refused (the caller falls back to the folder/UID identity).
 #[must_use]
 pub(crate) fn normalise_message_id(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let candidate = match (raw.find('<'), raw.find('>')) {
-        (Some(start), Some(end)) if start < end => raw.get(start + 1..end)?,
-        _ => raw.split_ascii_whitespace().next().unwrap_or(raw),
-    };
-    let candidate = candidate.trim();
-    if candidate.is_empty() || candidate.len() > 998 {
+    let inner = trimmed.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')).unwrap_or(trimmed);
+    if inner.is_empty() || inner.len() > 998 || inner.bytes().any(|byte| byte.is_ascii_control()) {
         return None;
     }
-    if candidate.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()) {
-        return None;
-    }
-    Some(candidate.to_owned())
+    Some(inner.to_owned())
 }
 
 #[cfg(test)]
@@ -123,12 +131,27 @@ mod tests {
     fn message_ids_are_normalised_or_refused() {
         assert_eq!(normalise_message_id(" <a@example.com> ").as_deref(), Some("a@example.com"));
         assert_eq!(normalise_message_id("a@example.com").as_deref(), Some("a@example.com"));
-        assert_eq!(normalise_message_id("<one@example.com> <two@example.com>").as_deref(), Some("one@example.com"));
+        assert_eq!(
+            normalise_message_id("<one@example.com> <two@example.com>").as_deref(),
+            Some("one@example.com> <two@example.com"),
+            "the exact interior is hashed, never the first token"
+        );
         assert_eq!(normalise_message_id(""), None);
         assert_eq!(normalise_message_id("<>"), None);
-        assert_eq!(normalise_message_id("has space").as_deref(), Some("has"));
+        assert_eq!(normalise_message_id("has space").as_deref(), Some("has space"));
         assert_eq!(normalise_message_id("bad\u{0}id"), None);
         assert_eq!(normalise_message_id(&"x".repeat(999)), None);
+        assert_ne!(normalise_message_id("<A@example.com>"), normalise_message_id("<a@example.com>"), "case is part of the identity");
+    }
+
+    #[test]
+    fn duplicate_message_ids_get_deterministic_candidates() {
+        let variants = message_id_variants("acc_1", "a@example.com", 2, 10);
+        assert_eq!(variants[0].len(), 20);
+        assert_eq!(variants[1], format!("{}_2", variants[0]));
+        assert_eq!(variants[2], format!("{}_2_10", variants[0]));
+        assert_eq!(variants, message_id_variants("acc_1", "a@example.com", 2, 10));
+        assert_ne!(variants[0], message_id_variants("acc_1", "a2@example.com", 2, 10)[0]);
     }
 
     #[test]
@@ -137,7 +160,11 @@ mod tests {
         assert_eq!(thread_id(&references, Some("<parent@example.com>"), "msg_local"), "root@example.com");
         assert_eq!(thread_id(&[], Some("<parent@example.com>"), "msg_local"), "parent@example.com");
         assert_eq!(thread_id(&[], None, "msg_local"), "msg_local");
-        assert_eq!(thread_id(&["<bad id>".to_owned(), "<good@example.com>".to_owned()], None, "msg_local"), "good@example.com");
+        assert_eq!(
+            thread_id(&["<bad\u{0}id>".to_owned(), "<good@example.com>".to_owned()], None, "msg_local"),
+            "good@example.com",
+            "an unusable reference is skipped, not substituted"
+        );
     }
 
     #[test]

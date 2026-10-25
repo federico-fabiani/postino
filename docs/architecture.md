@@ -493,7 +493,7 @@ save.
 another message may reference the same content; P9 or the daemon will sweep unreferenced hashes.
 `BlobStore::remove` exists for an explicit delete and for tests, not as a repair step.
 
-### 4.6 Implemented in P5b: syncing an account into the store
+### 4.6 Implemented in P5b, hardened in P5c: syncing an account into the store
 
 `postino-sync` is the reconciler between one `postino-net` session and the encrypted repository. It
 ships no operation, CLI command, scheduler or screen: `sync_account(store, account, config, limits,
@@ -502,20 +502,27 @@ blocks; the `Store` stays on the caller thread and one connection serves the who
 
 ```text
 LIST "" "*"                 ──▶ folders, special-use, \Noselect skipped
-SELECT <wire name>          ──▶ UIDVALIDITY, UIDNEXT
+SELECT <wire name>          ──▶ UIDVALIDITY, UIDNEXT (a hint only)
   UIDVALIDITY changed       ──▶ drop that folder's cached messages, cursor = 1
-UID FETCH <cursor>:<end> (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)   (bounded windows)
-UID FETCH <uid> (BODY.PEEK[])  ──▶ postino-mime ──▶ one transaction: message + attachments
-UID FETCH 1:* (…ENVELOPE)      ──▶ full UID list: delete gone rows, observe flag drift
-recount                        ──▶ folder counts, last_sync_at
+UID FETCH <hint>:* (UID FLAGS)       ──▶ probe the true maximum UID
+UID FETCH <cursor>:<end> (…ENVELOPE) ──▶ explicit windows below the true maximum
+UID FETCH <uid> (BODY.PEEK[])        ──▶ postino-mime ──▶ one transaction: message + attachments
+UID FETCH <a>:<b> (UID FLAGS)        ──▶ full liveness/flags scan, 1 000 UIDs per window
+deferred deletion                    ──▶ after every folder: drop missing ids seen nowhere
+recount                              ──▶ folder counts, last_sync_at
 ```
 
-**Batches and the cursor.** `UID FETCH n:*` includes the last message even when it is below `n`
-(RFC 3501 §6.4.8), so each window has an explicit end: `min(cursor + batch - 1, UIDNEXT - 1)` when
-the server reports `UIDNEXT`, otherwise `cursor + batch - 1` and an empty window ends the pass.
-`sync_state.uid_next` (the next UID to fetch) advances after each committed message and after each
-completed window; `folders.uid_next` holds the server's advertised `UIDNEXT`. A crash between the
-message transaction and the cursor write re-fetches one message; the upsert is idempotent.
+**UID discovery and the cursor.** `UIDNEXT` is a hint, never truth: a missing or stale value hides
+mail above a gap, and `EXISTS`/`RECENT` are counts, not liveness. After `SELECT` the reconciler
+probes `UID FETCH <max(cursor, UIDNEXT)>:* (UID FLAGS)`; the highest UID returned is the true upper
+bound, and UIDs below the hint are the RFC 3501 §6.4.8 `*` artifact that do not extend the new-mail
+range. If the probe is empty and the hint is ahead of the cursor, the bound is `hint - 1`; with no
+`UIDNEXT` the bound is `cursor - 1` and there is no new mail. New mail is fetched in explicit windows
+of `batch` UIDs below that bound, never with an open `*` end, so a response cannot exceed the
+untagged cap. `sync_state.uid_next` (the next UID to fetch) advances after each committed message and
+after each completed window; `folders.uid_next` holds the server's advertised value. `EXISTS 0` does
+not skip a folder. A crash between the message transaction and the cursor write re-fetches one
+message; the upsert is idempotent.
 
 **Folders.** `LIST` once. `\Noselect` is skipped; `\Inbox`, `\Sent`, `\Drafts`, `\Trash`, `\Junk`,
 `\Archive` and `\Flagged` map to the store roles, and a folder named `INBOX` is the inbox even when
@@ -529,15 +536,17 @@ display-name rename does not orphan the cache. Local labels and drafts are untou
 `\Flagged` folder is stored as `FolderKind::Starred`; the engine's virtual starred view is derived
 from message flags, so P6 must decide which of the two the sidebar shows.
 
-**Message ids.** `msg_` plus 16 hex of `BLAKE3(account, Message-ID)` when a usable header exists,
-otherwise `msg_{folder}_{uidvalidity}_{uid}`. A message with a Message-ID keeps its local row across
-a folder move, a re-download and a UIDVALIDITY change; one without one cannot be recognised after
-those events and is re-created (documented trade-off). The same Message-ID in two folders maps to one
-local message: the later folder wins `folder_id`, label assignments survive and the row's UID becomes
-the later copy's. If that surviving folder then loses the message, the deletion pass removes the row;
-the other folder still holds it on the server, but the cache will not recreate it until that folder is
-fetched from scratch. This is the price of a mailbox-wide identity, and it is why sync never deletes
-on the server.
+**Message ids.** The hash input is the exact trimmed Message-ID: one pair of angle brackets removed,
+nothing else changed (no case-folding, no first-token shortcut, no character substitution). `msg_`
+plus 16 hex of `BLAKE3(account, value)` is the mailbox-wide identity; a message without a usable
+header uses `msg_{folder}_{uidvalidity}_{uid}`. A second distinct message with the same Message-ID
+in the same folder cannot share that id: envelopes are processed in ascending UID order, so the
+second gets `msg_<hash>_<uid>`, and if that is taken (a duplicate in another folder with the same
+UID) `msg_<hash>_<uid>_<uidvalidity>`. The choice is deterministic and stable while the UID stays;
+if every candidate is taken the message is skipped with a warning rather than overwriting another
+row. The same Message-ID in another folder is a move: the row keeps its id and labels and the later
+folder wins `folder_id`. A message without a Message-ID that moves gets a new id, so its labels
+cannot follow; the old row is removed only after the new copy exists, at the end of a complete run.
 
 **Threading.** `thread_id` is the first `References` entry, else `In-Reply-To`, else the message's own
 Message-ID (or the local id when it has none), all without angle brackets. That is a stable
@@ -545,10 +554,12 @@ placeholder that links a reply to a root; full JWZ threading is P9.
 
 **Flags.** Server flags are applied only when a message is first inserted: `\Seen` becomes
 `unread = false`, `\Flagged` becomes `starred = true`. On later runs the local `unread`/`starred` are
-kept because M1 flags are local-only and M2 will push them. The deletion pass compares the server's
-flags with the local state and increments `SyncOutcome::updated_flags` for every difference; one
-warning per run says that local flags were kept. Sync never sends `STORE`, so a run cannot change the
-user's mail state on the server.
+kept because M1 flags are local-only and M2 will push them. The full UID/flags scan feeds drift
+detection in memory: one `folder_message_flags` query returns every cached id, UID and local
+read/star state, and each `UID FETCH a:b (UID FLAGS)` window is compared with that snapshot. There is
+no per-message flag query. `SyncOutcome::updated_flags` counts distinct messages per run; one warning
+says local flags were kept. Sync never sends `STORE`, so a run cannot change the user's mail state on
+the server.
 
 **UIDVALIDITY.** A different value means every cached UID describes a mailbox state that no longer
 exists. `reset_folder_messages` deletes the folder's server messages, attachments and label
@@ -557,13 +568,14 @@ clears the folder's `sync_state` and recounts the folder; the run records a warn
 UID 1. Rows without a UID survive every reset: local drafts and locally sent mail were never on the
 server, and rebuilding its cache must not discard them.
 
-**Deletions.** After a complete new-mail pass the reconciler fetches the full UID list per folder in
-the same bounded windows, removes cached rows whose UID is gone in one transaction
-(`delete_synced_messages`, which never touches a draft), and leaves the server untouched: no
-`EXPUNGE`, no `STORE`, no `DELETE`. The network client has no flags-only `FETCH`, so the list uses
-the envelope items it exposes and the extra fields are discarded. A run that stopped at
-`max_messages` has an incomplete view and skips the deletion pass for that folder, so a truncated
-pass cannot empty the cache.
+**Deletions are deferred and account-wide.** A per-folder deletion pass cannot tell a deleted message
+from one moved to a folder processed later: it would drop the row, and its labels, before the target
+copy was read. So each folder proposes `missing = cached_uids - live_uids` and the run deletes only
+after every folder has been scanned completely. Every id ingested anywhere in the run is tracked; a
+missing id seen in another folder is a move and is never deleted. A run stopped by `max_messages`, a
+cancellation or a folder that could not be selected deletes nothing. Each folder's deletion is one
+`delete_synced_messages` transaction (local drafts and rows without a UID are never candidates), and
+the server is never touched: no `EXPUNGE`, no `STORE`, no `DELETE`.
 
 **Attachments.** Each MIME part gets a deterministic id `att_{message_id}_{index}`. Bytes go through
 `Store::blobs().put` only when the part was decoded completely and is within
@@ -571,6 +583,11 @@ pass cannot empty the cache.
 oversized or truncated part keeps its metadata with `blob_hash = NULL` and produces a warning: the
 message is still readable. The effective single-part cap is the smaller of the sync limit and the MIME
 crate's 32 MiB hard part limit; the blob format's 64 MiB ceiling is the storage backstop.
+
+**MIME warnings.** Every `ParsedMessage.warnings` entry is mapped into the run warnings, prefixed with
+the local message id and deduplicated per run. A part-limit or depth warning therefore says that the
+attachment list may be incomplete instead of letting a truncated message look whole; a truncated body
+or a sanitizer strip is visible for the same reason.
 
 **Status.** `meta` key `sync_status:<account_id>` holds
 `{"state":"idle|syncing|error","last_attempt":ms,"last_success":ms|null,"error":sentence|null,
@@ -581,9 +598,10 @@ is the read-only helper for P6 and the CLI. `messages` counts messages ingested 
 those committed before a cancellation.
 
 **Cancellation.** The caller passes an `AtomicBool`; it is checked before connecting, before each
-folder, between batches and before each message. A cancelled run returns `SyncError::Cancelled` and
-every committed message stays. The next run resumes from `sync_state.uid_next`; the deletion pass is
-skipped for the interrupted folder because its UID list was never completed.
+folder, between new-mail batches, between UID/flags scan windows and before each message. A cancelled
+run returns `SyncError::Cancelled` and every committed message stays. The next run resumes from
+`sync_state.uid_next`; the whole-account deletion is skipped because no run that stopped early deletes
+anything.
 
 **Limits and counts.** `SyncLimits` defaults are 100 envelopes per fetch, 25 MiB per message, 25 MiB
 per attachment and 50 000 messages per run; every field is clamped to a usable range and the message
@@ -601,10 +619,14 @@ operation, CLI command, MCP tool or UI binding yet: P6 owns onboarding and those
 
 **Evidence.** The scripted server moved to `postino-testkit`, and the sync tests script real protocol
 exchanges: initial sync, incremental UIDs, UIDVALIDITY, deletion, flag drift, oversized attachment,
-message limit, three disconnect points, cancellation plus reopen, `BODY.PEEK`-only and an offline read
-through `Engine::open`. On the Windows GNU host in a debug build (opt-level 1, dependencies at 2), a
-2 000-message sync took 10.9-11.7 s with a 22.9 MB peak working set; 10 000 messages (behind
-`POSTINO_SLOW_TESTS=1`) took 47-56 s with 38.6 MB. The 2 000-message test asserts a 180 s budget.
+message limit, a move that keeps labels and read state, duplicate Message-IDs, missing and low
+`UIDNEXT`, `EXISTS 0`, an empty mailbox, an expunged body, cancellation during the flags scan, MIME
+warnings (a 300-part message), `max_messages` exhaustion with no deletion, three disconnect points,
+cancellation plus reopen, `BODY.PEEK`-only and an offline read through `Engine::open`. On the Windows
+GNU host in a debug build (opt-level 1, dependencies at 2), a 2 000-message sync took 9.1 s with a
+23.3 MB peak working set; 10 000 messages (`cargo test … -- --ignored ten_thousand_messages`) took
+37.3 s with 34.8 MB. The old per-folder deletion re-fetched 20 envelope windows at 2 000 messages;
+the flag scan costs one probe plus two 1 000-UID windows, which is why the run got faster.
 
 ## 5. Synchronization
 

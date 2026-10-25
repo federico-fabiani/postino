@@ -25,7 +25,9 @@ session.logout().await?;
 | `list` | `LIST "" "*"` |
 | `select` / `examine` | `SELECT "X"` / `EXAMINE "X"` |
 | `fetch_envelopes` | `UID FETCH <set> (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)` |
+| `fetch_uid_flags` | `UID FETCH <set> (UID FLAGS)`: the folder liveness scan, no envelope |
 | `fetch_body` | `UID FETCH <uid> (BODY.PEEK[])` |
+| `fetch_body_opt` | the same, but `None` when the UID has vanished instead of a protocol error |
 | `store_flags` | `UID STORE <set> +FLAGS.SILENT (...)` / `-FLAGS.SILENT` / `FLAGS.SILENT` |
 | `noop` | `NOOP` |
 | `idle` | `IDLE`, continuation, untagged events for at most `wait`, `DONE`, tagged `OK` |
@@ -35,8 +37,11 @@ Tags are `A0001`, `A0002`, ...; a response with any other tag is a `Protocol` er
 session. `BODY.PEEK[]` is used for bodies, never `BODY[]`: reading a message never sets `\Seen`.
 `UID STORE` is always `UID` and always silent. `fetch_body` refuses a body whose UID is not the one
 it asked for, and `fetch_envelopes` refuses a UID outside the requested set: a server that returns
-the wrong message must not be believed. `select` honours `OK [READ-ONLY]` on the tagged response,
-not only on an untagged one.
+the wrong message must not be believed. `fetch_uid_flags` applies the same rule to a UID/FLAGS-only
+response. `fetch_body_opt` returns `None` when the server answers a fetch of an expunged UID with a
+bare `OK` and no `FETCH`: a vanished message is a caller decision, not a protocol failure; the strict
+`fetch_body` keeps its old `Protocol` error for callers that need it. `select` honours
+`OK [READ-ONLY]` on the tagged response, not only on an untagged one.
 
 `RemoteFolder` carries both the decoded `name` (modified UTF-7 resolved) and the exact `wire_name`:
 pass `wire_name` back to `select`/`examine`, because re-encoding a decoded name can change bytes the
@@ -115,10 +120,11 @@ needs.
 - Integration tests against `postino-testkit`, a scripted TLS server with a throwaway `rcgen` CA
   (`extra_roots`), real sockets, exact command assertions, literals split across reads, delays,
   disconnects and STARTTLS mid-session:
-  `connection.rs`, `auth.rs`, `mailbox.rs`, `fetch.rs`, `idle.rs`, `tls.rs`, `failures.rs` and a
-  54-case hostile corpus in `hostile.rs` (bad tags, missing `*`, unterminated literals, huge and
-  negative numbers, `NIL` where a number belongs, deep nesting, oversized lines and more). Every
-  corpus case must return a typed error within three seconds.
+  `connection.rs`, `auth.rs`, `mailbox.rs`, `fetch.rs` (including a UID/FLAGS-only fetch and a
+  vanished body), `idle.rs`, `tls.rs`, `failures.rs` and a 54-case hostile corpus in `hostile.rs`
+  (bad tags, missing `*`, unterminated literals, huge and negative numbers, `NIL` where a number
+  belongs, deep nesting, oversized lines and more). Every corpus case must return a typed error
+  within three seconds.
 
 All integration tests use real TLS, not a bypass: the fake server presents a certificate for
 `localhost` signed by the test CA, and the client verifies it through the same platform verifier as
