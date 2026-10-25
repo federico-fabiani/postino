@@ -1,6 +1,6 @@
 # Delivery plan
 
-> **Status:** active · **Updated:** 2026-10-24 · **Owner:** coordinator
+> **Status:** active · **Updated:** 2026-10-26 · **Owner:** coordinator
 >
 > This document is the operating plan for the push from the M0/U0 shell to a finished v0.1. It is
 > not a second roadmap: milestones and scope stay in [ROADMAP.md](../ROADMAP.md).
@@ -66,8 +66,8 @@ Status: `todo` · `active` · `review` · `done`.
 | P0 | Screenshot harness | `--screenshot` states for shell, reading, compose, palette; dark variants; docs regenerated | done |
 | P0.1 | Harness hardening | frozen clock, strict flags, no-hang watchdog, atomic PNG, parser/PNG tests | done |
 | P1 | U0.5 labels | label create/rename/delete/apply/filter in engine, GUI, CLI, MCP; counts; keyboard | done |
-| P2a | Layout and modals | composer fits 980x600, modal palette, pinned sidebar editor, list proportions | todo |
-| P2b | States and a11y | empty/error/loading states, contrast floors, accessible rows, persistence, copy | todo |
+| P2a | Layout and modals | composer fits 980x600, modal palette, pinned sidebar editor, list proportions | done |
+| P2b | States and a11y | empty/error/loading states, contrast floors, accessible rows, persistence, copy | done |
 | P3d | Persistence correctness | atomic draft save, patch updates, account routing, revision and label sequences, keyring lock | done |
 | P3a | Store spike | SQLCipher go/no-go with measured build time, size and encrypted-file proof | done |
 | P3b | Store schema + keyring | platform keyring seam, schema v2, repository API, no-plaintext tests | done |
@@ -77,16 +77,19 @@ Status: `todo` · `active` · `review` · `done`.
 | P5a | IMAP client | CAPABILITY/LOGIN/LIST/SELECT/FETCH/IDLE, TLS, bounds, scripted fake server | done |
 | P5b | Sync and cache | reconciliation, offline cache, sync status, 10k/kill-resume tests | done |
 | P6a | Accounts backend | credentials, schema v4, account/sync operations, CLI and MCP, sensitive filtering | done |
-| P6b | M1 onboarding UI | autodiscovery screen, Aruba app-password flow, app on real data | todo |
-| P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | todo |
+| P6b | M1 onboarding UI | autodiscovery screen, Aruba app-password flow, app on real data | done |
+| P6c | M1 reading + settings | text reading pane, safe links, attachment Save, full settings, chrome cleanup | done |
+| P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | active |
 | P8 | M2 compose | attachments bytes, signatures per identity, scheduled send, undo send | todo |
 | P9 | M3 organize | threads, FTS5 search, rules, label mapping, attachment preview/save | todo |
 | P10 | M4 daemon | `postino-daemon`, named pipe/UDS + token, tray, autostart, clients | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
 
-P0-P2 close U0. P3-P6b make M1 real; P7-P8 close M2. Each package may split when the brief is too
-large; splits are recorded here.
+P0-P2 close U0. P3-P6c make M1 real; P7-P8 close M2. Each package may split when the brief is too
+large; splits are recorded here. P7 runs on its own branch and worktree so a blind P6c review can
+proceed with the warm main target; the branch merges only after `cargo xtask ci` is green and the
+review findings are triaged.
 
 ## 5. Delighters backlog
 
