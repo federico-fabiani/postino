@@ -3,13 +3,14 @@
 **Local-first, agent-first mail.** A fast, native email client written in Rust, with one operation
 registry shared by the desktop app, the CLI and an MCP server.
 
-> **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c).** The
-> shell, the operation registry, the CLI and the MCP server work against a synthetic demo mailbox,
-> and `postino --store <path>` can now run the same operations on the encrypted SQLCipher database:
-> accounts, folders, messages, labels, drafts and flags survive a restart. The desktop app still
-> boots on the demo until onboarding (P6). IMAP, MIME, SMTP and the background daemon land in
-> M1-M4. No real account is configured, no mail leaves the machine, and the composer's send is
-> explicitly a local demo.
+> **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c) + the
+> MIME crate (P4a).** The shell, the operation registry, the CLI and the MCP server work against a
+> synthetic demo mailbox, and `postino --store <path>` can now run the same operations on the
+> encrypted SQLCipher database: accounts, folders, messages, labels, drafts and flags survive a
+> restart. The desktop app still boots on the demo until onboarding (P6). MIME parsing,
+> sanitization and serialization exist as `postino-mime` but are not wired into the engine yet;
+> IMAP, SMTP and the background daemon land in M1-M4. No real account is configured, no mail leaves
+> the machine, and the composer's send is explicitly a local demo.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -43,6 +44,11 @@ MCP      ─┘
   v2, additive migrations and a typed repository (`postino-store`), plus the Windows Credential
   Manager key seam (`postino-platform`). `Engine::open` loads the mailbox once and writes every
   mutation through; `Engine::demo()` is unchanged and the desktop app still uses it.
+- The M1 MIME foundation as a crate (`postino-mime`, P4a): bounded RFC 5322/2045 parsing with
+  recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
+  `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
+  guards and `Bcc` kept in the envelope. It is not wired into the engine or the app yet, so the
+  shell still shows demo mail.
 - Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
   MCP protocol tests, and store round-trip tests at both the repository and engine level.
 
@@ -56,7 +62,7 @@ Everything below the UI is headless and has no egui dependency.
 
 ## Quick start
 
-Requires Rust 1.95 or newer.
+Requires Rust 1.98 or newer.
 
 ```sh
 # Desktop app (demo mailbox)

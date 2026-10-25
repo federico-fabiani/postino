@@ -1,0 +1,24 @@
+From: Phish <phish@example.com>
+To: Giulia <giulia@example.com>
+Subject: =?UTF-8?B?VW5hIG5vdml0w6A=?=
+Date: Sun, 25 Oct 2026 10:20:00 +0000
+Message-ID: <xss-001@example.com>
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+<html><body>
+<script>alert('x')</script>
+<img src="x" onerror="alert(1)">
+<a href="javascript:alert(2)">js</a>
+<a href="data:text/html;base64,PHNjcmlwdD4=">data</a>
+<a href="vbscript:msgbox(3)">vb</a>
+<a href="JaVaScRiPt:alert(4)">mixed</a>
+<a href="java&#115;cript:alert(5)">entity</a>
+<a href="//evil.example/x">protocol-relative</a>
+<iframe src="https://evil.example"></iframe>
+<form action="https://evil.example"><input name="x"><button>Invia</button></form>
+<svg onload="alert(6)"><text>svg</text></svg>
+<p style="color:red" onclick="alert(7)">Testo sicuro</p>
+<img src="data:image/png;base64,AAAA" alt="data">
+</body></html>

@@ -1,16 +1,17 @@
 # Postino architecture
 
-> **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c) ·
-> **Last updated:** 2026-10-25 · **Target:** a local-first, agent-first mail client that is fast on
-> every desktop.
+> **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c) + MIME
+> crate (P4a) · **Last updated:** 2026-10-25 · **Target:** a local-first, agent-first mail client
+> that is fast on every desktop.
 
 ## 1. Shape today
 
-One Cargo workspace, edition 2024, Rust 1.95+:
+One Cargo workspace, edition 2024, Rust 1.98+:
 
 | Path | Role |
 |---|---|
 | `crates/core` | Domain types, the engine (demo or store-backed), the operation registry and its JSON Schemas |
+| `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/platform` | OS seams; today the store key in the Windows Credential Manager |
 | `crates/store` | SQLCipher schema v2, migrations and the repository; the engine's persistence layer since P3c |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -100,7 +101,7 @@ decision and the migration path.
 | Crate | Responsibility |
 |---|---|
 | `postino-store` | SQLCipher schema, migrations, repository (P3b); FTS5 and encrypted blobs later |
-| `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards |
+| `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blobs P4b) |
 | `postino-net` | IMAP (IDLE, QRESYNC), SMTP submission, autodiscovery |
 | `postino-sync` | reconciliation, outbox with idempotency keys, drafts, flags, threading |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
@@ -232,8 +233,43 @@ saw creation order; P6 decides the real folder-tree order when onboarding writes
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
 a store. **Still missing:** onboarding and the default store path (P6), IMAP writers for
-`sync_state` (P5), MIME parsing and encrypted attachment blobs (P4), FTS5 (P9), outbox (P7), the
-daemon (M4).
+`sync_state` (P5), MIME wiring into the engine and encrypted attachment blobs (P4b), FTS5 (P9),
+outbox (P7), the daemon (M4).
+
+### 4.3 Implemented in P4a: the MIME crate
+
+`postino-mime` is a foundation crate: it parses, sanitizes and serializes, and it opens no socket,
+store or database. The engine still returns demo bodies until P4b wires `parse` into the repository.
+
+```
+raw bytes ──▶ parse (bounds, mail-parser) ──▶ Headers + body parts ──▶ sanitize HTML (ammonia)
+                                                                  └──▶ html_to_text alternative
+OutgoingMessage ──▶ validate headers ──▶ deterministic boundaries ──▶ RFC 5322 bytes + envelope
+```
+
+**Parsing.** `parse(raw, &Limits)` checks the raw size, the header-block size and a
+`Content-Type: multipart/...` pre-scan before the parser runs; `mail-parser` is then configured with
+the depth and part limits. Missing boundaries, truncated base64, unknown charsets and excessive
+nesting become `Warning`s, not a failed message. `ParsedMessage` exposes decoded headers, standard
+address fields, `text`, sanitized `html`, warnings, `remote_images_blocked` and bounded attachments;
+`message/rfc822` parts stay metadata-only. Bodies and attachments are disjoint: a part chosen as a
+body is never repeated as an attachment.
+
+**Sanitization.** `ParsedMessage::html` is always ammonia allowlist output. Remote images are
+removed; `http`/`https` sources are counted, `cid:` images survive with their `Content-ID`, and
+`javascript:`, `data:`, `vbscript:`, `file:`, relative and protocol-relative URLs never survive.
+CSS is not supported at all: this crate is the seam, not a second sanitizer. `html_to_text` is
+public and gives the plain alternative when a message has only HTML.
+
+**Serialization.** `serialize(&OutgoingMessage)` owns header folding, RFC 2047 B-encoding,
+quoted-printable, base64, RFC 2231 continuations, deterministic boundaries from a content hash and
+the generated `Message-ID`. Header injection is `MimeError::HeaderInjection`, never a strip. `Bcc`
+is validated, deduplicated into `Envelope.recipients`, and never appears in `raw`.
+
+**Next.** P4b stores the bounded attachment bytes as encrypted blobs and maps `ParsedMessage` onto
+the core `Address`/`Attachment` shapes; P5 supplies the IMAP bytes and P7 uses `serialize` for
+submission. The crate has no dependency on `postino-core`, so the mapping stays in the engine
+layer.
 
 ## 5. Synchronization
 
@@ -313,3 +349,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P3a: encrypted SQLCipher store proof and the build decision |
 | 2026-10-25 | major | P3b: platform keyring seam, schema v2, repository and tests |
 | 2026-10-25 | major | P3c: engine loads the store once and writes through; CLI `--store`; demo unchanged |
+| 2026-10-25 | major | P4a: `postino-mime` parses, sanitizes and serializes MIME with bounds, warnings and injection guards |

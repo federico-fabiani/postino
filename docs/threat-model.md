@@ -1,7 +1,7 @@
 # Postino threat model
 
-> **Status:** M0 · **Last updated:** 2026-10-23 · **Review:** before every release that touches
-> networking, storage, HTML rendering or MCP.
+> **Status:** M0 + M1 MIME parser (P4a) · **Last updated:** 2026-10-25 · **Review:** before every
+> release that touches networking, storage, HTML rendering or MCP.
 
 ## 1. What we protect
 
@@ -57,10 +57,14 @@
 
 ### 4.1 Malicious email
 
-- MIME parser: streaming, depth-limited, part-count-limited, tolerant but recorded. Fuzz with
-  `cargo-fuzz`; every finding becomes a synthetic regression test.
-- HTML: allowlist sanitizer (`ammonia` or equivalent), no `<script>`, no `<iframe>`, no forms, no
-  `javascript:`/`data:` navigation. CSS limited; remote URLs stripped.
+- MIME parser (`postino-mime`, P4a): raw size, header block, part count and multipart depth are
+  bounded before and inside the parser; decoded part size, total attachment bytes and HTML size are
+  capped. `message/rfc822` parts are not expanded. Malformed structure is repaired and recorded as
+  warnings. A mutation corpus runs in CI; `cargo-fuzz` and the network-fed corpus remain M6 work.
+- HTML (`postino-mime`, P4a): ammonia allowlist, no `<script>`, `<iframe>`, forms, SVG/MathML,
+  `style`, `class`/`id` or `on*`; `javascript:`, `vbscript:`, `data:`, `file:`, relative and
+  protocol-relative URLs never survive. Remote images are removed and `http`/`https` sources are
+  counted; `cid:` images survive. CSS is unsupported, not partially sanitized.
 - Links: show the destination, warn on punycode/IDN homographs, never auto-open.
 - Attachments: never auto-execute; warn on executables and macro-enabled documents; optional
   ClamAV integration later.

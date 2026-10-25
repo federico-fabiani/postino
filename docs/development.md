@@ -1,10 +1,11 @@
 # Development
 
-> **Status:** M0 + U0.5 labels + P3c engine on the encrypted store · **Last updated:** 2026-10-25
+> **Status:** M0 + U0.5 labels + P3c engine on the encrypted store + P4a MIME crate ·
+> **Last updated:** 2026-10-25
 
 ## 1. Toolchain
 
-- Rust 1.95+ (edition 2024).
+- Rust 1.98+ (edition 2024). The MIME crate's parser, `mail-parser` 1.0, sets the floor.
 - On Windows the active host is `x86_64-pc-windows-gnu`. `cargo test` needs `dlltool.exe` from
   MSYS2 MinGW:
 
@@ -49,6 +50,7 @@ cargo xtask assets --write                    # regenerate ATTRIBUTION.md
 
 ```
 crates/core/        domain, engine (demo or store-backed), operation registry, store_map
+crates/mime/        MIME parse/serialize, HTML sanitization, HTML-to-text, header guards
 crates/platform/    OS seams: the store key in the Windows Credential Manager
 crates/store/       encrypted SQLCipher store, schema v2, repository
 apps/postino-app/   egui shell (demo data until P6)
@@ -157,6 +159,10 @@ they have a reason to exist.
   read/move/delete, atomic batches, draft revisions across reopen, wrong key, schema-too-new and a
   no-plaintext scan over the database, WAL and SHM; plus the one-query-per-table mailbox hydration
   used by `Engine::open`.
+- **MIME:** ten synthetic fixtures (plain, alternative, HTML newsletter, nested mixed, RFC 2047,
+  RFC 2231, quoted-printable, XSS, malformed, injection), the allowlist scheme/attribute rules,
+  serializer round trip and injection rejection, Bcc absence, deterministic bytes, bounds and a
+  mutation corpus that must not panic. `cargo test -p postino-mime`.
 - **Engine on the store:** a demo-shaped fixture written to a temp store and reopened (accounts,
   folders, counts, messages, recipients, labels, attachments, flags), mutations surviving a reopen
   (draft revision, send, label apply/remove, move, read/star), a repository failure surfacing as
@@ -167,8 +173,8 @@ they have a reason to exist.
 - **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery,
   composer, sidebar label registry, label filter, inline create/rename and the multi-select label
   undo path. The test asserts the shell paints at least one shape.
-- **Future:** a fake IMAP/SMTP server, MIME fixtures, property tests for parsers, fuzzing for MIME
-  and HTML.
+- **Future:** a fake IMAP/SMTP server, property tests for the network parsers, fuzzing for MIME and
+  HTML.
 
 Run the full suite before a commit:
 

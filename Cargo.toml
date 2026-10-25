@@ -7,16 +7,19 @@ default-members = ["crates/*", "apps/postino-app", "apps/postino-cli", "xtask"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.95"
+rust-version = "1.98"
 repository = "https://github.com/federicopostino/postino"
 
 [workspace.dependencies]
 # internal
 postino-core = { path = "crates/core", version = "0.1.0" }
+postino-mime = { path = "crates/mime", version = "0.1.0" }
 postino-platform = { path = "crates/platform", version = "0.1.0" }
 postino-store = { path = "crates/store", version = "0.1.0" }
 
 # foundation
+mail-parser = { version = "=1.0.0", features = ["full_encoding"] }
+ammonia = "=4.2.4"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

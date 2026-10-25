@@ -1,0 +1,22 @@
+From: Giulia Ferri <giulia@example.com>
+To: Marco Verdi <marco@example.it>
+Subject: Relazione in allegato
+Date: Sun, 25 Oct 2026 10:00:00 +0000
+Message-ID: <rfc2231-001@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="rfc2231"
+
+--rfc2231
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+La relazione è in allegato.
+--rfc2231
+Content-Type: application/pdf
+Content-Disposition: attachment;
+ filename*0*=UTF-8''Relazione%20finale%20dell%27ufficio%20tecnico%20;
+ filename*1*=%E2%82%AC%20pronta.pdf
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJUVPRgo=
+--rfc2231--

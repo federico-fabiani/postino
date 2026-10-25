@@ -66,11 +66,14 @@ Status: `todo` · `active` · `review` · `done`.
 | P0 | Screenshot harness | `--screenshot` states for shell, reading, compose, palette; dark variants; docs regenerated | done |
 | P0.1 | Harness hardening | frozen clock, strict flags, no-hang watchdog, atomic PNG, parser/PNG tests | done |
 | P1 | U0.5 labels | label create/rename/delete/apply/filter in engine, GUI, CLI, MCP; counts; keyboard | done |
-| P2 | U0.5 polish | loading/error/empty states, reduced motion, a11y pass, final light/dark screenshots | todo |
+| P2a | Layout and modals | composer fits 980x600, modal palette, pinned sidebar editor, list proportions | todo |
+| P2b | States and a11y | empty/error/loading states, contrast floors, accessible rows, persistence, copy | todo |
+| P3d | Persistence correctness | atomic draft save, patch updates, account routing, revision and label sequences, keyring lock | todo |
 | P3a | Store spike | SQLCipher go/no-go with measured build time, size and encrypted-file proof | done |
 | P3b | Store schema + keyring | platform keyring seam, schema v2, repository API, no-plaintext tests | done |
 | P3c | Engine wiring | engine reads/writes the encrypted store; demo path unchanged; reopen test | done |
-| P4 | M1 MIME | parser/serializer, sanitized HTML subset, plain-text alternative, attachment storage | todo |
+| P4a | MIME crate | parse/serialize, sanitized HTML allowlist, text alternative, bounds and fixtures | done |
+| P4b | Attachment blobs | content-addressed encrypted blobs, engine/store plumbing, reopen test | todo |
 | P5 | M1 IMAP | CAPABILITY/LOGIN/LIST/SELECT/FETCH/IDLE, fake-server tests, offline cache | todo |
 | P6 | M1 onboarding | autodiscovery, Aruba app-password flow, multi-account model, real folder tree | todo |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | todo |

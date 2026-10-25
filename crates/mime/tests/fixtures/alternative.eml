@@ -1,0 +1,19 @@
+From: Studio Verdi <info@example.it>
+To: Giulia <giulia@example.com>
+Subject: =?UTF-8?Q?Aggiornamento_citt=C3=A0?=
+Date: Sun, 25 Oct 2026 09:20:00 +0000
+Message-ID: <alternative-001@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt-1"
+
+--alt-1
+Content-Type: text/plain; charset=iso-8859-1
+Content-Transfer-Encoding: quoted-printable
+
+Citt=E0, aggiornamento pronto.
+--alt-1
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+<html><body><p>Città, <strong>aggiornamento</strong> pronto.</p></body></html>
+--alt-1--

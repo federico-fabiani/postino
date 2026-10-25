@@ -1,13 +1,13 @@
 # Postino roadmap
 
-> **Current milestone:** U0 — UI foundation (M0 skeleton done) · **Last updated:** 2026-10-24
+> **Current milestone:** U0 — UI foundation (M0 skeleton done) · **Last updated:** 2026-10-25
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.
 
 ## M0 — walking skeleton (done)
 
-- [x] Cargo workspace, edition 2024, Rust 1.95+, MIT OR Apache-2.0.
+- [x] Cargo workspace, edition 2024, Rust 1.98+, MIT OR Apache-2.0.
 - [x] `postino-core` with domain types, demo engine and typed operations.
 - [x] JSON Schemas derived from Rust request types with `schemars`; unknown keys rejected.
 - [x] `postino` CLI: `info`, `tools`, `schema`, `accounts`, `folders`, `messages`, `read`,
@@ -59,7 +59,10 @@ interaction model before real mail makes them expensive to change. Full spec:
 
 - [x] SQLCipher store, migrations, WAL, key in the OS keyring (P3a-P3c; the CLI runs on it, the app
       still boots on demo until P6).
-- [ ] MIME parser/serializer, sanitized HTML, plain-text alternative, attachment storage.
+- [x] MIME parsing, allowlist HTML sanitization, HTML-to-text and RFC 5322 serialization as the
+      `postino-mime` crate (P4a): bounded input, warnings, header-injection guards, deterministic
+      bytes, ten synthetic fixtures and a mutation corpus.
+- [ ] Attachment blob storage and MIME wiring into the engine/store (P4b).
 - [ ] Account onboarding with autodiscovery and Aruba app-password flow.
 - [ ] IMAP: CAPABILITY, LOGIN/AUTH, LIST, SELECT, UID FETCH envelope/flags/body, IDLE.
 - [ ] Local cache and offline mode; folder tree from special-use attributes.

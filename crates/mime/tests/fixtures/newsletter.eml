@@ -1,0 +1,22 @@
+From: Notizie <notizie@example.com>
+To: iscritti@example.it
+Subject: =?UTF-8?B?Tm90aXppZSBkaSBvdHRvYnJl?=
+Date: Sun, 25 Oct 2026 09:30:00 +0000
+Message-ID: <newsletter-001@example.com>
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+<html>
+<head><style>body { color: #173D32 }</style></head>
+<body>
+<script>alert('tracking')</script>
+<h1>Notizie di ottobre</h1>
+<p>Le novità del mese, con una tabella e due immagini remote.</p>
+<img src="https://cdn.example.com/banner.png" alt="Banner di ottobre">
+<img src="https://tracker.example.com/pixel.gif" width="1" height="1" alt="">
+<table><thead><tr><th>Voce</th><th>Valore</th></tr></thead><tbody><tr><td>Alfa</td><td>1</td></tr></tbody></table>
+<ul><li>Prima novità</li><li>Seconda novità</li></ul>
+<p><a href="https://example.com/leggi">Leggi tutto</a></p>
+</body>
+</html>

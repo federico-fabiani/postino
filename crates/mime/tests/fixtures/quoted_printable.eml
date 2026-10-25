@@ -1,0 +1,25 @@
+From: Studio Verdi <info@example.it>
+To: Giulia <giulia@example.com>
+Subject: =?UTF-8?Q?Citt=C3=A0_e_relazione?=
+Date: Sun, 25 Oct 2026 10:10:00 +0000
+Message-ID: <quoted-001@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="qp-1"
+
+--qp-1
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Citt=C3=A0, ecco l'aggiornamento:
+
+- voce uno
+- voce due
+
+Allegato: relazione.pdf
+--qp-1
+Content-Type: application/pdf; name="relazione.pdf"
+Content-Disposition: attachment; filename="relazione.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJUVPRgo=
+--qp-1--

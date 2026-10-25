@@ -1,0 +1,24 @@
+From: Rotto <rotto@example.com>
+To: Giulia <giulia@example.com>
+Subject: Malformatoma tollerante
+Date: Sun, 25 Oct 2026 10:30:00 +0000
+Message-ID: <malformed-001@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer"
+
+--outer
+Content-Type: text/plain; charset=x-bogus
+Content-Transfer-Encoding: 7bit
+
+Testo con charset sconosciuto: ciao.
+--outer
+Content-Type: multipart/related; boundary="absent"
+
+preambolo senza delimitatore
+--outer
+Content-Type: application/pdf; name="troncato.pdf"
+Content-Disposition: attachment; filename="troncato.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJUVPRg$%^
+--outer--

@@ -1,0 +1,17 @@
+[package]
+name = "postino-mime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization"
+
+[dependencies]
+ammonia.workspace = true
+chrono.workspace = true
+mail-parser.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

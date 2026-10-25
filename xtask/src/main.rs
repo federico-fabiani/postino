@@ -82,6 +82,7 @@ fn layers() -> Result<()> {
         // The engine sits above the foundation: it owns the domain types and drives the encrypted
         // repository. The store never depends back on it.
         ("postino-core", &["postino-store"][..]),
+        ("postino-mime", &[][..]),
         ("postino-platform", &[][..]),
         ("postino-store", &[][..]),
         ("postino-app", &["postino-core"][..]),
@@ -102,7 +103,7 @@ fn layers() -> Result<()> {
                 bail!("layering: {} may not depend on workspace crate {}", package.name, dependency.name);
             }
         }
-        if matches!(package.name.as_str(), "postino-core" | "postino-platform" | "postino-store") {
+        if matches!(package.name.as_str(), "postino-core" | "postino-mime" | "postino-platform" | "postino-store") {
             for dependency in &package.dependencies {
                 if ui_crates.contains(&dependency.name.as_str()) {
                     bail!("layering: {} must stay headless, but depends on {}", package.name, dependency.name);
