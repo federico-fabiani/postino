@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1–U0.5 foundations implemented; P2a layout/modals done, P2b states/accessibility done · **Last updated:** 2026-10-25
+> **Status:** U0.1–U0.5 foundations, P2a/P2b and P6b onboarding/sync done · **Last updated:** 2026-10-25
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
@@ -422,6 +422,63 @@ su questo computer.` before the click. Attachments are metadata-only in M0, as i
   plain vs Shift J/K, loading delay, error toast, date column width and subject floor.
   Screenshots: shell/reading at 1280×720 and 980×600, light and dark, compose, palette, empty
   states and the refreshed attribution hashes.
+
+Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
+
+### P6b Onboarding, real mailbox and sync — done
+
+- **Boot.** A normal launch opens `%LOCALAPPDATA%\Postino\mail.db` (or `--store <path>`) with the
+  store key and every IMAP credential read through the `postino-platform` keyring adapter; `--demo`
+  keeps the synthetic mailbox and the status bar labels it. A store, keyring or data-directory
+  failure renders a recovery card with the path, the failing stage, an Italian explanation of the
+  keyring/archive and two actions, **Riprova** and **Apri la modalità demo**. It never panics and
+  never opens an empty mailbox in place of the user's own. A store with no accounts opens the
+  first-run wizard; a store with accounts shows the cache at once and starts one background refresh
+  for the active account.
+- **Onboarding** is a real state machine: Benvenuto → Provider (Aruba/Gmail/Altro, with host, port,
+  TLS implicit/STARTTLS for Altro) → Credenziali (name, address, masked password, Caps Lock hint,
+  zeroising buffer) → Cartelle (the server's selectable folders and mapped roles, plus Italian
+  warnings for missing roles) → Prima sincronizzazione (determinate folders/messages progress,
+  Cancel, Continue in background) → the mailbox. Back exists at every stage; Esc goes back and a
+  filled form asks once before discarding; Enter continues; focus is visible and follows a failed
+  connection to the field to fix. Every provider note and error class (wrong password, app
+  password/2FA, TLS, DNS, timeout, refused IMAP, no selectable folder) has its own Italian copy and
+  never prints server text or a secret. The connection test runs on a worker thread with the engine's
+  optional extra roots (tests trust the fake server's throwaway CA only).
+- **Sync worker.** One background thread owns its own store connection and opens an
+  `Engine::open_with_vault` for the account/server view. `SyncNow` / `Cancel` / `Stop` are commands;
+  `Started` / `Progress` / `Finished` / `Failed` are events. The worker drives
+  `postino_sync::sync_account` directly because `Engine::sync_now` has no cancellation flag or
+  progress hook; it polls the persisted status for determinate progress, coalesces queued requests
+  and never calls egui. A second request while running says `Sincronizzazione già in corso`. After a
+  run the UI reopens its own engine from the store and keeps selection, filters and the open message.
+- **Mailbox on store data.** The sidebar account block is the switcher (name, address, provider,
+  unread total; switch, add, manage): folders, counts, messages, labels and sync health come from the
+  active account only. The folder list has no demo entries when an account exists. Refresh now is the
+  toolbar sync button and runs the worker. The status bar says `Sincronizzazione… n/m cartelle · k
+  messaggi`, `Aggiornato alle HH:MM`, `Offline · ultimo sync HH:MM` or `Errore · motivo` with Retry;
+  the offline banner lives above the list and cached messages stay readable. A failed sync never
+  clears the list. Compose uses the active account identity (the composer shows `Da`), creates
+  drafts in that account and keeps the local-move send notice.
+- **Account management.** The account dialog lists accounts, adds one through the same onboarding,
+  removes one with a destructive confirmation that names the local cache and keyring credential,
+  and explains the return to onboarding when the last account goes. Theme and reduced motion stay in
+  the existing settings file, which now also remembers the opaque active account id; store path and
+  version stay read-only. The full settings page and licences remain P6c.
+- **Tests.** Headless boot (demo/store/empty/recovery), a fake-server onboarding run with the test
+  CA and an in-memory vault, each connection error class, cancel at every stage, keyboard-only
+  onboarding, 980×600 light/dark renders, worker progress/cancel/failure/second request/coalescing,
+  a real sync and a second reload preserving selection/filter/open message, offline keeps the list,
+  account switch/remove and compose identity. `cargo xtask ci` covers fmt, clippy, layers, assets and
+  the workspace tests.
+- **Screenshots.** `docs/images/postino-p6b-onboarding-welcome.png`, `-provider`, `-form`, `-error`,
+  `-folders`, `-sync`, `postino-p6b-mailbox.png`, `postino-p6b-offline.png`, dark variants for the
+  form, folders, mailbox and offline states, and the 980×600 folders and mailbox shots. The images
+  use the deterministic demo mailbox with seeded sync states; no real address, credential or store
+  is captured.
+- **Deferred to P6c.** Link opening with a scheme allowlist and destination preview, attachment Save
+  through rfd and its safety warnings, the full settings page and the remaining reading-pane
+  attachment affordances. HTML rendering, SMTP and OAuth remain later milestones.
 
 Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 

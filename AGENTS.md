@@ -8,8 +8,8 @@ If a rule here conflicts with a habit from another project, this file wins.
 Postino is a local-first, agent-first mail client written in Rust. The desktop app, the `postino`
 CLI and the `postino mcp` server are three clients of **one operation registry**. The engine runs on
 synthetic demo mail in memory or on the encrypted local store (`postino --store <path>`); accounts,
-credentials and IMAP sync exist (P6a), there is no SMTP and no daemon yet, and the desktop app still
-boots on the demo until P6b.
+credentials, IMAP sync and the desktop onboarding exist (P6a/P6b), there is no SMTP and no daemon
+yet, and the desktop app boots on the encrypted store with `--demo` as the synthetic fallback.
 
 **The current milestone is the only source of truth for scope.** Read `ROADMAP.md` before
 starting. Do not build M1 features into M0.

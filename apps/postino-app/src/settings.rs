@@ -1,5 +1,6 @@
-//! The few preferences the app owns across restarts: theme, reading-pane fraction and the last
-//! folder. Nothing here may ever carry draft text, message bodies, addresses or credentials.
+//! The few preferences the app owns across restarts: theme, reading-pane fraction, the last
+//! folder and the opaque active account id. Nothing here may ever carry draft text, message bodies,
+//! addresses or credentials.
 //!
 //! A missing or unreadable file is not an error the user has to see: every field has a default and
 //! every loaded value is sanitised before it reaches the shell.
@@ -15,6 +16,7 @@ pub const DEFAULT_READING_PANE_RATIO: f32 = 0.52;
 const MIN_READING_PANE_RATIO: f32 = 0.1;
 const MAX_READING_PANE_RATIO: f32 = 0.9;
 const MAX_FOLDER_ID: usize = 64;
+const MAX_ACCOUNT_ID: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +27,8 @@ pub struct Settings {
     pub reading_pane_ratio: f32,
     pub folder: String,
     pub reduced_motion: bool,
+    /// The account whose mailbox was last open. Opaque id only, never an address.
+    pub account: Option<String>,
 }
 
 impl Default for Settings {
@@ -35,6 +39,7 @@ impl Default for Settings {
             reading_pane_ratio: DEFAULT_READING_PANE_RATIO,
             folder: "inbox".to_owned(),
             reduced_motion: false,
+            account: None,
         }
     }
 }
@@ -54,6 +59,18 @@ impl Settings {
         if settings.folder.is_empty() || settings.folder.len() > MAX_FOLDER_ID || settings.folder.chars().any(|character| character.is_control()) {
             settings.folder = "inbox".to_owned();
         }
+        let account = settings.account.take().and_then(|account| {
+            let account = account.trim().to_owned();
+            if account.is_empty()
+                || account.len() > MAX_ACCOUNT_ID
+                || !account.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                None
+            } else {
+                Some(account)
+            }
+        });
+        settings.account = account;
         settings
     }
 
@@ -137,12 +154,20 @@ mod tests {
         assert_eq!(settings.reading_pane_ratio, 0.52);
         assert_eq!(settings.folder, "inbox");
         assert!(!settings.reduced_motion);
+        assert_eq!(settings.account, None);
     }
 
     #[test]
     fn a_saved_file_round_trips() {
         let path = path("round-trip");
-        let saved = Settings { dark: true, reading_pane_ratio: 0.47, folder: "archive".to_owned(), reduced_motion: true, ..Settings::default() };
+        let saved = Settings {
+            dark: true,
+            reading_pane_ratio: 0.47,
+            folder: "archive".to_owned(),
+            reduced_motion: true,
+            account: Some("acc_0123456789abcdef".to_owned()),
+            ..Settings::default()
+        };
         saved.save_to(&path).expect("the settings file");
         assert_eq!(Settings::load_from(&path), saved);
         assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists(), "the atomic write must clean its temp file");
@@ -180,12 +205,21 @@ mod tests {
         let path = path("no-mail");
         Settings { dark: true, ..Settings::default() }.save_to(&path).expect("the settings file");
         let text = std::fs::read_to_string(&path).expect("the settings file");
-        for forbidden in ["body", "subject", "to", "cc", "bcc", "password", "attachment"] {
+        for forbidden in ["\"body\"", "\"subject\"", "\"to\"", "\"cc\"", "\"bcc\"", "password", "attachment"] {
             assert!(!text.contains(forbidden), "settings must not persist {forbidden}: {text}");
         }
         let fields = serde_json::from_str::<serde_json::Value>(&text).expect("valid JSON");
         let keys = fields.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-        assert_eq!(keys.len(), 5, "only the five documented settings: {keys:?}");
+        assert_eq!(keys.len(), 6, "only the six documented settings: {keys:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_invalid_account_id_is_dropped() {
+        let long = "a".repeat(65);
+        for account in ["", "with space", "a:b", "../x", long.as_str()] {
+            let settings = Settings { account: Some((*account).to_owned()), ..Settings::default() };
+            assert_eq!(settings.sanitised().account, None, "{account:?}");
+        }
     }
 }

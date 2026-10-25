@@ -33,7 +33,9 @@
 ## 2. Commands
 
 ```sh
-cargo run -p postino-app                      # desktop shell, demo data (until P6b)
+cargo run -p postino-app                      # desktop shell, default encrypted store
+cargo run -p postino-app -- --demo            # synthetic mailbox, labelled in the status bar
+cargo run -p postino-app -- --store D:\tmp\mail.db
 cargo run -p postino-cli -- --demo info
 cargo run -p postino-cli -- --demo tools
 cargo run -p postino-cli -- --demo mcp        # stdio MCP server
@@ -58,7 +60,7 @@ crates/platform/    OS seams: store key and account credentials in the OS keyrin
 crates/store/       encrypted SQLCipher store, schema v4, repository, encrypted blob directory
 crates/sync/        one IMAP account into the store: folders, UIDs, MIME, blobs, status
 crates/testkit/     test-only fake IMAP server, TLS fixture and synthetic mail
-apps/postino-app/   egui shell (demo data until P6b)
+apps/postino-app/   egui shell (demo, store, onboarding, sync worker)
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks
 docs/               product, architecture, security, design, ADRs
@@ -95,24 +97,24 @@ authenticates an existing file before it deduplicates, so storing the same bytes
 damaged or foreign file; there is no separate repair command. A draft re-save keeps the stored hash
 and size of an attachment that survives, so a stale metadata size cannot shrink the read cap. There
 is no garbage collector yet: deleting a message leaves its blob, because the same content may belong
-to another message. Nothing in the CLI, the app or the operations calls the seam yet; sync (P5b) and
-the reading pane (P6) will.
+to another message. `postino-sync` writes received attachment bytes through the seam; the reading
+pane's Save action arrives with P6c.
 
 What is still demo or missing:
 
-- The desktop app always boots `Engine::demo_at`; the store is CLI-only until P6b onboarding chooses
-  the default path and the account it belongs to.
-- A fresh store has no accounts and no folders until `postino account add` writes the first one
-  (P6a). The onboarding UI is P6b. `postino --store <path> info` answers on a fresh store and the mail
-  commands report that no account is configured.
-- One process owns the store. There is no daemon, no pipe and no second writer (M4); the CLI and a
-  future app must not open the same file at once. Do not run two `postino --store` commands against
-  one database.
-- No IMAP, MIME, SMTP, FTS5, attachment bytes in the UI or operations, or scheduled send.
-  `draft_send` is still a local demo move to Sent and contacts no server. Attachment bytes have a
-  storage seam and tests but no caller yet.
-- `uid`, `Message-ID`, RFC 822 size and `in_reply_to` are not written by the engine; the columns
-  exist for P4/P5.
+- The desktop app boots the encrypted store by default and `--demo` keeps the synthetic mailbox for
+  screenshots and trials.
+- A fresh store has no accounts: the app opens onboarding, the CLI uses `postino account add`.
+  `postino --store <path> info` answers on a fresh store and the mail commands report that no account
+  is configured.
+- One app process owns the store and its background sync worker opens a second connection in the
+  same process; SQLite WAL and the busy timeout serialise them. There is no daemon, pipe or
+  cross-process lock yet (M4): do not run two `postino --store` commands against one database.
+- IMAP, MIME, attachment blobs, sync and real accounts exist (P5-P6). Still missing: SMTP and
+  scheduled send (P7), FTS5 search and threading (P9), the daemon (M4), HTML rendering (M5) and
+  Gmail OAuth (P12). `draft_send` is still a local move to Sent and contacts no server.
+- Sync writes `uid`, `Message-ID` and the RFC 822 size; local drafts keep them empty until they are
+  submitted.
 - The database file lives wherever `--store` points; Postino does not create the parent directory.
 
 A quick manual check that persistence works (unit level, no keyring):
@@ -242,6 +244,20 @@ cargo run -p postino-app -- --screenshot empty_unread --out docs/images/postino-
 cargo run -p postino-app -- --screenshot empty_attachments --out docs/images/postino-p2b-empty-attachments.png
 cargo run -p postino-app -- --screenshot empty_label_unread --out docs/images/postino-p2b-empty-label-unread.png
 cargo run -p postino-app -- --screenshot shell --size 980x600 --out tmp-shell-980.png
+cargo run -p postino-app -- --screenshot onboarding_welcome --out docs/images/postino-p6b-onboarding-welcome.png
+cargo run -p postino-app -- --screenshot onboarding_provider --out docs/images/postino-p6b-onboarding-provider.png
+cargo run -p postino-app -- --screenshot onboarding_form --out docs/images/postino-p6b-onboarding-form.png
+cargo run -p postino-app -- --screenshot onboarding_error --out docs/images/postino-p6b-onboarding-error.png
+cargo run -p postino-app -- --screenshot onboarding_folders --out docs/images/postino-p6b-onboarding-folders.png
+cargo run -p postino-app -- --screenshot onboarding_sync --out docs/images/postino-p6b-onboarding-sync.png
+cargo run -p postino-app -- --screenshot mailbox --out docs/images/postino-p6b-mailbox.png
+cargo run -p postino-app -- --screenshot offline --out docs/images/postino-p6b-offline.png
+cargo run -p postino-app -- --screenshot onboarding_form --dark --out docs/images/postino-p6b-onboarding-form-dark.png
+cargo run -p postino-app -- --screenshot onboarding_folders --dark --out docs/images/postino-p6b-onboarding-folders-dark.png
+cargo run -p postino-app -- --screenshot mailbox --dark --out docs/images/postino-p6b-mailbox-dark.png
+cargo run -p postino-app -- --screenshot offline --dark --out docs/images/postino-p6b-offline-dark.png
+cargo run -p postino-app -- --screenshot mailbox --size 980x600 --out docs/images/postino-p6b-mailbox-980.png
+cargo run -p postino-app -- --screenshot onboarding_folders --size 980x600 --out docs/images/postino-p6b-onboarding-folders-980.png
 ```
 
 The states are `shell` (demo inbox, no selection), `reading` (first inbox message open),
@@ -250,8 +266,12 @@ the docs fixture), `palette` (command palette open), `labels` (Lavoro filter act
 `label_menu` (a labelled message open with the modal label menu above its captured target),
 `label_editor` (the inline create editor open under the ETICHETTE header with a name typed),
 `empty_unread` (the inbox with every message read and the unread filter on), `empty_attachments`
-(inbox mail with attachments moved out and the attachments filter on) and `empty_label_unread`
-(Lavoro selected, its unread mail read, the unread filter on). `--dark` applies the dark theme.
+(inbox mail with attachments moved out and the attachments filter on), `empty_label_unread`
+(Lavoro selected, its unread mail read, the unread filter on), `onboarding_welcome`, `onboarding_provider`,
+`onboarding_form`, `onboarding_error`, `onboarding_folders`, `onboarding_sync`, `mailbox` (the shell
+with a seeded updated-at state) and `offline` (a cached message open under the offline banner). The
+onboarding and mailbox scenes are deterministic fixtures; they do not read a store or touch the
+network. `--dark` applies the dark theme.
 `--gallery` is a separate component review window, not a screenshot state, and cannot be combined
 with `--screenshot`.
 
@@ -272,9 +292,11 @@ but a window must be able to open and paint on the desktop. A watchdog exits 1 w
 20 s if the window never returns a surface; closing the window before the capture also exits 1.
 Flag errors exit 2, print the reason to stderr and write nothing.
 
-Only `--screenshot <state>`, `--out <path>`, `--dark`, `--native-chrome`, `--size WxH` and
-`--gallery` are accepted. Unknown flags, duplicate flags, `--flag=value` forms, a missing value and
-a value that is another flag are all refused. `--native-chrome` keeps the operating system title
+Only `--screenshot <state>`, `--out <path>`, `--dark`, `--native-chrome`, `--size WxH`,
+`--gallery`, `--demo` and `--store <path>` are accepted. Unknown flags, duplicate flags,
+`--flag=value` forms, a missing value and a value that is another flag are all refused. `--demo` and
+`--store` are mutually exclusive; a screenshot always uses the deterministic demo mailbox/none of
+the user's data, so `--store` is refused with `--screenshot`. `--native-chrome` keeps the operating system title
 bar; on macOS the native title bar is always used. Screenshots otherwise use the same chrome rule
 as a normal startup.
 
@@ -282,13 +304,14 @@ as a normal startup.
 
 The app owns one small settings file, not eframe storage:
 `%APPDATA%\Postino\settings.json` on Windows, `$XDG_CONFIG_HOME/Postino/settings.json` (or
-`~/.config/Postino/settings.json`) elsewhere. It holds exactly five fields: theme (`dark`), the
+`~/.config/Postino/settings.json`) elsewhere. It holds exactly six fields: theme (`dark`), the
 reading-pane fraction of the width left by the sidebar (`reading_pane_ratio`), the last folder id
-(`folder`) and `reduced_motion`, plus the schema `version`. Missing, truncated, unknown-version or
-out-of-range values fall back to the defaults (light, 0.52, `inbox`, motion on) without a dialog.
-The file is written atomically (`.tmp` then rename) at most once a second while a pane is dragged
-and once on exit; renaming, deleting or corrupting it is safe. It never carries draft text, message
-bodies, addresses or credentials, and a test asserts that.
+(`folder`), `reduced_motion`, the opaque active account id (`account`) and the schema `version`.
+Missing, truncated, unknown-version or out-of-range values fall back to the defaults (light, 0.52,
+`inbox`, motion on, no account) without a dialog. The file is written atomically (`.tmp` then rename)
+immediately for theme, folder, reduced motion and account changes, at most once a second while a pane
+is dragged and once on exit; renaming, deleting or corrupting it is safe. It never carries draft text,
+message bodies, addresses or credentials, and a test asserts that.
 
 `POSTINO_REDUCE_MOTION=1` forces reduced motion for one session (the persisted preference works
 too, and "Riduci le animazioni" in the palette toggles it). Reduced motion sets
@@ -300,6 +323,27 @@ UI-kit images predate it and are not reproduced by it. Regenerating a committed 
 its SHA-256 in `ATTRIBUTION.toml`: update the affected `sha256` entries, run
 `cargo xtask assets --write` to regenerate `ATTRIBUTION.md`, then run `cargo xtask assets` (or
 `cargo xtask ci`) to verify the hashes.
+
+## 9.2 Store, keyring and sync
+
+A normal launch opens `<data dir>/mail.db` (the same default as the CLI) or the file named by
+`--store`. The 256-bit SQLCipher key and every `account:<id>:imap` credential live in the OS keyring
+under the `postino` service; the app implements the engine's `CredentialVault` over
+`postino-platform`, so no password reaches a log, the settings file or the database. `--demo` keeps
+the synthetic in-memory mailbox and is the explicit fallback on the recovery screen. A store with
+accounts shows its cache immediately and starts one background refresh for the active account. When
+the store, the keyring or the data directory cannot be opened, the app shows the path, the failing
+stage and a retry; it does not start an empty mailbox.
+
+Sync runs on one worker thread with its own store connection and its own
+`Engine::open_with_vault`. The UI sends `SyncNow` / `Cancel` / `Stop`; the worker sends
+`Started` / `Progress` / `Finished` / `Failed` and never calls egui. `Engine::sync_now` has no cancel
+flag or progress hook, so the worker drives `postino_sync::sync_account` with the account row and the
+same vault, and polls the persisted sync status for determinate progress. After a run the UI reopens
+its engine from the store without clearing selection, filters or the open message; a connectivity
+failure keeps the cached list and turns the offline state on, while a credential or store failure
+shows its own reason with Retry. The tests cover a real fake-server onboarding, the test CA hook,
+cancellation, progress, a second request, and reload preservation.
 
 ## 10. Style
 

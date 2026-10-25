@@ -17,13 +17,26 @@ pub struct TextField<'a> {
     multiline: bool,
     rows: usize,
     focus: bool,
+    password: bool,
     id_salt: Option<Id>,
 }
 
 impl<'a> TextField<'a> {
     #[must_use]
     pub fn new(text: &'a mut String, hint: &'a str) -> Self {
-        Self { text, hint, label: None, leading_icon: None, error: None, width: None, multiline: false, rows: 3, focus: false, id_salt: None }
+        Self {
+            text,
+            hint,
+            label: None,
+            leading_icon: None,
+            error: None,
+            width: None,
+            multiline: false,
+            rows: 3,
+            focus: false,
+            password: false,
+            id_salt: None,
+        }
     }
 
     /// A stable id for a field whose layout may shift between passes, such as the palette search.
@@ -49,7 +62,7 @@ impl<'a> TextField<'a> {
 
     #[must_use]
     pub fn error(mut self, error: &'a str) -> Self {
-        self.error = Some(error);
+        self.error = (!error.is_empty()).then_some(error);
         self
     }
 
@@ -70,6 +83,13 @@ impl<'a> TextField<'a> {
     #[must_use]
     pub fn focus(mut self, focus: bool) -> Self {
         self.focus = focus;
+        self
+    }
+
+    /// Mask the value. The field never exposes the text in a tooltip or an accessible name.
+    #[must_use]
+    pub fn password(mut self, password: bool) -> Self {
+        self.password = password;
         self
     }
 
@@ -97,6 +117,7 @@ impl<'a> TextField<'a> {
                     .font(FontId::new(type_size::BODY_SMALL, FontFamily::Proportional))
                     .text_color(t.text)
                     .frame(Frame::NONE)
+                    .password(self.password)
                     .desired_width(f32::INFINITY)
                     .margin(Margin::ZERO);
                 if let Some(id_salt) = self.id_salt {

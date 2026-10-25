@@ -98,7 +98,10 @@ fn layers() -> Result<()> {
         // Test infrastructure: it may use the network types it scripts, and nothing may link it in
         // a production binary (enforced below).
         ("postino-testkit", &["postino-net"][..]),
-        ("postino-app", &["postino-core"][..]),
+        // The desktop app is the second production adapter of the credential seam: it opens the
+        // default store from the keyring, runs sync on its worker thread and probes a server during
+        // onboarding. It never depends on the CLI.
+        ("postino-app", &["postino-core", "postino-net", "postino-platform", "postino-store", "postino-sync", "postino-testkit"][..]),
         // The CLI is the production adapter between the engine's vault seam and the OS keyring; it
         // uses the network types only in its account/sync tests.
         ("postino-cli", &["postino-core", "postino-net", "postino-store", "postino-platform", "postino-testkit"][..]),

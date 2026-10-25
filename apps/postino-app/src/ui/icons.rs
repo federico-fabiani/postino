@@ -76,6 +76,8 @@ pub const TEXT_ITALIC: &str = regular::TEXT_ITALIC;
 pub const LIST_BULLETS: &str = regular::LIST_BULLETS;
 pub const QUOTES: &str = regular::QUOTES;
 pub const LINK: &str = regular::LINK;
+pub const LOCK: &str = regular::LOCK_SIMPLE;
+pub const GLOBE: &str = regular::GLOBE;
 
 /// An icon as rich text. Use with `ui.label`, a button label, or a painter galley.
 #[must_use]

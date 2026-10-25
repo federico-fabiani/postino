@@ -5,14 +5,16 @@ registry shared by the desktop app, the CLI and an MCP server.
 
 > **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
 > the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
-> store (P5b) + accounts, credentials and sync operations (P6a).** The shell, the operation registry,
-> the CLI and the MCP server work against a synthetic demo mailbox; `postino --store <path>` (or the
-> default `%LOCALAPPDATA%\Postino\mail.db` on Windows) runs the same operations on the encrypted
-> SQLCipher database, and the CLI can now add a real Aruba or Gmail account with an app password, test
-> it, sync it and remove it. Passwords live only in the OS keyring; **Windows Credential Manager is
-> the only keyring backend in this build**, and macOS/Linux fail at the platform seam until their
-> keychains land with packaging. The desktop app still boots on the demo
-> until onboarding (P6b). MIME parsing, sanitization and serialization exist as `postino-mime`;
+> store (P5b/P5c) + accounts, credentials and sync operations (P6a) + onboarding and the app on real
+> data (P6b).** The desktop app opens the encrypted SQLCipher store by default, offers a guided
+> Aruba/Gmail/custom onboarding with a real connection test and background sync, and reads cached
+> mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI and the MCP
+> server use the same operation registry: `postino --store <path>` (or the default
+> `%LOCALAPPDATA%\Postino\mail.db` on Windows) runs the same operations on the encrypted database,
+> and the CLI can add a real Aruba or Gmail account with an app password, test it, sync it and remove
+> it. Passwords live only in the OS keyring; **Windows Credential Manager is the only keyring backend
+> in this build**, and macOS/Linux fail at the platform seam until their keychains land with
+> packaging. MIME parsing, sanitization and serialization exist as `postino-mime`;
 > `postino-net` is an IMAP4rev1 client that logs in over TLS, lists folders, selects, fetches
 > envelopes and `BODY.PEEK[]` bodies, stores flags and idles; and `postino-sync` reconciles one
 > account into the encrypted store: folders with special-use, UIDVALIDITY resets, incremental UID
@@ -159,9 +161,9 @@ account is configured. An explicit `--store` on a read-only command must already
 is a usage error. Mutations (`account add`, `sync run`, account removal, draft/label/flag writes) may
 create the default store. Exit codes are 0 for success, 1 for an operation failure and 2 for a usage
 error, including `OpError::InvalidArgs` (missing `--yes`, an invalid address/name/endpoint, an unknown
-id) and malformed `postino run` arguments. The `add | test | list | remove` account commands and
-`sync run | status` are real, but the desktop app itself is still on the demo until P6b; Gmail OAuth
-is P12 and no SMTP connection is opened.
+id) and malformed `postino run` arguments. The `add | test | list | remove` account commands,
+`sync run | status` and the desktop onboarding all use the same encrypted store; Gmail OAuth is P12
+and no SMTP connection is opened.
 
 ### MCP
 

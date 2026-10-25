@@ -14,11 +14,15 @@ use eframe::egui::{
 };
 use postino_core::{
     Account, Address, Attachment, DraftSave, DraftSend, Engine, FolderKind, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary,
-    LabelUpdate, Message, MessageSummary, MessagesList, SearchResult,
+    LabelUpdate, Message, MessageSummary, MessagesList, SearchResult, SyncPhase,
 };
+use postino_net::CertificateDer;
 use serde_json::json;
 
+use crate::boot::{self, BootFailure, Launch, StoreHandle};
+use crate::onboarding::{self, ConnectionError, ErrorKind, FocusField, FolderPreview, FolderRole, FoldersPreview, Onboarding, ProviderChoice, Stage};
 use crate::settings::Settings;
+use crate::sync_worker::{SyncEvent, SyncProgress, SyncRequest, SyncWorker};
 use crate::theme::{self, GOLD, IVORY, Tokens};
 use crate::ui::icons;
 use crate::ui::tokens;
@@ -46,6 +50,14 @@ pub enum ScreenshotState {
     EmptyUnread,
     EmptyAttachments,
     EmptyLabelUnread,
+    OnboardingWelcome,
+    OnboardingProvider,
+    OnboardingForm,
+    OnboardingError,
+    OnboardingFolders,
+    OnboardingSync,
+    Mailbox,
+    Offline,
 }
 
 impl ScreenshotState {
@@ -62,9 +74,18 @@ impl ScreenshotState {
             "empty_unread" => Ok(Self::EmptyUnread),
             "empty_attachments" => Ok(Self::EmptyAttachments),
             "empty_label_unread" => Ok(Self::EmptyLabelUnread),
+            "onboarding_welcome" => Ok(Self::OnboardingWelcome),
+            "onboarding_provider" => Ok(Self::OnboardingProvider),
+            "onboarding_form" => Ok(Self::OnboardingForm),
+            "onboarding_error" => Ok(Self::OnboardingError),
+            "onboarding_folders" => Ok(Self::OnboardingFolders),
+            "onboarding_sync" => Ok(Self::OnboardingSync),
+            "mailbox" => Ok(Self::Mailbox),
+            "offline" => Ok(Self::Offline),
             other => Err(format!(
                 "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
-                 empty_unread, empty_attachments, empty_label_unread"
+                 empty_unread, empty_attachments, empty_label_unread, onboarding_welcome, onboarding_provider, onboarding_form, onboarding_error, \
+                 onboarding_folders, onboarding_sync, mailbox, offline"
             )),
         }
     }
@@ -116,6 +137,34 @@ const LABEL_APPLY_CHUNK: usize = 500;
 pub struct PostinoApp {
     engine: Engine,
     folder: String,
+    /// The account whose mail is on screen. Every folder view is scoped to it.
+    active_account: Option<String>,
+    /// `Some` only for a normal launch that opened the encrypted store. The sync worker and the
+    /// post-sync reload use this handle; a demo session has none.
+    store: Option<StoreHandle>,
+    store_path: Option<PathBuf>,
+    /// True for the synthetic mailbox, including a screenshot that seeds the store UI.
+    demo: bool,
+    /// The command line choice, so the recovery screen can retry the same store.
+    launch: Launch,
+    boot_failure: Option<BootFailure>,
+    onboarding: Option<Onboarding>,
+    sync_worker: Option<SyncWorker>,
+    sync_view: SyncView,
+    /// The account the running worker was asked to sync. Used to ignore late events from an account
+    /// the user has switched away from.
+    sync_account: Option<String>,
+    /// An account creation running on its own thread (it probes the server through the engine, so
+    /// the UI must not block on it).
+    add_account_job: Option<std::sync::mpsc::Receiver<Result<(String, String), String>>>,
+    /// Last successful sync instant, kept across a running attempt so an offline failure can still
+    /// say when the mailbox was last updated.
+    last_sync: Option<i64>,
+    show_accounts_menu: bool,
+    show_accounts_dialog: bool,
+    account_remove: Option<AccountRemoveState>,
+    /// Extra trust anchors for the fake server in tests. Empty in production.
+    extra_roots: Vec<CertificateDer<'static>>,
     /// Keyboard focus and the message shown in the reading pane.
     selected: Option<String>,
     /// The rows painted as selected. It always contains `selected` when non-empty.
@@ -190,19 +239,126 @@ pub struct PostinoApp {
 }
 
 impl PostinoApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, custom_chrome: bool) -> Self {
+    /// Normal desktop launch. The command line chose demo or a store; a failure is a recovery
+    /// screen, never a panic and never an empty mailbox.
+    pub fn launch(cc: &eframe::CreationContext<'_>, custom_chrome: bool, launch: Launch) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let settings_path = Settings::path();
         let settings = settings_path.as_deref().map_or_else(Settings::default, Settings::load_from);
         theme::apply(&cc.egui_ctx, settings.dark);
         let reduced = settings.reduced_motion || crate::settings::reduced_motion_from_env();
         theme::apply_motion(&cc.egui_ctx, reduced);
-        let mut app = Self::demo(custom_chrome);
+        let now = Utc::now();
+        let mut app = match boot::boot(launch.clone(), boot::KeySource::Keyring, now) {
+            Ok(booted) => Self::from_booted(booted, custom_chrome, now, launch, Vec::new()),
+            Err(failure) => Self::with_engine(Engine::empty(), None, false, Some(failure), launch, custom_chrome, now, Vec::new()),
+        };
         app.reading_ratio = settings.reading_pane_ratio;
         app.apply_settings(settings);
         app.reduced_motion = reduced;
         app.settings_path = settings_path;
+        // A later launch shows the cache first and refreshes it in the background; first-run
+        // onboarding has no account yet, and the demo has no server.
+        if !app.demo
+            && app.onboarding.is_none()
+            && let Some(account) = app.active_account.clone()
+        {
+            app.start_sync_for(Some(account));
+        }
         app
+    }
+
+    fn from_booted(booted: boot::Booted, custom_chrome: bool, now: DateTime<Utc>, launch: Launch, extra_roots: Vec<CertificateDer<'static>>) -> Self {
+        let boot::Booted { engine, store, demo } = booted;
+        Self::with_engine(engine, store, demo, None, launch, custom_chrome, now, extra_roots)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_engine(
+        engine: Engine,
+        store: Option<StoreHandle>,
+        demo: bool,
+        boot_failure: Option<BootFailure>,
+        launch: Launch,
+        custom_chrome: bool,
+        now: DateTime<Utc>,
+        extra_roots: Vec<CertificateDer<'static>>,
+    ) -> Self {
+        let labels_cache = engine.label_summaries();
+        let active_account = engine.accounts().first().map(|account| account.id.clone());
+        let folder = default_folder_for(&engine, active_account.as_deref());
+        let sync_view = if demo { SyncView::Idle { last_sync: None } } else { sync_view_for(&engine, active_account.as_deref()) };
+        let last_sync = last_sync_from(&sync_view);
+        let onboarding = (!demo && boot_failure.is_none() && engine.accounts().is_empty()).then(Onboarding::first_run);
+        let store_path = store.as_ref().map(|handle| handle.path().to_path_buf());
+        let sync_worker =
+            store.as_ref().map(|handle| SyncWorker::start(Box::new(crate::sync_worker::StoreSyncBackend::new(handle.clone(), extra_roots.clone()))));
+        Self {
+            engine,
+            folder,
+            active_account,
+            store,
+            store_path,
+            demo,
+            launch,
+            boot_failure,
+            onboarding,
+            sync_worker,
+            sync_view,
+            sync_account: None,
+            add_account_job: None,
+            last_sync,
+            show_accounts_menu: false,
+            show_accounts_dialog: false,
+            account_remove: None,
+            extra_roots,
+            selected: None,
+            selection: BTreeSet::new(),
+            anchor: None,
+            label_filter: None,
+            label_folder: None,
+            labels_cache,
+            label_editor: None,
+            label_delete: None,
+            label_menu: None,
+            pending_read: None,
+            toast: None,
+            query: String::new(),
+            unread_only: false,
+            attachments_only: false,
+            dark: false,
+            status: String::new(),
+            failure: None,
+            list_error_ack: false,
+            list_signature: String::new(),
+            loading: None,
+            show_about: false,
+            show_palette: false,
+            palette_query: String::new(),
+            palette_focus: false,
+            palette_selected: 0,
+            focus_search: false,
+            show_shortcuts: false,
+            shortcut_query: String::new(),
+            shortcut_focus: false,
+            scroll_to_selected: false,
+            now: 0.0,
+            now_utc: now,
+            custom_chrome,
+            reading_open: false,
+            reading_full: false,
+            reading_ratio: READING_PANE_DEFAULT_RATIO,
+            reduced_motion: false,
+            settings_path: None,
+            settings_dirty: false,
+            settings_saved_at: 0.0,
+            composer: ComposerState::closed(),
+            composer_return_focus: None,
+            composer_focus_pending: false,
+            row_ids: BTreeMap::new(),
+            focus_selected_row: false,
+            screenshot: None,
+        }
     }
 
     /// Build the shell in the exact state a docs screenshot shows. Used only by `--screenshot`;
@@ -360,75 +516,114 @@ impl PostinoApp {
                     self.open_label_menu(vec![id]);
                 }
             }
+            ScreenshotState::OnboardingWelcome => self.seed_onboarding_screenshot(Stage::Welcome, ProviderChoice::Aruba, None, None, None),
+            ScreenshotState::OnboardingProvider => self.seed_onboarding_screenshot(Stage::Provider, ProviderChoice::Gmail, None, None, None),
+            ScreenshotState::OnboardingForm => self.seed_onboarding_screenshot(Stage::Credentials, ProviderChoice::Aruba, None, None, None),
+            ScreenshotState::OnboardingError => self.seed_onboarding_screenshot(
+                Stage::Credentials,
+                ProviderChoice::Aruba,
+                None,
+                Some(ConnectionError {
+                    kind: ErrorKind::Password,
+                    message: "La password non è stata accettata da imaps.aruba.it. Controlla di averla digitata bene; se hai attivo il secondo fattore, serve una password per le app.".to_owned(),
+                    focus: FocusField::Password,
+                }),
+                None,
+            ),
+            ScreenshotState::OnboardingFolders => self.seed_onboarding_screenshot(Stage::Folders, ProviderChoice::Aruba, Some(demo_folders_preview()), None, None),
+            ScreenshotState::OnboardingSync => self.seed_onboarding_screenshot(
+                Stage::Sync,
+                ProviderChoice::Aruba,
+                Some(demo_folders_preview()),
+                None,
+                Some(SyncProgress { folders_done: 3, folders_total: 7, messages: 128 }),
+            ),
+            ScreenshotState::Mailbox => {
+                self.demo = false;
+                let last = self.now_utc.timestamp_millis() - 12 * 60 * 1000;
+                self.sync_view = SyncView::Idle { last_sync: Some(last) };
+                self.last_sync = Some(last);
+                self.status.clear();
+            }
+            ScreenshotState::Offline => {
+                self.demo = false;
+                let last = self.now_utc.timestamp_millis() - 87 * 60 * 1000;
+                self.sync_view = SyncView::Offline { last_sync: Some(last) };
+                self.last_sync = Some(last);
+                self.status.clear();
+                let first = self.visible_messages().0.first().map(|message| message.id.clone());
+                if let Some(id) = first {
+                    self.open_message(id);
+                    self.now = 1.0;
+                    self.maybe_complete_read();
+                    self.toast = None;
+                    self.status.clear();
+                }
+            }
         }
     }
 
+    fn seed_onboarding_screenshot(
+        &mut self,
+        stage: Stage,
+        provider: ProviderChoice,
+        preview: Option<FoldersPreview>,
+        error: Option<ConnectionError>,
+        sync: Option<SyncProgress>,
+    ) {
+        self.engine = Engine::empty();
+        self.demo = false;
+        self.store = None;
+        self.store_path = None;
+        self.active_account = None;
+        self.folder.clear();
+        self.labels_cache.clear();
+        self.clear_selection();
+        self.close_reading();
+        self.sync_view = SyncView::Idle { last_sync: None };
+        self.last_sync = None;
+        self.sync_worker = None;
+        self.boot_failure = None;
+        self.status.clear();
+        self.onboarding = Some(Onboarding::screenshot(stage, provider, preview, error, sync));
+    }
+
+    #[cfg(test)]
     fn demo(custom_chrome: bool) -> Self {
         Self::demo_at(custom_chrome, Utc::now())
     }
 
     fn demo_at(custom_chrome: bool, now: DateTime<Utc>) -> Self {
         let engine = Engine::demo_at(now);
-        let labels_cache = engine.label_summaries();
-        Self {
-            engine,
-            folder: "inbox".to_owned(),
-            selected: None,
-            selection: BTreeSet::new(),
-            anchor: None,
-            label_filter: None,
-            label_folder: None,
-            labels_cache,
-            label_editor: None,
-            label_delete: None,
-            label_menu: None,
-            pending_read: None,
-            toast: None,
-            query: String::new(),
-            unread_only: false,
-            attachments_only: false,
-            dark: false,
-            status: String::new(),
-            failure: None,
-            list_error_ack: false,
-            list_signature: String::new(),
-            loading: None,
-            show_about: false,
-            show_palette: false,
-            palette_query: String::new(),
-            palette_focus: false,
-            palette_selected: 0,
-            focus_search: false,
-            show_shortcuts: false,
-            shortcut_query: String::new(),
-            shortcut_focus: false,
-            scroll_to_selected: false,
-            now: 0.0,
-            now_utc: now,
-            custom_chrome,
-            reading_open: false,
-            reading_full: false,
-            reading_ratio: READING_PANE_DEFAULT_RATIO,
-            reduced_motion: false,
-            settings_path: None,
-            settings_dirty: false,
-            settings_saved_at: 0.0,
-            composer: ComposerState::closed(),
-            composer_return_focus: None,
-            composer_focus_pending: false,
-            row_ids: BTreeMap::new(),
-            focus_selected_row: false,
-            screenshot: None,
-        }
+        Self::with_engine(engine, None, true, None, Launch::Demo, custom_chrome, now, Vec::new())
     }
 
-    /// Adopt a loaded settings file. The folder is only accepted when the engine knows it; a
-    /// settings file from another mailbox falls back to the inbox instead of opening a blank view.
+    /// Adopt a loaded settings file. The account and the folder are only accepted when the engine
+    /// knows them; a settings file from another mailbox falls back to the first account and its
+    /// inbox instead of opening a blank view.
     fn apply_settings(&mut self, settings: Settings) {
         self.dark = settings.dark;
-        self.folder = if self.engine.folders().iter().any(|folder| folder.id == settings.folder) { settings.folder } else { "inbox".to_owned() };
+        if let Some(account) = settings.account
+            && self.engine.accounts().iter().any(|candidate| candidate.id == account)
+        {
+            self.active_account = Some(account);
+        }
+        if self.active_account.is_none() {
+            self.active_account = self.engine.accounts().first().map(|account| account.id.clone());
+        }
+        let folder_ok = self
+            .engine
+            .folders()
+            .iter()
+            .find(|folder| folder.id == settings.folder)
+            .is_some_and(|folder| self.active_account.as_deref() == Some(folder.account_id.as_str()));
+        self.folder = if folder_ok { settings.folder } else { default_folder_for(&self.engine, self.active_account.as_deref()) };
         self.reading_ratio = settings.reading_pane_ratio;
         self.reduced_motion = settings.reduced_motion;
+        if !self.demo {
+            self.sync_view = sync_view_for(&self.engine, self.active_account.as_deref());
+            self.last_sync = last_sync_from(&self.sync_view);
+        }
     }
 
     fn settings_snapshot(&self) -> Settings {
@@ -438,6 +633,7 @@ impl PostinoApp {
             reading_pane_ratio: self.reading_ratio,
             folder: self.folder.clone(),
             reduced_motion: self.reduced_motion,
+            account: self.active_account.clone(),
         }
     }
 
@@ -478,10 +674,569 @@ impl PostinoApp {
         self.persist_settings();
     }
 
+    fn active_account(&self) -> Option<&Account> {
+        let id = self.active_account.as_deref()?;
+        self.engine.accounts().iter().find(|account| account.id == id)
+    }
+
+    fn folder(&self, id: &str) -> Option<&postino_core::Folder> {
+        self.engine.folders().iter().find(|folder| folder.id == id)
+    }
+
+    fn folder_kind(&self, id: &str) -> Option<FolderKind> {
+        self.folder(id).map(|folder| folder.kind)
+    }
+
+    /// The folder of a role in the active account. Aggregate/starred rows are only returned when
+    /// that exact role is asked for.
+    fn folder_for_kind(&self, kind: FolderKind) -> Option<String> {
+        let active = self.active_account.as_deref()?;
+        self.folder_for_kind_in(active, kind)
+    }
+
+    fn folder_for_kind_in(&self, account: &str, kind: FolderKind) -> Option<String> {
+        self.engine.folders().iter().find(|folder| folder.account_id == account && folder.kind == kind).map(|folder| folder.id.clone())
+    }
+
+    fn active_folder_ids(&self) -> BTreeSet<String> {
+        let Some(active) = self.active_account.as_deref() else {
+            return BTreeSet::new();
+        };
+        self.engine.folders().iter().filter(|folder| folder.account_id == active).map(|folder| folder.id.clone()).collect()
+    }
+
+    fn can_add_account(&self) -> bool {
+        !self.demo && (self.store.is_some() || self.screenshot.is_some())
+    }
+
+    fn sync_ready(&self) -> bool {
+        !self.demo && (self.store.is_some() || self.screenshot.is_some()) && self.active_account.is_some()
+    }
+
+    fn sync_running(&self) -> bool {
+        matches!(self.sync_view, SyncView::Running(_)) || self.sync_worker.as_ref().is_some_and(SyncWorker::is_running)
+    }
+
+    fn request_sync(&mut self) {
+        if self.demo || self.store.is_none() {
+            self.status = "La modalità demo non ha un server da aggiornare".to_owned();
+            return;
+        }
+        let Some(account) = self.active_account.clone() else {
+            self.status = "Nessun account da sincronizzare".to_owned();
+            return;
+        };
+        let Some(worker) = self.sync_worker.as_mut() else {
+            self.status = "Il servizio di sincronizzazione non è disponibile".to_owned();
+            return;
+        };
+        match worker.request(Some(account.clone())) {
+            SyncRequest::Started => {
+                self.sync_account = Some(account);
+                self.sync_view = SyncView::Running(SyncProgress::default());
+                self.status = "Sincronizzazione avviata".to_owned();
+            }
+            SyncRequest::AlreadyRunning => self.status = "Sincronizzazione già in corso".to_owned(),
+        }
+    }
+
+    fn cancel_sync(&mut self) {
+        if let Some(worker) = &self.sync_worker {
+            worker.cancel();
+            self.status = "Annullamento della sincronizzazione…".to_owned();
+        }
+    }
+
+    /// Drain worker events once per frame. No event ever clears the list: a reload only replaces
+    /// the engine while the selection, filters and open message stay as they are.
+    fn handle_sync_events(&mut self) {
+        let events = {
+            let Some(worker) = &mut self.sync_worker else {
+                return;
+            };
+            worker.poll()
+        };
+        for event in events {
+            let event_account = match &event {
+                SyncEvent::Started { account } => account.clone(),
+                SyncEvent::Progress { account, .. } => account.clone(),
+                SyncEvent::Finished { report } => Some(report.account.clone()),
+                SyncEvent::Failed { account, .. } => account.clone(),
+            };
+            let active = self.active_account.clone();
+            let applies = event_account.is_none() || event_account.as_deref() == active.as_deref();
+            match event {
+                SyncEvent::Started { .. } => {
+                    if applies && !matches!(self.sync_view, SyncView::Running(_)) {
+                        if self.sync_account.is_none() {
+                            self.sync_account = event_account;
+                        }
+                        self.sync_view = SyncView::Running(SyncProgress::default());
+                    }
+                }
+                SyncEvent::Progress { progress, .. } => {
+                    if applies {
+                        self.sync_view = SyncView::Running(progress);
+                        if let Some(onboarding) = self.onboarding.as_mut() {
+                            onboarding.set_sync_progress(progress);
+                        }
+                    }
+                }
+                SyncEvent::Finished { report } => {
+                    self.reload_engine_after_sync(true);
+                    self.clear_sync_account(event_account.as_deref());
+                    if !applies {
+                        continue;
+                    }
+                    let last = self.last_sync.or_else(|| Some(self.now_utc.timestamp_millis()));
+                    self.last_sync = last;
+                    self.sync_view = SyncView::Idle { last_sync: last };
+                    self.status = format!("Sincronizzazione completata · {} messaggi aggiornati", report.fetched);
+                    if let Some(onboarding) = self.onboarding.as_mut() {
+                        onboarding.sync_finished();
+                    }
+                    self.finish_onboarding_if_synced();
+                }
+                SyncEvent::Failed { message, cancelled, offline, .. } => {
+                    self.reload_engine_after_sync(false);
+                    self.clear_sync_account(event_account.as_deref());
+                    if !applies {
+                        continue;
+                    }
+                    if cancelled {
+                        self.sync_view = SyncView::Idle { last_sync: self.last_sync };
+                        self.status = "Sincronizzazione annullata".to_owned();
+                    } else {
+                        self.sync_view = if offline {
+                            SyncView::Offline { last_sync: self.last_sync }
+                        } else {
+                            SyncView::Error { reason: message.clone(), last_sync: self.last_sync }
+                        };
+                        self.status = message.clone();
+                    }
+                    if let Some(onboarding) = self.onboarding.as_mut() {
+                        onboarding.sync_failed(message, cancelled);
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_sync_account(&mut self, event_account: Option<&str>) {
+        if event_account.is_none() || self.sync_account.as_deref() == event_account {
+            self.sync_account = None;
+        }
+    }
+
+    fn poll_add_account(&mut self) {
+        let result = {
+            let Some(receiver) = &self.add_account_job else {
+                return;
+            };
+            match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("La creazione dell'account si è interrotta. Riprova.".to_owned())),
+            }
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.add_account_job = None;
+        match result {
+            Ok((id, email)) => {
+                self.reload_engine_after_sync(false);
+                if !self.engine.accounts().iter().any(|account| account.id == id) {
+                    if let Some(onboarding) = self.onboarding.as_mut() {
+                        onboarding.account_failed("L'account è stato creato ma l'archivio non lo rilegge. Riapri l'app o riprova.".to_owned());
+                    }
+                    return;
+                }
+                if let Some(onboarding) = self.onboarding.as_mut() {
+                    onboarding.account_created(&id, &email);
+                }
+                self.active_account = Some(id.clone());
+                self.folder = default_folder_for(&self.engine, Some(&id));
+                self.labels_cache = self.engine.label_summaries();
+                self.ensure_sync_worker();
+                self.start_first_sync(&id);
+            }
+            Err(message) => {
+                if let Some(onboarding) = self.onboarding.as_mut() {
+                    onboarding.account_failed(message);
+                }
+            }
+        }
+    }
+
+    fn finish_onboarding_if_synced(&mut self) {
+        let Some(onboarding) = self.onboarding.as_ref() else {
+            return;
+        };
+        if !onboarding.sync_is_finished() {
+            return;
+        }
+        let account = onboarding.account_id().map(str::to_owned);
+        self.onboarding = None;
+        if let Some(account) = account {
+            self.enter_account(account);
+        }
+        self.status = "Account pronto".to_owned();
+    }
+
+    /// Reload the whole engine from the store after a sync. The old engine stays on screen if the
+    /// reopen fails, so a failed refresh is a message, never an empty mailbox.
+    fn reload_engine_after_sync(&mut self, report_failure: bool) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        match store.open_engine() {
+            Ok(engine) => {
+                self.engine = engine;
+                self.labels_cache = self.engine.label_summaries();
+                self.keep_view_state();
+            }
+            Err(error) => {
+                if report_failure {
+                    self.report_failure(format!("La sincronizzazione è riuscita ma l'archivio non si riapre: {error}"), false);
+                } else {
+                    log::warn!("the store could not be reopened after a failed sync: {error}");
+                }
+            }
+        }
+    }
+
+    /// Keep the selected id, the open message and every filter; repair only what no longer exists.
+    fn keep_view_state(&mut self) {
+        if let Some(account) = self.active_account.clone()
+            && !self.engine.accounts().iter().any(|candidate| candidate.id == account)
+        {
+            self.active_account = self.engine.accounts().first().map(|candidate| candidate.id.clone());
+        }
+        let folder_exists = self
+            .engine
+            .folders()
+            .iter()
+            .find(|folder| folder.id == self.folder)
+            .is_some_and(|folder| self.active_account.as_deref() == Some(folder.account_id.as_str()));
+        if !folder_exists {
+            self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
+        }
+        self.selection.retain(|id| self.engine.message(id).is_some());
+        if self.selected.as_deref().is_some_and(|id| self.engine.message(id).is_none()) {
+            self.selected = None;
+            self.reading_open = false;
+            self.reading_full = false;
+            self.pending_read = None;
+        }
+        if let Some(id) = self.selected.clone()
+            && self.selection.is_empty()
+        {
+            self.selection.insert(id);
+        }
+        self.row_ids.clear();
+    }
+
+    fn switch_account(&mut self, id: String) {
+        if !self.engine.accounts().iter().any(|account| account.id == id) {
+            self.status = "Account non trovato".to_owned();
+            return;
+        }
+        self.active_account = Some(id);
+        self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
+        self.query.clear();
+        self.unread_only = false;
+        self.attachments_only = false;
+        self.label_filter = None;
+        self.label_folder = None;
+        self.clear_selection();
+        self.close_reading();
+        self.labels_cache = self.engine.label_summaries();
+        if self.sync_worker.as_ref().is_some_and(SyncWorker::is_running) && self.sync_account.as_deref() == self.active_account.as_deref() {
+            self.sync_view = SyncView::Running(SyncProgress::default());
+        } else {
+            self.sync_view = sync_view_for(&self.engine, self.active_account.as_deref());
+        }
+        self.last_sync = last_sync_from(&self.sync_view);
+        if !self.sync_worker.as_ref().is_some_and(SyncWorker::is_running) {
+            self.sync_account = None;
+        }
+        self.mark_settings_dirty();
+        self.persist_settings();
+    }
+
+    /// Enter an account after onboarding: switch to it, choose its inbox, keep the worker running.
+    fn enter_account(&mut self, id: String) {
+        self.active_account = Some(id.clone());
+        self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
+        self.query.clear();
+        self.unread_only = false;
+        self.attachments_only = false;
+        self.label_filter = None;
+        self.label_folder = None;
+        self.clear_selection();
+        self.close_reading();
+        self.labels_cache = self.engine.label_summaries();
+        let view = sync_view_for(&self.engine, Some(&id));
+        self.last_sync = last_sync_from(&view);
+        if self.sync_worker.as_ref().is_some_and(SyncWorker::is_running) && self.sync_account.as_deref() == Some(id.as_str()) {
+            self.sync_view = SyncView::Running(SyncProgress::default());
+        } else {
+            self.sync_view = view;
+        }
+        self.mark_settings_dirty();
+        self.persist_settings();
+    }
+
+    fn remove_account(&mut self, state: &AccountRemoveState) {
+        if self.active_account.as_deref() == Some(state.id.as_str()) {
+            self.cancel_sync();
+        }
+        match self.engine.call("account_remove", json!({ "id": state.id, "confirm": true })) {
+            Ok(_) => self.after_account_removal(&state.id, None),
+            Err(error) => {
+                // The engine removes the store rows before the credential. A keyring refusal can
+                // therefore leave a readable warning while the account is already gone.
+                if self.engine.accounts().iter().any(|account| account.id == state.id) {
+                    self.report_failure(format!("Non è stato possibile rimuovere l'account: {}", op_error_copy(&error)), false);
+                    return;
+                }
+                self.after_account_removal(
+                    &state.id,
+                    Some(format!("Account rimosso, ma il portachiavi non ha eliminato la password: {}", op_error_copy(&error))),
+                );
+            }
+        }
+    }
+
+    fn after_account_removal(&mut self, removed: &str, warning: Option<String>) {
+        self.account_remove = None;
+        if self.sync_account.as_deref() == Some(removed) {
+            self.sync_account = None;
+        }
+        self.labels_cache = self.engine.label_summaries();
+        if self.active_account.as_deref() == Some(removed) {
+            self.active_account = self.engine.accounts().first().map(|account| account.id.clone());
+        }
+        if self.engine.accounts().is_empty() {
+            self.stop_sync_worker();
+            self.active_account = None;
+            self.folder.clear();
+            self.clear_selection();
+            self.close_reading();
+            self.query.clear();
+            self.label_filter = None;
+            self.label_folder = None;
+            self.sync_view = SyncView::Idle { last_sync: None };
+            self.last_sync = None;
+            self.onboarding = Some(Onboarding::first_run());
+            self.show_accounts_dialog = false;
+            self.status = "Account rimosso · configura un nuovo account".to_owned();
+        } else {
+            self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
+            self.clear_selection();
+            self.close_reading();
+            self.sync_view = sync_view_for(&self.engine, self.active_account.as_deref());
+            self.last_sync = last_sync_from(&self.sync_view);
+            self.status = warning.unwrap_or_else(|| "Account rimosso".to_owned());
+        }
+        self.mark_settings_dirty();
+        self.persist_settings();
+    }
+
+    fn stop_sync_worker(&mut self) {
+        if let Some(worker) = self.sync_worker.as_mut() {
+            worker.stop();
+        }
+        self.sync_worker = None;
+        self.sync_account = None;
+    }
+
+    fn ensure_sync_worker(&mut self) {
+        if self.sync_worker.is_some() {
+            return;
+        }
+        let Some(store) = &self.store else {
+            return;
+        };
+        self.sync_worker = Some(SyncWorker::start(Box::new(crate::sync_worker::StoreSyncBackend::new(store.clone(), self.extra_roots.clone()))));
+    }
+
+    fn open_demo(&mut self) {
+        self.stop_sync_worker();
+        self.engine = Engine::demo_at(self.now_utc);
+        self.demo = true;
+        self.store = None;
+        self.store_path = None;
+        self.boot_failure = None;
+        self.onboarding = None;
+        self.show_accounts_dialog = false;
+        self.show_accounts_menu = false;
+        self.active_account = self.engine.accounts().first().map(|account| account.id.clone());
+        self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
+        self.labels_cache = self.engine.label_summaries();
+        self.clear_selection();
+        self.close_reading();
+        self.query.clear();
+        self.unread_only = false;
+        self.attachments_only = false;
+        self.label_filter = None;
+        self.label_folder = None;
+        self.sync_view = SyncView::Idle { last_sync: None };
+        self.last_sync = None;
+        self.status = "Modalità demo".to_owned();
+        self.mark_settings_dirty();
+        self.persist_settings();
+    }
+
+    fn retry_boot(&mut self) {
+        let launch = self.launch.clone();
+        match boot::boot(launch.clone(), boot::KeySource::Keyring, self.now_utc) {
+            Ok(booted) => {
+                let replacement = Self::from_booted(booted, self.custom_chrome, self.now_utc, launch, self.extra_roots.clone());
+                let settings_path = self.settings_path.clone();
+                let settings = self.settings_snapshot();
+                *self = replacement;
+                self.settings_path = settings_path;
+                self.apply_settings(settings);
+            }
+            Err(failure) => self.boot_failure = Some(failure),
+        }
+    }
+
+    /// The one place onboarding actions become engine calls, worker commands and view changes.
+    fn handle_onboarding_action(&mut self, action: onboarding::Action) {
+        match action {
+            onboarding::Action::None => {}
+            onboarding::Action::OpenDemo => self.open_demo(),
+            onboarding::Action::Cancel => {
+                self.onboarding = None;
+                if self.engine.accounts().is_empty() {
+                    self.open_demo();
+                } else {
+                    self.status = "Configurazione annullata".to_owned();
+                }
+            }
+            onboarding::Action::AddAccount(setup) => {
+                let Some(handle) = self.store.clone() else {
+                    if let Some(onboarding) = self.onboarding.as_mut() {
+                        onboarding.account_failed("La modalità demo non ha un archivio locale.".to_owned());
+                    }
+                    return;
+                };
+                let (sender, receiver) = std::sync::mpsc::channel();
+                self.add_account_job = Some(receiver);
+                std::thread::spawn(move || {
+                    let result = match handle.open_engine() {
+                        Ok(mut engine) => engine.add_account(*setup).map(|view| (view.account.id, view.account.email)).map_err(add_account_copy),
+                        Err(error) => Err(format!("Non riesco ad aprire l'archivio locale: {error}")),
+                    };
+                    let _ = sender.send(result);
+                });
+            }
+            onboarding::Action::StartSync(id) => {
+                if let Some(onboarding) = self.onboarding.as_mut() {
+                    onboarding.sync_started();
+                }
+                self.start_sync_for(Some(id));
+            }
+            onboarding::Action::CancelSync => self.cancel_sync(),
+            onboarding::Action::Finish(id) => {
+                self.onboarding = None;
+                self.enter_account(id);
+                self.status = "Account pronto".to_owned();
+            }
+        }
+    }
+
+    fn start_first_sync(&mut self, id: &str) {
+        if let Some(onboarding) = self.onboarding.as_mut() {
+            onboarding.sync_started();
+        }
+        self.start_sync_for(Some(id.to_owned()));
+    }
+
+    fn start_sync_for(&mut self, account: Option<String>) {
+        let Some(worker) = self.sync_worker.as_mut() else {
+            let message = "La modalità demo non ha un server da aggiornare".to_owned();
+            self.status = message.clone();
+            if let Some(onboarding) = self.onboarding.as_mut() {
+                onboarding.sync_failed(message, false);
+            }
+            return;
+        };
+        match worker.request(account.clone()) {
+            SyncRequest::Started => {
+                self.sync_account = account.or_else(|| self.active_account.clone());
+                self.sync_view = SyncView::Running(SyncProgress::default());
+                self.status = "Sincronizzazione avviata".to_owned();
+            }
+            SyncRequest::AlreadyRunning => {
+                let message = "C'è già una sincronizzazione in corso. Riprova tra poco.".to_owned();
+                self.status = "Sincronizzazione già in corso".to_owned();
+                if let Some(onboarding) = self.onboarding.as_mut() {
+                    onboarding.sync_failed(message, false);
+                }
+            }
+        }
+    }
+
+    fn sync_text(&self) -> Option<String> {
+        if self.demo {
+            return None;
+        }
+        match &self.sync_view {
+            SyncView::Running(progress) => Some(if progress.folders_total > 0 {
+                format!("Sincronizzazione… {}/{} cartelle · {} messaggi", progress.folders_done, progress.folders_total, progress.messages)
+            } else {
+                "Sincronizzazione…".to_owned()
+            }),
+            SyncView::Idle { last_sync: Some(ms) } => Some(format!("Aggiornato alle {}", format_millis(*ms))),
+            SyncView::Idle { last_sync: None } => Some("Mai sincronizzato".to_owned()),
+            SyncView::Offline { last_sync: Some(ms) } => Some(format!("Offline · ultimo sync {}", format_millis(*ms))),
+            SyncView::Offline { last_sync: None } => Some("Offline · nessuna sincronizzazione".to_owned()),
+            SyncView::Error { reason, .. } => Some(format!("Errore · {reason}")),
+        }
+    }
+
+    fn sync_needs_retry(&self) -> bool {
+        matches!(self.sync_view, SyncView::Offline { .. } | SyncView::Error { .. })
+    }
+
+    fn account_unread(&self, account_id: &str) -> u32 {
+        self.engine
+            .folders()
+            .iter()
+            .filter(|folder| folder.account_id == account_id && folder.kind != FolderKind::Starred)
+            .fold(0, |total, folder| total.saturating_add(folder.unread))
+    }
+
+    /// The starred view is a virtual folder: the core count is mailbox-wide, while the sidebar and
+    /// list must show only the active account. Compute the same filtered totals here.
+    fn starred_counts(&self, account_id: &str) -> (u32, u32) {
+        let folders =
+            self.engine.folders().iter().filter(|folder| folder.account_id == account_id).map(|folder| folder.id.as_str()).collect::<BTreeSet<_>>();
+        self.engine
+            .messages()
+            .iter()
+            .filter(|message| folders.contains(message.summary.folder_id.as_str()) && message.summary.starred)
+            .fold((0, 0), |(total, unread), message| (total.saturating_add(1), unread.saturating_add(if message.summary.unread { 1 } else { 0 })))
+    }
+
     /// The honest tri-state shown by the status bar. `Errore` is a real failure that has not been
     /// dismissed; `Pronto` is a store-backed engine; `Demo` is synthetic mail in memory.
     fn status_kind(&self) -> StatusKind {
-        status_kind(self.engine.is_demo(), self.failure.is_some())
+        let sync_error = matches!(self.sync_view, SyncView::Error { .. });
+        if self.failure.is_some() || sync_error || self.boot_failure.is_some() {
+            return StatusKind::Error;
+        }
+        if self.demo {
+            return StatusKind::Demo;
+        }
+        if matches!(self.sync_view, SyncView::Offline { .. }) {
+            return StatusKind::Offline;
+        }
+        StatusKind::Ready
     }
 
     /// One place for every operation failure: an Italian sentence, a red status dot and a single
@@ -597,7 +1352,7 @@ impl PostinoApp {
                 secondary: None,
             };
         }
-        if self.folder == "drafts" {
+        if self.folder_kind(&self.folder) == Some(FolderKind::Drafts) {
             return EmptyView {
                 icon: icons::DRAFTS,
                 title: "Nessuna bozza".to_owned(),
@@ -606,7 +1361,7 @@ impl PostinoApp {
                 secondary: None,
             };
         }
-        if self.folder == "inbox" {
+        if self.folder_kind(&self.folder) == Some(FolderKind::Inbox) {
             return EmptyView {
                 icon: icons::INBOX,
                 title: "Nessun messaggio".to_owned(),
@@ -619,7 +1374,7 @@ impl PostinoApp {
             icon: icons::INBOX,
             title: "Nessun messaggio".to_owned(),
             body: "Questa cartella è vuota.".to_owned(),
-            primary: Some(("Vai a Posta in arrivo", EmptyAction::Inbox)),
+            primary: self.folder_for_kind(FolderKind::Inbox).is_some().then_some(("Vai a Posta in arrivo", EmptyAction::Inbox)),
             secondary: None,
         }
     }
@@ -645,13 +1400,28 @@ impl PostinoApp {
             EmptyAction::ClearAttachments => self.attachments_only = false,
             EmptyAction::ClearSearch => self.query.clear(),
             EmptyAction::Compose => self.compose_new(),
-            EmptyAction::Inbox => self.select_folder("inbox"),
+            EmptyAction::Inbox => {
+                if let Some(folder) = self.folder_for_kind(FolderKind::Inbox) {
+                    self.select_folder(folder);
+                }
+            }
         }
         self.list_error_ack = false;
     }
 
     fn select_folder(&mut self, folder: impl Into<String>) {
-        self.folder = folder.into();
+        let folder = folder.into();
+        if !self
+            .engine
+            .folders()
+            .iter()
+            .find(|candidate| candidate.id == folder)
+            .is_some_and(|candidate| self.active_account.as_deref() == Some(candidate.account_id.as_str()))
+        {
+            self.status = "Cartella non disponibile per questo account".to_owned();
+            return;
+        }
+        self.folder = folder;
         // A folder click narrows an active label view to the intersection instead of dropping the
         // filter; "Mostra tutte" is the explicit way back to the whole mail list.
         if self.label_filter.is_some() {
@@ -1111,8 +1881,10 @@ impl PostinoApp {
             RowAction::Label => self.open_label_menu(targets),
             RowAction::Star => self.set_starred_many(&targets, true),
             RowAction::Unstar => self.set_starred_many(&targets, false),
-            RowAction::Archive => self.move_many(&targets, "archive", "Messaggio archiviato", "Messaggi archiviati"),
-            RowAction::Delete => self.move_many(&targets, "trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            RowAction::Archive => self.move_many_to_kind(&targets, FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati"),
+            RowAction::Delete => {
+                self.move_many_to_kind(&targets, FolderKind::Trash, "Messaggio spostato nel cestino", "Messaggi spostati nel cestino")
+            }
         }
     }
 
@@ -1186,8 +1958,10 @@ impl PostinoApp {
             Some(BulkAction::Unread) => self.set_unread_many(&ids, true),
             Some(BulkAction::Star) => self.set_starred_many(&ids, true),
             Some(BulkAction::Unstar) => self.set_starred_many(&ids, false),
-            Some(BulkAction::Archive) => self.move_many(&ids, "archive", "Messaggio archiviato", "Messaggi archiviati"),
-            Some(BulkAction::Delete) => self.move_many(&ids, "trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            Some(BulkAction::Archive) => self.move_many_to_kind(&ids, FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati"),
+            Some(BulkAction::Delete) => {
+                self.move_many_to_kind(&ids, FolderKind::Trash, "Messaggio spostato nel cestino", "Messaggi spostati nel cestino")
+            }
             Some(BulkAction::Clear) => self.clear_selection(),
             None => {}
         }
@@ -1199,9 +1973,21 @@ impl PostinoApp {
         self.pending_read = None;
     }
 
-    fn move_selected(&mut self, folder: &str, confirmation: &str, plural: &str) {
+    fn move_selected(&mut self, kind: FolderKind, confirmation: &str, plural: &str) {
         let ids = self.action_ids();
-        self.move_many(&ids, folder, confirmation, plural);
+        self.move_many_to_kind(&ids, kind, confirmation, plural);
+    }
+
+    fn move_many_to_kind(&mut self, ids: &[String], kind: FolderKind, confirmation: &str, plural: &str) {
+        let Some(folder) = self.folder_for_kind(kind) else {
+            self.status = match kind {
+                FolderKind::Trash => "Il server non ha una cartella Cestino".to_owned(),
+                FolderKind::Archive => "Il server non ha una cartella Archivio".to_owned(),
+                _ => "Il server non ha una cartella adatta".to_owned(),
+            };
+            return;
+        };
+        self.move_many(ids, &folder, confirmation, plural);
     }
 
     fn move_many(&mut self, ids: &[String], folder: &str, confirmation: &str, plural: &str) {
@@ -1435,7 +2221,13 @@ impl PostinoApp {
                 }
             }
             UndoAction::Send(id) => {
-                if self.engine.call("message_move", json!({ "id": id, "folder": "drafts" })).is_err() {
+                let account =
+                    self.engine.message(&id).and_then(|message| self.folder(&message.summary.folder_id)).map(|folder| folder.account_id.clone());
+                if let Some(drafts) = account.as_deref().and_then(|account| self.folder_for_kind_in(account, FolderKind::Drafts)) {
+                    if self.engine.call("message_move", json!({ "id": id, "folder": drafts })).is_err() {
+                        failed = true;
+                    }
+                } else {
                     failed = true;
                 }
             }
@@ -1502,12 +2294,17 @@ impl PostinoApp {
         let label_scoped = self.label_filter.is_some();
         let list_folder = if label_scoped { self.label_folder.clone() } else { Some(self.folder.clone()) };
         let search_folder = if label_scoped { self.label_folder.clone() } else { None };
+        let account = self.active_account.clone();
+        if account.is_none() || (list_folder.as_deref().is_none_or(str::is_empty) && self.label_filter.is_none()) {
+            return (Vec::new(), 0, 0);
+        }
         let (name, args) = if searching {
             ("search", json!({ "query": self.query, "label": self.label_filter, "folder": search_folder, "limit": 200 }))
         } else {
             (
                 "messages_list",
                 json!({
+                    "account": account,
                     "folder": list_folder,
                     "unread_only": self.unread_only,
                     "with_attachments": self.attachments_only,
@@ -1516,10 +2313,12 @@ impl PostinoApp {
                 }),
             )
         };
+        let active_folders = self.active_folder_ids();
         match self.engine.call(name, args) {
             Ok(value) if searching => match serde_json::from_value::<SearchResult>(value) {
                 Ok(result) => {
                     let mut rows = result.messages;
+                    rows.retain(|message| active_folders.contains(&message.folder_id));
                     if self.unread_only {
                         rows.retain(|message| message.unread);
                     }
@@ -1536,7 +2335,15 @@ impl PostinoApp {
                 }
             },
             Ok(value) => match serde_json::from_value::<MessagesList>(value) {
-                Ok(result) => (result.messages, result.total, result.unread),
+                Ok(mut result) => {
+                    result.messages.retain(|message| active_folders.contains(&message.folder_id));
+                    if self.folder_kind(&self.folder) == Some(FolderKind::Starred) {
+                        let (total, unread) = self.starred_counts(self.active_account.as_deref().unwrap_or_default());
+                        result.total = usize::try_from(total).unwrap_or(usize::MAX);
+                        result.unread = usize::try_from(unread).unwrap_or(usize::MAX);
+                    }
+                    (result.messages, result.total, result.unread)
+                }
                 Err(_) => {
                     self.report_list_failure();
                     (Vec::new(), 0, 0)
@@ -1550,6 +2357,16 @@ impl PostinoApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Onboarding and account dialogs own their keyboard. The shell must not steal J/K/Enter
+        // while a first-run form or a modal is in front of it.
+        if self.boot_failure.is_some()
+            || self.onboarding.is_some()
+            || self.show_accounts_menu
+            || self.show_accounts_dialog
+            || self.account_remove.is_some()
+        {
+            return;
+        }
         // The inline label field owns Enter/Escape only while it really has focus. Otherwise a
         // composer field or the global map keeps the keys instead of a hidden editor swallowing
         // them.
@@ -1742,10 +2559,10 @@ impl PostinoApp {
             self.toggle_star();
         }
         if archive {
-            self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati");
+            self.move_selected(FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati");
         }
         if delete {
-            self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino");
+            self.move_selected(FolderKind::Trash, "Messaggio spostato nel cestino", "Messaggi spostati nel cestino");
         }
         if undo {
             self.undo_last();
@@ -1764,19 +2581,22 @@ impl PostinoApp {
     }
 
     fn mark_all_read(&mut self, folder: &str) {
+        let starred = self.folder_kind(folder) == Some(FolderKind::Starred);
+        let active_folders = self.active_folder_ids();
         let ids = self
             .engine
             .messages()
             .iter()
             .filter(|message| message.summary.unread)
-            .filter(|message| if folder == "starred" { message.summary.starred } else { message.summary.folder_id == folder })
+            .filter(|message| active_folders.contains(&message.summary.folder_id))
+            .filter(|message| if starred { message.summary.starred } else { message.summary.folder_id == folder })
             .map(|message| message.summary.id.clone())
             .collect::<Vec<_>>();
         self.set_unread_many(&ids, false);
     }
 
     fn account(&self) -> Option<&Account> {
-        self.engine.accounts().first()
+        self.active_account()
     }
 
     fn start_composer(&mut self, mut state: ComposerState) {
@@ -1904,6 +2724,10 @@ impl PostinoApp {
             && let Some(object) = args.as_object_mut()
         {
             object.insert("id".to_owned(), json!(id));
+        } else if let Some(account) = &self.active_account
+            && let Some(object) = args.as_object_mut()
+        {
+            object.insert("account".to_owned(), json!(account));
         }
         let result = self.engine.call("draft_save", args);
         match result {
@@ -1979,13 +2803,19 @@ impl PostinoApp {
             return;
         }
         if let Some(id) = self.composer.draft_id.clone()
-            && self.engine.message(&id).is_some()
+            && let Some(message) = self.engine.message(&id)
         {
-            match self.engine.call("message_move", json!({ "id": id, "folder": "trash" })) {
+            let account = self.folder(&message.summary.folder_id).map(|folder| folder.account_id.clone());
+            let previous = message.summary.folder_id.clone();
+            let Some(trash) = account.as_deref().and_then(|account| self.folder_for_kind_in(account, FolderKind::Trash)) else {
+                self.composer.mark_failed("Il server non ha una cartella Cestino.", self.now);
+                return;
+            };
+            match self.engine.call("message_move", json!({ "id": id, "folder": trash })) {
                 Ok(_) => {
                     self.composer = ComposerState::closed();
                     self.status = "Bozza spostata nel cestino".to_owned();
-                    self.push_toast("Bozza scartata", UndoAction::Move(vec![(id, "drafts".to_owned())]));
+                    self.push_toast("Bozza scartata", UndoAction::Move(vec![(id, previous)]));
                 }
                 Err(_) => self.composer.mark_failed("Non è stato possibile spostare la bozza nel cestino.", self.now),
             }
@@ -2029,6 +2859,12 @@ impl PostinoApp {
             && self.now - started < LOADING_DELAY
         {
             ctx.request_repaint_after(Duration::from_secs_f64(LOADING_DELAY - (self.now - started)));
+        }
+        if self.sync_worker.as_ref().is_some_and(SyncWorker::is_running) || matches!(self.sync_view, SyncView::Running(_)) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if self.add_account_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(120));
         }
     }
 
@@ -2077,6 +2913,78 @@ impl PostinoApp {
         #[cfg(test)]
         probe::loading(ui, rect, progress);
         ui.ctx().request_repaint();
+    }
+
+    fn boot_recovery(&mut self, ui: &mut Ui) {
+        let t = theme::tokens(self.dark);
+        let Some(failure) = self.boot_failure.clone() else {
+            return;
+        };
+        let enter = ui.ctx().input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+        if enter {
+            self.retry_boot();
+            return;
+        }
+        egui::CentralPanel::default().frame(Frame::new().fill(t.bg)).show(ui, |ui| {
+            let viewport = ui.available_rect_before_wrap();
+            let width = (viewport.width() - 2.0 * space::HUGE).clamp(360.0, 660.0);
+            let card = Rect::from_center_size(viewport.center(), Vec2::new(width, (viewport.height() - 2.0 * space::MD).max(360.0)));
+            ui.scope_builder(UiBuilder::new().max_rect(card), |ui| {
+                Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)).show(
+                    ui,
+                    |ui| {
+                        ui.set_width((width - 2.0 * f32::from(inset::XXL)).max(300.0));
+                        ui.horizontal(|ui| {
+                            ui.label(icons::icon(icons::WARNING, 22.0, t.danger));
+                            ui.add_space(space::SM);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(typography::text(Role::Caption, "POSTINO · ARCHIVIO", t.text_faint));
+                                ui.label(typography::strong(Role::Section, failure.stage.title(), t.text));
+                            });
+                        });
+                        ui.add_space(space::LG);
+                        ui.label(typography::text(Role::Body, failure.stage.advice(), t.text_muted));
+                        ui.add_space(space::LG);
+                        ui.label(typography::text(Role::Meta, format!("Percorso · {}", failure.path_text()), t.text_muted));
+                        ui.add_space(space::XS);
+                        ui.label(typography::text(Role::Meta, format!("Passaggio · {}", failure.stage.label()), t.text_faint));
+                        ui.add_space(space::XS);
+                        ui.add(egui::Label::new(typography::mono(failure.reason.as_str(), type_size::CAPTION, t.text_faint)).truncate());
+                        ui.add_space(space::MD);
+                        ui.label(typography::text(
+                            Role::Meta,
+                            "Il file non viene cancellato: le mail già scaricate restano sul disco e si riaprono quando il portachiavi torna disponibile.",
+                            t.text_muted,
+                        ));
+                        ui.add_space(space::XL);
+                        ui.horizontal(|ui| {
+                            if Button::primary("Riprova").icon(icons::SYNC).show(ui).clicked() {
+                                self.retry_boot();
+                            }
+                            if Button::new("Apri la modalità demo").icon(icons::MAIL).show(ui).clicked() {
+                                self.open_demo();
+                            }
+                        });
+                        ui.add_space(space::SM);
+                        ui.label(typography::text(Role::Caption, "Invio riprova · la modalità demo non tocca il file", t.text_faint));
+                    },
+                );
+            });
+        });
+    }
+
+    fn onboarding_screen(&mut self, ui: &mut Ui) {
+        let t = theme::tokens(self.dark);
+        let dark = self.dark;
+        let roots = self.extra_roots.clone();
+        let Some(onboarding) = self.onboarding.as_mut() else {
+            return;
+        };
+        let action = egui::CentralPanel::default().frame(Frame::new().fill(t.bg)).show(ui, |ui| onboarding.show(ui, dark, roots));
+        if !matches!(action.inner, onboarding::Action::None) {
+            self.handle_onboarding_action(action.inner);
+        }
     }
 
     fn title_bar(&mut self, ui: &mut Ui) {
@@ -2178,7 +3086,7 @@ impl PostinoApp {
                 let right_rect = Rect::from_min_max(egui::pos2(rect.max.x - side_width, rect.min.y), rect.max);
 
                 ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-                    if let Some(account) = self.engine.accounts().first() {
+                    if let Some(account) = self.active_account() {
                         let details = if account.provider.trim().is_empty() {
                             account.email.clone()
                         } else {
@@ -2208,6 +3116,17 @@ impl PostinoApp {
                         self.compose_new();
                     }
                     ui.add_space(space::SM);
+                    let sync_label = if self.sync_running() {
+                        "Aggiorna la posta · sincronizzazione già in corso"
+                    } else if !self.can_add_account() {
+                        "Aggiorna la posta · la modalità demo non ha un server"
+                    } else {
+                        "Aggiorna la posta"
+                    };
+                    if IconButton::new(icons::SYNC, sync_label).enabled(self.can_add_account()).show(ui).clicked() {
+                        self.request_sync();
+                    }
+                    ui.add_space(space::SM);
                     let theme_icon = if self.dark { icons::SUN } else { icons::MOON };
                     if IconButton::new(theme_icon, "Cambia tema").show(ui).clicked() {
                         let dark = !self.dark;
@@ -2215,6 +3134,36 @@ impl PostinoApp {
                     }
                 });
             });
+    }
+
+    /// The account switcher in the sidebar header. It is a two-line account row, not a message row:
+    /// clicking it opens the account menu, and the keyboard reaches it with Tab and Enter.
+    fn sidebar_account(&mut self, ui: &mut Ui, t: &Tokens) {
+        let Some(account) = self.active_account().cloned() else {
+            return;
+        };
+        let unread = self.account_unread(&account.id);
+        let detail = if account.provider.trim().is_empty() { account.email.clone() } else { format!("{} · {}", account.email, account.provider) };
+        let meta = if unread > 0 { unread.to_string() } else { String::new() };
+        let detail_clone = detail.clone();
+        let row = ListRow::account(account.name.as_str(), detail_clone.as_str(), meta.as_str()).icon(icons::USER).height(40.0);
+        let response = row.show(ui);
+        let accessible = format!(
+            "Account {} — {} · {} non lett{}. Premi Invio per cambiare account.",
+            account.name,
+            detail,
+            unread,
+            if unread == 1 { "o" } else { "i" }
+        );
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
+        let response = response.on_hover_text(accessible);
+        if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
+            self.show_accounts_menu = true;
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let _ = t;
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
@@ -2259,6 +3208,8 @@ impl PostinoApp {
 
                 #[cfg(test)]
                 probe::clear_rows(ui);
+                self.sidebar_account(ui, &t);
+                ui.add_space(space::XS);
                 // A visible bar, local to the sidebar: egui's default is a 2 pt floating sliver
                 // that only appears on hover, which at 980×600 hid the overflow instead of
                 // revealing it. Text colour on ivory is 10:1, and on the dark panel 12:1.
@@ -2279,12 +3230,23 @@ impl PostinoApp {
                         #[cfg(not(test))]
                         let _ = header;
                         ui.add_space(space::XS);
-                        let folders = self.engine.folders().to_vec();
+                        let folders = self
+                            .engine
+                            .folders()
+                            .iter()
+                            .filter(|folder| self.active_account.as_deref() == Some(folder.account_id.as_str()))
+                            .cloned()
+                            .collect::<Vec<_>>();
                         for folder in folders {
-                            let meta = if folder.kind == FolderKind::Drafts && folder.total > 0 {
-                                folder.total.to_string()
-                            } else if folder.unread > 0 {
-                                folder.unread.to_string()
+                            let (total, unread) = if folder.kind == FolderKind::Starred {
+                                self.starred_counts(&folder.account_id)
+                            } else {
+                                (folder.total, folder.unread)
+                            };
+                            let meta = if folder.kind == FolderKind::Drafts && total > 0 {
+                                total.to_string()
+                            } else if unread > 0 {
+                                unread.to_string()
                             } else {
                                 String::new()
                             };
@@ -2398,6 +3360,32 @@ impl PostinoApp {
             });
     }
 
+    fn offline_banner(&mut self, ui: &mut Ui, t: &Tokens) {
+        Frame::new()
+            .fill(t.panel_alt)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(radius::CONTROL)
+            .inner_margin(Margin::symmetric(inset::LG, inset::MD))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(icons::icon(icons::WARNING, 16.0, t.gold_ink));
+                    ui.add_space(space::SM);
+                    let detail = match self.sync_view {
+                        SyncView::Offline { last_sync: Some(ms) } => {
+                            format!("Sei offline · i messaggi salvati restano disponibili · ultimo sync {}", format_millis(ms))
+                        }
+                        _ => "Sei offline · i messaggi salvati restano disponibili".to_owned(),
+                    };
+                    ui.add(egui::Label::new(typography::text(Role::Meta, detail, t.text_muted)).truncate());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if Button::ghost("Riprova").size(ButtonSize::Sm).show(ui).clicked() {
+                            self.request_sync();
+                        }
+                    });
+                });
+            });
+    }
+
     fn list_panel(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
         #[cfg(test)]
@@ -2433,6 +3421,10 @@ impl PostinoApp {
             None => format!("{} · {}", unread_text(unread), messages_text(total)),
         };
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
+            if matches!(self.sync_view, SyncView::Offline { .. }) {
+                self.offline_banner(ui, &t);
+                ui.add_space(space::SM);
+            }
             if multi {
                 self.bulk_bar(ui, &t);
             } else {
@@ -2492,14 +3484,14 @@ impl PostinoApp {
                 let mut menu_action = None;
                 let background = ui.interact(ui.available_rect_before_wrap(), ui.id().with("empty-list-menu"), Sense::click());
                 let has_label_filter = label_filter.is_some();
+                let sync_ready = self.sync_ready();
+                let sync_reason = if self.demo { "La modalità demo non ha un server" } else { "Nessun account da sincronizzare" };
                 background.context_menu(|ui| {
                     let items = [
                         menu_item("label_new"),
                         menu_item("label_clear_filter").enabled(has_label_filter).reason("Nessun filtro etichetta attivo"),
                         MenuItem::separator(),
-                        // Sync does not exist yet: the item is visibly unavailable with the reason,
-                        // never an enabled row that only writes to the status bar.
-                        menu_item("sync"),
+                        MenuItem::new(command_label("sync", "Aggiorna la posta")).icon(icons::SYNC).enabled(sync_ready).reason(sync_reason),
                         menu_item("select_all").enabled(false).reason("Non ci sono messaggi da selezionare"),
                         menu_item("compose"),
                         MenuItem::new("Cancella ricerca").icon(icons::CLOSE).enabled(searching).reason("Nessuna ricerca attiva"),
@@ -2511,6 +3503,10 @@ impl PostinoApp {
                         }
                         Some(1) => {
                             menu_action = Some(EmptyMenuAction::ClearLabel);
+                            ui.close();
+                        }
+                        Some(3) if sync_ready => {
+                            menu_action = Some(EmptyMenuAction::Sync);
                             ui.close();
                         }
                         Some(5) => {
@@ -2550,6 +3546,7 @@ impl PostinoApp {
                     Some(EmptyMenuAction::ClearLabel) => self.apply_empty_action(EmptyAction::ClearLabel),
                     Some(EmptyMenuAction::Compose) => self.compose_new(),
                     Some(EmptyMenuAction::ClearSearch) => self.query.clear(),
+                    Some(EmptyMenuAction::Sync) => self.request_sync(),
                     None => {}
                 }
                 return;
@@ -3095,6 +4092,10 @@ impl PostinoApp {
         }
         ui.add_space(space::MD);
         ui.separator();
+        if message.body_html.is_some() {
+            ui.add_space(space::SM);
+            ui.label(typography::text(Role::Caption, "Vista testo · il rendering HTML arriverà con il visualizzatore isolato.", t.text_faint));
+        }
         ui.add_space(space::MD);
         egui::ScrollArea::vertical().id_salt(("reading-scroll", message.summary.id.as_str())).auto_shrink([false, false]).show(ui, |ui| {
             for paragraph in message.body_text.split("\n\n") {
@@ -3144,8 +4145,8 @@ impl PostinoApp {
 
         let action = left_action.or(right_action);
         match action {
-            Some(ReadingAction::Archive) => self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati"),
-            Some(ReadingAction::Delete) => self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            Some(ReadingAction::Archive) => self.move_selected(FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati"),
+            Some(ReadingAction::Delete) => self.move_selected(FolderKind::Trash, "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
             Some(ReadingAction::Reply) => {
                 let id = message.summary.id.clone();
                 self.reply_to(&id, ComposeMode::Reply);
@@ -3179,6 +4180,226 @@ impl PostinoApp {
         }
     }
 
+    fn account_menu(&mut self, ui: &mut Ui) {
+        if !self.show_accounts_menu {
+            return;
+        }
+        let t = theme::tokens(self.dark);
+        let accounts = self.engine.accounts().to_vec();
+        let active = self.active_account.clone();
+        let mut switch = None;
+        let mut add = false;
+        let mut manage = false;
+        let response = egui::Modal::new(Id::new("postino-accounts"))
+            .area(egui::Modal::default_area(Id::new("postino-accounts")).anchor(Align2::LEFT_TOP, Vec2::new(ui_size::SIDEBAR + 24.0, 96.0)))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(340.0);
+                ui.label(typography::strong(Role::BodySmall, "Account", t.text));
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Caption, "La posta, le cartelle e la sincronizzazione seguono l'account attivo.", t.text_faint));
+                ui.add_space(space::SM);
+                if accounts.is_empty() {
+                    ui.label(typography::text(Role::BodySmall, "Nessun account configurato.", t.text_muted));
+                } else {
+                    for account in &accounts {
+                        let label = format!("{} <{}>", account.name, account.email);
+                        let selected = active.as_deref() == Some(account.id.as_str());
+                        let response = Button::ghost(&label).icon(icons::MAIL).full_width().selected(selected).show(ui);
+                        if response.clicked() && !selected {
+                            switch = Some(account.id.clone());
+                        }
+                    }
+                }
+                ui.add_space(space::SM);
+                let add_button = Button::new("Aggiungi account")
+                    .icon(icons::PLUS)
+                    .full_width()
+                    .enabled(self.can_add_account())
+                    .disabled_reason("La modalità demo non ha un archivio locale: avvia Postino senza --demo")
+                    .show(ui);
+                if add_button.clicked() {
+                    add = true;
+                }
+                if Button::ghost("Gestisci account…").icon(icons::SETTINGS).full_width().show(ui).clicked() {
+                    manage = true;
+                }
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Caption, "Esc chiude", t.text_faint));
+            });
+        if response.should_close() {
+            self.show_accounts_menu = false;
+        }
+        if let Some(id) = switch {
+            self.show_accounts_menu = false;
+            self.switch_account(id);
+        }
+        if add {
+            self.show_accounts_menu = false;
+            self.onboarding = Some(Onboarding::add_account());
+        }
+        if manage {
+            self.show_accounts_menu = false;
+            self.show_accounts_dialog = true;
+        }
+    }
+
+    fn accounts_dialog(&mut self, ui: &mut Ui) {
+        if !self.show_accounts_dialog {
+            return;
+        }
+        let t = theme::tokens(self.dark);
+        let accounts = self.engine.accounts().to_vec();
+        let last = accounts.len() == 1;
+        let mut remove = None;
+        let mut add = false;
+        let mut close = false;
+        let mut dark = self.dark;
+        let mut reduced = self.reduced_motion;
+        let response = egui::Modal::new(Id::new("postino-settings"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(520.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(typography::strong(Role::Section, "Account e impostazioni", t.text));
+                        ui.label(typography::text(Role::Meta, "La pagina completa arriva con le prossime impostazioni.", t.text_faint));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if Button::ghost("Chiudi").show(ui).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(space::LG);
+                ui.label(typography::strong(Role::BodySmall, "ACCOUNT", t.text_faint));
+                ui.add_space(space::XS);
+                if accounts.is_empty() {
+                    ui.label(typography::text(Role::BodySmall, "Nessun account configurato.", t.text_muted));
+                }
+                for account in &accounts {
+                    ui.horizontal(|ui| {
+                        ui.label(icons::icon(icons::MAIL, 16.0, t.text_faint));
+                        ui.add_space(space::SM);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(typography::text(Role::BodySmall, account.name.as_str(), t.text));
+                            ui.label(typography::text(Role::Caption, account.email.as_str(), t.text_faint));
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if Button::danger("Rimuovi")
+                                .size(ButtonSize::Sm)
+                                .enabled(self.can_add_account())
+                                .disabled_reason("La modalità demo non ha un archivio locale")
+                                .show(ui)
+                                .clicked()
+                            {
+                                remove = Some(AccountRemoveState {
+                                    id: account.id.clone(),
+                                    name: account.name.clone(),
+                                    email: account.email.clone(),
+                                    last,
+                                    focus_primary: true,
+                                });
+                            }
+                        });
+                    });
+                    ui.add_space(space::XS);
+                }
+                ui.add_space(space::XS);
+                if Button::new("Aggiungi account")
+                    .icon(icons::PLUS)
+                    .enabled(self.can_add_account())
+                    .disabled_reason("La modalità demo non ha un archivio locale")
+                    .show(ui)
+                    .clicked()
+                {
+                    add = true;
+                }
+                ui.add_space(space::LG);
+                ui.label(typography::strong(Role::BodySmall, "ASPETTO", t.text_faint));
+                ui.add_space(space::XS);
+                ui.horizontal(|ui| {
+                    if Button::new(if dark { "Tema scuro" } else { "Tema chiaro" })
+                        .icon(if dark { icons::MOON } else { icons::SUN })
+                        .show(ui)
+                        .clicked()
+                    {
+                        dark = !dark;
+                    }
+                    if Button::new(if reduced { "Animazioni ridotte" } else { "Animazioni attive" }).icon(icons::CLOCK).show(ui).clicked() {
+                        reduced = !reduced;
+                    }
+                });
+                ui.add_space(space::LG);
+                ui.label(typography::strong(Role::BodySmall, "ARCHIVIO", t.text_faint));
+                ui.add_space(space::XS);
+                let path =
+                    self.store_path.as_ref().map_or_else(|| "Modalità demo: nessun archivio locale".to_owned(), |path| path.display().to_string());
+                ui.add(egui::Label::new(typography::mono(path.as_str(), type_size::CAPTION, t.text_faint)).truncate());
+                ui.add_space(space::SM);
+                ui.label(typography::mono(format!("Postino {}", env!("CARGO_PKG_VERSION")), type_size::CAPTION, t.text_faint));
+            });
+        if dark != self.dark {
+            self.set_dark(ui.ctx(), dark);
+        }
+        if reduced != self.reduced_motion {
+            self.set_reduced_motion(ui.ctx(), reduced);
+        }
+        if close || response.should_close() {
+            self.show_accounts_dialog = false;
+        }
+        if add {
+            self.show_accounts_dialog = false;
+            self.onboarding = Some(Onboarding::add_account());
+        }
+        if let Some(state) = remove {
+            self.account_remove = Some(state);
+        }
+    }
+
+    fn account_remove_dialog(&mut self, ui: &mut Ui) {
+        let Some(state) = self.account_remove.clone() else {
+            return;
+        };
+        let body = if state.last {
+            format!(
+                "L'account “{}” ({}) è l'ultimo. Rimuovendolo Postino elimina dal computer le mail scaricate, le cartelle e la password nel portachiavi, e torna alla configurazione iniziale. Le mail sul server non vengono toccate.",
+                state.name, state.email
+            )
+        } else {
+            format!(
+                "Rimuovendo “{}” ({}) Postino elimina da questo computer le mail scaricate, le cartelle e la password nel portachiavi. Le mail sul server non vengono toccate.",
+                state.name, state.email
+            )
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let focus_primary = state.focus_primary;
+        if let Some(state) = self.account_remove.as_mut() {
+            state.focus_primary = false;
+        }
+        let response =
+            egui::Modal::new(Id::new("postino-remove-account")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
+                let response = Dialog::new("Rimuovere l'account?", &body, "Rimuovi")
+                    .secondary("Annulla")
+                    .danger(true)
+                    .width(460.0)
+                    .focus_primary(focus_primary)
+                    .show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            });
+        if confirm {
+            self.account_remove = None;
+            self.remove_account(&state);
+        } else if cancel || response.should_close() {
+            self.account_remove = None;
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
         let kind = self.status_kind();
@@ -3192,6 +4413,7 @@ impl PostinoApp {
                     let dot = match kind {
                         StatusKind::Demo => t.gold_ink,
                         StatusKind::Ready => t.success,
+                        StatusKind::Offline => t.gold_ink,
                         StatusKind::Error => t.danger,
                     };
                     ui.painter().circle_filled(rect.center(), 3.0, dot);
@@ -3205,12 +4427,35 @@ impl PostinoApp {
                         StatusKind::Ready => {
                             ui.label(typography::text(Role::Meta, "Pronto", t.text_muted));
                         }
+                        StatusKind::Offline => {
+                            // The sync line starts with "Offline ·": one phrase, not two.
+                        }
                         StatusKind::Error => {
-                            ui.label(typography::text(Role::Meta, "Errore", t.danger));
+                            if !(self.failure.is_none() && matches!(self.sync_view, SyncView::Error { .. })) {
+                                ui.label(typography::text(Role::Meta, "Errore", t.danger));
+                            }
                         }
                     }
                     ui.add_space(space::SM);
                     ui.label(typography::mono(format!("Postino {}", env!("CARGO_PKG_VERSION")), 10.5, t.text_faint));
+                    if self.boot_failure.is_none()
+                        && self.onboarding.is_none()
+                        && let Some(text) = self.sync_text()
+                    {
+                        ui.add_space(space::MD);
+                        let color = match self.sync_view {
+                            SyncView::Error { .. } => t.danger,
+                            SyncView::Offline { .. } => t.gold_ink,
+                            _ => t.text_muted,
+                        };
+                        ui.add(egui::Label::new(typography::text(Role::Meta, text, color)).truncate());
+                        if self.sync_needs_retry() && self.can_add_account() {
+                            ui.add_space(space::XS);
+                            if Button::ghost("Riprova").size(ButtonSize::Sm).show(ui).clicked() {
+                                self.request_sync();
+                            }
+                        }
+                    }
                     if !self.status.is_empty() {
                         ui.add_space(space::MD);
                         ui.add(egui::Label::new(typography::text(Role::Meta, self.status.as_str(), t.text_muted)).truncate());
@@ -3633,7 +4878,8 @@ impl PostinoApp {
             CommandRule::Message => self.selected.is_some(),
             CommandRule::ActiveLabel => self.label_filter.is_some(),
             CommandRule::LabelFilter => self.label_filter.is_some(),
-            CommandRule::Sync => false,
+            CommandRule::Sync => self.sync_ready(),
+            CommandRule::Store => self.can_add_account(),
         }
     }
 
@@ -3682,8 +4928,8 @@ impl PostinoApp {
             "unread" => self.mark_unread(),
             "star" => self.set_starred(true),
             "unstar" => self.set_starred(false),
-            "archive" => self.move_selected("archive", "Messaggio archiviato", "Messaggi archiviati"),
-            "delete" => self.move_selected("trash", "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            "archive" => self.move_selected(FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati"),
+            "delete" => self.move_selected(FolderKind::Trash, "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
             "label_menu" => {
                 let ids = self.action_ids();
                 self.open_label_menu(ids);
@@ -3706,8 +4952,20 @@ impl PostinoApp {
                     self.status = "Nessun filtro etichetta attivo".to_owned();
                 }
             }
-            "inbox" => self.select_folder("inbox"),
-            "starred" => self.select_folder("starred"),
+            "inbox" => {
+                if let Some(folder) = self.folder_for_kind(FolderKind::Inbox) {
+                    self.select_folder(folder);
+                } else {
+                    self.status = "Il server non ha una cartella Posta in arrivo".to_owned();
+                }
+            }
+            "starred" => {
+                if let Some(folder) = self.folder_for_kind(FolderKind::Starred) {
+                    self.select_folder(folder);
+                } else {
+                    self.status = "Il server non espone una cartella Preferiti".to_owned();
+                }
+            }
             "theme" => {
                 let dark = !self.dark;
                 self.set_dark(ctx, dark);
@@ -3752,6 +5010,15 @@ impl PostinoApp {
                 }
             }
             "undo" => self.undo_last(),
+            "sync" => self.request_sync(),
+            "accounts" => self.show_accounts_dialog = true,
+            "add_account" => {
+                if self.can_add_account() {
+                    self.onboarding = Some(Onboarding::add_account());
+                } else {
+                    self.status = "La modalità demo non ha un archivio locale".to_owned();
+                }
+            }
             _ => {}
         }
     }
@@ -3808,11 +5075,31 @@ impl PostinoApp {
     }
 
     fn show_inner(&mut self, ui: &mut egui::Ui) {
+        self.poll_add_account();
+        self.handle_sync_events();
         let composer_was_open = self.composer.open;
         self.capture_screenshot(ui.ctx());
         self.tick(ui.ctx());
         self.resize_handles(ui.ctx());
         self.handle_shortcuts(ui.ctx());
+        if self.boot_failure.is_some() {
+            self.status_bar(ui);
+            if self.custom_chrome {
+                self.title_bar(ui);
+            }
+            self.boot_recovery(ui);
+            self.toast_overlay(ui.ctx());
+            return;
+        }
+        if self.onboarding.is_some() {
+            self.status_bar(ui);
+            if self.custom_chrome {
+                self.title_bar(ui);
+            }
+            self.onboarding_screen(ui);
+            self.toast_overlay(ui.ctx());
+            return;
+        }
         // egui 0.36 nests panels in the order they are added. The status bar goes first so it is
         // the outermost panel and spans the full width; the title bar and toolbar sit above the
         // three columns.
@@ -3839,6 +5126,9 @@ impl PostinoApp {
         self.shortcuts_sheet(ui);
         self.label_menu_window(ui);
         self.label_delete_dialog(ui);
+        self.account_menu(ui);
+        self.accounts_dialog(ui);
+        self.account_remove_dialog(ui);
         // The composer owns the keyboard while it is open. Capture the widget that had it before
         // the composer requests focus, so closing returns the user exactly where they were.
         if self.composer.open && self.composer_focus_pending {
@@ -3862,6 +5152,7 @@ impl eframe::App for PostinoApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_sync_worker();
         // Write the last pane width and folder even if the debounce had not fired yet. A capture
         // never owns a settings path, so this cannot touch the user's file.
         if self.screenshot.is_none() && self.settings_dirty {
@@ -3907,6 +5198,7 @@ enum EmptyMenuAction {
     ClearLabel,
     Compose,
     ClearSearch,
+    Sync,
 }
 
 /// What one empty-state button does. The label lives in [`EmptyView`]; the action is data so the
@@ -3945,9 +5237,11 @@ const SETTINGS_SAVE_DELAY: f64 = 1.0;
 enum StatusKind {
     Demo,
     Ready,
+    Offline,
     Error,
 }
 
+#[cfg(test)]
 fn status_kind(demo: bool, failure: bool) -> StatusKind {
     if failure {
         StatusKind::Error
@@ -3956,6 +5250,134 @@ fn status_kind(demo: bool, failure: bool) -> StatusKind {
     } else {
         StatusKind::Ready
     }
+}
+
+/// The inbox of one account, or its first real folder. A store account always has an inbox because
+/// `account_add` refuses a server without one; a half-configured row still lands somewhere visible.
+fn default_folder_for(engine: &Engine, account: Option<&str>) -> String {
+    let Some(account) = account else {
+        return String::new();
+    };
+    let folders = engine.folders().iter().filter(|folder| folder.account_id == account).collect::<Vec<_>>();
+    folders
+        .iter()
+        .find(|folder| folder.kind == FolderKind::Inbox)
+        .or_else(|| folders.iter().find(|folder| folder.kind != FolderKind::Starred))
+        .or_else(|| folders.first())
+        .map_or_else(String::new, |folder| folder.id.clone())
+}
+
+/// The persisted sync health of one account as the three honest states the status bar shows.
+fn sync_view_for(engine: &Engine, account: Option<&str>) -> SyncView {
+    let Some(account) = account else {
+        return SyncView::Idle { last_sync: None };
+    };
+    let Ok(views) = engine.account_views() else {
+        return SyncView::Error { reason: "l'archivio non si legge".to_owned(), last_sync: None };
+    };
+    let Some(view) = views.into_iter().find(|view| view.account.id == account) else {
+        return SyncView::Idle { last_sync: None };
+    };
+    let Some(status) = view.sync else {
+        return SyncView::Idle { last_sync: None };
+    };
+    let last = status.last_success;
+    match status.state {
+        SyncPhase::Idle => SyncView::Idle { last_sync: last },
+        SyncPhase::Syncing => SyncView::Error { reason: "sincronizzazione interrotta".to_owned(), last_sync: last },
+        SyncPhase::Error => {
+            let error = status.error.unwrap_or_default();
+            if error.contains("could not talk to the server") {
+                SyncView::Offline { last_sync: last }
+            } else if error.contains("rejected the credentials") {
+                SyncView::Error { reason: "credenziali rifiutate".to_owned(), last_sync: last }
+            } else if error.contains("local store") {
+                SyncView::Error { reason: "archivio locale non disponibile".to_owned(), last_sync: last }
+            } else if error.contains("cancelled") {
+                SyncView::Idle { last_sync: last }
+            } else {
+                SyncView::Error { reason: crate::sync_worker::persisted_reason(&error), last_sync: last }
+            }
+        }
+    }
+}
+
+fn last_sync_from(view: &SyncView) -> Option<i64> {
+    match view {
+        SyncView::Idle { last_sync } | SyncView::Offline { last_sync } | SyncView::Error { last_sync, .. } => *last_sync,
+        SyncView::Running(_) => None,
+    }
+}
+
+fn format_millis(ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms).map_or_else(|| "—".to_owned(), format_time)
+}
+
+/// The folder preview a docs screenshot shows. It is synthetic, like the demo mailbox.
+fn demo_folders_preview() -> FoldersPreview {
+    FoldersPreview {
+        folders: vec![
+            FolderPreview { name: "Posta in arrivo".to_owned(), role: FolderRole::Inbox, aggregate: false },
+            FolderPreview { name: "Inviati".to_owned(), role: FolderRole::Sent, aggregate: false },
+            FolderPreview { name: "Bozze".to_owned(), role: FolderRole::Drafts, aggregate: false },
+            FolderPreview { name: "Cestino".to_owned(), role: FolderRole::Trash, aggregate: false },
+            FolderPreview { name: "Spam".to_owned(), role: FolderRole::Spam, aggregate: false },
+            FolderPreview { name: "Archivio".to_owned(), role: FolderRole::Archive, aggregate: false },
+            FolderPreview { name: "Tutte le mail".to_owned(), role: FolderRole::Custom, aggregate: true },
+        ],
+        warnings: vec!["Il server non dichiara una cartella Preferiti: i preferiti restano locali.".to_owned()],
+    }
+}
+
+/// Short Italian copy for an engine failure. The raw engine sentence never reaches the status bar.
+fn op_error_copy(error: &postino_core::OpError) -> String {
+    match error {
+        postino_core::OpError::Auth(_) => "credenziali rifiutate".to_owned(),
+        postino_core::OpError::Network(_) => "server non raggiungibile".to_owned(),
+        postino_core::OpError::InvalidArgs(_) => "dati non validi".to_owned(),
+        postino_core::OpError::UnknownOp(_) => "operazione non disponibile".to_owned(),
+        postino_core::OpError::Failed(_) => "l'archivio locale ha rifiutato l'operazione".to_owned(),
+    }
+}
+
+/// The account-creation copy shown inside the onboarding card. It keeps the specific class and never
+/// the raw engine sentence, which may mention internals.
+fn add_account_copy(error: postino_core::OpError) -> String {
+    match error {
+        postino_core::OpError::Auth(_) => "Il server ha rifiutato le credenziali durante la creazione. Controlla la password.".to_owned(),
+        postino_core::OpError::Network(_) => "Il server non è raggiungibile in questo momento. Riprova.".to_owned(),
+        postino_core::OpError::InvalidArgs(_) => "I dati dell'account non sono validi. Controlla i campi.".to_owned(),
+        postino_core::OpError::UnknownOp(_) => "La creazione dell'account non è disponibile in questa versione.".to_owned(),
+        postino_core::OpError::Failed(_) => "La creazione dell'account non è riuscita. Controlla il portachiavi e riprova.".to_owned(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SyncView {
+    /// No run in progress. `last_sync` is the persisted success instant, if any.
+    Idle {
+        last_sync: Option<i64>,
+    },
+    Running(SyncProgress),
+    /// The last attempt could not reach the server. Cached mail stays readable.
+    Offline {
+        last_sync: Option<i64>,
+    },
+    Error {
+        reason: String,
+        last_sync: Option<i64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccountRemoveState {
+    id: String,
+    name: String,
+    email: String,
+    /// Removing the last account returns to onboarding; the copy says so.
+    last: bool,
+    /// Request focus on the destructive button on the first frame only.
+    focus_primary: bool,
 }
 
 /// The one current failure: the sentence the toast shows and whether reloading the list is a
@@ -4078,8 +5500,10 @@ enum CommandRule {
     Message,
     ActiveLabel,
     LabelFilter,
-    /// Sync has no implementation yet. It is a visible, explained refusal, never an enabled no-op.
+    /// Sync needs a store-backed account. It is disabled with a reason in the demo.
     Sync,
+    /// Adding or removing accounts needs the encrypted store; the demo is memory-only.
+    Store,
 }
 
 impl CommandRule {
@@ -4091,7 +5515,8 @@ impl CommandRule {
             Self::Message => Some("Seleziona prima un messaggio"),
             Self::ActiveLabel => Some("Seleziona prima un'etichetta"),
             Self::LabelFilter => Some("Nessun filtro etichetta attivo"),
-            Self::Sync => Some("La sincronizzazione arriva con IMAP"),
+            Self::Sync => Some("Aggiungi un account per sincronizzare"),
+            Self::Store => Some("La modalità demo non ha un archivio locale"),
         }
     }
 
@@ -4195,7 +5620,9 @@ const COMMANDS: &[Command] = &[
     Command { id: "close", label: "Chiudi lettura", icon: icons::CLOSE, shortcut: "Esc", rule: CommandRule::Always, in_palette: false },
     Command { id: "undo", label: "Annulla ultima azione", icon: icons::UNDO, shortcut: "Z", rule: CommandRule::Always, in_palette: false },
     Command { id: "palette", label: "Apri i comandi", icon: icons::COMMAND, shortcut: "Ctrl+K", rule: CommandRule::Always, in_palette: false },
-    Command { id: "sync", label: "Aggiorna", icon: icons::SYNC, shortcut: "", rule: CommandRule::Sync, in_palette: false },
+    Command { id: "sync", label: "Aggiorna la posta", icon: icons::SYNC, shortcut: "", rule: CommandRule::Sync, in_palette: true },
+    Command { id: "accounts", label: "Account e impostazioni", icon: icons::USER, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "add_account", label: "Aggiungi account", icon: icons::PLUS, shortcut: "", rule: CommandRule::Store, in_palette: true },
     Command { id: "reduced_motion", label: "Riduci le animazioni", icon: icons::CLOCK, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
         id: "mark_folder_read",
@@ -5137,6 +6564,18 @@ pub(crate) mod probe {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use postino_core::CredentialVault;
+    use postino_store::{
+        Account as StoreAccount, AccountServer, AccountTls, Address as StoreAddress, Folder as StoreFolder, FolderKind as StoreFolderKind,
+    };
+    use postino_store::{Message as StoreMessage, MessageSummary as StoreMessageSummary};
+
+    use crate::boot::{BootStage, KeySource};
+    use crate::test_support::{MemoryVault, RunningServer, three_folders};
+
     use super::*;
 
     fn frame_at(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, events: Vec<egui::Event>) {
@@ -5589,7 +7028,7 @@ mod tests {
         let mut app = PostinoApp::demo(true);
         let id = app.engine.messages()[0].summary.id.clone();
         app.open_message(id.clone());
-        app.move_selected("archive", "archiviato", "archiviati");
+        app.move_selected(FolderKind::Archive, "archiviato", "archiviati");
         assert!(app.selected.is_none());
         assert!(!app.reading_open);
         assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("archive"));
@@ -5633,6 +7072,14 @@ mod tests {
             ("empty_unread", ScreenshotState::EmptyUnread),
             ("empty_attachments", ScreenshotState::EmptyAttachments),
             ("empty_label_unread", ScreenshotState::EmptyLabelUnread),
+            ("onboarding_welcome", ScreenshotState::OnboardingWelcome),
+            ("onboarding_provider", ScreenshotState::OnboardingProvider),
+            ("onboarding_form", ScreenshotState::OnboardingForm),
+            ("onboarding_error", ScreenshotState::OnboardingError),
+            ("onboarding_folders", ScreenshotState::OnboardingFolders),
+            ("onboarding_sync", ScreenshotState::OnboardingSync),
+            ("mailbox", ScreenshotState::Mailbox),
+            ("offline", ScreenshotState::Offline),
         ] {
             assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
         }
@@ -6075,6 +7522,7 @@ mod tests {
         let loaded = Settings::load_from(&path);
         assert!(loaded.dark);
         assert_eq!(loaded.folder, "archive");
+        assert_eq!(loaded.account.as_deref(), Some("acc_demo"), "the active account is a preference");
         assert!((loaded.reading_pane_ratio - 0.44).abs() < f32::EPSILON);
         assert!(loaded.reduced_motion);
         let text = std::fs::read_to_string(&path).expect("the settings file");
@@ -6084,13 +7532,16 @@ mod tests {
         let mut restored = PostinoApp::demo(true);
         restored.apply_settings(loaded);
         assert_eq!(restored.folder, "archive");
+        assert_eq!(restored.active_account.as_deref(), Some("acc_demo"));
         assert!(restored.dark);
         assert!(restored.reduced_motion);
 
-        // A folder the engine does not know falls back to the inbox.
-        let unknown = Settings { folder: "cartella-inesistente".to_owned(), ..Settings::default() };
+        // A folder or account the engine does not know falls back to the current account and its
+        // inbox.
+        let unknown = Settings { folder: "cartella-inesistente".to_owned(), account: Some("acc_inesistente".to_owned()), ..Settings::default() };
         restored.apply_settings(unknown);
         assert_eq!(restored.folder, "inbox");
+        assert_eq!(restored.active_account.as_deref(), Some("acc_demo"));
     }
 
     #[test]
@@ -6116,6 +7567,13 @@ mod tests {
 
         let mut app = PostinoApp::demo(true);
         assert_eq!(app.status_kind(), StatusKind::Demo);
+        app.demo = false;
+        app.sync_view = SyncView::Offline { last_sync: Some(1_700_000_000_000) };
+        assert_eq!(app.status_kind(), StatusKind::Offline);
+        app.sync_view = SyncView::Error { reason: "credenziali rifiutate".to_owned(), last_sync: None };
+        assert_eq!(app.status_kind(), StatusKind::Error);
+        app.sync_view = SyncView::Idle { last_sync: None };
+        app.demo = true;
         app.report_failure("Non è stato possibile leggere i messaggi. Riprova.", true);
         assert_eq!(app.status_kind(), StatusKind::Error);
         assert!(app.toast.is_none(), "an error is a toast, not an undo toast");
@@ -6187,13 +7645,13 @@ mod tests {
     }
 
     #[test]
-    fn refresh_is_gone_and_sync_is_a_visible_disabled_reason() {
+    fn sync_is_enabled_only_for_a_store_account() {
         assert!(command("refresh").is_none(), "the enabled no-op must not exist");
         let sync = command("sync").expect("sync is registered");
-        assert_eq!(sync.label, "Aggiorna");
+        assert_eq!(sync.label, "Aggiorna la posta");
         let app = PostinoApp::demo(true);
         assert!(!app.command_enabled(sync));
-        assert!(sync.rule.reason().is_some_and(|reason| reason.contains("IMAP")));
+        assert!(sync.rule.reason().is_some_and(|reason| reason.contains("account")));
     }
 
     #[test]
@@ -7014,6 +8472,418 @@ mod tests {
         let header = probe::reading_header_rect(&ctx).expect("the overlay header");
         double_click_at(&ctx, &mut app, header.center(), narrow);
         assert!(!app.reading_open, "a header double-click on the overlay returns to the list");
+    }
+
+    fn test_directory(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join("opencode").join("p6b-postino").join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&path);
+        let _ = std::fs::remove_file(path.join("mail.db"));
+        let _ = std::fs::remove_dir_all(path.join("mail.db.blobs"));
+        path
+    }
+
+    fn fresh_store(name: &str) -> (PathBuf, Arc<postino_store::StoreKey>, Arc<MemoryVault>) {
+        let directory = test_directory(name);
+        let path = directory.join("mail.db");
+        (path, Arc::new(postino_store::StoreKey::from_bytes([0x5a; 32])), MemoryVault::new())
+    }
+
+    fn store_message(folder: &str, account_id: &str, id: &str, subject: &str) -> StoreMessage {
+        StoreMessage {
+            summary: StoreMessageSummary {
+                id: id.to_owned(),
+                account_id: account_id.to_owned(),
+                folder_id: folder.to_owned(),
+                thread_id: format!("thr_{id}"),
+                from: StoreAddress::new("Mittente", "mittente@example.com"),
+                to: vec![StoreAddress::new("Postino Test", "test@example.com")],
+                subject: subject.to_owned(),
+                snippet: format!("{subject} — anteprima"),
+                date: 1_700_000_000_000,
+                unread: true,
+                starred: false,
+                has_attachments: false,
+                labels: Vec::new(),
+            },
+            uid: None,
+            message_id: None,
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            body_text: format!("{subject}\n\nCorpo salvato nell'archivio locale."),
+            body_html: None,
+            size: None,
+        }
+    }
+
+    /// Seed one account, its inbox folder and one local message. `port` adds the IMAP server row.
+    fn seed_account_rows(store: &postino_store::Store, id: &str, email: &str, port: Option<u16>) {
+        store
+            .upsert_account(&StoreAccount {
+                id: id.to_owned(),
+                name: format!("Account {id}"),
+                email: email.to_owned(),
+                provider: "custom".to_owned(),
+                signature: String::new(),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("account row");
+        if let Some(port) = port {
+            store
+                .upsert_account_server(&AccountServer {
+                    account_id: id.to_owned(),
+                    host: "localhost".to_owned(),
+                    port,
+                    tls: AccountTls::Implicit,
+                    username: email.to_owned(),
+                    created_at: 1_700_000_000_000,
+                })
+                .expect("server row");
+        }
+        let folder = format!("fld_{id}_inbox");
+        for (suffix, name, kind) in [
+            ("inbox", "Posta in arrivo", StoreFolderKind::Inbox),
+            ("sent", "Inviati", StoreFolderKind::Sent),
+            ("drafts", "Bozze", StoreFolderKind::Drafts),
+            ("trash", "Cestino", StoreFolderKind::Trash),
+            ("archive", "Archivio", StoreFolderKind::Archive),
+            ("starred", "Preferiti", StoreFolderKind::Starred),
+        ] {
+            store
+                .upsert_folder(&StoreFolder {
+                    id: format!("fld_{id}_{suffix}"),
+                    account_id: id.to_owned(),
+                    name: name.to_owned(),
+                    kind,
+                    unread: 0,
+                    total: 0,
+                    uid_validity: None,
+                    uid_next: None,
+                    last_sync_at: None,
+                })
+                .expect("folder row");
+        }
+        store.upsert_message(&store_message(&folder, id, &format!("msg_{id}_1"), &format!("Messaggio di {id}"))).expect("message row");
+    }
+
+    fn booted_app(name: &str, roots: Vec<CertificateDer<'static>>, seed: impl FnOnce(&postino_store::Store)) -> PostinoApp {
+        let (path, key, vault) = fresh_store(name);
+        {
+            let store = postino_store::Store::open(&path, key.as_ref()).expect("seed store");
+            seed(&store);
+        }
+        let vault_dyn: Arc<dyn CredentialVault> = vault;
+        let booted =
+            boot::boot(Launch::Store(Some(path.clone())), KeySource::Fixed { key: key.clone(), vault: vault_dyn }, Utc::now()).expect("boot");
+        PostinoApp::from_booted(booted, true, Utc::now(), Launch::Store(Some(path)), roots)
+    }
+
+    fn wait_for_sync(app: &mut PostinoApp) {
+        for _ in 0..1500 {
+            app.handle_sync_events();
+            if !app.sync_running() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the sync did not finish");
+    }
+
+    fn set_test_password(app: &PostinoApp, account: &str) {
+        let store = app.store.as_ref().expect("a store-backed app");
+        store.vault().store_imap_password(account, postino_testkit::PASSWORD.as_bytes()).expect("the test vault stores the password");
+    }
+
+    #[test]
+    fn an_empty_store_boots_into_onboarding_not_a_fake_mailbox() {
+        let mut app = booted_app("app-empty-store", Vec::new(), |_| {});
+        assert!(!app.demo);
+        assert!(app.engine.accounts().is_empty());
+        assert!(app.onboarding.is_some());
+        assert_eq!(app.onboarding.as_ref().map(Onboarding::stage), Some(Stage::Welcome));
+        assert_eq!(app.onboarding.as_ref().map(Onboarding::mode), Some(onboarding::Mode::FirstRun));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        let text = output.shapes.iter().any(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) => text.galley.text().contains("Aggiungi il tuo account"),
+            _ => false,
+        });
+        output.textures_delta.clear();
+        assert!(text, "the welcome screen must offer the first-run action");
+    }
+
+    #[test]
+    fn a_store_failure_renders_the_recovery_screen() {
+        let mut app = PostinoApp::with_engine(
+            Engine::empty(),
+            None,
+            false,
+            Some(BootFailure {
+                path: Some(PathBuf::from("C:/Users/demo/AppData/Local/Postino/mail.db")),
+                stage: BootStage::Keyring,
+                reason: "the keyring is locked".to_owned(),
+            }),
+            Launch::Store(None),
+            true,
+            Utc::now(),
+            Vec::new(),
+        );
+        assert_eq!(app.status_kind(), StatusKind::Error);
+        assert!(app.onboarding.is_none());
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        let text = output.shapes.iter().any(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) => text.galley.text().contains("portachiavi"),
+            _ => false,
+        });
+        output.textures_delta.clear();
+        assert!(text, "the recovery screen must name the keyring");
+        app.open_demo();
+        assert!(app.demo);
+        assert!(app.boot_failure.is_none());
+        assert!(app.engine.is_demo());
+    }
+
+    #[test]
+    fn demo_is_still_a_labelled_fallback() {
+        let app = PostinoApp::demo(true);
+        assert!(app.demo);
+        assert_eq!(app.status_kind(), StatusKind::Demo);
+        assert!(app.sync_text().is_none(), "the demo has no sync state to claim");
+    }
+
+    #[test]
+    fn switching_and_removing_accounts_keeps_data_and_credentials_isolated() {
+        let mut app = booted_app("app-accounts", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+        });
+        assert_eq!(app.engine.accounts().len(), 2);
+        assert_eq!(app.active_account.as_deref(), Some("acc_a"));
+        assert!(app.visible_messages().0.iter().any(|message| message.subject.contains("acc_a")));
+        assert!(!app.visible_messages().0.iter().any(|message| message.subject.contains("acc_b")));
+
+        app.switch_account("acc_b".to_owned());
+        assert_eq!(app.active_account.as_deref(), Some("acc_b"));
+        assert_eq!(app.folder, "fld_acc_b_inbox");
+        assert!(app.visible_messages().0.iter().any(|message| message.subject.contains("acc_b")));
+        assert!(!app.visible_messages().0.iter().any(|message| message.subject.contains("acc_a")));
+
+        let state = AccountRemoveState {
+            id: "acc_b".to_owned(),
+            name: "Account acc_b".to_owned(),
+            email: "b@example.com".to_owned(),
+            last: false,
+            focus_primary: true,
+        };
+        app.remove_account(&state);
+        assert_eq!(app.engine.accounts().len(), 1);
+        assert_eq!(app.active_account.as_deref(), Some("acc_a"));
+        assert!(app.engine.messages().iter().all(|message| !message.summary.id.contains("acc_b")));
+
+        let state = AccountRemoveState {
+            id: "acc_a".to_owned(),
+            name: "Account acc_a".to_owned(),
+            email: "a@example.com".to_owned(),
+            last: true,
+            focus_primary: true,
+        };
+        app.remove_account(&state);
+        assert_eq!(app.engine.accounts().len(), 0);
+        assert!(app.onboarding.is_some(), "removing the last account returns to onboarding");
+        assert!(app.active_account.is_none());
+        assert!(app.sync_worker.is_none());
+    }
+
+    #[test]
+    fn a_second_sync_request_says_it_is_already_running() {
+        let server = RunningServer::mailbox(three_folders(), 1);
+        let port = server.port();
+        let mut app = booted_app("app-second-sync", vec![server.ca()], |store| {
+            seed_account_rows(store, "acc_sync", postino_testkit::USER, Some(port));
+        });
+        set_test_password(&app, "acc_sync");
+        app.request_sync();
+        assert!(matches!(app.sync_view, SyncView::Running(_)));
+        app.request_sync();
+        assert_eq!(app.status, "Sincronizzazione già in corso");
+        wait_for_sync(&mut app);
+        server.finish();
+    }
+
+    #[test]
+    fn a_failed_sync_is_offline_and_never_empties_the_list() {
+        let mut app = booted_app("app-offline", Vec::new(), |store| {
+            seed_account_rows(store, "acc_offline", postino_testkit::USER, Some(1));
+        });
+        set_test_password(&app, "acc_offline");
+        app.last_sync = Some(1_700_000_000_000);
+        let before = app.visible_messages().0.len();
+        assert_eq!(before, 1);
+        app.request_sync();
+        wait_for_sync(&mut app);
+        assert!(matches!(app.sync_view, SyncView::Offline { last_sync: Some(1_700_000_000_000) }), "{:?}", app.sync_view);
+        assert_eq!(app.visible_messages().0.len(), before, "an offline sync keeps the cached mail");
+        assert_eq!(app.status_kind(), StatusKind::Offline, "offline is its own honest state, not a red error");
+    }
+
+    #[test]
+    fn a_real_onboarding_creates_the_account_and_first_sync() {
+        let server = RunningServer::mailbox(three_folders(), 3);
+        let roots = vec![server.ca()];
+        let port = server.port();
+        let mut app = booted_app("app-onboarding-real", roots.clone(), |_| {});
+        {
+            let onboarding = app.onboarding.as_mut().expect("first run");
+            onboarding.seed_for_test(Stage::Credentials, ProviderChoice::Custom, None, None);
+            onboarding.set_custom("localhost", &port.to_string());
+            onboarding.set_fields("Postino Test", postino_testkit::USER, postino_testkit::PASSWORD);
+            onboarding.set_probe_timeout(Duration::from_secs(3));
+            onboarding.start_probe(roots.clone(), false);
+        }
+        for _ in 0..500 {
+            let onboarding = app.onboarding.as_mut().expect("onboarding");
+            onboarding.poll_probe();
+            if !onboarding.is_testing() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let action = {
+            let onboarding = app.onboarding.as_mut().expect("onboarding");
+            assert!(onboarding.connection_error().is_none(), "{:?}", onboarding.connection_error());
+            let action = onboarding.advance(roots.clone());
+            assert!(matches!(action, onboarding::Action::None));
+            onboarding.advance(roots.clone())
+        };
+        assert!(matches!(action, onboarding::Action::AddAccount(_)));
+        app.handle_onboarding_action(action);
+        for _ in 0..1500 {
+            app.poll_add_account();
+            app.handle_sync_events();
+            if app.onboarding.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.onboarding.is_none(), "the first sync closes the wizard");
+        assert_eq!(app.engine.accounts().len(), 1);
+        assert_eq!(app.engine.messages().len(), 3);
+        assert!(app.engine.messages().iter().all(|message| message.summary.folder_id != "inbox"));
+        assert!(matches!(app.sync_view, SyncView::Idle { last_sync: Some(_) }));
+        server.finish();
+    }
+
+    #[test]
+    fn a_successful_sync_reloads_without_losing_selection_filters_or_the_open_message() {
+        let server = RunningServer::mailbox(three_folders(), 2);
+        let port = server.port();
+        let mut app = booted_app("app-reload", vec![server.ca()], |store| {
+            seed_account_rows(store, "acc_reload", postino_testkit::USER, Some(port));
+        });
+        set_test_password(&app, "acc_reload");
+        app.request_sync();
+        wait_for_sync(&mut app);
+        let rows = app.visible_messages().0;
+        let selected = rows.first().map(|message| message.id.clone()).expect("synced mail");
+        app.open_message(selected.clone());
+        app.query = "Synthetic".to_owned();
+        app.unread_only = true;
+        assert!(app.reading_open);
+        app.request_sync();
+        wait_for_sync(&mut app);
+        assert_eq!(app.selected.as_deref(), Some(selected.as_str()), "the open message survives the reload");
+        assert!(app.reading_open);
+        assert_eq!(app.query, "Synthetic");
+        assert!(app.unread_only);
+        assert!(app.engine.message(&selected).is_some());
+        server.finish();
+    }
+
+    #[test]
+    fn compose_uses_the_active_account_identity_and_drafts_folder() {
+        let mut app = booted_app("app-compose-identity", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+        });
+        app.switch_account("acc_b".to_owned());
+        app.compose_new();
+        assert_eq!(app.account().map(|account| account.id.as_str()), Some("acc_b"));
+        app.composer.to = "Destinatario <dest@example.com>".to_owned();
+        app.composer.subject = "Bozza dell'account attivo".to_owned();
+        app.composer.body = "Corpo".to_owned();
+        app.composer.touch(0.0);
+        assert!(app.save_composer(false));
+        let draft = app.composer.draft_id.clone().expect("a saved draft");
+        assert_eq!(app.engine.message(&draft).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_b_drafts"));
+        assert_eq!(
+            app.engine.message(&draft).map(|message| message.summary.to.first().map(|address| address.email.as_str())),
+            Some(Some("dest@example.com"))
+        );
+    }
+
+    #[test]
+    fn the_account_menu_and_settings_dialog_render_at_the_minimum_size() {
+        let mut app = booted_app("app-account-menu", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+        });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.show_accounts_dialog = true;
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        app.show_accounts_dialog = false;
+        app.show_accounts_menu = true;
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        app.show_accounts_menu = false;
+        app.account_remove = Some(AccountRemoveState {
+            id: "acc_b".to_owned(),
+            name: "Account acc_b".to_owned(),
+            email: "b@example.com".to_owned(),
+            last: false,
+            focus_primary: true,
+        });
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        assert!(app.account_remove.is_some(), "Esc was not pressed: the confirmation stays open");
+    }
+
+    #[test]
+    fn a_store_mailbox_renders_at_the_minimum_size_and_in_dark() {
+        let mut app = booted_app("app-mailbox-980", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+        });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        for dark in [false, true] {
+            theme::apply(&ctx, dark);
+            let raw =
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() };
+            let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+            assert!(!output.shapes.is_empty(), "the store-backed mailbox painted nothing (dark={dark})");
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn the_starred_view_is_scoped_to_the_active_account() {
+        let mut app = booted_app("app-starred", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+        });
+        app.switch_account("acc_b".to_owned());
+        let starred = app.visible_messages().0.first().map(|message| message.id.clone()).expect("an acc_b message");
+        app.set_starred_for(&starred, true);
+        assert_eq!(app.starred_counts("acc_b"), (1, 1));
+        app.switch_account("acc_a".to_owned());
+        assert_eq!(app.starred_counts("acc_a"), (0, 0));
+        app.select_folder("fld_acc_a_starred");
+        assert!(app.visible_messages().0.is_empty(), "another account's star must not leak into Preferiti");
     }
 
     fn label_unread(app: &PostinoApp, id: &str) -> Option<u32> {

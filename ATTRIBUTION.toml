@@ -320,6 +320,146 @@ license_file = "LICENSE-MIT"
 sha256 = "f25a58d324efc0479a9eb83bd610fedf946bbefe12d0669a147c46497b65548f"
 usage = "Original design sketch, kept for reference"
 
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-welcome.png"
+title = "Postino P6b onboarding welcome"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "4cab33e1d8a18e062c70f13167d580813968595ae43e374fee9dde158b51e643"
+usage = "Documentation screenshot of the first-run welcome"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-provider.png"
+title = "Postino P6b onboarding provider"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "c50a68395b7241d04d896bbb4233b085f9bbb96d044eba85026c73638f0bdda8"
+usage = "Documentation screenshot of the provider step with the Gmail app-password note"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-form.png"
+title = "Postino P6b onboarding credentials"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "682a426ac7611cc133c903c6dc0092dbc7c1a4c497ee85305472197b6ccf6ab7"
+usage = "Documentation screenshot of the masked credentials form"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-error.png"
+title = "Postino P6b onboarding connection error"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "f9e874651e709ebb3303808f3536746252e7485b7e3372b6d600c600d4e8963b"
+usage = "Documentation screenshot of a specific rejected-password error"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-folders.png"
+title = "Postino P6b onboarding folders"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "4b0de182b736f08afac6c6c38414e57f3288874516ae7d33b526737ccc313f8f"
+usage = "Documentation screenshot of discovered folders and role warnings"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-sync.png"
+title = "Postino P6b first sync"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "a7e99391c4d894a47ec76a56365a922392b842b3c9e0a03d291d7d7a5841475d"
+usage = "Documentation screenshot of determinate first-sync progress"
+
+[[asset]]
+path = "docs/images/postino-p6b-mailbox.png"
+title = "Postino P6b mailbox"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "ee542dcc358024d996d06dd5d511fdfab2d44d48a7f4a67a2eb427d93d257153"
+usage = "Documentation screenshot of the account switcher, store folders and sync status"
+
+[[asset]]
+path = "docs/images/postino-p6b-offline.png"
+title = "Postino P6b offline mailbox"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "7528e62474af7d555a74fb41666ab3291482caaa20cb72be09f183c09c0eb73d"
+usage = "Documentation screenshot of the offline banner with cached mail still readable"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-form-dark.png"
+title = "Postino P6b onboarding credentials, dark"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "f36aab831f65b25c5ef6ccce4e62379643175b77b6c08efa4dc25345ff8fbbe0"
+usage = "Documentation screenshot of the dark credentials form"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-folders-dark.png"
+title = "Postino P6b onboarding folders, dark"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "f77383ba9beba2f7014986b5c67d63bbf3ac4ca11e3c7f0d1ee363cd87779eba"
+usage = "Documentation screenshot of dark discovered folders"
+
+[[asset]]
+path = "docs/images/postino-p6b-mailbox-dark.png"
+title = "Postino P6b mailbox, dark"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "60a07de654e4382fd50d2341589492d4ccd88f19a82eefbcb54eba16f787d38e"
+usage = "Documentation screenshot of the dark mailbox"
+
+[[asset]]
+path = "docs/images/postino-p6b-offline-dark.png"
+title = "Postino P6b offline mailbox, dark"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "1590c53130f341dbc465c71b2fee515e14cc815edff5050b379699c8a8d73521"
+usage = "Documentation screenshot of the dark offline state"
+
+[[asset]]
+path = "docs/images/postino-p6b-mailbox-980.png"
+title = "Postino P6b mailbox at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "10e145eb2b1af1364cd816d284795447ccfa67e2565a1c5449c1940f3048bc58"
+usage = "Documentation screenshot of the minimum supported window"
+
+[[asset]]
+path = "docs/images/postino-p6b-onboarding-folders-980.png"
+title = "Postino P6b onboarding folders at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "a9eba0fdd69a04dfa6d21109bcaa1d5b2dfe0f4737942e5c7980bf16a812b329"
+usage = "Documentation screenshot of the folder step at the minimum window"
+
 # Cargo dependencies that carry licensed assets (an icon font, not a vendored file).
 [[dependency]]
 name = "egui-phosphor"

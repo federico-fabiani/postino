@@ -3258,8 +3258,16 @@ dependencies = [
  "log",
  "png",
  "postino-core",
+ "postino-net",
+ "postino-platform",
+ "postino-store",
+ "postino-sync",
+ "postino-testkit",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

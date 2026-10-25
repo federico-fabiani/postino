@@ -12,6 +12,8 @@ use crate::ui::widgets::{layout, paint_left, paint_right};
 pub enum ListRowKind {
     Message,
     Folder,
+    /// A two-line account block with no unread dot, star or avatar.
+    Account,
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +69,26 @@ impl<'a> ListRow<'a> {
             show_avatar: false,
             height: size::ROW_COMPACT,
             kind: ListRowKind::Folder,
+        }
+    }
+
+    /// The account switcher block: name, address and a right-aligned unread total.
+    #[must_use]
+    pub fn account(title: &'a str, subtitle: &'a str, meta: &'a str) -> Self {
+        Self {
+            title,
+            subtitle,
+            meta,
+            initials: "",
+            leading_icon: None,
+            dot: None,
+            unread: false,
+            starred: false,
+            selected: false,
+            focused: false,
+            show_avatar: false,
+            height: 40.0,
+            kind: ListRowKind::Account,
         }
     }
 
@@ -153,7 +175,7 @@ impl<'a> ListRow<'a> {
         let faint = if selected { t.selected_muted } else { t.text_faint };
 
         let mut cursor = rect.left() + space::LG;
-        if self.kind == ListRowKind::Folder {
+        if self.kind == ListRowKind::Folder || self.kind == ListRowKind::Account {
             if let Some(dot) = self.dot {
                 // The caller resolves a selected-safe colour: a label must keep its identity.
                 ui.painter().circle_filled(pos2(cursor + 3.0, rect.center().y), 3.0, dot);
@@ -204,7 +226,7 @@ impl<'a> ListRow<'a> {
         let subtitle = eframe::egui::WidgetText::from(eframe::egui::RichText::new(self.subtitle).font(subtitle_font.clone()).color(muted))
             .into_galley(ui, Some(TextWrapMode::Truncate), text_width, subtitle_font.clone());
 
-        if self.kind == ListRowKind::Message {
+        if self.kind == ListRowKind::Message || self.kind == ListRowKind::Account {
             let total = title.size().y + 2.0 + subtitle.size().y;
             let top = rect.center().y - total * 0.5;
             ui.painter().galley(pos2(cursor, top), title.clone(), Color32::PLACEHOLDER);

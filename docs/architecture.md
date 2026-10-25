@@ -24,14 +24,14 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 
 The engine has two sources of truth, chosen at construction:
 
-- `Engine::demo()` / `demo_at()` — synthetic mail in memory, no I/O. This is what the desktop app
-  still boots on until onboarding (P6b).
+- `Engine::demo()` / `demo_at()` — synthetic mail in memory, no I/O. This is the `--demo` path the
+  desktop app uses for screenshots, trials and the recovery screen.
 - `Engine::open(store)` — the encrypted SQLCipher store, loaded once and written through on every
-  mutation. The CLI reaches it with `--store <path>` or the default local path; the key comes from the
-  OS keyring.
+  mutation. The desktop app boots on it by default (onboarding when it has no account); the CLI
+  reaches it with `--store <path>` or the default local path; the key comes from the OS keyring.
 
 The UI, CLI and MCP read both through the same `Engine::call(name, args)` door. The MCP server and
-the GUI never touch SQL directly. Nothing is fetched from a server and nothing is sent: IMAP is P5,
+the GUI never touch SQL directly. Mail is fetched from IMAP by `postino-sync`; nothing is sent yet:
 SMTP is P7.
 
 ## 2. The seam that matters: operations, not functions
@@ -277,14 +277,14 @@ cache; the engine is authoritative for it.
 
 **Residual windows.** Each engine mutation is one repository transaction, so a crash or disk
 failure cannot leave the store one step ahead of memory within an operation. Activations and the
-app are still demo-only; the engine writes attachment bytes only through the P4b seam, and it writes
-local drafts with `uid`, `Message-ID` and `size` empty. Received mail is different: `postino-sync`
-(P5b) fills those columns, parses the MIME body and stores attachment bytes through the same seam.
-The keyring lock protects first-run key creation, not the store file itself. There is no cross-process
-locking story beyond SQLite's WAL, busy timeout and the keyring lock: one process owns the store
-until the daemon (M4), and the desktop app does not open it yet. The repository returns folders and
-labels ordered by name, so a store engine sees alphabetical order where the demo saw creation order;
-P6b decides the real folder-tree order when onboarding writes it.
+desktop app both use the store now; the engine writes attachment bytes only through the P4b seam, and
+it writes local drafts with `uid`, `Message-ID` and `size` empty. Received mail is different:
+`postino-sync` (P5b) fills those columns, parses the MIME body and stores attachment bytes through
+the same seam. The keyring lock protects every keyring access, not the store file itself. There is no
+cross-process locking story beyond SQLite's WAL, busy timeout and the keyring lock: one app process
+owns the store, and the background sync worker opens a second connection in that same process until
+the daemon (M4). The repository returns folders and labels ordered by name; onboarding writes the
+server's folder tree in that order.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
 a store. **Still missing:** the onboarding UI (P6b) and its `sync_now` binding, FTS5 (P9), outbox
@@ -623,8 +623,9 @@ run or an explicit `recount_folder`.
 
 **Not synced.** Server-side filters and rules, flag changes pushed out, `EXPUNGE`, `APPEND` of drafts
 or sent mail, `CONDSTORE`/`QRESYNC` increments, a folder-removal pass (a folder deleted on the server
-keeps its cached rows until P6b decides), full JWZ threading, FTS5 and any scheduled loop. P6a adds the
-operations and the CLI/MCP bindings (§4.7); the UI binding is P6b, and there is still no scheduler.
+keeps its cached rows until a later package decides), full JWZ threading, FTS5 and any periodic
+scheduler. P6a adds the operations and the CLI/MCP bindings; P6b adds the worker, so a run starts on
+launch, on Refresh, or from onboarding. There is still no daemon and no timer inside the process.
 
 **Evidence.** The scripted server moved to `postino-testkit`, and the sync tests script real protocol
 exchanges: initial sync, incremental UIDs, UIDVALIDITY, deletion, flag drift, oversized attachment,
@@ -639,10 +640,10 @@ the flag scan costs one probe plus two 1 000-UID windows, which is why the run g
 
 ### 4.7 Implemented in P6a: accounts, credentials and sync operations
 
-The backend that turns Postino from a demo into a client for a real mailbox. There is no onboarding
-screen yet (P6b), but the CLI, MCP and the operation registry are complete: a person can add an Aruba
-or Gmail account with an app password, test it, sync it into the encrypted store, read the cached
-mail and remove it. The desktop app still boots on the demo until P6b.
+The backend that turns Postino from a demo into a client for a real mailbox. The CLI, MCP and the
+operation registry are complete: a person can add an Aruba or Gmail account with an app password,
+test it, sync it into the encrypted store, read the cached mail and remove it. P6b adds the desktop
+onboarding, the boot on the store and the background worker (§4.8).
 
 **Credential scopes.** `postino-platform` owns every keyring access under service `postino`:
 
@@ -748,15 +749,55 @@ failed sync that keeps the cache, remove isolation, the remove failure window, a
 transaction that rolls the credential back, the read-only store seam and the demo errors. No test
 uses a real vault, a real account or `%LOCALAPPDATA%\Postino`.
 
+### 4.8 Implemented in P6b: onboarding, boot and the sync worker
+
+The desktop app is a client of the same store as the CLI.
+
+**Boot.** Without `--demo`, the app opens `Engine::data_dir()/mail.db` (or `--store`), reads the
+store key from the OS keyring and loads the mailbox once. A failure at any stage (data directory,
+keyring, key, schema) shows a recovery card with the path, the failing stage, a Retry button and an
+explicit “Apri la modalità demo”; it never panics and never silently starts on an empty mailbox. A
+store with no account opens onboarding; a store with an account opens the mailbox, shows the cache
+immediately and starts one background refresh. `--demo` is the synthetic fallback and is labelled as
+such, so a screenshot can never be mistaken for real mail.
+
+**Onboarding.** Welcome → provider (Aruba, Gmail, custom host/port/TLS) → credentials (masked
+password in a zeroising buffer, Caps Lock hint, no password in labels) → folders with the server's
+roles and Italian warnings → first sync with determinate progress, Cancel and “Continua in
+background” → mailbox. Back exists at every stage, Esc uses the unsaved guard, Enter continues, focus
+moves to the field that failed. The account probe runs on a worker thread so the UI never blocks; a
+failed probe writes nothing (P6a). The credential is zeroised when the flow succeeds, is cancelled or
+is dropped.
+
+**Worker.** One thread owns its own SQLCipher connection and `Engine::open_with_vault`, with command
+(`SyncNow`, `Cancel`, `Stop`) and event (`Started`, `Progress`, `Finished`, `Failed`) channels. It
+drives `postino_sync::sync_account` directly, polls the persisted status for progress and reloads
+its engine from disk before reporting. Duplicate requests coalesce and a second UI request says
+“Sincronizzazione già in corso”. The UI thread polls events, never calls egui from the worker and
+reloads the account without losing selection, filters or the open message. Events from an account the
+user switched away from are ignored for the UI while the store is still refreshed. Two connections
+live in one process until the daemon (M4); SQLite WAL and the busy timeout serialise them.
+
+**Mailbox.** Folders, messages and counts come from the store; the account switcher carries the
+active identity and offers add/manage; Refresh runs the worker; the status bar shows syncing with
+progress, “Aggiornato alle HH:MM”, offline with the last sync and an error with Retry. An offline
+banner never empties the list. Account removal is destructive, explains the local-cache and keyring
+consequences, and returns to onboarding when the last account goes.
+
+**Deferred to P6c.** Link opening with a scheme allowlist, attachment Save through the blob seam,
+the full settings/licences surface and the remaining reading-pane affordances. SMTP, HTML rendering
+and OAuth remain later packages.
+
 ## 5. Synchronization
 
 IMAP is the synchronization protocol. There is no Postino server.
 
 P5a ships the client (`postino-net`): one connection, TLS, the commands in §4.4, typed data out. P5b
 ships the reconciler (`postino-sync`) described in §4.6: one account, one store connection, one run at
-a time. P6a wires it to the engine: `sync_now` is the only operation that calls it, and the CLI and
-MCP reach it through the same registry. It is still not scheduled: there is no loop and no daemon, so
-a sync runs only when a caller asks for one.
+a time. P6a wires it to the engine: `sync_now` is the only operation that calls it, and the CLI, MCP
+and the desktop worker reach it through the same registry. It is still not scheduled: there is no
+periodic loop and no daemon, so a sync starts on app launch, on Refresh, from onboarding or when a
+CLI/MCP caller asks for one.
 
 The target loop, most of which does not exist yet:
 

@@ -1,10 +1,9 @@
 # Postino roadmap
 
-> **Current milestone:** U0 — UI foundation (M0 skeleton done) · **Last updated:** 2026-10-25
+> **Current milestone:** M1 complete — read real mail · **Last updated:** 2026-10-25
 >
-> The M1 backend packages P3-P6a are ahead of the app: the store, MIME, blobs, IMAP, sync and the
-> account/sync operations exist as tested crates and CLI/MCP paths, while the desktop app still boots
-> on demo data until onboarding (P6b).
+> M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
+> desktop app reads and syncs a real mailbox from the encrypted cache. M2 starts with SMTP.
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.
@@ -54,15 +53,15 @@ interaction model before real mail makes them expensive to change. Full spec:
       and apply/remove (creating a label is not an undo step). The reading pane is a resizable side
       pane at 1000 px and wider, and a full-width overlay below it. Labels stay local and in-memory
       until M1. Screenshots: `docs/images/postino-u05-labels.png`, `postino-u05-label-menu.png`.
-- [ ] **U0.5 Polish** — empty/loading/error states, reduced motion, accessibility pass, final
-      light/dark screenshots and docs.
-- [ ] Verify: every component in the gallery in light/dark; full keyboard-only workflow; no dead
+- [x] **U0.5 Polish** — empty/loading/error states, reduced motion, accessibility pass, final
+      light/dark screenshots and docs (P2a/P2b).
+- [x] Verify: every component in the gallery in light/dark; full keyboard-only workflow; no dead
       actions; no ad-hoc literals in screens; `cargo xtask ci` green.
 
 ## M1 — read real mail
 
-- [x] SQLCipher store, migrations, WAL, key in the OS keyring (P3a-P3c; the CLI runs on it, the app
-      still boots on demo until P6).
+- [x] SQLCipher store, migrations, WAL, key in the OS keyring (P3a-P3c); the CLI and the desktop
+      app both run on it, with `--demo` as the synthetic fallback.
 - [x] MIME parsing, allowlist HTML sanitization, HTML-to-text and RFC 5322 serialization as the
       `postino-mime` crate (P4a): bounded input, warnings, header-injection guards, deterministic
       bytes, ten synthetic fixtures and a mutation corpus.
@@ -72,9 +71,10 @@ interaction model before real mail makes them expensive to change. Full spec:
       `account_test`, `account_remove`, `sync_now` and `sync_status`; OS-keyring credentials under
       `account:<id>:imap`, schema v4 `account_servers`, offline Aruba/Gmail autodiscovery, the
       credential-first add and cache-first remove order, and sensitive-operation filtering in MCP.
-      The CLI can add, test, sync and remove an account; the app still boots on the demo.
-- [ ] Account onboarding UI and the app on real data (P6b): autodiscovery screen, Aruba app-password
-      flow, first-run store wiring in the desktop app.
+      The CLI and the desktop app can add, test, sync and remove an account.
+- [x] Account onboarding UI and the app on real data (P6b): welcome/provider/credentials/folders/
+      first-sync flow, Aruba and Gmail app-password guidance, recovery screen, background sync
+      worker, account switcher and offline banner.
 - [x] IMAP: CAPABILITY, LOGIN/AUTH, LIST, SELECT, UID FETCH envelope/flags/body, IDLE, as the
       `postino-net` client crate (P5a): TLS-only, bounded, typed errors, and a 54-case hostile corpus
       against the scripted TLS server now shared as `postino-testkit`.
@@ -82,16 +82,16 @@ interaction model before real mail makes them expensive to change. Full spec:
       special-use, UIDVALIDITY resets, incremental UID windows, MIME bodies, attachment blobs,
       deletion pass, flags on first insert with drift reporting, cancellable runs and a persistent
       status. 111 net tests plus the sync suite, a 2 000-message test in CI and 10 000 behind
-      `POSTINO_SLOW_TESTS=1`. **No operation, CLI command, MCP tool, UI or scheduler calls it yet.**
+      `POSTINO_SLOW_TESTS=1`. `sync_now`/`sync_status`, the CLI and the desktop worker call it.
 - [x] Local cache and offline read: a synced mailbox opened through `Engine::open` serves bodies and
       attachment bytes with the network off (proved by the sync suite). The folder tree comes from
       the server's special-use attributes.
-- [ ] Wire sync to the operation registry and the CLI, so a user can start a run (P6).
-- [ ] Message list and reading pane fed by the store, not demo data.
-- [ ] Sync status and errors the user can act on.
-- [x] Verify at crate level: 10 000-message sync under a time/memory budget (56 s / 38.6 MB peak
-      working set on the Windows GNU host), cancel mid-sync and resume without duplicates, and read a
-      message with the network off. The app-level verify waits for P6.
+- [x] Wire sync to the operation registry, the CLI and the desktop worker (P6a/P6b).
+- [x] Message list and reading pane fed by the store, not demo data.
+- [x] Sync status and errors the user can act on: syncing, updated at, offline with the last sync, error with Retry.
+- [x] Verify: 10 000-message sync in 36.5 s / 34.8 MB peak working set on the Windows GNU host,
+      cancel mid-sync and resume without duplicates, read a message with the network off, and add an
+      account through the desktop onboarding against the scripted server.
 
 ## M2 — write real mail
 

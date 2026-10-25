@@ -5,7 +5,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod app;
+mod boot;
+mod onboarding;
 mod settings;
+mod sync_worker;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod ui;
 
@@ -26,7 +31,7 @@ const MIN_SIZE: [f32; 2] = [980.0, 600.0];
 /// A scripted capture must fail loudly instead of waiting forever for a window that never paints.
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Every flag the app understands. Used in the parse error so a typo is self-correcting.
-const ACCEPTED_FLAGS: &str = "--screenshot <state>, --out <path>, --dark, --native-chrome, --size WxH, --gallery";
+const ACCEPTED_FLAGS: &str = "--screenshot <state>, --out <path>, --dark, --native-chrome, --size WxH, --gallery, --demo, --store <path>";
 
 #[derive(Debug, PartialEq)]
 struct ScreenshotRequest {
@@ -36,12 +41,13 @@ struct ScreenshotRequest {
 }
 
 /// The validated command line. `screenshot` and `gallery` are mutually exclusive by construction.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug)]
 struct Args {
     screenshot: Option<ScreenshotRequest>,
     gallery: bool,
     dark: bool,
     native_chrome: bool,
+    launch: boot::Launch,
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +58,8 @@ struct ParsedArgs {
     gallery: bool,
     dark: bool,
     native_chrome: bool,
+    demo: bool,
+    store: Option<PathBuf>,
 }
 
 impl ParsedArgs {
@@ -60,6 +68,12 @@ impl ParsedArgs {
     fn finish(self) -> Result<Args, String> {
         if self.gallery && self.state.is_some() {
             return Err("--screenshot and --gallery cannot be combined; run one or the other".to_owned());
+        }
+        if self.demo && self.store.is_some() {
+            return Err("--demo and --store cannot be combined: choose the synthetic mailbox or the encrypted store".to_owned());
+        }
+        if self.store.is_some() && self.state.is_some() {
+            return Err("--store is only valid for a normal launch; a screenshot uses the deterministic demo mailbox".to_owned());
         }
         let screenshot = match self.state {
             Some(state) => {
@@ -76,7 +90,8 @@ impl ParsedArgs {
                 None
             }
         };
-        Ok(Args { screenshot, gallery: self.gallery, dark: self.dark, native_chrome: self.native_chrome })
+        let launch = if self.demo { boot::Launch::Demo } else { boot::Launch::Store(self.store) };
+        Ok(Args { screenshot, gallery: self.gallery, dark: self.dark, native_chrome: self.native_chrome, launch })
     }
 }
 
@@ -91,7 +106,7 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         }
     };
-    let Args { screenshot, gallery, dark, native_chrome } = args;
+    let Args { screenshot, gallery, dark, native_chrome, launch } = args;
     // The normal window draws its own forest title bar. Screenshot mode obeys the same rule so it
     // captures what a user sees, and macOS keeps its native title bar.
     let custom_chrome = !native_chrome && !cfg!(target_os = "macos");
@@ -113,7 +128,7 @@ fn main() -> eframe::Result<()> {
         if gallery {
             return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(ui::gallery::GalleryApp::new(cc, dark)))));
         }
-        return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(app::PostinoApp::new(cc, custom_chrome)))));
+        return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(app::PostinoApp::launch(cc, custom_chrome, launch)))));
     };
     let clock = match app::screenshot_clock() {
         Ok(clock) => clock,
@@ -212,6 +227,14 @@ fn parse_args(raw: &[OsString]) -> Result<Args, String> {
             "--gallery" => {
                 mark(&mut seen, "--gallery")?;
                 parsed.gallery = true;
+            }
+            "--demo" => {
+                mark(&mut seen, "--demo")?;
+                parsed.demo = true;
+            }
+            "--store" => {
+                mark(&mut seen, "--store")?;
+                parsed.store = Some(PathBuf::from(raw_value(raw, &mut index, "--store")?));
             }
             other => {
                 return Err(format!("unknown argument {other:?}; accepted flags are {ACCEPTED_FLAGS}"));
@@ -318,11 +341,24 @@ mod tests {
         let plain = parse(&[]).expect("an empty command line is a normal launch");
         assert!(plain.screenshot.is_none());
         assert!(!plain.gallery);
+        assert_eq!(plain.launch, boot::Launch::Store(None), "the normal launch opens the default store");
         let gallery = parse(&["--gallery", "--dark"]).expect("gallery launch");
         assert!(gallery.gallery);
         assert!(gallery.dark);
         assert!(gallery.screenshot.is_none());
         assert!(parse(&["--native-chrome"]).expect("normal launch with native chrome").native_chrome);
+    }
+
+    #[test]
+    fn demo_and_store_select_the_mailbox() {
+        let demo = parse(&["--demo"]).expect("demo launch");
+        assert_eq!(demo.launch, boot::Launch::Demo);
+        let store = parse(&["--store", "D:/Postino/mail.db"]).expect("explicit store");
+        assert_eq!(store.launch, boot::Launch::Store(Some(PathBuf::from("D:/Postino/mail.db"))));
+        assert!(parse(&["--demo", "--store", "a.db"]).is_err(), "the two mailbox choices are exclusive");
+        assert!(parse(&["--store"]).is_err(), "the store needs a path");
+        assert!(parse(&["--store", "a.db", "--store", "b.db"]).is_err(), "duplicate flags are refused");
+        assert!(parse(&["--store", "a.db", "--screenshot", "shell", "--out", "a.png"]).is_err(), "a screenshot is always the demo");
     }
 
     #[test]
