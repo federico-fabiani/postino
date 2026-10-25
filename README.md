@@ -4,13 +4,15 @@
 registry shared by the desktop app, the CLI and an MCP server.
 
 > **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
-> the MIME crate (P4a).** The shell, the operation registry, the CLI and the MCP server work against
-> a synthetic demo mailbox, and `postino --store <path>` can now run the same operations on the
-> encrypted SQLCipher database: accounts, folders, messages, labels, drafts and flags survive a
-> restart. The desktop app still boots on the demo until onboarding (P6). MIME parsing,
-> sanitization and serialization exist as `postino-mime` but are not wired into the engine yet;
-> IMAP, SMTP and the background daemon land in M1-M4. No real account is configured, no mail leaves
-> the machine, and the composer's send is a local move to Sent, never an SMTP submission.
+> the MIME crate (P4a) + the IMAP client (P5a).** The shell, the operation registry, the CLI and the
+> MCP server work against a synthetic demo mailbox, and `postino --store <path>` can now run the same
+> operations on the encrypted SQLCipher database: accounts, folders, messages, labels, drafts and
+> flags survive a restart. The desktop app still boots on the demo until onboarding (P6). MIME
+> parsing, sanitization and serialization exist as `postino-mime` but are not wired into the engine
+> yet; `postino-net` is an IMAP4rev1 client that can log in over TLS, list folders, select, fetch
+> envelopes and `BODY.PEEK[]` bodies, store flags and idle, but no sync loop calls it yet. SMTP and
+> the background daemon land in M2-M4. No real account is configured, no mail leaves the machine,
+> and the composer's send is a local move to Sent, never an SMTP submission.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -52,6 +54,14 @@ MCP      ─┘
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
   guards and `Bcc` kept in the envelope. It is not wired into the engine or the app yet, so the
   shell still shows demo mail.
+- The M1 network foundation as a crate (`postino-net`, P5a): an IMAP4rev1 client over implicit TLS
+  or STARTTLS, with the operating system's certificate verifier and no way to switch verification
+  off. It logs in with `AUTHENTICATE PLAIN` or `LOGIN`, lists folders with special-use and modified
+  UTF-7 names, selects and examines, fetches envelopes and whole bodies with `BODY.PEEK[]` (never
+  setting `\Seen`), stores flags by UID, runs one `IDLE` cycle and logs out. Every line, literal,
+  command and response is bounded, the password is zeroised and redacted, and a scripted TLS server
+  with a 53-case hostile corpus proves each path. It is tested against that fake server only and is
+  not wired into the engine, the app or a sync loop yet.
 - Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
   MCP protocol tests, and store round-trip tests at both the repository and engine level.
 

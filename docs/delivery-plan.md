@@ -74,7 +74,8 @@ Status: `todo` · `active` · `review` · `done`.
 | P3c | Engine wiring | engine reads/writes the encrypted store; demo path unchanged; reopen test | done |
 | P4a | MIME crate | parse/serialize, sanitized HTML allowlist, text alternative, bounds and fixtures | done |
 | P4b | Attachment blobs | content-addressed encrypted blobs, engine/store plumbing, reopen test | todo |
-| P5 | M1 IMAP | CAPABILITY/LOGIN/LIST/SELECT/FETCH/IDLE, fake-server tests, offline cache | todo |
+| P5a | IMAP client | CAPABILITY/LOGIN/LIST/SELECT/FETCH/IDLE, TLS, bounds, scripted fake server | done |
+| P5b | Sync and cache | reconciliation, offline cache, sync status operations, 10k/kill-resume tests | todo |
 | P6 | M1 onboarding | autodiscovery, Aruba app-password flow, multi-account model, real folder tree | todo |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | todo |
 | P8 | M2 compose | attachments bytes, signatures per identity, scheduled send, undo send | todo |

@@ -102,7 +102,7 @@ decision and the migration path.
 |---|---|
 | `postino-store` | SQLCipher schema, migrations, repository (P3b); FTS5 and encrypted blobs later |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blobs P4b) |
-| `postino-net` | IMAP (IDLE, QRESYNC), SMTP submission, autodiscovery |
+| `postino-net` | IMAP4rev1 client (P5a): TLS, bounded responses, testable against a scripted server. SMTP submission, autodiscovery, QRESYNC later |
 | `postino-sync` | reconciliation, outbox with idempotency keys, drafts, flags, threading |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
 | `postino-rules` | local rules and Sieve generation |
@@ -110,9 +110,10 @@ decision and the migration path.
 | `postino-platform` | keyring (P3b); paths, notifications, tray, autostart, single instance later |
 | `postino-testkit` | fake IMAP/SMTP, MIME fixtures, golden messages |
 
-Layers: foundation (platform, store, mime, crypto) → network/sync → features (compose, rules) →
-engine → frontends. `postino-core` stays as the façade and operation registry. Nothing below the
-frontends depends on egui.
+Layers: foundation (platform, store, mime, crypto) → network (net) and sync → features (compose,
+rules) → engine → frontends. `postino-net` depends on no other workspace crate: it speaks to the
+server, and the sync layer above it decides what to keep. `postino-core` stays as the façade and
+operation registry. Nothing below the frontends depends on egui.
 
 ## 4. Data model
 
@@ -300,9 +301,64 @@ the core `Address`/`Attachment` shapes; P5 supplies the IMAP bytes and P7 uses `
 submission. The crate has no dependency on `postino-core`, so the mapping stays in the engine
 layer.
 
+### 4.4 Implemented in P5a: the IMAP client
+
+`postino-net` is the network layer and nothing above it. It owns one TCP connection, its TLS
+session and the IMAP conversation; it does not choose what to download, write the store or run a
+loop. Bodies leave it as bytes, unparsed.
+
+```
+ImapConfig ──▶ TCP ──▶ TLS ──▶ greeting ──▶ CAPABILITY ──▶ login ──▶ LIST / SELECT / FETCH / STORE / IDLE
+                                            └─ STARTTLS ──▶ TLS ──▶ CAPABILITY (pre-TLS state discarded)
+```
+
+**TLS policy.** Two modes and no third: implicit TLS (993) and STARTTLS (143). There is no
+plaintext mode and no option that skips verification. Verification is the operating system's
+through `rustls-platform-verifier` — CryptoAPI on Windows, the Security framework on macOS, the
+system trust store through WebPKI elsewhere — with `ring` as the crypto provider, so the crate
+adds no OpenSSL and no C build beyond `ring`. `ImapConfig::extra_roots` adds trust anchors, which is
+how the test server is trusted; it augments the platform verifier and cannot disable it. A
+certificate failure reports the host and the verifier's reason, never the certificate bytes.
+
+STARTTLS is not a suggestion: when the mode is selected and the server does not advertise
+`STARTTLS`, the session stops with `Unsupported`. After the tagged `OK`, bytes already buffered on
+the socket are plaintext sent before the handshake — a command-injection attempt — and are refused
+rather than parsed. Capabilities collected before the upgrade are discarded and asked again over
+TLS, so a server cannot downgrade what it claims.
+
+**Command surface.** `CAPABILITY`, `AUTHENTICATE PLAIN` (preferred) or `LOGIN`, `LIST "" "*"`,
+`SELECT`/`EXAMINE`, `UID FETCH ... (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)`,
+`UID FETCH <uid> (BODY.PEEK[])`, `UID STORE` with `+FLAGS.SILENT`/`-FLAGS.SILENT`/`FLAGS.SILENT`,
+`NOOP`, `IDLE` with a single `DONE` cycle, `LOGOUT`. Tags are `A0001`… and an unexpected tag is a
+`Protocol` error. Bodies are never fetched with `BODY[]`: `BODY.PEEK[]` keeps reading from mutating
+`\Seen`. Modified UTF-7 is decoded for display and the wire name is kept for subsequent commands.
+
+**Bounds.** A response line is at most 64 KiB, a literal 25 MiB by default (configurable, hard
+ceiling 64 MiB), untagged responses per command 10 000, folders per `LIST` 5 000, a command line
+8 KiB, and one command may consume at most 64 MiB of response bytes (hard ceiling 128 MiB). Fixed
+parser limits cap nesting at 32 levels, literals per response at 4 096, atoms and mailbox names at
+1 KiB, and numbers at 20 digits; a number is parsed, never wrapped. Exceeding a bound is
+`TooLarge` or `Protocol`, never a hang or an unbounded allocation. Every phase has a timeout
+(DNS, connect, TLS handshake, greeting, each command, `DONE`); a timeout closes the session and the
+next call fails as `Closed` instead of reading a half-command.
+
+**Security.** The password is a `Secret` that zeroises on drop and prints `[redacted]`, and it is
+dropped after a successful login. The SASL payload and the `LOGIN` line are built in `Zeroizing`
+buffers. Logs carry the tag and the command verb, never arguments, addresses, bodies or
+credentials. Server text in errors is cut to printable ASCII.
+
+**Not implemented.** Sync loops, store writes, engine operations, `APPEND`/`COPY`/`MOVE`/`EXPUNGE`,
+QRESYNC/CONDSTORE beyond reading `HIGHESTMODSEQ` when the server volunteers it, SORT/THREAD,
+METADATA, ACL, SIEVE, NOTIFY, ESEARCH, `BODYSTRUCTURE` and per-part fetches, OAuth/SASL XOAUTH2 and
+any mechanism other than PLAIN, SMTP, autodiscovery and MIME parsing. The fake server lives in
+`crates/net/tests/support/`; it is promoted to `postino-testkit` only when SMTP needs it.
+
 ## 5. Synchronization
 
 IMAP is the synchronization protocol. There is no Postino server.
+
+P5a ships the client (`postino-net`): one connection, TLS, the commands in §4.4, typed data out.
+P5b adds everything below: the loop, the store writes, reconciliation and the scheduler binding.
 
 - Discover settings with RFC 6186 SRV records, autoconfig, then a manual fallback.
 - One connection per account for IDLE; separate short-lived connections for bulk fetch.
@@ -349,7 +405,8 @@ ADR-0001.
 
 ## 7. Security architecture
 
-- TLS only; certificate validation cannot be disabled from the UI.
+- TLS only; certificate validation cannot be disabled from the UI. The IMAP client verifies with
+  the operating system's verifier, refuses STARTTLS downgrades, and has no plaintext mode at all.
 - Credentials in the OS keyring; OAuth2 PKCE with a loopback redirect for providers that require it.
 - Store encrypted at rest; the key is generated on first run and kept in the keyring.
 - HTML sanitized with an allowlist; remote images and tracking pixels blocked by default; no
@@ -380,3 +437,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P3c: engine loads the store once and writes through; CLI `--store`; demo unchanged |
 | 2026-10-25 | major | P3d: schema v3 (`draft_seq`, `label_seq`), atomic draft save/send, draft patch semantics, per-account Sent, orphan repair, keyring first-run lock, categorised store errors |
 | 2026-10-25 | major | P4a: `postino-mime` parses, sanitizes and serializes MIME with bounds, warnings and injection guards |
+| 2026-10-25 | major | P5a: `postino-net` speaks IMAP4rev1 over implicit TLS or STARTTLS with OS verification, bounded lines/literals/commands, typed errors and a scripted hostile-server corpus; the sync loop and store writes are still missing |

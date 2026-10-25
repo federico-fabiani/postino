@@ -70,6 +70,17 @@
   ClamAV integration later.
 - Phishing: display SPF/DKIM/DMARC results from `Authentication-Results`, flag mismatches, but do
   not claim certainty.
+- IMAP responses (`postino-net`, P5a): the server is untrusted input even after authentication.
+  Lines are capped at 64 KiB, literals at 25 MiB by default (hard ceiling 64 MiB), untagged
+  responses per command at 10 000, folders at 5 000, command lines at 8 KiB and the response for
+  one command at 64 MiB. Nesting, atoms, flags, addresses and numeric digits have fixed caps; a
+  number is parsed, never wrapped. A truncated literal, a missing `*`, a bad tag, `NIL` where a
+  number is required and a negative number are typed errors, and a 53-case corpus runs in CI with a
+  three-second bound per case. A timeout closes the session, so the next call cannot read the tail
+  of a half-command. Whole bodies are fetched with `BODY.PEEK[]`, so a read never sets `\Seen`.
+- IMAP commands (`postino-net`, P5a): mailbox names, user names and passwords are quoted with `"`
+  and backslash escaping; CR, LF and NUL are refused instead of escaped, so no value can become a
+  second command. A UID set is parsed, not expanded, so `1:*` on a huge mailbox is one range.
 
 ### 4.2 Account compromise
 
@@ -77,6 +88,17 @@
 - App passwords are supported for providers that require them (Aruba), stored in the keyring.
 - Tokens are refreshed in memory; refresh tokens are stored encrypted in the keyring.
 - A failed login is a readable error, never a silent retry loop that locks the account.
+- TLS is mandatory (`postino-net`, P5a): implicit TLS or STARTTLS, and no configuration that skips
+  certificate verification. Verification uses the operating system's verifier through
+  `rustls-platform-verifier`; extra trust anchors exist for tests and only add to it. A missing
+  `STARTTLS` capability stops the session before a credential is written, and plaintext already
+  buffered after the STARTTLS `OK` is treated as a command-injection attempt and refused. A
+  `LOGINDISABLED` capability is a clear `Auth` error, not a retry.
+- Passwords (`postino-net`, P5a): held in a `Secret` that zeroises on drop and prints `[redacted]`,
+  dropped after a successful login, and written only inside `AUTHENTICATE PLAIN` or `LOGIN`; command
+  lines and SASL payloads live in `Zeroizing` buffers. Logs carry tags and command verbs, never
+  arguments, credentials, addresses or bodies. Authentication errors say what failed, never echo
+  the password.
 
 ### 4.3 Local disk theft
 

@@ -1,0 +1,383 @@
+//! A scripted IMAP server for integration tests.
+//!
+//! Every test drives a real TCP socket (TLS by default, with a throwaway CA from `rcgen`) and
+//! asserts the exact command lines the client writes. Helpers cover the details that are easy to
+//! get wrong in a server implementation: literals, raw byte payloads, delays, disconnects and the
+//! STARTTLS upgrade in the middle of a session.
+
+#![allow(dead_code)]
+
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use postino_net::{ImapConfig, Secret, TlsMode};
+use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
+
+/// Login name used by every test.
+pub const USER: &str = "user@example.com";
+/// Password used by every test. It contains a space on purpose: quoting must work.
+pub const PASSWORD: &str = "correct horse battery";
+
+/// The SASL PLAIN payload the client must send for [`USER`] and [`PASSWORD`].
+pub fn expected_sasl() -> String {
+    STANDARD.encode(format!("\0{USER}\0{PASSWORD}"))
+}
+
+/// A server-side stream, plain or after the TLS handshake.
+pub enum Stream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+    Placeholder,
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(self: Pin<&mut Self>, context: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(context, buffer),
+            Self::Placeholder => Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected))),
+        }
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(self: Pin<&mut Self>, context: &mut Context<'_>, bytes: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(context, bytes),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(context, bytes),
+            Self::Placeholder => Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(context),
+            Self::Placeholder => Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected))),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(context),
+            Self::Placeholder => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+/// One accepted connection, with a line reader and a record of what the client sent.
+pub struct Conn {
+    stream: Stream,
+    buffer: Vec<u8>,
+    position: usize,
+    received: Vec<String>,
+}
+
+impl Conn {
+    fn new(stream: Stream) -> Self {
+        Self { stream, buffer: Vec::new(), position: 0, received: Vec::new() }
+    }
+
+    /// Every line the client has sent so far.
+    pub fn received(&self) -> &[String] {
+        &self.received
+    }
+
+    /// Whether the client sent a line starting with `prefix`.
+    pub fn sent_prefix(&self, prefix: &str) -> bool {
+        self.received.iter().any(|line| line.starts_with(prefix))
+    }
+
+    fn take_line(&mut self) -> Option<String> {
+        let available = self.buffer.get(self.position..)?;
+        let mut index = 0;
+        while index + 1 < available.len() {
+            if available.get(index) == Some(&b'\r') && available.get(index + 1) == Some(&b'\n') {
+                let raw = available.get(..index)?;
+                let line = String::from_utf8_lossy(raw).into_owned();
+                self.position += index + 2;
+                if self.position == self.buffer.len() {
+                    self.buffer.clear();
+                    self.position = 0;
+                }
+                return Some(line);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    async fn fill(&mut self) -> bool {
+        let mut chunk = [0u8; 4096];
+        match self.stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => false,
+            Ok(count) => {
+                self.buffer.extend_from_slice(chunk.get(..count).unwrap_or_default());
+                true
+            }
+        }
+    }
+
+    /// Read one CRLF-terminated line. Panics on a disconnect: a test server that expected a command
+    /// and got EOF is a failed expectation.
+    pub async fn read_line(&mut self) -> String {
+        match self.read_line_opt().await {
+            Some(line) => line,
+            None => panic!("client closed the connection; lines so far: {:?}", self.received),
+        }
+    }
+
+    /// Read one line, or `None` when the client closed the connection.
+    pub async fn read_line_opt(&mut self) -> Option<String> {
+        loop {
+            if let Some(line) = self.take_line() {
+                self.received.push(line.clone());
+                return Some(line);
+            }
+            if !self.fill().await {
+                return None;
+            }
+        }
+    }
+
+    /// Assert the next client line is exactly `expected`.
+    pub async fn expect(&mut self, expected: &str) {
+        let line = self.read_line().await;
+        assert_eq!(line, expected);
+    }
+
+    /// Assert the next client line starts with `prefix`.
+    pub async fn expect_prefix(&mut self, prefix: &str) {
+        let line = self.read_line().await;
+        assert!(line.starts_with(prefix), "expected a line starting with {prefix:?}, got {line:?}");
+    }
+
+    /// Write a string exactly as given.
+    pub async fn send(&mut self, text: &str) {
+        self.stream.write_all(text.as_bytes()).await.expect("server write");
+        self.stream.flush().await.expect("server flush");
+    }
+
+    /// Write a line with CRLF.
+    pub async fn send_line(&mut self, line: &str) {
+        self.send(&format!("{line}\r\n")).await;
+    }
+
+    /// Write raw bytes, literals included.
+    pub async fn send_bytes(&mut self, bytes: &[u8]) {
+        self.stream.write_all(bytes).await.expect("server write");
+        self.stream.flush().await.expect("server flush");
+    }
+
+    /// Wait before the next step.
+    pub async fn delay(&mut self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+
+    /// Complete the server side of a TLS handshake. Returns `false` when the client rejected the
+    /// certificate (which is the point of the wrong-hostname test).
+    pub async fn accept_tls(&mut self, acceptor: TlsAcceptor) -> bool {
+        let placeholder = std::mem::replace(&mut self.stream, Stream::Placeholder);
+        let Stream::Plain(tcp) = placeholder else {
+            panic!("TLS can only start on a plaintext connection");
+        };
+        match acceptor.accept(tcp).await {
+            Ok(tls) => {
+                self.stream = Stream::Tls(Box::new(tls));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Greeting and CAPABILITY, answered with `* CAPABILITY IMAP4rev1` plus `extra`.
+    pub async fn prepare(&mut self, extra: &str) {
+        self.send_line("* OK [CAPABILITY IMAP4rev1] fake IMAP ready").await;
+        self.expect("A0001 CAPABILITY").await;
+        if extra.is_empty() {
+            self.send_line("* CAPABILITY IMAP4rev1").await;
+        } else {
+            self.send_line(&format!("* CAPABILITY IMAP4rev1 {extra}")).await;
+        }
+        self.send_line("A0001 OK done").await;
+    }
+
+    /// Answer the `LOGIN` command the client sends when `AUTH=PLAIN` is not advertised.
+    pub async fn login_ok(&mut self) {
+        self.expect_prefix("A0002 LOGIN ").await;
+        self.send_line("A0002 OK logged in").await;
+    }
+
+    /// Greeting, CAPABILITY with `AUTH=PLAIN`, the full SASL exchange, and the post-login state.
+    pub async fn prepare_sasl(&mut self) {
+        self.send_line("* OK fake IMAP ready").await;
+        self.expect("A0001 CAPABILITY").await;
+        self.send_line("* CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE").await;
+        self.send_line("A0001 OK done").await;
+        self.expect("A0002 AUTHENTICATE PLAIN").await;
+        self.send_line("+ ").await;
+        let payload = self.read_line().await;
+        assert_eq!(payload, expected_sasl());
+        self.send_line("A0002 OK [CAPABILITY IMAP4rev1 IDLE] logged in").await;
+    }
+}
+
+/// Quote an IMAP string, escaping backslashes and quotes.
+pub fn quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// Build a `* LIST` line with attributes, an optional delimiter and a name.
+pub fn list_line(attributes: &[&str], delimiter: Option<char>, name: &str) -> String {
+    let delimiter = match delimiter {
+        Some(ch) => quoted(&ch.to_string()),
+        None => "NIL".to_owned(),
+    };
+    format!("* LIST ({}) {delimiter} {}", attributes.join(" "), quoted(name))
+}
+
+/// Build a `* n FETCH (UID u BODY[] {len}\r\n<body>)` response, literal included.
+pub fn fetch_body_response(sequence: u32, uid: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = format!("* {sequence} FETCH (UID {uid} BODY[] {{{}}}\r\n", body.len()).into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(b")\r\n");
+    out
+}
+
+/// Build an IDLE continuation line.
+pub fn idle_continuation(text: &str) -> String {
+    if text.is_empty() { "+".to_owned() } else { format!("+ {text}") }
+}
+
+/// A throwaway CA and the server half of a TLS configuration for `localhost`.
+pub struct TlsFixture {
+    acceptor: TlsAcceptor,
+    ca: CertificateDer<'static>,
+}
+
+impl TlsFixture {
+    /// Generate a CA and a leaf certificate for `localhost`.
+    pub fn generate() -> Self {
+        let ca_key = KeyPair::generate().expect("CA key");
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(DnType::CommonName, "Postino P5a test CA");
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
+        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("CA certificate");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let mut leaf_params = CertificateParams::new(vec!["localhost".to_owned()]).expect("leaf parameters");
+        leaf_params.distinguished_name.push(DnType::CommonName, "localhost");
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = leaf_params.signed_by(&leaf_key, &ca).expect("leaf certificate");
+
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone()], key)
+            .expect("server certificate");
+        Self { acceptor: TlsAcceptor::from(Arc::new(config)), ca: ca.der().clone() }
+    }
+
+    /// The CA certificate to trust on the client side.
+    pub fn ca(&self) -> CertificateDer<'static> {
+        self.ca.clone()
+    }
+
+    pub fn acceptor(&self) -> TlsAcceptor {
+        self.acceptor.clone()
+    }
+}
+
+/// A listener on `127.0.0.1` that runs one handler for one connection.
+pub struct FakeServer {
+    address: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl FakeServer {
+    /// Accept one plaintext connection and run the handler.
+    pub async fn start<F, Fut>(handler: F) -> Self
+    where
+        F: FnOnce(Conn) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        Self::start_inner(None, handler).await
+    }
+
+    /// Accept one connection, complete the TLS handshake, then run the handler.
+    pub async fn start_tls<F, Fut>(fixture: &TlsFixture, handler: F) -> Self
+    where
+        F: FnOnce(Conn) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        Self::start_inner(Some(fixture.acceptor()), handler).await
+    }
+
+    async fn start_inner<F, Fut>(acceptor: Option<TlsAcceptor>, handler: F) -> Self
+    where
+        F: FnOnce(Conn) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind fake server");
+        let address = listener.local_addr().expect("fake server address");
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut conn = Conn::new(Stream::Plain(stream));
+            if let Some(acceptor) = acceptor {
+                assert!(conn.accept_tls(acceptor).await, "the client failed the TLS handshake");
+            }
+            handler(conn).await;
+        });
+        Self { address, task }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.address.port()
+    }
+
+    /// Client configuration for this server: `localhost`, implicit TLS, the test CA trusted.
+    pub fn config(&self, fixture: &TlsFixture) -> ImapConfig {
+        ImapConfig::new("localhost", self.port(), TlsMode::Implicit, USER, Secret::new(PASSWORD))
+            .with_timeout(Duration::from_secs(5))
+            .with_extra_root(fixture.ca())
+    }
+
+    /// Wait for the handler and propagate its assertion failures.
+    pub async fn finish(self) {
+        if let Err(error) = self.task.await {
+            std::panic::resume_unwind(error.into_panic());
+        }
+    }
+}
+
+/// Shorthand: a configured `ImapConfig` with a short timeout, for corpus and failure tests.
+pub fn config_with_timeout(server: &FakeServer, fixture: &TlsFixture, timeout: Duration) -> ImapConfig {
+    server.config(fixture).with_timeout(timeout)
+}

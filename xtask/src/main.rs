@@ -83,6 +83,7 @@ fn layers() -> Result<()> {
         // repository. The store never depends back on it.
         ("postino-core", &["postino-store"][..]),
         ("postino-mime", &[][..]),
+        ("postino-net", &[][..]),
         ("postino-platform", &[][..]),
         ("postino-store", &[][..]),
         ("postino-app", &["postino-core"][..]),

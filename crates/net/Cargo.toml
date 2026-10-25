@@ -1,0 +1,24 @@
+[package]
+name = "postino-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "IMAP4rev1 client: TLS-first, bounded, testable against a scripted server"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+log.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+
+[lints]
+workspace = true

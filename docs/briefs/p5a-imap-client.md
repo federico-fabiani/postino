@@ -154,3 +154,33 @@ fixtures. Temp files only in `%TEMP%\opencode\p5a-postino`; do not commit.
 
 Dependency lines and build cost, API, command grammar covered, test map, TLS evidence, bounds, and
 any deviation with the reason.
+
+## Implementation status (P5a)
+
+Delivered as specified. Decisions and deviations, all deliberate and documented in the crate:
+
+- **`Envelope::references` and `list_id` are always empty.** RFC 3501's `ENVELOPE` carries neither;
+  filling them needs a second `BODY.PEEK[HEADER.FIELDS (REFERENCES LIST-ID)]` fetch, which the brief
+  assigns to P5b. The fields exist so sync can fill them without changing the type.
+- **`MailboxStatus` has two extra fields**, `read_only` and `permanent_flags`: §3 requires parsing
+  `READ-ONLY` and `PERMANENTFLAGS`, and the brief's field list had nowhere to put them.
+- **`\Noselect` stays in `RemoteFolder::attributes`**, not in `SpecialUse`: it is a selectability
+  attribute, not a folder role (RFC 6154 lists the eight special-use values). `is_selectable()`
+  exposes it.
+- **`RemoteFolder::wire_name`** is added because re-encoding a decoded modified UTF-7 name can change
+  bytes the server treats as meaningful; `select`/`examine` take the wire name.
+- **`ImapConfig::extra_roots`** is the injectable test CA. It augments the platform verifier through
+  `rustls-platform-verifier`'s `new_with_extra_roots`; there is no skip-verification path.
+- **`Limits::max_response_bytes`** (64 MiB, ceiling 128 MiB) bounds the total for one command, as §3
+  asks ("cap each literal and the total per command"). Fixed internal caps: 32 nesting levels, 4 096
+  literals per response, 1 KiB atoms and names, 256 addresses and flags per list, 20 digits per
+  number.
+- **`NetError::Protocol` also covers a request the client refuses to build** (a CR/LF/NUL in a name,
+  an empty UID set). The variant list is unchanged; the reason says which side is at fault.
+- **Connect budget is shared fairly** across resolved addresses (capped at 5 s each) so a
+  black-holed IPv6 route cannot consume the timeout the IPv4 address needs.
+- **STARTTLS with pipelined plaintext after the `OK` is a `Protocol` error**, not a silent discard:
+  the bytes are a command-injection attempt.
+- **No OpenSSL, no cmake, no nasm**: `ring` is the crypto provider for `rustls`, so the crate builds
+  on the Windows GNU host with the MSYS2 toolchain the workspace already needs.
+

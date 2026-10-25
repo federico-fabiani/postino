@@ -14,6 +14,7 @@ repository = "https://github.com/federicopostino/postino"
 # internal
 postino-core = { path = "crates/core", version = "0.1.0" }
 postino-mime = { path = "crates/mime", version = "0.1.0" }
+postino-net = { path = "crates/net", version = "0.1.0" }
 postino-platform = { path = "crates/platform", version = "0.1.0" }
 postino-store = { path = "crates/store", version = "0.1.0" }
 
@@ -32,6 +33,16 @@ fs4 = { version = "0.13", features = ["sync"] }
 anyhow = "1"
 getrandom = { version = "0.3", features = ["std"] }
 zeroize = "1"
+
+# network
+tokio = { version = "=1.53.1", features = ["rt", "net", "time", "io-util", "macros"] }
+tokio-rustls = { version = "=0.26.5", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls-platform-verifier = "=0.7.1"
+base64 = "=0.22.1"
+
+# network tests
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
 
 # keyring
 keyring-core = "1"
