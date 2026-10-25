@@ -10,15 +10,16 @@ use rusqlite::types::{Type, Value};
 use rusqlite::{ErrorCode, OptionalExtension, Row, params, params_from_iter};
 
 use crate::model::{
-    Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label, LabelCount, Message, MessageCounts,
-    MessageFilter, MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
+    Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
+    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
 };
-use crate::{Store, StoreError};
+use crate::{SYNC_STATUS_KEY_PREFIX, Store, StoreError};
 
 /// Largest page a caller can request. A mailbox list never needs more, and the cap bounds memory.
 const MAX_PAGE: u32 = 500;
 
 const ACCOUNT_COLUMNS: &str = "id, name, email, provider, signature, created_at";
+const SERVER_COLUMNS: &str = "account_id, imap_host, imap_port, imap_tls, imap_username, created_at";
 const FOLDER_COLUMNS: &str = "id, account_id, name, kind, unread, total, uid_validity, uid_next, last_sync_at";
 const SUMMARY_COLUMNS: &str = "m.id, m.account_id, m.folder_id, m.thread_id, m.from_name, m.from_email, m.to_json, m.subject, m.snippet, m.date, m.unread, m.starred, m.has_attachments";
 const MESSAGE_DETAIL_COLUMNS: &str = "m.uid, m.message_id, m.cc_json, m.bcc_json, m.body_text, m.body_html, m.size";
@@ -27,24 +28,13 @@ const DRAFT_COLUMNS: &str = "id, account_id, revision, updated_at, body_text, to
 const ATTACHMENT_COLUMNS: &str = "id, filename, mime, size, blob_hash";
 
 // ---------------------------------------------------------------------------------------------
-// Accounts
+// Accounts and their IMAP server
 // ---------------------------------------------------------------------------------------------
 
 impl Store {
     /// Insert or replace an account. The row is authoritative: every column is overwritten.
     pub fn upsert_account(&self, account: &Account) -> Result<(), StoreError> {
-        self.conn.execute(
-            &format!(
-                "INSERT INTO accounts({ACCOUNT_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(id) DO UPDATE SET
-                     name = excluded.name,
-                     email = excluded.email,
-                     provider = excluded.provider,
-                     signature = excluded.signature,
-                     created_at = excluded.created_at"
-            ),
-            params![account.id, account.name, account.email, account.provider, account.signature, account.created_at],
-        )?;
+        upsert_account_row(&self.conn, account)?;
         Ok(())
     }
 
@@ -57,6 +47,74 @@ impl Store {
     pub fn get_account(&self, id: &str) -> Result<Option<Account>, StoreError> {
         Ok(self.conn.query_row(&format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ?1"), [id], row_to_account).optional()?)
     }
+
+    /// Write an account, its IMAP server configuration and its folders in **one transaction**.
+    ///
+    /// Onboarding (P6a) uses this after the credential is in the keyring and after the server has
+    /// accepted the login: a failure leaves no account, no server row and no folder behind. The
+    /// server row and every folder row are stamped with the account id, so a caller cannot create a
+    /// row for another account through this path.
+    pub fn save_account(&self, account: &Account, server: &AccountServer, folders: &[Folder]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        upsert_account_row(&tx, account)?;
+        let server = AccountServer { account_id: account.id.clone(), ..server.clone() };
+        upsert_account_server_row(&tx, &server)?;
+        for folder in folders {
+            let mut row = folder.clone();
+            row.account_id = account.id.clone();
+            upsert_folder_row(&tx, &row)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert or replace one account's IMAP server configuration.
+    pub fn upsert_account_server(&self, server: &AccountServer) -> Result<(), StoreError> {
+        upsert_account_server_row(&self.conn, server)?;
+        Ok(())
+    }
+
+    pub fn get_account_server(&self, account_id: &str) -> Result<Option<AccountServer>, StoreError> {
+        self.conn
+            .query_row(&format!("SELECT {SERVER_COLUMNS} FROM account_servers WHERE account_id = ?1"), [account_id], row_to_account_server)
+            .optional()
+            .map_err(|error| corrupt_on_decode("account_servers", error))
+    }
+
+    /// Remove one server configuration. Returns whether a row was there.
+    pub fn delete_account_server(&self, account_id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute("DELETE FROM account_servers WHERE account_id = ?1", [account_id])? > 0)
+    }
+
+    /// Remove an account and its local cache in **one transaction**: messages (and, by cascade,
+    /// attachments and label assignments), folders (and sync cursors), drafts, the IMAP server
+    /// configuration, the persisted sync status and finally the account row.
+    ///
+    /// Labels are mailbox-wide (`account_id IS NULL`) and are deliberately untouched. The caller
+    /// deletes the keyring credential on its own schedule; this function never sees a secret.
+    pub fn delete_account(&self, account_id: &str) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)", [account_id], |row| row.get(0))?;
+        if !exists {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM draft_seq
+             WHERE message_id IN (SELECT id FROM messages WHERE account_id = ?1)
+                OR message_id IN (SELECT id FROM drafts WHERE account_id = ?1)",
+            [account_id],
+        )?;
+        tx.execute("DELETE FROM messages WHERE account_id = ?1", [account_id])?;
+        tx.execute("DELETE FROM drafts WHERE account_id = ?1", [account_id])?;
+        tx.execute("DELETE FROM account_servers WHERE account_id = ?1", [account_id])?;
+        tx.execute("DELETE FROM folders WHERE account_id = ?1", [account_id])?;
+        let status_key = format!("{SYNC_STATUS_KEY_PREFIX}{account_id}");
+        tx.execute("DELETE FROM meta WHERE key = ?1", [status_key])?;
+        tx.execute("DELETE FROM accounts WHERE id = ?1", [account_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -67,31 +125,7 @@ impl Store {
     /// Insert or replace a folder. `unread` and `total` are a cache: message mutations refresh them
     /// and [`Store::recount_folder`] repairs them after a bulk import.
     pub fn upsert_folder(&self, folder: &Folder) -> Result<(), StoreError> {
-        self.conn.execute(
-            &format!(
-                "INSERT INTO folders({FOLDER_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(id) DO UPDATE SET
-                     account_id = excluded.account_id,
-                     name = excluded.name,
-                     kind = excluded.kind,
-                     unread = excluded.unread,
-                     total = excluded.total,
-                     uid_validity = excluded.uid_validity,
-                     uid_next = excluded.uid_next,
-                     last_sync_at = excluded.last_sync_at"
-            ),
-            params![
-                folder.id,
-                folder.account_id,
-                folder.name,
-                folder.kind.as_str(),
-                i64::from(folder.unread),
-                i64::from(folder.total),
-                folder.uid_validity.map(i64::from),
-                folder.uid_next.map(i64::from),
-                folder.last_sync_at
-            ],
-        )?;
+        upsert_folder_row(&self.conn, folder)?;
         Ok(())
     }
 
@@ -803,6 +837,70 @@ impl Store {
 // Shared helpers
 // ---------------------------------------------------------------------------------------------
 
+/// Upsert an account row. The caller owns the transaction boundary.
+fn upsert_account_row(conn: &rusqlite::Connection, account: &Account) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "INSERT INTO accounts({ACCOUNT_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 email = excluded.email,
+                 provider = excluded.provider,
+                 signature = excluded.signature,
+                 created_at = excluded.created_at"
+        ),
+        params![account.id, account.name, account.email, account.provider, account.signature, account.created_at],
+    )?;
+    Ok(())
+}
+
+/// Upsert one IMAP server row. The caller owns the transaction boundary.
+fn upsert_account_server_row(conn: &rusqlite::Connection, server: &AccountServer) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "INSERT INTO account_servers({SERVER_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id) DO UPDATE SET
+                 imap_host = excluded.imap_host,
+                 imap_port = excluded.imap_port,
+                 imap_tls = excluded.imap_tls,
+                 imap_username = excluded.imap_username,
+                 created_at = excluded.created_at"
+        ),
+        params![server.account_id, server.host, i64::from(server.port), server.tls.as_str(), server.username, server.created_at],
+    )?;
+    Ok(())
+}
+
+/// Upsert a folder row. The caller owns the transaction boundary.
+fn upsert_folder_row(conn: &rusqlite::Connection, folder: &Folder) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "INSERT INTO folders({FOLDER_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                 account_id = excluded.account_id,
+                 name = excluded.name,
+                 kind = excluded.kind,
+                 unread = excluded.unread,
+                 total = excluded.total,
+                 uid_validity = excluded.uid_validity,
+                 uid_next = excluded.uid_next,
+                 last_sync_at = excluded.last_sync_at"
+        ),
+        params![
+            folder.id,
+            folder.account_id,
+            folder.name,
+            folder.kind.as_str(),
+            i64::from(folder.unread),
+            i64::from(folder.total),
+            folder.uid_validity.map(i64::from),
+            folder.uid_next.map(i64::from),
+            folder.last_sync_at
+        ],
+    )?;
+    Ok(())
+}
+
 /// Upsert a message row inside an open transaction and keep the folder `total`/`unread` cache in
 /// step. The caller owns the transaction boundary.
 fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh_counts: bool) -> Result<(), StoreError> {
@@ -1155,6 +1253,15 @@ fn get_opt_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
 
 fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account { id: row.get(0)?, name: row.get(1)?, email: row.get(2)?, provider: row.get(3)?, signature: row.get(4)?, created_at: row.get(5)? })
+}
+
+fn row_to_account_server(row: &Row<'_>) -> rusqlite::Result<AccountServer> {
+    let raw: String = row.get(3)?;
+    let tls = AccountTls::parse(&raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(std::io::Error::other(format!("unknown IMAP TLS mode {raw:?}"))))
+    })?;
+    let port = u16::try_from(get_u32(row, 2)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error)))?;
+    Ok(AccountServer { account_id: row.get(0)?, host: row.get(1)?, port, tls, username: row.get(4)?, created_at: row.get(5)? })
 }
 
 fn row_to_folder(row: &Row<'_>) -> rusqlite::Result<Folder> {

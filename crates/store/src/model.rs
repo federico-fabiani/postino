@@ -21,6 +21,50 @@ pub struct Account {
     pub created_at: i64,
 }
 
+/// How the IMAP connection is protected. There is deliberately no plaintext mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountTls {
+    /// TLS from the first byte, usually port 993.
+    Implicit,
+    /// Plaintext greeting and `CAPABILITY`, then `STARTTLS`, usually port 143.
+    StartTls,
+}
+
+impl AccountTls {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implicit => "implicit",
+            Self::StartTls => "starttls",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "implicit" => Some(Self::Implicit),
+            "starttls" => Some(Self::StartTls),
+            _ => None,
+        }
+    }
+}
+
+/// Where one account's mail comes from.
+///
+/// There is no password column and no field that could hold one: the credential lives in the OS
+/// keyring under `account:<id>:imap` and is never written to the encrypted database. The table is
+/// deliberately one row per account, so a half-configured account cannot exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountServer {
+    pub account_id: String,
+    pub host: String,
+    pub port: u16,
+    pub tls: AccountTls,
+    /// Login name. It is normally the address, but the column is separate so a future provider can
+    /// use a different one.
+    pub username: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+}
+
 /// The role a folder plays. `Custom` is an ordinary IMAP folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FolderKind {
@@ -298,5 +342,14 @@ mod tests {
         }
         assert_eq!(FolderKind::parse("Inbox"), None);
         assert_eq!(FolderKind::parse(""), None);
+    }
+
+    #[test]
+    fn every_tls_mode_round_trips_through_its_name() {
+        for tls in [AccountTls::Implicit, AccountTls::StartTls] {
+            assert_eq!(AccountTls::parse(tls.as_str()), Some(tls));
+        }
+        assert_eq!(AccountTls::parse("Implicit"), None);
+        assert_eq!(AccountTls::parse("plain"), None, "there is no plaintext mode");
     }
 }

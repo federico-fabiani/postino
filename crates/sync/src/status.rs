@@ -7,8 +7,9 @@
 use postino_store as store;
 use serde::{Deserialize, Serialize};
 
-/// `meta` key prefix; the account id follows.
-pub const STATUS_KEY_PREFIX: &str = "sync_status:";
+/// `meta` key prefix; the account id follows. The convention lives in the store crate because
+/// `Store::delete_account` removes the same key with the account.
+pub const STATUS_KEY_PREFIX: &str = store::SYNC_STATUS_KEY_PREFIX;
 
 /// The phase of the last attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,16 +48,32 @@ pub fn status_key(account_id: &str) -> String {
     format!("{STATUS_KEY_PREFIX}{account_id}")
 }
 
+/// Read the last status of one account id without touching the network.
+///
+/// This is the engine/CLI form: it does not need a full [`store::Account`] row. `None` when the
+/// account has never synced.
+///
+/// # Errors
+///
+/// A value that was written by a future build, or damaged on disk, is a [`store::StoreError::Encode`]
+/// rather than a silently empty status: a caller that shows sync health must not invent it. A sync
+/// run itself tolerates an unreadable status and starts from zero.
+pub fn read_status_for(store: &store::Store, account_id: &str) -> Result<Option<SyncStatus>, store::StoreError> {
+    let Some(raw) = store.get_meta(&status_key(account_id))? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&raw).map(Some).map_err(store::StoreError::from)
+}
+
 /// Read the last status without touching the network. `None` when the account has never synced.
+///
+/// # Errors
 ///
 /// A value that was written by a future build, or damaged on disk, is a [`store::StoreError::Encode`]
 /// rather than a silently empty status: a caller that shows sync health must not invent it. A sync
 /// run itself tolerates an unreadable status and starts from zero.
 pub fn read_status(store: &store::Store, account: &store::Account) -> Result<Option<SyncStatus>, store::StoreError> {
-    let Some(raw) = store.get_meta(&status_key(&account.id))? else {
-        return Ok(None);
-    };
-    serde_json::from_str(&raw).map(Some).map_err(store::StoreError::from)
+    read_status_for(store, &account.id)
 }
 
 /// Write one status value, overwriting the previous one.

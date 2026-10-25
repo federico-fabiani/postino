@@ -9,16 +9,23 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
+use postino_net::{CertificateDer, ImapConfig, Secret};
 use postino_store::{FlagUpdate, Store};
+use postino_sync::{SyncError, SyncLimits};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use crate::model::{
-    Account, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, Message, MessageSummary, snippet,
+    Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
+    Provider, snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::store_map;
+use crate::vault::CredentialVault;
 
 /// A caller-supplied id that does not exist. The engine's pre-checks and the store's `NotFound`
 /// both map to this sentence, so a mistake is `InvalidArgs` whichever layer notices it first.
@@ -58,8 +65,35 @@ pub enum OpError {
     UnknownOp(String),
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
+    /// The server rejected the account's credential. The message names the provider and the likely
+    /// cause and never contains the password or any server-supplied text.
+    #[error("authentication failed: {0}")]
+    Auth(String),
+    /// DNS, TCP, TLS, timeout or disconnect failure while talking to the account's server.
+    #[error("the server could not be reached: {0}")]
+    Network(String),
     #[error("{0}")]
     Failed(String),
+}
+
+/// Everything `account_add` needs, including the password.
+///
+/// The operation registry builds this from [`crate::ops::AccountAddArgs`]; callers that are not the
+/// registry (tests, and the desktop onboarding in P6b) build it directly. `extra_roots` is the only
+/// test hook: it adds trust anchors for the connection check and can never disable verification.
+/// There is no `skip_verify` switch and none will be added.
+pub struct AccountSetup {
+    pub provider: Provider,
+    pub email: String,
+    pub name: Option<String>,
+    /// The password or app password. Zeroised when this setup is dropped.
+    pub password: Zeroizing<String>,
+    /// Required for [`Provider::Custom`]; refused for the two known providers.
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub tls: Option<MailTls>,
+    /// Extra certificate authorities. Empty in production; tests pass the fake server's CA.
+    pub extra_roots: Vec<CertificateDer<'static>>,
 }
 
 pub struct Engine {
@@ -71,6 +105,13 @@ pub struct Engine {
     demo: bool,
     /// `None` for the demo and the empty engine; every mutation is memory-only there.
     store: Option<Store>,
+    /// The OS-keyring seam. `None` for an engine that was opened without one; account and sync
+    /// operations then fail with a readable sentence instead of touching a real vault.
+    vault: Option<Arc<dyn CredentialVault>>,
+    /// Extra trust anchors for IMAP connections. Empty in production. Tests use
+    /// [`Engine::set_test_extra_roots`] to trust the fake server's throwaway CA; this can only add
+    /// anchors and never disables verification.
+    extra_roots: Vec<CertificateDer<'static>>,
     /// Attachment id → BLAKE3 hex hash of its stored blob bytes, for attachments that have bytes.
     ///
     /// Core's `Attachment` deliberately carries no `blob_hash`: it is part of the `message_get`
@@ -91,6 +132,8 @@ impl Engine {
             next_label_seq: 1,
             demo: false,
             store: None,
+            vault: None,
+            extra_roots: Vec::new(),
             blob_hashes: HashMap::new(),
         }
     }
@@ -113,7 +156,33 @@ impl Engine {
     /// without a message row is repaired into a real message row in one transaction *before* the
     /// mailbox is hydrated; if that repair fails the open fails with an actionable error instead of
     /// serving a draft that cannot be flagged, labelled or moved.
+    ///
+    /// This form has no credential vault: mail reads and writes work, while `account_add`,
+    /// `account_test`, `account_remove` and sync answer with a readable error. The CLI uses
+    /// [`Engine::open_with_vault`].
     pub fn open(store: Store) -> Result<Self, OpError> {
+        Self::open_inner(store, None)
+    }
+
+    /// Load the mailbox and attach the keyring seam used by the account and sync operations.
+    ///
+    /// The store already owns the SQLCipher key; the vault holds only account credentials. Tests pass
+    /// an in-memory vault; the CLI passes `postino-platform`'s keyring adapter. Nothing in this
+    /// function touches a vault, so a test that only reads mail still cannot reach the real keyring.
+    pub fn open_with_vault(store: Store, vault: Arc<dyn CredentialVault>) -> Result<Self, OpError> {
+        Self::open_inner(store, Some(vault))
+    }
+
+    /// Add certificate authorities to every IMAP connection this engine opens.
+    ///
+    /// This exists for tests: the fake server trusts a throwaway CA and the client must be told about
+    /// it. It augments the operating system's roots and cannot disable verification, and it is not an
+    /// operation, so no caller can set it from JSON. Production builds leave it empty.
+    pub fn set_test_extra_roots(&mut self, roots: Vec<CertificateDer<'static>>) {
+        self.extra_roots = roots;
+    }
+
+    fn open_inner(store: Store, vault: Option<Arc<dyn CredentialVault>>) -> Result<Self, OpError> {
         let accounts = store.list_accounts().map_err(store_map::read_error)?.into_iter().map(store_map::account).collect::<Vec<_>>();
         let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
         repair_orphan_drafts(&store, &accounts, &folders)?;
@@ -137,6 +206,7 @@ impl Engine {
         let label_seq = repair_label_seq(&store, &labels)?;
 
         let mut engine = Self::from_parts(accounts, folders, messages, labels, false, Some(store));
+        engine.vault = vault;
         engine.next_label_seq = label_seq.saturating_add(1);
         engine.blob_hashes = blob_hashes;
         Ok(engine)
@@ -151,7 +221,18 @@ impl Engine {
         store: Option<Store>,
     ) -> Self {
         let next_label_seq = labels.iter().filter_map(label_number).max().unwrap_or(0).saturating_add(1);
-        let mut engine = Self { accounts, folders, messages, labels, next_label_seq, demo, store, blob_hashes: HashMap::new() };
+        let mut engine = Self {
+            accounts,
+            folders,
+            messages,
+            labels,
+            next_label_seq,
+            demo,
+            store,
+            vault: None,
+            extra_roots: Vec::new(),
+            blob_hashes: HashMap::new(),
+        };
         engine.recount();
         engine
     }
@@ -223,6 +304,297 @@ impl Engine {
                 (total.saturating_add(1), unread.saturating_add(if message.summary.unread { 1 } else { 0 }))
             });
         Some(LabelSummary { id: label.id.clone(), name: label.name.clone(), color: label.color, message_count, unread_count })
+    }
+
+    /// Every configured account with its IMAP server and last sync status. The demo account has
+    /// neither, and no view ever contains a credential.
+    pub fn account_views(&self) -> Result<Vec<AccountView>, OpError> {
+        self.accounts.iter().map(|account| self.account_view(account)).collect()
+    }
+
+    /// One account with its server settings and persisted sync status.
+    pub fn account_view(&self, account: &Account) -> Result<AccountView, OpError> {
+        let (server, sync) = match &self.store {
+            Some(store) => {
+                let server = store.get_account_server(&account.id).map_err(store_map::read_error)?.map(store_map::server_settings);
+                let sync = postino_sync::read_status_for(store, &account.id).map_err(store_map::read_error)?;
+                (server, sync)
+            }
+            None => (None, None),
+        };
+        Ok(AccountView { account: account.clone(), server, sync })
+    }
+
+    /// Add an IMAP account: validate, prove the login on the real server, store the credential,
+    /// then write the account, its server row and its folder tree in one store transaction.
+    ///
+    /// Nothing is written before the server accepts the login. The credential is written **first**
+    /// on purpose: a crash between the two durable writes leaves an unreferenced keyring entry,
+    /// which a retry with the same address reuses, instead of an account whose password was never
+    /// stored and can therefore never sync. If the store transaction fails, the credential is
+    /// deleted again before the error is returned; memory is untouched either way.
+    pub fn add_account(&mut self, setup: AccountSetup) -> Result<AccountView, OpError> {
+        let email = validate_account_email(&setup.email)?;
+        validate_account_password(&setup.password)?;
+        let name = validate_account_name(setup.name.as_deref(), &email)?;
+        let (host, port, tls) = resolve_server(setup.provider, setup.host.as_deref(), setup.port, setup.tls)?;
+        let store = self.require_store("account_add")?;
+        let vault = self.require_vault("account_add")?;
+        if let Some(existing) = self.accounts.iter().find(|account| account.email.eq_ignore_ascii_case(&email)) {
+            return Err(OpError::InvalidArgs(format!(
+                "an account for {email:?} already exists ({:?}); remove it with account_remove before adding it again",
+                existing.id
+            )));
+        }
+        let id = account_id(&email);
+        if self.accounts.iter().any(|account| account.id == id) {
+            return Err(OpError::InvalidArgs(format!(
+                "account id {id:?} is already taken by a different address; remove that account before adding {email:?}"
+            )));
+        }
+
+        let mut config = ImapConfig::new(host.clone(), port, store_map::net_tls(tls), email.clone(), Secret::new(setup.password.as_str().to_owned()));
+        let mut extra_roots = self.extra_roots.clone();
+        extra_roots.extend(setup.extra_roots);
+        for root in extra_roots {
+            config = config.with_extra_root(root);
+        }
+        let probe = postino_sync::probe(&config).map_err(|error| {
+            account_error(error, setup.provider, &host, "Nothing was written; check the address, host, password and TLS mode and retry.")
+        })?;
+        if probe.folders.iter().all(|folder| !folder.is_selectable()) {
+            return Err(OpError::Failed(format!(
+                "the server {host} listed no selectable folder; check that IMAP is enabled for this account. Nothing was written."
+            )));
+        }
+        let (planned, _warnings) = postino_sync::plan_folders(&id, &probe.folders);
+        if planned.is_empty() {
+            return Err(OpError::Failed(format!("the server {host} listed no usable folder; nothing was written")));
+        }
+        let created_at = Utc::now().timestamp_millis();
+        let provider = setup.provider.as_str().to_owned();
+        let account_row = postino_store::Account { id: id.clone(), name, email: email.clone(), provider, signature: String::new(), created_at };
+        let server_row = postino_store::AccountServer {
+            account_id: id.clone(),
+            host: host.clone(),
+            port,
+            tls: store_map::account_tls(tls),
+            username: email,
+            created_at,
+        };
+        let folder_rows = planned.into_iter().map(|folder| folder.row).collect::<Vec<_>>();
+
+        if let Err(error) = vault.store_imap_password(&id, setup.password.as_bytes()) {
+            return Err(OpError::Failed(format!("the IMAP credential could not be stored in the OS keyring: {error}. Nothing was written.")));
+        }
+        if let Err(error) = store.save_account(&account_row, &server_row, &folder_rows) {
+            let cleanup = vault.delete_imap_password(&id);
+            let outcome = match cleanup {
+                Ok(()) => "The credential was removed again and nothing was written.".to_owned(),
+                Err(cleanup) => format!(
+                    "The credential could not be removed again from the OS keyring ({cleanup}); a retry with the same address overwrites it, or delete it in the OS credential manager."
+                ),
+            };
+            return Err(OpError::Failed(format!("the local store refused the account: {error}. {outcome}")));
+        }
+
+        // Durable writes are done; only now does memory change.
+        let account = store_map::account(account_row);
+        self.accounts.push(account.clone());
+        self.folders.extend(folder_rows.iter().cloned().map(store_map::folder));
+        self.recount();
+        self.account_view(&account)
+    }
+
+    /// Log in with the stored credential, list folders and return the count and capabilities.
+    ///
+    /// Read-only: nothing is written, no mailbox is selected and no message is fetched. A broken
+    /// credential is an [`OpError::Auth`] that names the provider and the likely cause and leaves the
+    /// account and its cache exactly as they were.
+    pub fn test_account(&self, id: &str) -> Result<crate::ops::AccountTest, OpError> {
+        let account = self.find_account(id)?;
+        let store = self.require_store("account_test")?;
+        let server = store.get_account_server(&account.id).map_err(store_map::read_error)?.ok_or_else(|| {
+            OpError::Failed(format!("account {:?} has no IMAP server configuration; remove it with account_remove and add it again", account.id))
+        })?;
+        let password = self.load_password(&account.id, "account_test")?;
+        let config = imap_config(&server, &password, self.extra_roots.clone());
+        let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
+        let probe = postino_sync::probe(&config)
+            .map_err(|error| account_error(error, provider, &server.host, "The account and its cached mail are unchanged."))?;
+        let folders = u32::try_from(probe.folders.iter().filter(|folder| folder.is_selectable()).count()).unwrap_or(u32::MAX);
+        Ok(crate::ops::AccountTest { account: account.id.clone(), folders, capabilities: probe.capabilities })
+    }
+
+    /// Remove an account, its keyring credential and its local cache.
+    ///
+    /// The order is deliberate: the store rows go first, the credential second. The only failure
+    /// window therefore leaves an orphan keyring entry, never cached mail whose password is gone.
+    /// An orphan secret is retryable (a re-add with the same address derives the same account id and
+    /// the same scope) and is reported explicitly. Labels are mailbox-wide and stay.
+    pub fn remove_account(&mut self, id: &str, confirm: bool) -> Result<AccountView, OpError> {
+        let index = self.accounts.iter().position(|account| account.id == id).ok_or_else(|| unknown_account(id))?;
+        if !confirm {
+            return Err(OpError::InvalidArgs(format!(
+                "removing account {id:?} also deletes its cached mail and its IMAP credential; pass confirm: true to proceed"
+            )));
+        }
+        let account = self.accounts.get(index).cloned().ok_or_else(|| unknown_account(id))?;
+        let view = self.account_view(&account)?;
+        let store = self.require_store("account_remove")?;
+        let vault = self.require_vault("account_remove")?;
+        if !store.delete_account(&account.id).map_err(store_map::write_error)? {
+            return Err(OpError::Failed(format!("the local store no longer has account {:?}; nothing was changed", account.id)));
+        }
+        let credential = vault.delete_imap_password(&account.id);
+        let folder_ids =
+            self.folders.iter().filter(|folder| folder.account_id == account.id).map(|folder| folder.id.clone()).collect::<BTreeSet<_>>();
+        self.accounts.retain(|candidate| candidate.id != account.id);
+        self.folders.retain(|folder| folder.account_id != account.id);
+        self.messages.retain(|message| !folder_ids.contains(&message.summary.folder_id));
+        self.recount();
+        match credential {
+            Ok(()) => Ok(view),
+            Err(error) => Err(OpError::Failed(format!(
+                "account {:?} and its cached mail were removed, but the OS keyring refused to delete the credential: {error}. The credential is now unreferenced; adding this address again overwrites it, or delete it in the OS credential manager.",
+                account.id
+            ))),
+        }
+    }
+
+    /// Run one IMAP sync for one account (or the only account) and refresh memory from the store.
+    ///
+    /// A failed run returns the typed error after reloading the cache, so memory shows every message
+    /// that was committed before the failure and never loses one. Labels are reloaded from the store
+    /// and are preserved by the reconciler, so a sync does not detach them.
+    pub fn sync_now(&mut self, account: Option<&str>) -> Result<crate::ops::SyncReport, OpError> {
+        let account = self.requested_account(account, "sync_now")?;
+        let store = self.require_store("sync_now")?;
+        let server = store.get_account_server(&account.id).map_err(store_map::read_error)?.ok_or_else(|| {
+            OpError::Failed(format!("account {:?} has no IMAP server configuration; remove it with account_remove and add it again", account.id))
+        })?;
+        let row = store
+            .get_account(&account.id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::Failed(format!("account {:?} is not in the local store", account.id)))?;
+        let password = self.load_password(&account.id, "sync_now")?;
+        let config = imap_config(&server, &password, self.extra_roots.clone());
+        let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
+        let result = postino_sync::sync_account(store, &row, &config, &SyncLimits::default(), &AtomicBool::new(false));
+        let reloaded = self.reload_mailbox();
+        let outcome = result.map_err(|error| {
+            account_error(
+                error,
+                provider,
+                &server.host,
+                "Messages committed before the stop are kept; the next run resumes from the last committed message.",
+            )
+        });
+        reloaded?;
+        outcome.map(crate::ops::SyncReport::from)
+    }
+
+    /// The persisted status of one account, or of every account.
+    pub fn sync_statuses(&self, account: Option<&str>) -> Result<Vec<crate::ops::SyncStatusView>, OpError> {
+        let store = self.require_store("sync_status")?;
+        let accounts = match account {
+            Some(id) => vec![self.find_account(id)?.clone()],
+            None => self.accounts.clone(),
+        };
+        accounts
+            .iter()
+            .map(|account| {
+                let status = postino_sync::read_status_for(store, &account.id).map_err(store_map::read_error)?;
+                Ok(crate::ops::SyncStatusView { account: account.id.clone(), email: account.email.clone(), status })
+            })
+            .collect()
+    }
+
+    fn find_account(&self, id: &str) -> Result<&Account, OpError> {
+        self.accounts.iter().find(|account| account.id == id).ok_or_else(|| unknown_account(id))
+    }
+
+    /// Resolve an optional account argument: one id if given, the only account if there is one, and
+    /// a readable choice when there are several.
+    fn requested_account(&self, id: Option<&str>, operation: &str) -> Result<Account, OpError> {
+        if let Some(id) = id {
+            return self.find_account(id).cloned();
+        }
+        match self.accounts.as_slice() {
+            [] => Err(OpError::Failed(format!("no account is configured; add one with account_add before {operation}"))),
+            [account] => Ok(account.clone()),
+            accounts => Err(OpError::InvalidArgs(format!(
+                "the mailbox has {} accounts; pass `account` with one of {}",
+                accounts.len(),
+                accounts.iter().map(|account| format!("{:?}", account.id)).collect::<Vec<_>>().join(", ")
+            ))),
+        }
+    }
+
+    fn load_password(&self, account_id: &str, operation: &str) -> Result<Zeroizing<String>, OpError> {
+        let vault = self.require_vault(operation)?;
+        let bytes = vault
+            .load_imap_password(account_id)
+            .map_err(|error| OpError::Failed(format!("the OS keyring could not provide the IMAP credential for account {account_id:?}: {error}")))?;
+        let Some(bytes) = bytes else {
+            return Err(OpError::Failed(format!(
+                "account {account_id:?} has no IMAP credential in the OS keyring; remove it with account_remove and add it again"
+            )));
+        };
+        let text = std::str::from_utf8(bytes.as_slice()).map_err(|_| {
+            OpError::Failed(format!("the stored IMAP credential for account {account_id:?} is not valid UTF-8; remove the account and add it again"))
+        })?;
+        Ok(Zeroizing::new(text.to_owned()))
+    }
+
+    fn require_store(&self, operation: &str) -> Result<&Store, OpError> {
+        match &self.store {
+            Some(store) => Ok(store),
+            None if self.demo => Err(OpError::Failed(format!(
+                "the demo mailbox is in memory and has no IMAP account or local cache; {operation} needs a local store (postino --store <path>)"
+            ))),
+            None => Err(OpError::Failed(format!("this engine has no local store; {operation} needs one (postino --store <path>)"))),
+        }
+    }
+
+    fn require_vault(&self, operation: &str) -> Result<&dyn CredentialVault, OpError> {
+        match &self.vault {
+            Some(vault) => Ok(vault.as_ref()),
+            None => Err(OpError::Failed(format!(
+                "this engine has no credential vault, so {operation} cannot read or write the OS keyring; open it with Engine::open_with_vault"
+            ))),
+        }
+    }
+
+    /// Re-read folders, messages, attachments and blob hashes from the store after a sync. Labels,
+    /// the label sequence and the account list are untouched: sync never changes them, and a label
+    /// assignment lives in the store anyway.
+    fn reload_mailbox(&mut self) -> Result<(), OpError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
+        let mut attachment_rows = store.list_all_attachments().map_err(store_map::read_error)?;
+        let mut blob_hashes = HashMap::new();
+        let messages = store
+            .list_all_messages()
+            .map_err(store_map::read_error)?
+            .into_iter()
+            .map(|row| {
+                let rows = attachment_rows.remove(&row.summary.id).unwrap_or_default();
+                for attachment in &rows {
+                    if let Some(hash) = &attachment.blob_hash {
+                        blob_hashes.insert(attachment.id.clone(), hash.clone());
+                    }
+                }
+                store_map::message(row, rows)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.folders = folders;
+        self.messages = messages;
+        self.blob_hashes = blob_hashes;
+        self.recount();
+        Ok(())
     }
 
     /// Create a local label. The name is trimmed, must be 1-48 characters with no control, bidi
@@ -759,6 +1131,141 @@ impl Engine {
             folder.total = total;
             folder.unread = unread;
         }
+    }
+}
+
+/// Hash an address into a stable local account id. The same address always maps to the same id,
+/// which makes a retry after a failed add reuse one keyring scope instead of leaving a second secret
+/// behind. The address is case-folded for the id; the stored address keeps the caller's spelling.
+fn account_id(email: &str) -> String {
+    let digest = blake3::hash(email.trim().to_lowercase().as_bytes()).to_hex();
+    let text = digest.as_str();
+    format!("acc_{}", text.get(..16).unwrap_or(text))
+}
+
+/// Validate and normalise an account address. It must be one bare mailbox, not a display name or a
+/// list: the login name is the address.
+fn validate_account_email(raw: &str) -> Result<String, OpError> {
+    let email = raw.trim();
+    if email.is_empty() {
+        return Err(OpError::InvalidArgs("email must not be empty".to_owned()));
+    }
+    if email.len() > 320 {
+        return Err(OpError::InvalidArgs("email is longer than 320 bytes".to_owned()));
+    }
+    if email.chars().any(|character| character.is_control() || character.is_whitespace()) || email.contains(['<', '>', ',', ';']) {
+        return Err(OpError::InvalidArgs(format!("{email:?} is not a bare email address; use one address without a display name")));
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err(OpError::InvalidArgs(format!("{email:?} is not a valid email address; it needs one @")));
+    };
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return Err(OpError::InvalidArgs(format!("{email:?} is not a valid email address")));
+    }
+    Ok(email.to_owned())
+}
+
+/// A password or app password: non-empty, bounded and free of control characters. Leading and
+/// trailing spaces are legal and are never trimmed. The value is never included in an error.
+fn validate_account_password(password: &str) -> Result<(), OpError> {
+    if password.is_empty() {
+        return Err(OpError::InvalidArgs("password must not be empty".to_owned()));
+    }
+    if password.len() > 1024 {
+        return Err(OpError::InvalidArgs("password is longer than 1024 bytes".to_owned()));
+    }
+    if password.chars().any(char::is_control) {
+        return Err(OpError::InvalidArgs("password must not contain control characters".to_owned()));
+    }
+    Ok(())
+}
+
+/// The display name: trimmed, 1-256 characters, no control characters; omitted means the local part.
+fn validate_account_name(name: Option<&str>, email: &str) -> Result<String, OpError> {
+    let fallback = email.split('@').next().unwrap_or(email);
+    let name = match name {
+        Some(name) if !name.trim().is_empty() => name.trim(),
+        _ => fallback,
+    };
+    if name.chars().count() > 256 {
+        return Err(OpError::InvalidArgs("name is longer than 256 characters".to_owned()));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(OpError::InvalidArgs("name must not contain control characters".to_owned()));
+    }
+    Ok(name.to_owned())
+}
+
+/// Resolve the offline provider table against explicit settings. Known providers own their endpoint;
+/// `custom` requires host, port and TLS and has no defaults.
+fn resolve_server(provider: Provider, host: Option<&str>, port: Option<u16>, tls: Option<MailTls>) -> Result<(String, u16, MailTls), OpError> {
+    match provider.discovery() {
+        Some(discovery) => {
+            if host.is_some() || port.is_some() || tls.is_some() {
+                return Err(OpError::InvalidArgs(format!(
+                    "provider {} uses {}:{} with {} TLS; omit host, port and tls, or use provider custom",
+                    provider.as_str(),
+                    discovery.host,
+                    discovery.port,
+                    discovery.tls.as_str()
+                )));
+            }
+            Ok((discovery.host.to_owned(), discovery.port, discovery.tls))
+        }
+        None => {
+            let host = host.ok_or_else(|| OpError::InvalidArgs("provider custom requires host, port and tls".to_owned()))?;
+            let port = port.ok_or_else(|| OpError::InvalidArgs("provider custom requires host, port and tls".to_owned()))?;
+            let tls = tls.ok_or_else(|| OpError::InvalidArgs("provider custom requires host, port and tls".to_owned()))?;
+            let host = validate_host(host)?;
+            if port == 0 {
+                return Err(OpError::InvalidArgs("port must be between 1 and 65535".to_owned()));
+            }
+            Ok((host, port, tls))
+        }
+    }
+}
+
+fn validate_host(raw: &str) -> Result<String, OpError> {
+    let host = raw.trim();
+    if host.is_empty() || host.len() > 255 {
+        return Err(OpError::InvalidArgs("host must be 1-255 characters".to_owned()));
+    }
+    if host.chars().any(|character| character.is_control() || character.is_whitespace()) || host.contains(['/', '@']) {
+        return Err(OpError::InvalidArgs(format!("{host:?} is not a host name or address")));
+    }
+    Ok(host.to_owned())
+}
+
+fn imap_config(server: &postino_store::AccountServer, password: &Zeroizing<String>, extra_roots: Vec<CertificateDer<'static>>) -> ImapConfig {
+    let mut config = ImapConfig::new(
+        server.host.clone(),
+        server.port,
+        store_map::net_tls(store_map::mail_tls(server.tls)),
+        server.username.clone(),
+        Secret::new(password.as_str().to_owned()),
+    );
+    for root in extra_roots {
+        config = config.with_extra_root(root);
+    }
+    config
+}
+
+/// Turn a sync/probe failure into an actionable operation error with a tail that states what was and
+/// was not written. The password never appears: neither [`SyncError`] nor [`OpError`] carries it.
+fn account_error(error: SyncError, provider: Provider, host: &str, tail: &str) -> OpError {
+    match error {
+        // The server's own text is deliberately dropped: a hostile or broken server can echo the
+        // credential in a tagged NO, and this sentence is shown to a person, a log and an agent.
+        SyncError::Auth(_) => OpError::Auth(format!(
+            "the server {host} rejected the credential for the {} account. {}. {tail}",
+            provider.as_str(),
+            provider.login_advice()
+        )),
+        SyncError::Connect(source) => OpError::Network(format!("could not reach {host}: {source}. {tail}")),
+        SyncError::Store(error) => OpError::Failed(format!("sync could not use the local store: {error}. {tail}")),
+        SyncError::Cancelled => OpError::Failed("the sync was cancelled; messages written before the stop are kept".to_owned()),
+        SyncError::NoAccount(id) => OpError::Failed(format!("account {id:?} is not in the local store")),
+        SyncError::Protocol(reason) => OpError::Failed(format!("sync cannot proceed: {reason}. {tail}")),
     }
 }
 

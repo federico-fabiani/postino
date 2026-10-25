@@ -10,7 +10,7 @@ use postino_store as store;
 use postino_store::StoreError;
 
 use crate::engine::OpError;
-use crate::model::{Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, Message, MessageSummary, snippet};
+use crate::model::{Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, MailTls, Message, MessageSummary, ServerSettings, snippet};
 
 /// Unix milliseconds: the store's only date format (see the `postino-store` crate docs).
 pub(crate) fn millis(date: DateTime<Utc>) -> i64 {
@@ -95,6 +95,33 @@ pub(crate) fn repair_error(error: StoreError) -> OpError {
 
 pub(crate) fn account(row: store::Account) -> Account {
     Account { id: row.id, name: row.name, email: row.email, provider: row.provider, signature: row.signature }
+}
+
+/// The public view of an IMAP endpoint. The store row's `created_at` is storage detail and stays
+/// out of the operation surface.
+pub(crate) fn server_settings(row: store::AccountServer) -> ServerSettings {
+    ServerSettings { host: row.host, port: row.port, tls: mail_tls(row.tls), username: row.username }
+}
+
+pub(crate) fn account_tls(tls: MailTls) -> store::AccountTls {
+    match tls {
+        MailTls::Implicit => store::AccountTls::Implicit,
+        MailTls::StartTls => store::AccountTls::StartTls,
+    }
+}
+
+pub(crate) fn mail_tls(tls: store::AccountTls) -> MailTls {
+    match tls {
+        store::AccountTls::Implicit => MailTls::Implicit,
+        store::AccountTls::StartTls => MailTls::StartTls,
+    }
+}
+
+pub(crate) fn net_tls(tls: MailTls) -> postino_net::TlsMode {
+    match tls {
+        MailTls::Implicit => postino_net::TlsMode::Implicit,
+        MailTls::StartTls => postino_net::TlsMode::StartTls,
+    }
 }
 
 pub(crate) fn folder(row: store::Folder) -> Folder {

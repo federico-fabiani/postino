@@ -78,6 +78,9 @@ fn tools_list(engine: &Engine) -> Value {
     let tools = engine
         .tools()
         .into_iter()
+        // A sensitive operation handles a credential. It is not advertised and cannot be called over
+        // MCP; the CLI and the desktop app are the only clients that may pass a password.
+        .filter(|def| !def.sensitive)
         .map(|def| {
             json!({
                 "name": def.name,
@@ -88,7 +91,7 @@ fn tools_list(engine: &Engine) -> Value {
                     "readOnlyHint": def.read_only,
                     "destructiveHint": def.destructive,
                     "idempotentHint": def.read_only || matches!(def.name, "message_flag" | "label_apply" | "label_update"),
-                    "openWorldHint": false
+                    "openWorldHint": matches!(def.name, "account_test" | "sync_now")
                 }
             })
         })
@@ -101,6 +104,9 @@ fn tools_call(engine: &mut Engine, params: &Value) -> Result<Value, (i64, String
     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     if !arguments.is_object() {
         return Err((-32602, "tools/call `arguments` must be a JSON object".to_owned()));
+    }
+    if engine.tools().into_iter().any(|def| def.name == name && def.sensitive) {
+        return Ok(sensitive_refusal(name));
     }
 
     match engine.call(name, arguments) {
@@ -116,6 +122,17 @@ fn tools_call(engine: &mut Engine, params: &Value) -> Result<Value, (i64, String
             "isError": true
         })),
     }
+}
+
+/// A readable refusal that does not repeat the arguments (which may contain a password).
+fn sensitive_refusal(name: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!("operation {name:?} is not available over MCP: it handles an account credential and is available only from the CLI or the desktop app")
+        }],
+        "isError": true
+    })
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> Value {
@@ -321,5 +338,92 @@ mod tests {
         let mut engine = Engine::demo();
         let response = handle(&mut engine, &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn sensitive_operations_are_absent_and_rejected_without_echoing_arguments() {
+        let mut engine = Engine::demo();
+        let tools = request(&mut engine, "tools/list");
+        let names = tools["result"]["tools"].as_array().expect("tools").iter().filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>();
+        assert!(!names.contains(&"account_add"), "account_add is sensitive and must not be listed");
+        assert!(!names.contains(&"account_remove"), "account_remove is sensitive and must not be listed");
+        for name in ["accounts_list", "account_test", "sync_now", "sync_status"] {
+            assert!(names.contains(&name), "{name} must stay available over MCP");
+        }
+
+        for name in ["account_add", "account_remove"] {
+            let response = handle(
+                &mut engine,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 20,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": { "password": "super-secret-password" } }
+                }),
+            )
+            .expect("response");
+            assert_eq!(response["result"]["isError"], json!(true), "{name}");
+            let text = response["result"]["content"][0]["text"].as_str().expect("text");
+            assert!(text.contains("not available over MCP"), "{text}");
+            assert!(!text.contains("super-secret-password"), "the refusal echoed the arguments: {text}");
+            assert!(response["result"]["structuredContent"].is_null());
+        }
+    }
+
+    #[test]
+    fn sync_now_and_sync_status_work_over_mcp_without_a_secret_in_the_response() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mail.db");
+        let mut key_bytes = [0u8; 32];
+        getrandom::fill(&mut key_bytes).expect("OS random source");
+        let store = postino_store::Store::open(&path, &postino_store::StoreKey::from_bytes(key_bytes)).expect("store");
+        let vault = crate::test_support::MemoryVault::new();
+        let server = crate::test_support::RunningServer::start(crate::test_support::three_folders(), 1);
+        crate::test_support::seed_account(&store, &vault, "acc_mcp", server.port());
+        let mut engine = Engine::open_with_vault(store, vault.clone()).expect("engine");
+        engine.set_test_extra_roots(vec![server.ca()]);
+
+        let synced = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": { "name": "sync_now", "arguments": {} }
+            }),
+        )
+        .expect("response");
+        assert!(synced.get("error").is_none(), "{synced}");
+        assert_eq!(synced["result"]["structuredContent"]["outcome"]["account"], "acc_mcp");
+        assert_eq!(synced["result"]["structuredContent"]["outcome"]["folders"], 3);
+        assert_eq!(synced["result"]["structuredContent"]["outcome"]["fetched"], 3);
+
+        let status = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": { "name": "sync_status", "arguments": {} }
+            }),
+        )
+        .expect("response");
+        assert_eq!(status["result"]["structuredContent"]["accounts"][0]["status"]["state"], "idle");
+        assert!(status["result"]["structuredContent"]["accounts"][0]["status"]["last_success"].is_number());
+
+        let accounts = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 23,
+                "method": "tools/call",
+                "params": { "name": "accounts_list", "arguments": {} }
+            }),
+        )
+        .expect("response");
+        assert_eq!(accounts["result"]["structuredContent"]["accounts"][0]["server"]["host"], "localhost");
+        let encoded = serde_json::to_string(&accounts).expect("JSON");
+        assert!(!encoded.contains(postino_testkit::PASSWORD), "an MCP response contained the password");
+        server.finish();
     }
 }

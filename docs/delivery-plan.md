@@ -75,8 +75,9 @@ Status: `todo` · `active` · `review` · `done`.
 | P4a | MIME crate | parse/serialize, sanitized HTML allowlist, text alternative, bounds and fixtures | done |
 | P4b | Attachment blobs | content-addressed encrypted blobs, engine/store plumbing, reopen test | done |
 | P5a | IMAP client | CAPABILITY/LOGIN/LIST/SELECT/FETCH/IDLE, TLS, bounds, scripted fake server | done |
-| P5b | Sync and cache | reconciliation, offline cache, sync status operations, 10k/kill-resume tests | todo |
-| P6 | M1 onboarding | autodiscovery, Aruba app-password flow, multi-account model, real folder tree | todo |
+| P5b | Sync and cache | reconciliation, offline cache, sync status, 10k/kill-resume tests | done |
+| P6a | Accounts backend | credentials, schema v4, account/sync operations, CLI and MCP, sensitive filtering | done |
+| P6b | M1 onboarding UI | autodiscovery screen, Aruba app-password flow, app on real data | todo |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | todo |
 | P8 | M2 compose | attachments bytes, signatures per identity, scheduled send, undo send | todo |
 | P9 | M3 organize | threads, FTS5 search, rules, label mapping, attachment preview/save | todo |
@@ -84,7 +85,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
 
-P0-P2 close U0. P3-P6 make M1 real; P7-P8 close M2. Each package may split when the brief is too
+P0-P2 close U0. P3-P6b make M1 real; P7-P8 close M2. Each package may split when the brief is too
 large; splits are recorded here.
 
 ## 5. Delighters backlog

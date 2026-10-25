@@ -160,6 +160,105 @@ pub struct Account {
     pub signature: String,
 }
 
+/// The closed autodiscovery table. `Custom` requires the caller to supply host, port and TLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Aruba,
+    Gmail,
+    Custom,
+}
+
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aruba => "aruba",
+            Self::Gmail => "gmail",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "aruba" => Some(Self::Aruba),
+            "gmail" => Some(Self::Gmail),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    /// The offline settings of a known provider, or `None` for `custom`.
+    pub fn discovery(self) -> Option<Discovery> {
+        match self {
+            Self::Aruba => Some(Discovery { host: "imaps.aruba.it", port: 993, tls: MailTls::Implicit }),
+            Self::Gmail => Some(Discovery { host: "imap.gmail.com", port: 993, tls: MailTls::Implicit }),
+            Self::Custom => None,
+        }
+    }
+
+    /// The likely cause of a rejected login, for an actionable auth error. Never includes a secret.
+    pub fn login_advice(self) -> &'static str {
+        match self {
+            Self::Aruba => "Aruba needs IMAP enabled and an app password when two-factor authentication is on",
+            Self::Gmail => "Gmail requires 2-Step Verification and an app password; OAuth arrives in P12",
+            Self::Custom => "check the username, password, host, port and TLS mode, and that the server allows IMAP",
+        }
+    }
+}
+
+/// Settings the offline provider table knows before any network call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Discovery {
+    pub host: &'static str,
+    pub port: u16,
+    pub tls: MailTls,
+}
+
+/// How the IMAP connection is protected. There is deliberately no plaintext mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MailTls {
+    /// TLS from the first byte, usually port 993.
+    Implicit,
+    /// Plaintext greeting and `CAPABILITY`, then `STARTTLS`, usually port 143.
+    StartTls,
+}
+
+impl MailTls {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implicit => "implicit",
+            Self::StartTls => "starttls",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "implicit" => Some(Self::Implicit),
+            "starttls" => Some(Self::StartTls),
+            _ => None,
+        }
+    }
+}
+
+/// Where an account's mail comes from, as reported back to a caller. There is no password field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerSettings {
+    pub host: String,
+    pub port: u16,
+    pub tls: MailTls,
+    pub username: String,
+}
+
+/// One account with its IMAP endpoint and last sync status. This is what `accounts_list` returns:
+/// provider, address, server and sync health, never a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountView {
+    pub account: Account,
+    pub server: Option<ServerSettings>,
+    pub sync: Option<postino_sync::SyncStatus>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Folder {
     pub id: String,
@@ -337,5 +436,24 @@ mod tests {
         }
         assert_eq!(LabelColor::parse("Gold"), None);
         assert_eq!(LabelColor::parse("blue"), None);
+    }
+
+    #[test]
+    fn the_autodiscovery_table_is_the_documented_one() {
+        let aruba = Provider::Aruba.discovery().expect("aruba is known");
+        assert_eq!((aruba.host, aruba.port, aruba.tls), ("imaps.aruba.it", 993, MailTls::Implicit));
+        let gmail = Provider::Gmail.discovery().expect("gmail is known");
+        assert_eq!((gmail.host, gmail.port, gmail.tls), ("imap.gmail.com", 993, MailTls::Implicit));
+        assert!(Provider::Gmail.login_advice().contains("app password"));
+        assert!(Provider::Custom.discovery().is_none());
+        for provider in [Provider::Aruba, Provider::Gmail, Provider::Custom] {
+            assert_eq!(Provider::parse(provider.as_str()), Some(provider));
+            assert_eq!(serde_json::to_value(provider).expect("provider JSON"), serde_json::json!(provider.as_str()));
+        }
+        assert_eq!(Provider::parse("Aruba"), None);
+        for tls in [MailTls::Implicit, MailTls::StartTls] {
+            assert_eq!(MailTls::parse(tls.as_str()), Some(tls));
+            assert_eq!(serde_json::to_value(tls).expect("tls JSON"), serde_json::json!(tls.as_str()));
+        }
     }
 }

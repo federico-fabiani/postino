@@ -256,6 +256,32 @@ impl FakeServer {
         Self::start_inner(Some(fixture.acceptor()), handler).await
     }
 
+    /// Accept `connections` TLS connections on the same port, one after another, and run the handler
+    /// for each.
+    ///
+    /// A reconciler test needs several sessions against one account: the account stores a port, and a
+    /// second run must reach the same mailbox. The handler is called once per connection, so it can
+    /// keep state (for example a mailbox behind an `Arc<Mutex<_>>`) and script a different outcome
+    /// for each run. Each connection completes its handshake before the next is accepted.
+    pub async fn start_tls_many<F, Fut>(fixture: &TlsFixture, connections: usize, handler: F) -> Self
+    where
+        F: Fn(Conn) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind fake server");
+        let address = listener.local_addr().expect("fake server address");
+        let acceptor = fixture.acceptor();
+        let task = tokio::spawn(async move {
+            for _ in 0..connections {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut conn = Conn::new(Stream::Plain(stream));
+                assert!(conn.accept_tls(acceptor.clone()).await, "the client failed the TLS handshake");
+                handler(conn).await;
+            }
+        });
+        Self { address, task }
+    }
+
     async fn start_inner<F, Fut>(acceptor: Option<TlsAcceptor>, handler: F) -> Self
     where
         F: FnOnce(Conn) -> Fut + Send + 'static,

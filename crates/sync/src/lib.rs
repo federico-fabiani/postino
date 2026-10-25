@@ -62,7 +62,8 @@ use postino_net::{Flag, ImapConfig, NetError, Session, UidSet};
 use postino_store as store;
 use thiserror::Error;
 
-pub use status::{STATUS_KEY_PREFIX, SyncPhase, SyncStatus, read_status, status_key};
+pub use folder::{PlannedFolder, plan_folders};
+pub use status::{STATUS_KEY_PREFIX, SyncPhase, SyncStatus, read_status, read_status_for, status_key};
 
 /// UIDs requested per liveness/flags window. The network client caps untagged responses at 10 000;
 /// 1 000 keeps every window small and a 50 000-message folder to fifty round trips.
@@ -192,6 +193,40 @@ struct RunProgress {
     seen: HashSet<String>,
     /// Local ids whose server flags disagree with the local read/star state, deduplicated per run.
     drifted: HashSet<String>,
+}
+
+/// What one login-and-list probe learned about a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerProbe {
+    /// Selectable and non-selectable folders exactly as `LIST` returned them.
+    pub folders: Vec<postino_net::RemoteFolder>,
+    /// Capabilities the server advertised after authentication, upper-cased.
+    pub capabilities: Vec<String>,
+}
+
+/// Log in once, list the folders and log out, without touching the store.
+///
+/// This is the onboarding and `account_test` path: it proves the host, TLS mode and credential before
+/// anything is written. It blocks the calling thread and runs its own current-thread runtime, exactly
+/// like [`sync_account`]. No message is selected or fetched, so the probe cannot change mail state.
+///
+/// # Errors
+///
+/// [`SyncError::Auth`] when the server rejects the credential, [`SyncError::Connect`] for DNS, TCP,
+/// TLS and timeout failures, and [`SyncError::Protocol`] when no session runtime can start.
+pub fn probe(config: &ImapConfig) -> Result<ServerProbe, SyncError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| SyncError::Protocol(format!("could not start the probe runtime: {error}")))?;
+    runtime.block_on(async {
+        let mut session = Session::connect(config.clone()).await.map_err(SyncError::from)?;
+        session.login().await.map_err(SyncError::from)?;
+        let capabilities = session.capabilities().iter().map(str::to_owned).collect();
+        let folders = session.list().await.map_err(SyncError::from)?;
+        let _ = session.logout().await;
+        Ok(ServerProbe { folders, capabilities })
+    })
 }
 
 /// Reconcile one account from IMAP into `store`.

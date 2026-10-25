@@ -33,12 +33,12 @@
 ## 2. Commands
 
 ```sh
-cargo run -p postino-app                      # desktop shell, demo data (until P6)
+cargo run -p postino-app                      # desktop shell, demo data (until P6b)
 cargo run -p postino-cli -- --demo info
 cargo run -p postino-cli -- --demo tools
 cargo run -p postino-cli -- --demo mcp        # stdio MCP server
 cargo run -p postino-cli -- --store mail.db info
-# the mail commands need an onboarded account; a fresh store has none until P6
+# the mail commands need an onboarded account; a fresh store has none until `postino account add`
 cargo xtask ci                                # fmt + clippy + tests + layers + assets
 cargo xtask layers                            # dependency rules
 cargo xtask assets                            # asset hashes and licences
@@ -54,11 +54,11 @@ crates/core/        domain, engine (demo or store-backed), operation registry, s
 crates/crypto/      HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type
 crates/mime/        MIME parse/serialize, HTML sanitization, HTML-to-text, header guards
 crates/net/         IMAP4rev1 client over TLS, bounded and typed
-crates/platform/    OS seams: the store key in the Windows Credential Manager
-crates/store/       encrypted SQLCipher store, schema v3, repository, encrypted blob directory
+crates/platform/    OS seams: store key and account credentials in the OS keyring
+crates/store/       encrypted SQLCipher store, schema v4, repository, encrypted blob directory
 crates/sync/        one IMAP account into the store: folders, UIDs, MIME, blobs, status
 crates/testkit/     test-only fake IMAP server, TLS fixture and synthetic mail
-apps/postino-app/   egui shell (demo data until P6)
+apps/postino-app/   egui shell (demo data until P6b)
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks
 docs/               product, architecture, security, design, ADRs
@@ -97,12 +97,11 @@ the reading pane (P6) will.
 
 What is still demo or missing:
 
-- The desktop app always boots `Engine::demo_at`; the store is CLI-only until P6 onboarding chooses
+- The desktop app always boots `Engine::demo_at`; the store is CLI-only until P6b onboarding chooses
   the default path and the account it belongs to.
-- A fresh store has no accounts and no folders, and nothing creates them yet. Onboarding is P6. Until
-  then a fresh store answers `--store <path> info` and the mail commands report that no account is
-  configured. The test suite seeds a store through the `postino-store` repository to exercise the
-  flow end to end.
+- A fresh store has no accounts and no folders until `postino account add` writes the first one
+  (P6a). The onboarding UI is P6b. `postino --store <path> info` answers on a fresh store and the mail
+  commands report that no account is configured.
 - One process owns the store. There is no daemon, no pipe and no second writer (M4); the CLI and a
   future app must not open the same file at once. Do not run two `postino --store` commands against
   one database.

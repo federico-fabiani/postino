@@ -19,12 +19,17 @@ chrono.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 log.workspace = true
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 getrandom.workspace = true
+postino-net.workspace = true
+postino-testkit.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

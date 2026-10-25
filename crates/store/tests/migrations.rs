@@ -52,17 +52,17 @@ fn upgrades_a_v1_database_additively() {
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v1 to v3");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        let store = Store::open(&path, &key).expect("upgrade v1 to v4");
+        assert_eq!(store.schema_version().expect("version"), 4);
         assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v1"), "the upgrade lost meta data");
         store.upsert_account(&account("acc_1")).expect("the v2 tables exist");
-        store.set_meta("schema", "v3").expect("write");
+        store.set_meta("schema", "v4").expect("write");
     }
 
     let store = Store::open(&path, &key).expect("reopen");
-    assert_eq!(store.schema_version().expect("version"), 3);
+    assert_eq!(store.schema_version().expect("version"), 4);
     assert!(store.get_account("acc_1").expect("account").is_some());
-    assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v3"));
+    assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v4"));
 }
 
 #[test]
@@ -83,20 +83,93 @@ fn upgrades_a_v2_database_and_seeds_the_draft_sequence() {
     };
 
     {
-        let store = Store::open(&path, &key).expect("open v3");
+        let store = Store::open(&path, &key).expect("open v4");
         store.upsert_account(&account("acc_1")).expect("account");
         store.save_draft(&draft("prima")).expect("draft");
         store.save_draft(&draft("seconda")).expect("second revision");
-        // Make the file look like the shipped v2 schema: the migration had not created draft_seq.
+        // Make the file look like the shipped v2 schema: the migration had not created draft_seq
+        // or the v4 server table.
         let connection = raw_open(&path, &key);
-        connection.execute_batch("DROP TABLE draft_seq; PRAGMA user_version = 2;").expect("forge v2");
+        connection.execute_batch("DROP TABLE draft_seq; DROP TABLE account_servers; PRAGMA user_version = 2;").expect("forge v2");
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v2 to v3");
-        assert_eq!(store.schema_version().expect("version"), 3);
+        let store = Store::open(&path, &key).expect("upgrade v2 to v4");
+        assert_eq!(store.schema_version().expect("version"), 4);
         let saved = store.save_draft(&draft("terza")).expect("the seeded sequence must continue");
         assert_eq!(saved.revision, 3, "the v2 draft revision did not seed draft_seq");
+    }
+}
+
+#[test]
+fn upgrades_a_v3_database_and_keeps_its_mail() {
+    use postino_store::{AccountServer, AccountTls, Address, Folder, FolderKind, Message, MessageSummary};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("store.db");
+    let key = random_key();
+    let folder = Folder {
+        id: "fld_inbox".to_owned(),
+        account_id: "acc_1".to_owned(),
+        name: "INBOX".to_owned(),
+        kind: FolderKind::Inbox,
+        unread: 1,
+        total: 1,
+        uid_validity: Some(10),
+        uid_next: Some(11),
+        last_sync_at: None,
+    };
+    let message = Message {
+        summary: MessageSummary {
+            id: "msg_1".to_owned(),
+            account_id: "acc_1".to_owned(),
+            folder_id: "fld_inbox".to_owned(),
+            thread_id: "thread_1".to_owned(),
+            from: Address::new("Giulia", "giulia@example.com"),
+            to: vec![Address::new("Me", "me@example.com")],
+            subject: "Prima della v4".to_owned(),
+            snippet: "corpo".to_owned(),
+            date: 1_700_000_100_000,
+            unread: true,
+            starred: false,
+            has_attachments: false,
+            labels: Vec::new(),
+        },
+        uid: Some(1),
+        message_id: Some("<one@example.com>".to_owned()),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        body_text: "corpo".to_owned(),
+        body_html: None,
+        size: Some(5),
+    };
+
+    {
+        let store = Store::open(&path, &key).expect("open v4");
+        store.upsert_account(&account("acc_1")).expect("account");
+        store.upsert_folder(&folder).expect("folder");
+        store.upsert_synced_message(&message, &[]).expect("message");
+        // Make the file look like the shipped v3 schema: the v4 table did not exist yet.
+        let connection = raw_open(&path, &key);
+        connection.execute_batch("DROP TABLE account_servers; PRAGMA user_version = 3;").expect("forge v3");
+    }
+
+    {
+        let store = Store::open(&path, &key).expect("upgrade v3 to v4");
+        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.list_all_messages().expect("messages").len(), 1, "the upgrade lost mail");
+        assert_eq!(store.get_folder("fld_inbox").expect("folder").expect("row").total, 1);
+        assert_eq!(store.get_account_server("acc_1").expect("server"), None, "a v3 store starts with no server row");
+        store
+            .upsert_account_server(&AccountServer {
+                account_id: "acc_1".to_owned(),
+                host: "imaps.example.com".to_owned(),
+                port: 993,
+                tls: AccountTls::Implicit,
+                username: "me@example.com".to_owned(),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("the v4 table accepts a server");
     }
 }
 
@@ -108,7 +181,7 @@ fn reopening_does_not_run_a_migration_twice() {
 
     for round in 0..3 {
         let store = Store::open(&path, &key).unwrap_or_else(|error| panic!("open round {round}: {error}"));
-        assert_eq!(store.schema_version().expect("version"), 3);
+        assert_eq!(store.schema_version().expect("version"), 4);
         store.set_meta("rounds", &round.to_string()).expect("write");
         // Dropping the store closes the connection and checkpoints the WAL.
     }
@@ -124,7 +197,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     let key = random_key();
 
     {
-        let store = Store::open(&path, &key).expect("open v3");
+        let store = Store::open(&path, &key).expect("open v4");
         store.set_meta("canary", "still here").expect("write");
     }
     {
@@ -133,7 +206,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     }
 
     let error = Store::open(&path, &key).err().expect("a newer schema must not be opened");
-    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 3 }), "{error}");
+    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 4 }), "{error}");
 }
 
 #[test]

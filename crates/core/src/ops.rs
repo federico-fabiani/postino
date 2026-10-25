@@ -8,9 +8,14 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
-use crate::engine::{Engine, OpError, unknown_account, unknown_folder, unknown_label, unknown_message};
-use crate::model::{Account, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, Message, MessageSummary};
+use postino_sync::SyncStatus;
+
+use crate::engine::{AccountSetup, Engine, OpError, unknown_account, unknown_folder, unknown_label, unknown_message};
+use crate::model::{
+    AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary, Provider,
+};
 
 /// One operation as the CLI and MCP see it.
 #[derive(Debug, Clone, Serialize)]
@@ -21,10 +26,16 @@ pub struct OpDef {
     pub input_schema: Value,
     pub read_only: bool,
     pub destructive: bool,
+    /// The operation handles a credential (a password or a keyring entry). The CLI and the desktop
+    /// app may call it; the MCP server must neither list it nor dispatch it.
+    pub sensitive: bool,
 }
 
 macro_rules! def {
     ($name:literal, $title:literal, $desc:literal, $args:ty, $ro:literal, $destructive:literal) => {
+        def!($name, $title, $desc, $args, $ro, $destructive, false)
+    };
+    ($name:literal, $title:literal, $desc:literal, $args:ty, $ro:literal, $destructive:literal, $sensitive:literal) => {
         OpDef {
             name: $name,
             title: $title,
@@ -32,6 +43,7 @@ macro_rules! def {
             input_schema: serde_json::to_value(schemars::schema_for!($args)).unwrap_or(Value::Null),
             read_only: $ro,
             destructive: $destructive,
+            sensitive: $sensitive,
         }
     };
 }
@@ -50,7 +62,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "accounts_list",
             "List accounts",
-            "The configured mail accounts. The demo engine has one synthetic account; a store engine returns what onboarding saved.",
+            "Every configured account with its IMAP provider, address, server host/port/TLS and last sync status. Never includes a password or a credential: account_add and account_remove are sensitive operations available only from the CLI and the desktop app.",
             AccountsListArgs,
             true,
             false
@@ -143,6 +155,48 @@ pub fn op_defs() -> Vec<OpDef> {
             "Apply one label to `message_ids` when `apply` is true, or remove it when false. Accepts 1-500 message ids, is idempotent, and rejects unknown labels or messages before changing anything. Labels are local metadata: kept in the encrypted store when one is attached, never synced to a server.",
             LabelApplyArgs,
             false,
+            false
+        ),
+        def!(
+            "account_add",
+            "Add an IMAP account",
+            "Sensitive: the password is read from the caller, used once for the login check and stored in the OS keyring, never logged or written to the database. Known providers are offline: aruba uses imaps.aruba.it:993 implicit; gmail uses imap.gmail.com:993 implicit and needs 2-Step Verification plus an app password (OAuth arrives in P12); custom requires host, port and tls. The server is contacted and its folders listed before anything is written, so a failed login writes nothing. Returns the account with its server and sync state; never the credential.",
+            AccountAddArgs,
+            false,
+            false,
+            true
+        ),
+        def!(
+            "account_test",
+            "Test an account",
+            "Log in with the account's stored credential and list its folders. Read-only: nothing is written, no mailbox is selected and no message is fetched. Returns the selectable folder count and the server capabilities. A rejected credential is an auth error naming the provider and the likely cause; the cached mail is unchanged.",
+            AccountTestArgs,
+            true,
+            false
+        ),
+        def!(
+            "account_remove",
+            "Remove an account",
+            "Sensitive and destructive: delete the account's IMAP credential, its server configuration and its local cache (folders, messages, drafts and attachments). Labels stay. Requires confirm: true. The cache is deleted first and the keyring entry second, so a failure can leave an orphan credential but never cached mail whose password is gone. Available only from the CLI and the desktop app, never over MCP.",
+            AccountRemoveArgs,
+            false,
+            true,
+            true
+        ),
+        def!(
+            "sync_now",
+            "Sync an account now",
+            "Run one IMAP sync for an account and cache new mail, bodies, flags and attachments in the encrypted store. `account` may be omitted when exactly one account exists and is required when several do. Returns what the run did; a failed run keeps the previous cache and every message committed before the stop.",
+            SyncNowArgs,
+            false,
+            false
+        ),
+        def!(
+            "sync_status",
+            "Sync status",
+            "The last persisted sync status per account, read offline: phase, last attempt, last success, error sentence and folders done/total. `account` narrows the answer to one account. Never includes a credential, a host name or message content.",
+            SyncStatusArgs,
+            true,
             false
         ),
     ]
@@ -309,6 +363,59 @@ pub struct LabelApplyArgs {
     pub apply: bool,
 }
 
+/// Add an account. Sensitive: never exposed over MCP.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountAddArgs {
+    /// Offline provider: aruba, gmail or custom.
+    pub provider: Provider,
+    /// The account address; it is also the login name.
+    pub email: String,
+    /// Display name. Omit it to use the local part of the address.
+    pub name: Option<String>,
+    /// Password or app password. Read from the caller, never logged and never written to the
+    /// database; it is stored in the OS keyring only after the server accepts it.
+    pub password: String,
+    /// Only for provider custom; known providers own their endpoint.
+    pub host: Option<String>,
+    /// Only for provider custom; 1-65535.
+    pub port: Option<u16>,
+    /// Only for provider custom: implicit or starttls. There is no plaintext mode.
+    pub tls: Option<MailTls>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountTestArgs {
+    /// Account id returned by accounts_list.
+    pub id: String,
+}
+
+/// Remove an account and its cache. Sensitive and destructive: never exposed over MCP.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountRemoveArgs {
+    /// Account id returned by accounts_list.
+    pub id: String,
+    /// Must be true. The confirmation is explicit because cached mail is deleted.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SyncNowArgs {
+    /// Account id. Omit it when exactly one account exists.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SyncStatusArgs {
+    /// Account id. Omit it for every account.
+    pub account: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Results
 // ---------------------------------------------------------------------------
@@ -328,7 +435,7 @@ pub struct AppInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsList {
-    pub accounts: Vec<Account>,
+    pub accounts: Vec<AccountView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +512,70 @@ pub struct LabelApply {
     pub changed: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountAdd {
+    pub account: AccountView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountTest {
+    pub account: String,
+    /// Selectable folders the server listed.
+    pub folders: u32,
+    /// Capabilities advertised after authentication, upper-cased.
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountRemove {
+    pub account: AccountView,
+}
+
+/// What one sync run did. A serialisable mirror of `postino_sync::SyncOutcome`; no password, host
+/// name or message content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncReport {
+    pub account: String,
+    pub folders: u32,
+    pub fetched: u32,
+    pub updated_flags: u32,
+    pub removed: u32,
+    pub attachments_stored: u32,
+    pub warnings: Vec<String>,
+}
+
+impl From<postino_sync::SyncOutcome> for SyncReport {
+    fn from(outcome: postino_sync::SyncOutcome) -> Self {
+        Self {
+            account: outcome.account,
+            folders: outcome.folders,
+            fetched: outcome.fetched,
+            updated_flags: outcome.updated_flags,
+            removed: outcome.removed,
+            attachments_stored: outcome.attachments_stored,
+            warnings: outcome.warnings,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNow {
+    pub outcome: SyncReport,
+}
+
+/// One account's persisted sync health. `status` is null when the account has never synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStatusView {
+    pub account: String,
+    pub email: String,
+    pub status: Option<SyncStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatusReport {
+    pub accounts: Vec<SyncStatusView>,
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -417,7 +588,7 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "accounts_list" => {
             let _: AccountsListArgs = parse(args)?;
-            value(AccountsList { accounts: engine.accounts().to_vec() })
+            value(AccountsList { accounts: engine.account_views()? })
         }
         "folders_list" => {
             let args: FoldersListArgs = parse(args)?;
@@ -473,6 +644,36 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let args: LabelApplyArgs = parse(args)?;
             let (label, changed) = engine.set_label(&args.id, &args.message_ids, args.apply)?;
             value(LabelApply { label, changed })
+        }
+        "account_add" => {
+            let args: AccountAddArgs = parse(args)?;
+            let setup = AccountSetup {
+                provider: args.provider,
+                email: args.email,
+                name: args.name,
+                password: Zeroizing::new(args.password),
+                host: args.host,
+                port: args.port,
+                tls: args.tls,
+                extra_roots: Vec::new(),
+            };
+            value(AccountAdd { account: engine.add_account(setup)? })
+        }
+        "account_test" => {
+            let args: AccountTestArgs = parse(args)?;
+            value(engine.test_account(&args.id)?)
+        }
+        "account_remove" => {
+            let args: AccountRemoveArgs = parse(args)?;
+            value(AccountRemove { account: engine.remove_account(&args.id, args.confirm)? })
+        }
+        "sync_now" => {
+            let args: SyncNowArgs = parse(args)?;
+            value(SyncNow { outcome: engine.sync_now(args.account.as_deref())? })
+        }
+        "sync_status" => {
+            let args: SyncStatusArgs = parse(args)?;
+            value(SyncStatusReport { accounts: engine.sync_statuses(args.account.as_deref())? })
         }
         other => Err(OpError::UnknownOp(other.to_owned())),
     }
@@ -1087,6 +1288,26 @@ mod tests {
         assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{error}");
         let error = engine.call("messages_list", json!({ "folder": "inbox", "label": "lbl_missing" })).expect_err("unknown label with folder");
         assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{error}");
+    }
+
+    #[test]
+    fn account_and_sync_operations_carry_the_documented_annotations() {
+        let defs = super::op_defs();
+        let by_name = |name: &str| defs.iter().find(|def| def.name == name).unwrap_or_else(|| panic!("missing operation {name}"));
+        for name in ["accounts_list", "account_test", "sync_status"] {
+            assert!(by_name(name).read_only, "{name} must be read-only");
+            assert!(!by_name(name).destructive, "{name} must not be destructive");
+            assert!(!by_name(name).sensitive, "{name} must stay available over MCP");
+        }
+        assert!(by_name("account_add").sensitive);
+        assert!(!by_name("account_add").read_only);
+        assert!(by_name("account_remove").sensitive);
+        assert!(by_name("account_remove").destructive);
+        assert!(!by_name("sync_now").read_only);
+        assert!(by_name("account_add").description.contains("never logged"));
+        assert!(by_name("account_add").description.contains("app password"));
+        assert!(by_name("account_add").input_schema["properties"]["password"].is_object());
+        assert!(by_name("account_remove").input_schema["properties"]["confirm"].is_object());
     }
 
     #[test]

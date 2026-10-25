@@ -11,20 +11,26 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod mcp;
+#[cfg(test)]
+mod test_support;
 
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use postino_core::{
-    AccountsList, Address, AppInfo, DraftSave, DraftSend, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary,
-    LabelUpdate, LabelsList, MessageFlag, MessageGet, MessageSummary, MessagesList, SearchResult,
+    AccountAdd, AccountRemove, AccountTest, AccountView, AccountsList, Address, AppInfo, CredentialVault, DraftSave, DraftSend, Engine, FoldersList,
+    LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary,
+    MessagesList, Provider, SearchResult, SyncNow, SyncReport, SyncStatusReport, VaultError,
 };
+use postino_platform::Keyring;
 use serde::Serialize;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(name = "postino", version, about = "Postino — local-first, agent-first mail", long_about = None)]
@@ -100,6 +106,66 @@ enum LabelCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum AccountCommand {
+    /// Add an IMAP account: test the login, store the credential in the OS keyring and write the
+    /// account, server and folders to the encrypted store.
+    Add {
+        /// Known provider with an offline endpoint: aruba or gmail. Use custom with --host,
+        /// --port and --tls for anything else.
+        #[arg(long, value_parser = ["aruba", "gmail", "custom"])]
+        provider: String,
+        /// The account address; it is also the IMAP login name.
+        #[arg(long)]
+        email: String,
+        /// Display name. Defaults to the local part of the address.
+        #[arg(long)]
+        name: Option<String>,
+        /// Only for provider custom.
+        #[arg(long, requires_all = ["port", "tls"])]
+        host: Option<String>,
+        /// Only for provider custom.
+        #[arg(long, requires_all = ["host", "tls"])]
+        port: Option<u16>,
+        /// Only for provider custom: implicit or starttls. There is no plaintext mode.
+        #[arg(long, value_parser = ["implicit", "starttls"], requires_all = ["host", "port"])]
+        tls: Option<String>,
+        /// Read the password (or app password) from one stdin line instead of prompting. There is
+        /// deliberately no --password argument: a password must not appear in argv or shell history.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Log in with the stored credential and list folders. Writes nothing.
+    Test {
+        /// Account id returned by `account list`.
+        id: String,
+    },
+    /// List accounts with their IMAP server and last sync status.
+    List,
+    /// Delete an account, its IMAP credential and its local cache. Labels stay.
+    Remove {
+        /// Account id returned by `account list`.
+        id: String,
+        /// Confirm the deletion. Cached mail and the keyring credential are removed.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommand {
+    /// Run one sync for an account (or the only account).
+    Run {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Show the persisted sync status without touching the network.
+    Status {
+        #[arg(long)]
+        account: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Version, platform, data directory and whether the mailbox is demo, store-backed or empty.
     Info,
@@ -109,6 +175,16 @@ enum Command {
     Schema { op: String },
     /// List accounts.
     Accounts,
+    /// Add, test, list or remove an IMAP account.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+    /// Run a sync or read its status.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
     /// List folders.
     Folders {
         #[arg(long)]
@@ -187,7 +263,40 @@ enum Command {
 
 /// Keyring scope the CLI uses for its store. A different scope is a different key and therefore a
 /// different database.
-const STORE_KEY_SCOPE: &str = "default";
+const STORE_KEY_SCOPE: &str = postino_platform::STORE_SCOPE;
+
+/// The production [`CredentialVault`]: every operation maps an account id to the platform scope
+/// `account:<id>:imap`, takes the shared keyring lock and returns only redacted errors.
+struct PlatformVault {
+    keyring: Keyring,
+}
+
+impl PlatformVault {
+    fn new(keyring: Keyring) -> Self {
+        Self { keyring }
+    }
+
+    fn scope(account_id: &str) -> Result<String, VaultError> {
+        postino_platform::account_scope(account_id).map_err(|error| VaultError::new(error.to_string()))
+    }
+}
+
+impl CredentialVault for PlatformVault {
+    fn store_imap_password(&self, account_id: &str, password: &[u8]) -> Result<(), VaultError> {
+        let scope = Self::scope(account_id)?;
+        self.keyring.store_secret(&scope, password).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn load_imap_password(&self, account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+        let scope = Self::scope(account_id)?;
+        self.keyring.load_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn delete_imap_password(&self, account_id: &str) -> Result<(), VaultError> {
+        let scope = Self::scope(account_id)?;
+        self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
+}
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).target(env_logger::Target::Stderr).init();
@@ -208,24 +317,55 @@ fn main() -> ExitCode {
     }
 }
 
-/// Build the engine the command asked for: demo, encrypted store, or the empty engine that waits
-/// for onboarding. The store key never leaves this function except inside the store connection.
+/// Build the engine the command asked for: demo, encrypted store, or the default local store.
+///
+/// The store key never leaves this function except inside the store connection. The credential vault
+/// is the OS keyring; account operations never print what they read from it.
 fn open_engine(cli: &Cli) -> Result<Engine> {
     match (&cli.store, cli.demo) {
         (Some(_), true) => bail!("--demo e --store non possono essere usati insieme: scegli la mailbox sintetica o il database cifrato"),
-        (Some(path), false) => {
-            let key = postino_platform::load_or_create_key(STORE_KEY_SCOPE)
-                .map_err(|error| anyhow::anyhow!("the OS keyring could not provide the store key: {error}"))?;
-            let store = postino_store::Store::open(path, &postino_store::StoreKey::from_bytes(*key.as_bytes()))
-                .map_err(|error| anyhow::anyhow!("opening the store at {}: {error}", path.display()))?;
-            Engine::open(store).map_err(anyhow::Error::new)
-        }
+        (Some(path), false) => open_store(path),
         (None, true) => Ok(Engine::demo()),
-        (None, false) => Ok(Engine::empty()),
+        (None, false) => {
+            let path = default_store_path()?;
+            open_store(&path)
+        }
     }
 }
 
+/// `%LOCALAPPDATA%\Postino\mail.db` (or the platform equivalent), created on first use.
+fn default_store_path() -> Result<PathBuf> {
+    let dir =
+        Engine::data_dir().ok_or_else(|| anyhow::anyhow!("the platform data directory is unavailable, so the default store cannot be placed"))?;
+    Ok(default_store_path_in(&dir))
+}
+
+fn default_store_path_in(dir: &Path) -> PathBuf {
+    dir.join("mail.db")
+}
+
+fn open_store(path: &Path) -> Result<Engine> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| anyhow::anyhow!("creating the store directory {}: {error}", parent.display()))?;
+    }
+    let keyring = Keyring::system().map_err(|error| anyhow::anyhow!("the OS keyring is unavailable: {error}"))?;
+    let key =
+        keyring.load_or_create_key(STORE_KEY_SCOPE).map_err(|error| anyhow::anyhow!("the OS keyring could not provide the store key: {error}"))?;
+    let store = postino_store::Store::open(path, &postino_store::StoreKey::from_bytes(*key.as_bytes()))
+        .map_err(|error| anyhow::anyhow!("opening the store at {}: {error}", path.display()))?;
+    Engine::open_with_vault(store, Arc::new(PlatformVault::new(keyring))).map_err(anyhow::Error::new)
+}
+
 fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
+    run_with_input(cli, engine, &mut std::io::stdin().lock(), std::io::stdin().is_terminal())
+}
+
+/// The command dispatcher with the password source injected. `input` is the `--password-stdin`
+/// stream; `interactive` says whether a no-echo terminal prompt is possible. Production calls
+/// [`run`], tests pass a cursor so the stdin path is exercised exactly as a script would.
+fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, interactive: bool) -> Result<()> {
     let json_output = cli.json;
     let needs_mail = matches!(
         &cli.command,
@@ -275,7 +415,8 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 let mut text = String::new();
                 for def in defs {
                     let mode = if def.read_only { "read-only" } else { "writes" };
-                    text.push_str(&format!("{:<16} {:<3} {}\n  {}\n", def.name, mode, def.title, def.description));
+                    let sensitive = if def.sensitive { " · sensitive (CLI only)" } else { "" };
+                    text.push_str(&format!("{:<16} {:<3} {}{}\n  {}\n", def.name, mode, def.title, sensitive, def.description));
                 }
                 say(text)?;
             }
@@ -292,13 +433,80 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
             if json_output {
                 print_json(&accounts)?;
             } else {
-                let mut text = String::new();
-                for account in accounts.accounts {
-                    text.push_str(&format!("{} <{}>  {}\n", account.name, account.email, account.provider));
-                }
-                say(text)?;
+                say(format_accounts(&accounts.accounts))?;
             }
         }
+        Command::Account { command } => match command {
+            AccountCommand::Add { provider, email, name, host, port, tls, password_stdin } => {
+                let provider =
+                    Provider::parse(&provider).ok_or_else(|| anyhow::anyhow!("provider {provider:?} non valido; usa aruba, gmail o custom"))?;
+                let tls = match tls {
+                    Some(value) => {
+                        Some(MailTls::parse(&value).ok_or_else(|| anyhow::anyhow!("modalità TLS {value:?} non valida; usa implicit o starttls"))?)
+                    }
+                    None => None,
+                };
+                let password = if password_stdin {
+                    read_password_stdin(input)?
+                } else if interactive {
+                    let password = rpassword::prompt_password("Password IMAP: ").context("reading the password from the terminal")?;
+                    if password.is_empty() {
+                        bail!("the password must not be empty");
+                    }
+                    Zeroizing::new(password)
+                } else {
+                    bail!("no terminal is available to prompt for the password; use --password-stdin and pipe one line into postino")
+                };
+                let view = account_add(engine, AccountAddRequest { provider, email, name, host, port, tls, password })?;
+                if json_output {
+                    print_json(&AccountAdd { account: view })?;
+                } else {
+                    say(format_account_add(&view))?;
+                }
+            }
+            AccountCommand::Test { id } => {
+                let result: AccountTest = decode(call(engine, "account_test", json!({ "id": id }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format_account_test(&result))?;
+                }
+            }
+            AccountCommand::List => {
+                let accounts: AccountsList = decode(call(engine, "accounts_list", json!({}))?)?;
+                if json_output {
+                    print_json(&accounts)?;
+                } else {
+                    say(format_accounts(&accounts.accounts))?;
+                }
+            }
+            AccountCommand::Remove { id, yes } => {
+                let removed: AccountRemove = decode(call(engine, "account_remove", json!({ "id": id, "confirm": yes }))?)?;
+                if json_output {
+                    print_json(&removed)?;
+                } else {
+                    say(format_account_remove(&removed.account))?;
+                }
+            }
+        },
+        Command::Sync { command } => match command {
+            SyncCommand::Run { account } => {
+                let result: SyncNow = decode(call(engine, "sync_now", json!({ "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format_sync_report(&result.outcome))?;
+                }
+            }
+            SyncCommand::Status { account } => {
+                let result: SyncStatusReport = decode(call(engine, "sync_status", json!({ "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format_sync_status(&result))?;
+                }
+            }
+        },
         Command::Folders { account } => {
             let folders: FoldersList = decode(call(engine, "folders_list", json!({ "account": account }))?)?;
             if json_output {
@@ -471,6 +679,11 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
             }
         },
         Command::Run { op, args, params } => {
+            if engine.tools().into_iter().any(|def| def.name == op && def.sensitive) {
+                bail!(
+                    "operation {op:?} is sensitive and cannot be called through `postino run`; use `postino account add` or `postino account remove`, which read the password without an argv flag"
+                );
+            }
             let object = parse_run_args(args, params)?;
             let result = call(engine, &op, object)?;
             print_json(&result)?;
@@ -478,6 +691,153 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
         Command::Mcp => mcp::serve(engine)?,
     }
     Ok(())
+}
+
+/// Everything the `account add` flags supply, with the password already read from the terminal or
+/// stdin. Kept separate from `run` so the password acquisition is testable without a TTY.
+struct AccountAddRequest {
+    provider: Provider,
+    email: String,
+    name: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    tls: Option<MailTls>,
+    password: Zeroizing<String>,
+}
+
+/// Dispatch `account_add` through the registry. The password travels in the request to the engine,
+/// which hands it to the keyring adapter after the login check; it is never printed here.
+fn account_add(engine: &mut Engine, request: AccountAddRequest) -> Result<AccountView> {
+    let AccountAddRequest { provider, email, name, host, port, tls, password } = request;
+    let args = json!({
+        "provider": provider,
+        "email": email,
+        "name": name,
+        "password": password.as_str(),
+        "host": host,
+        "port": port,
+        "tls": tls,
+    });
+    let added: AccountAdd = decode(call(engine, "account_add", args)?)?;
+    Ok(added.account)
+}
+
+/// Read exactly one line from `reader` and strip its line ending. The raw line is zeroised before it
+/// is returned, so the password does not linger in two buffers.
+fn read_password_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<Zeroizing<String>> {
+    let mut line = Zeroizing::new(String::new());
+    reader.read_line(&mut line).context("reading the password from stdin")?;
+    let password = line.trim_end_matches(['\r', '\n']).to_owned();
+    if password.is_empty() {
+        bail!("the password read from stdin is empty");
+    }
+    Ok(Zeroizing::new(password))
+}
+
+fn format_accounts(accounts: &[AccountView]) -> String {
+    if accounts.is_empty() {
+        return "Nessun account. Aggiungine uno con `postino account add --provider aruba --email me@example.it`.\n".to_owned();
+    }
+    let mut text = String::new();
+    for view in accounts {
+        text.push_str(&format_account_line(view));
+    }
+    text
+}
+
+fn format_account_line(view: &AccountView) -> String {
+    let server = match &view.server {
+        Some(server) => format!("{}:{} ({})", server.host, server.port, server.tls.as_str()),
+        None => "nessun server IMAP".to_owned(),
+    };
+    let sync = match &view.sync {
+        Some(status) => format_sync_phase(status),
+        None => "mai sincronizzato".to_owned(),
+    };
+    format!("{:<28} {:<28} {:<8} {:<34} {}\n", view.account.id, view.account.email, view.account.provider, server, sync)
+}
+
+/// The CLI reports the id, the address, the provider, the endpoint and the folder count. It never
+/// receives the password at all: `account_add` does not return it.
+fn format_account_add(view: &AccountView) -> String {
+    let mut text = format!("Account aggiunto: {} <{}> ({})\n", view.account.id, view.account.email, view.account.provider);
+    if let Some(server) = &view.server {
+        text.push_str(&format!("Server: {}:{} ({}) · utente {}\n", server.host, server.port, server.tls.as_str(), server.username));
+    }
+    text.push_str("La password è nel portachiavi del sistema, mai nel database. Le cartelle sono state lette dal server.\n");
+    text
+}
+
+fn format_account_test(result: &AccountTest) -> String {
+    let capabilities = if result.capabilities.is_empty() { "nessuna capability dichiarata".to_owned() } else { result.capabilities.join(", ") };
+    format!(
+        "Credenziali valide per {}: {} cartelle selezionabili.\nCapability: {capabilities}\nNessuna mail è stata scaricata o modificata.\n",
+        result.account,
+        count_label(result.folders, "cartella", "cartelle")
+    )
+}
+
+fn format_account_remove(view: &AccountView) -> String {
+    format!("Account rimosso: {} <{}>. Credenziale e cache locale eliminate; le etichette restano.\n", view.account.id, view.account.email)
+}
+
+fn format_sync_report(report: &SyncReport) -> String {
+    let mut text = format!(
+        "Sincronizzazione completata per {}: {},\n{} messaggi, {} allegati, {} rimossi, {} flag divergenti.\n",
+        report.account,
+        count_label(report.folders, "cartella", "cartelle"),
+        report.fetched,
+        report.attachments_stored,
+        report.removed,
+        report.updated_flags
+    );
+    for warning in &report.warnings {
+        text.push_str(&format!("  ! {warning}\n"));
+    }
+    text
+}
+
+fn format_sync_status(report: &SyncStatusReport) -> String {
+    if report.accounts.is_empty() {
+        return "Nessun account configurato.\n".to_owned();
+    }
+    let mut text = String::new();
+    for view in &report.accounts {
+        match &view.status {
+            None => text.push_str(&format!("{} <{}>  mai sincronizzato\n", view.account, view.email)),
+            Some(status) => {
+                let attempt = format_millis(status.last_attempt);
+                let success = status.last_success.map_or_else(|| "mai".to_owned(), format_millis);
+                text.push_str(&format!(
+                    "{} <{}>  {}  tentativo {} · successo {} · cartelle {}/{}\n",
+                    view.account,
+                    view.email,
+                    format_sync_phase(status),
+                    attempt,
+                    success,
+                    status.folders_done,
+                    status.folders_total
+                ));
+                if let Some(error) = &status.error {
+                    text.push_str(&format!("  errore: {error}\n"));
+                }
+            }
+        }
+    }
+    text
+}
+
+fn format_sync_phase(status: &postino_core::SyncStatus) -> String {
+    match status.state {
+        postino_core::SyncPhase::Idle => "in pari".to_owned(),
+        postino_core::SyncPhase::Syncing => "in corso".to_owned(),
+        postino_core::SyncPhase::Error => "errore".to_owned(),
+    }
+}
+
+fn format_millis(value: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(value)
+        .map_or_else(|| value.to_string(), |date| date.with_timezone(&Local).format("%d/%m/%Y %H:%M").to_string())
 }
 
 fn messages_args(folder: Option<String>, unread: bool, starred: bool, attachments: bool, label: Option<&str>, limit: u32, offset: u32) -> Value {
@@ -1193,5 +1553,112 @@ mod tests {
         let cli = Cli { demo: true, store: Some(fixture.path()), json: true, command: Command::Info };
         let error = open_engine(&cli).err().expect("both modes at once must be refused");
         assert!(error.to_string().contains("--demo e --store"), "{error}");
+    }
+
+    fn password() -> Zeroizing<String> {
+        Zeroizing::new(postino_testkit::PASSWORD.to_owned())
+    }
+
+    #[test]
+    fn password_stdin_reads_exactly_one_line_and_rejects_an_empty_secret() {
+        let mut input = std::io::Cursor::new(b"app password\r\nsecond line\n".to_vec());
+        let read = read_password_stdin(&mut input).expect("one line");
+        assert_eq!(read.as_str(), "app password");
+        assert!(read_password_stdin(&mut std::io::Cursor::new(Vec::new())).is_err());
+        assert!(read_password_stdin(&mut std::io::Cursor::new(b"\r\n".to_vec())).is_err());
+    }
+
+    #[test]
+    fn there_is_no_password_argv_flag_and_missing_arguments_exit_with_two() {
+        let error =
+            Cli::try_parse_from(["postino", "account", "add", "--provider", "custom", "--email", "me@example.com", "--password", "not-allowed"])
+                .expect_err("--password must not exist");
+        assert_eq!(error.exit_code(), 2);
+
+        let error = Cli::try_parse_from(["postino", "account", "add", "--email", "me@example.com"]).expect_err("provider is required");
+        assert_eq!(error.exit_code(), 2);
+
+        let parsed = Cli::try_parse_from(["postino", "account", "add", "--provider", "custom", "--email", "me@example.com", "--password-stdin"])
+            .expect("the stdin flag is the supported path");
+        assert!(matches!(parsed.command, Command::Account { command: AccountCommand::Add { password_stdin: true, .. } }));
+    }
+
+    #[test]
+    fn the_default_store_lives_under_the_platform_data_directory() {
+        let profile = std::path::Path::new("profile").join("Postino");
+        assert_eq!(default_store_path_in(&profile), profile.join("mail.db"));
+    }
+
+    #[test]
+    fn cli_run_refuses_sensitive_operations_without_echoing_the_arguments() {
+        let mut engine = Engine::demo();
+        for op in ["account_add", "account_remove"] {
+            let error = run(
+                cli(Command::Run { op: op.to_owned(), args: Some(json!({ "password": "argv-secret" }).to_string()), params: Vec::new() }),
+                &mut engine,
+            )
+            .expect_err("a sensitive operation must not run through `run`");
+            let text = error.to_string();
+            assert!(text.contains("sensitive"), "{text}");
+            assert!(!text.contains("argv-secret"), "{text}");
+        }
+    }
+
+    #[test]
+    fn cli_account_add_test_sync_status_and_remove_never_print_the_password() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        let server = crate::test_support::RunningServer::start(crate::test_support::three_folders(), 3);
+        let mut engine = Engine::open_with_vault(fixture.open(), vault.clone()).expect("engine");
+        engine.set_test_extra_roots(vec![server.ca()]);
+
+        let mut stdin = std::io::Cursor::new(format!("{}\n", password().as_str()).into_bytes());
+        run_with_input(
+            cli(Command::Account {
+                command: AccountCommand::Add {
+                    provider: "custom".to_owned(),
+                    email: postino_testkit::USER.to_owned(),
+                    name: Some("Postino Test".to_owned()),
+                    host: Some("localhost".to_owned()),
+                    port: Some(server.port()),
+                    tls: Some("implicit".to_owned()),
+                    password_stdin: true,
+                },
+            }),
+            &mut engine,
+            &mut stdin,
+            false,
+        )
+        .expect("account add with --password-stdin");
+        let view = engine.account_views().expect("views").pop().expect("the added account");
+        let added = format_account_add(&view);
+        assert!(added.contains(&view.account.id), "{added}");
+        assert!(added.contains("portachiavi"), "{added}");
+        assert!(!added.contains(postino_testkit::PASSWORD), "{added}");
+
+        let listed = format_accounts(&engine.account_views().expect("views"));
+        assert!(listed.contains(&view.account.id), "{listed}");
+        assert!(!listed.contains(postino_testkit::PASSWORD), "{listed}");
+
+        let tested: AccountTest = decode(call(&mut engine, "account_test", json!({ "id": view.account.id })).expect("account_test")).expect("result");
+        let report = format_account_test(&tested);
+        assert!(report.contains("3 cartelle"), "{report}");
+        assert!(!report.contains(postino_testkit::PASSWORD), "{report}");
+
+        run(cli(Command::Sync { command: SyncCommand::Run { account: None } }), &mut engine).expect("sync run");
+        assert_eq!(engine.messages().len(), 3);
+        let status: SyncStatusReport = decode(call(&mut engine, "sync_status", json!({})).expect("sync_status")).expect("status");
+        let report = format_sync_status(&status);
+        assert!(report.contains("in pari"), "{report}");
+        assert!(!report.contains(postino_testkit::PASSWORD), "{report}");
+
+        let error = run(cli(Command::Account { command: AccountCommand::Remove { id: view.account.id.clone(), yes: false } }), &mut engine)
+            .expect_err("an unconfirmed remove must fail");
+        assert!(error.to_string().contains("confirm"), "{error}");
+        run(cli(Command::Account { command: AccountCommand::Remove { id: view.account.id.clone(), yes: true } }), &mut engine)
+            .expect("confirmed remove");
+        assert!(engine.accounts().is_empty());
+        assert_eq!(vault.len(), 0);
+        server.finish();
     }
 }

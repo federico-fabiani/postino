@@ -7,8 +7,9 @@ If a rule here conflicts with a habit from another project, this file wins.
 
 Postino is a local-first, agent-first mail client written in Rust. The desktop app, the `postino`
 CLI and the `postino mcp` server are three clients of **one operation registry**. The engine runs on
-synthetic demo mail in memory or on the encrypted local store (`postino --store <path>`); there is
-no IMAP, no SMTP and no daemon yet, and the desktop app still boots on the demo until P6.
+synthetic demo mail in memory or on the encrypted local store (`postino --store <path>`); accounts,
+credentials and IMAP sync exist (P6a), there is no SMTP and no daemon yet, and the desktop app still
+boots on the demo until P6b.
 
 **The current milestone is the only source of truth for scope.** Read `ROADMAP.md` before
 starting. Do not build M1 features into M0.
@@ -65,11 +66,16 @@ xtask              build/quality tasks            tooling
 
 Rules enforced by `cargo xtask layers`:
 
-- `postino-core` may depend only on `postino-store` (the foundation it drives) and never on a UI
-  toolkit (`egui`, `eframe`, `winit`, `rfd`). The store never depends back on core.
+- `postino-core` may depend only on `postino-store`, `postino-net` and `postino-sync` (the
+  foundations it drives) and never on a UI toolkit (`egui`, `eframe`, `winit`, `rfd`). The store
+  never depends back on core; sync may use core only as a dev-dependency for its offline-read test.
 - `postino-crypto`, `postino-mime`, `postino-platform` and `postino-store` are foundation: no
   workspace dependency and no UI. `postino-net` is network: it depends on no other workspace crate.
+- The credential seam is explicit: core defines `CredentialVault` and never calls a keyring crate;
+  `postino-platform` owns the OS keyring and the `account:<id>:imap` scopes; the CLI adapts one to
+  the other. Do not move a keyring call into core or a password into the store.
 - `postino-app` and `postino-cli` may depend on `postino-core` and on libraries, never on each other.
+  The CLI may use `postino-net` only in tests (the fake server types).
 - New crates need a layer and a README before they need code. Planned crates are listed in
   `docs/architecture.md`; do not create speculative stubs.
 
@@ -79,6 +85,9 @@ Rules enforced by `cargo xtask layers`:
 - Every request struct uses `#[serde(deny_unknown_fields)]`. Typos fail loudly.
 - Every operation has a precise title, a description an agent can act on, a JSON Schema derived
   from the request type, and `read_only` / `destructive` annotations.
+- An operation that handles a credential is `sensitive`: the MCP server neither lists nor dispatches
+  it, and the CLI reads the secret from a no-echo prompt or stdin, never from argv. The CLI's generic
+  `postino run` refuses sensitive operations for the same reason.
 - Reads never mutate. Opening a message must not silently mark it read; the UI or CLI calls
   `message_flag` explicitly.
 - Errors say what was wrong and what is allowed. Do not leak whether an unrelated path or account

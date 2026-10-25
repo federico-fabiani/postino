@@ -14,8 +14,8 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/core` | Domain types, the engine (demo or store-backed), the operation registry and its JSON Schemas |
 | `crates/crypto` | HKDF-SHA256 subkeys and XChaCha20-Poly1305 sealing; the blob subkey (P4b) |
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
-| `crates/platform` | OS seams; today the store key in the Windows Credential Manager |
-| `crates/store` | SQLCipher schema v3, migrations, the repository and the encrypted blob store (P3b, P4b) |
+| `crates/platform` | OS seams: store key and account credentials in the OS keyring |
+| `crates/store` | SQLCipher schema v4, migrations, the repository and the encrypted blob store (P3b, P4b, P6a) |
 | `crates/sync` | One account from IMAP into the store: folders, UIDVALIDITY, incremental fetch, MIME, blobs, deletions, status (P5b) |
 | `crates/testkit` | Test-only fake IMAP server, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -25,9 +25,10 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 The engine has two sources of truth, chosen at construction:
 
 - `Engine::demo()` / `demo_at()` — synthetic mail in memory, no I/O. This is what the desktop app
-  still boots on until onboarding (P6).
+  still boots on until onboarding (P6b).
 - `Engine::open(store)` — the encrypted SQLCipher store, loaded once and written through on every
-  mutation. The CLI reaches it with `--store <path>`; the key comes from the OS keyring.
+  mutation. The CLI reaches it with `--store <path>` or the default local path; the key comes from the
+  OS keyring.
 
 The UI, CLI and MCP read both through the same `Engine::call(name, args)` door. The MCP server and
 the GUI never touch SQL directly. Nothing is fetched from a server and nothing is sent: IMAP is P5,
@@ -252,8 +253,8 @@ attachment id or a repeated one is refused before the first write. `send_draft` 
 account and deletes only the draft row, keeping its revision sequence. `delete_message` removes the
 draft row and sequence in the same transaction. Also wired in P3c: `set_flags`, `move_message`,
 label create/update/delete and label apply/remove. Reads (`message_get`, `messages_list`, `search`,
-`labels_list`) never mutate. Account and folder writes remain a P6 seam: onboarding will call
-`upsert_account`/`upsert_folder` before the first engine load.
+`labels_list`) never mutate. Account and folder writes were the P6 seam; §4.7 fills it with
+`account_add`, `account_remove` and the store transaction behind them.
 
 Caller mistakes are `OpError::InvalidArgs` with a specific sentence whichever layer notices them
 first: the engine's in-memory pre-checks and the `store_map` boundary agree on unknown account,
@@ -276,11 +277,12 @@ The keyring lock protects first-run key creation, not the store file itself. The
 locking story beyond SQLite's WAL, busy timeout and the keyring lock: one process owns the store
 until the daemon (M4), and the desktop app does not open it yet. The repository returns folders and
 labels ordered by name, so a store engine sees alphabetical order where the demo saw creation order;
-P6 decides the real folder-tree order when onboarding writes it.
+P6b decides the real folder-tree order when onboarding writes it.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
-a store. **Still missing:** onboarding and the default store path (P6), the operation/CLI/UI that
-calls `postino-sync`, FTS5 (P9), outbox (P7), the daemon (M4).
+a store. **Still missing:** the onboarding UI (P6b) and its `sync_now` binding, FTS5 (P9), outbox
+(P7), the daemon (M4). The default store path, the account/sync operations and their CLI/MCP bindings
+landed in P6a (§4.7).
 
 ### 4.3 Implemented in P4a: the MIME crate
 
@@ -614,8 +616,8 @@ run or an explicit `recount_folder`.
 
 **Not synced.** Server-side filters and rules, flag changes pushed out, `EXPUNGE`, `APPEND` of drafts
 or sent mail, `CONDSTORE`/`QRESYNC` increments, a folder-removal pass (a folder deleted on the server
-keeps its cached rows until P6 decides), full JWZ threading, FTS5 and any scheduled loop. There is no
-operation, CLI command, MCP tool or UI binding yet: P6 owns onboarding and those surfaces.
+keeps its cached rows until P6b decides), full JWZ threading, FTS5 and any scheduled loop. P6a adds the
+operations and the CLI/MCP bindings (§4.7); the UI binding is P6b, and there is still no scheduler.
 
 **Evidence.** The scripted server moved to `postino-testkit`, and the sync tests script real protocol
 exchanges: initial sync, incremental UIDs, UIDVALIDITY, deletion, flag drift, oversized attachment,
@@ -628,14 +630,118 @@ GNU host in a debug build (opt-level 1, dependencies at 2), a 2 000-message sync
 37.3 s with 34.8 MB. The old per-folder deletion re-fetched 20 envelope windows at 2 000 messages;
 the flag scan costs one probe plus two 1 000-UID windows, which is why the run got faster.
 
+### 4.7 Implemented in P6a: accounts, credentials and sync operations
+
+The backend that turns Postino from a demo into a client for a real mailbox. There is no onboarding
+screen yet (P6b), but the CLI, MCP and the operation registry are complete: a person can add an Aruba
+or Gmail account with an app password, test it, sync it into the encrypted store, read the cached
+mail and remove it. The desktop app still boots on the demo until P6b.
+
+**Credential scopes.** `postino-platform` owns every keyring access under service `postino`:
+
+| Scope | Secret | Used by |
+|---|---|---|
+| `default` | the 256-bit SQLCipher store key | `postino --store` / the default store |
+| `account:<id>:imap` | one account's IMAP password or app password | `account_add`, `account_test`, `sync_now`, `account_remove` |
+
+`Keyring` is a handle with an explicit lock path: production uses `Keyring::system()` (the lock lives
+next to the app data), tests use `Keyring::at(temp)` and never take the real lock. Every read, write
+and delete takes the same first-run file lock; a write is read back before it reports success. Loaded
+secrets are `Zeroizing<Vec<u8>>`, and no `PlatformError` variant carries secret bytes. `account_scope`
+accepts only ASCII letters, digits, `_` and `-` in the id, so two accounts cannot share a scope
+through a `:` in an id. The store has no password column and no credential table.
+
+The engine never calls a keyring crate: `postino-core` defines `CredentialVault`
+(`store_imap_password` / `load_imap_password` / `delete_imap_password`, addressed by account id) and
+the CLI implements it by mapping the id to the platform scope. Core's tests pass an in-memory vault;
+the CLI integration tests never construct the real adapter. This keeps the layer table honest and
+makes "no test touches the keyring" structural, not a convention.
+
+**Schema v4** (`crates/store/src/lib.rs`, additive from v3):
+
+```sql
+CREATE TABLE account_servers(
+    account_id    TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    imap_host     TEXT NOT NULL,
+    imap_port     INTEGER NOT NULL CHECK(imap_port BETWEEN 1 AND 65535),
+    imap_tls      TEXT NOT NULL CHECK(imap_tls IN ('implicit', 'starttls')),
+    imap_username TEXT NOT NULL,
+    created_at    INTEGER NOT NULL
+);
+```
+
+`Store::save_account(account, server, folders)` writes all three in one transaction: onboarding cannot
+leave an account without an endpoint or a half-written folder tree. `Store::delete_account(id)` runs
+one transaction: messages (attachments and label assignments cascade), drafts, the server row, the
+folder rows (sync cursors cascade), the `sync_status:<id>` meta value and finally the account. Labels
+are mailbox-wide (`account_id IS NULL`) and are never touched. Foreign keys and `\Noselect` handling
+are unchanged from P5b.
+
+**Autodiscovery.** Offline only, no DNS/SRV probing:
+
+| Provider | Host | Port | TLS | Note |
+|---|---|---|---|---|
+| `aruba` | `imaps.aruba.it` | 993 | implicit | app password when 2FA is on; IMAP must be enabled |
+| `gmail` | `imap.gmail.com` | 993 | implicit | 2-Step Verification + app password; OAuth is P12 |
+| `custom` | caller | caller | caller | host, port and TLS are required; there is no plaintext mode |
+
+Known providers refuse a `host`/`port`/`tls` override instead of silently ignoring it. The operation
+validates a bare address (one `@`, no display name, no controls, 320 bytes), a non-empty password with
+no control characters (1024 bytes), a display name (256 characters) and the custom endpoint before any
+network call. A rejected login names the provider and the likely cause and never echoes the password.
+
+**`account_add` flow.** Validate → reject a duplicate address (case-insensitive) → `probe`
+(TCP + TLS + login + `LIST` + `LOGOUT`, no store write) → plan the folder rows with the same
+special-use mapping sync uses → **store the credential** → `Store::save_account` (account + server +
+folders, one transaction) → memory. The credential goes first on purpose: a crash between the two
+durable writes leaves an orphan keyring entry, which a retry with the same address (and therefore the
+same deterministic `acc_<16 hex>` id and scope) reuses, instead of an account that can never sync. If
+the store transaction fails, the credential is deleted again before the error returns; a cleanup that
+also fails is reported explicitly. A failed login or an unreachable, wrongly-configured server writes
+nothing at all: no account, no server row, no folder, no credential.
+
+**`account_remove` order.** The store cache is deleted first; the credential second. The only failure
+window is therefore an orphan credential (reported; re-adding the same address reuses the scope), never
+cached mail whose password is already gone. `confirm: true` is mandatory; labels stay; a failure of the
+cache delete aborts before the keyring so the account remains fully usable. Attachment bytes are
+content-addressed and may be shared with a message of another account, so removing the account deletes
+their rows but not the blob files themselves; the unreferenced-file sweep is still P9/daemon work.
+
+**`sync_now`.** Load the server row and the credential, build an `ImapConfig`, call
+`postino_sync::sync_account` with the engine's store connection and the default limits, then reload
+folders, messages, attachments and blob hashes from the store into memory. Labels, the label sequence
+and the account list are not reloaded: sync never changes them and assignments live in the store, so a
+local label survives. A failed run is reported after the same reload, so memory shows every message
+committed before the stop and never loses a cached one. `account_test` is the same probe without the
+sync and without any write.
+
+**Operations and annotations.** `accounts_list` returns `AccountView { account, server, sync }`:
+provider, address, host/port/TLS/username and the persisted status, never a secret. `account_add` and
+`account_remove` are **sensitive** (`OpDef.sensitive`); the MCP server filters them out of
+`tools/list` and refuses `tools/call` for them before parsing the arguments, so a password cannot
+appear in a refusal. The CLI can call them and reads the password from a no-echo prompt or one
+`--password-stdin` line; there is no `--password` argv flag. `read_only` is set on `accounts_list`,
+`account_test` and `sync_status`; `destructive` on `account_remove`. `sync_now` and `account_add` are
+writes. `sync_status` is offline. MCP marks `account_test` and `sync_now` as `openWorldHint: true`;
+everything else is local.
+
+**Tests and limits.** The fake server gained `FakeServer::start_tls_many` so one stored port can serve
+add, test and several sync runs; `postino-sync` exposes `probe`, `plan_folders` and
+`read_status_for` without making the store or net APIs public. The engine test
+suite covers add success, wrong password, unreachable host, duplicate address, broken credential on
+test, a 3-folder initial sync with an attachment, incremental sync with a surviving label, a failed
+sync that keeps the cache, remove isolation, the remove failure window and the demo errors. No test
+uses a real vault, a real account or `%LOCALAPPDATA%\Postino`.
+
 ## 5. Synchronization
 
 IMAP is the synchronization protocol. There is no Postino server.
 
 P5a ships the client (`postino-net`): one connection, TLS, the commands in §4.4, typed data out. P5b
 ships the reconciler (`postino-sync`) described in §4.6: one account, one store connection, one run at
-a time. It is not scheduled and not wired to the engine, the CLI, MCP or a UI; P6 adds onboarding and
-the first operation that calls it.
+a time. P6a wires it to the engine: `sync_now` is the only operation that calls it, and the CLI and
+MCP reach it through the same registry. It is still not scheduled: there is no loop and no daemon, so
+a sync runs only when a caller asks for one.
 
 The target loop, most of which does not exist yet:
 

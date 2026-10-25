@@ -80,9 +80,10 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
 fn layers() -> Result<()> {
     let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec().context("cargo metadata")?;
     let allowed: HashMap<&str, &[&str]> = HashMap::from([
-        // The engine sits above the foundation: it owns the domain types and drives the encrypted
-        // repository. The store never depends back on it.
-        ("postino-core", &["postino-store"][..]),
+        // The engine sits above the foundation: it owns the domain types, drives the encrypted
+        // repository, speaks IMAP through the network crate and runs reconciliation through sync.
+        // The credential itself stays behind the engine's vault seam (the CLI's platform adapter).
+        ("postino-core", &["postino-net", "postino-store", "postino-sync", "postino-testkit"][..]),
         ("postino-crypto", &[][..]),
         ("postino-mime", &[][..]),
         // The network layer knows nothing above it. Its tests use the shared fake server, which is a
@@ -98,16 +99,21 @@ fn layers() -> Result<()> {
         // a production binary (enforced below).
         ("postino-testkit", &["postino-net"][..]),
         ("postino-app", &["postino-core"][..]),
-        ("postino-cli", &["postino-core", "postino-store", "postino-platform"][..]),
+        // The CLI is the production adapter between the engine's vault seam and the OS keyring; it
+        // uses the network types only in its account/sync tests.
+        ("postino-cli", &["postino-core", "postino-net", "postino-store", "postino-platform", "postino-testkit"][..]),
         ("xtask", &[][..]),
     ]);
     let ui_crates = ["eframe", "egui", "egui_extras", "winit", "rfd"];
 
     // Crates that may only enter a package through `[dev-dependencies]`. The fake server and its
-    // TLS fixture must never be reachable from a production build, and `postino-sync` uses the
-    // engine only to prove an offline read.
-    let dev_only: HashMap<&str, &[&str]> =
-        HashMap::from([("postino-net", &["postino-testkit"][..]), ("postino-sync", &["postino-core", "postino-testkit"][..])]);
+    // TLS fixture must never be reachable from a production build, `postino-sync` uses the engine
+    // only to prove an offline read, and the CLI names the network types only in its tests.
+    let dev_only: HashMap<&str, &[&str]> = HashMap::from([
+        ("postino-net", &["postino-testkit"][..]),
+        ("postino-sync", &["postino-core", "postino-testkit"][..]),
+        ("postino-cli", &["postino-net"][..]),
+    ]);
 
     for package in &metadata.packages {
         let Some(permitted) = allowed.get(package.name.as_str()) else {

@@ -116,6 +116,28 @@
   lines and SASL payloads live in `Zeroizing` buffers. Logs carry tags and command verbs, never
   arguments, credentials, addresses or bodies. Authentication errors say what failed, never echo
   the password.
+- **Keyring scopes (P6a).** Service `postino`; scope `default` holds the store key and
+  `account:<id>:imap` holds one account's IMAP credential. `postino-platform` owns every read,
+  write and delete, takes the shared keyring lock for the whole operation, reads a written value
+  back before reporting success and returns `Zeroizing<Vec<u8>>`. The account id is restricted to
+  ASCII letters, digits, `_` and `-`, so a crafted id cannot merge two scopes with a `:`.
+- **No password in the database, logs or MCP.** `account_servers` has no password column; the
+  operation result `AccountView` has no secret; `SyncStatus` carries a fixed error sentence, counts
+  and timestamps only. `account_add` and `account_remove` are `sensitive`: the MCP server filters
+  them out of `tools/list` and refuses `tools/call` before parsing arguments, so a password in a
+  crafted call is never echoed. The CLI reads the password from a no-echo prompt or one
+  `--password-stdin` line; there is no `--password` argv flag, and the generic `postino run` refuses
+  a sensitive operation so JSON arguments cannot put a password in shell history. The JSON bridge
+  inside the engine keeps one transient copy of the password for the duration of the call; it is
+  dropped immediately and never formatted, but it is not zeroised (see the swap/crash-dump entry).
+- **Account add writes nothing on failure.** The login and `LIST` run before any durable write. The
+  credential is stored first and the account, server and folders commit in one transaction; if that
+  transaction fails, the credential is deleted again. The remaining window is an orphan credential,
+  which a retry with the same address reuses, not an account that can never authenticate.
+- **Account remove order.** The local cache is deleted first and the keyring entry second. The only
+  failure window leaves an orphan credential, reported and overwritable by adding the same address
+  again; it never leaves cached mail whose password is gone. `confirm: true` is required, and a failed
+  cache delete aborts before the keyring, leaving the account usable.
 
 ### 4.3 Local disk theft
 
@@ -127,6 +149,8 @@ Exactly what is encrypted, and with what:
   disk. The file begins with a random per-database salt, not `SQLite format 3`. Sync adds the cached
   server UIDs, the local cursor and the status JSON (`sync_status:<account>`) to the same encrypted
   pages; the status contains counts and a failure category, not the server's name or any content.
+  The `account_servers` row (host, port, TLS mode, username) is ciphertext too; there is no password
+  column anywhere in the schema.
 - **Attachment bytes** (`<db file>.blobs/<xx>/<hash>.blob`, for example `mail.db.blobs/…`):
   XChaCha20-Poly1305 under a subkey
   derived with HKDF-SHA256 (salt `postino.v1`, label `blob`) from the same 256-bit store key. The file
@@ -168,7 +192,10 @@ What is **not** encrypted, and the consequence:
   returned, and closing them would mean a custom in-place AEAD construction and hand-rolled HMAC.
 - **Orphaned blobs.** A crash between writing a blob and committing the attachment row leaves an
   encrypted, deduplicated file with no row pointing at it. There is no garbage collector yet; a
-  deleted message also leaves its blob because another message may share the content.
+  deleted message also leaves its blob because another message may share the content. Removing an
+  account deletes its rows but not those files: the bytes are encrypted and deduplicated, and the
+  sweep belongs to P9/the daemon. A disk thief therefore still sees encrypted bytes for attachments
+  that were removed, but cannot read them.
 - **Backups.** A backup of the folder copies the database and the blobs. It is unreadable without the
   keyring entry, and there is no passphrase export yet, so the keyring entry is a single point of
   failure for restores.
@@ -187,7 +214,11 @@ crash-dump entry above.
 - Idempotency keys make retries safe. A per-call recipient cap and a configurable rate limit prevent
   a runaway loop.
 - `postino pause` / `--no-send` stops the server from sending without killing sync.
-- The agent never receives credentials; it receives operations.
+- The agent never receives credentials; it receives operations. `account_add` and `account_remove`
+  are `sensitive`: they are absent from `tools/list` and `tools/call` refuses them before parsing the
+  arguments, so an agent can neither create an account nor ask for a password to be stored.
+  `account_test` uses the existing keyring credential and returns only a folder count and
+  capabilities; `sync_status` and `accounts_list` never include a secret.
 - Tool errors are structured and actionable. An agent cannot use error text to probe paths outside
   its roots.
 

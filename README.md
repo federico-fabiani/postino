@@ -5,20 +5,20 @@ registry shared by the desktop app, the CLI and an MCP server.
 
 > **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
 > the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
-> store (P5b).** The shell, the operation registry, the CLI and the MCP server work against a
-> synthetic demo mailbox, and `postino --store <path>` can now run the same operations on the
-> encrypted SQLCipher database: accounts, folders, messages, labels, drafts and flags survive a
-> restart. The desktop app still boots on the demo until onboarding (P6). MIME parsing, sanitization
-> and serialization exist as `postino-mime`; `postino-net` is an IMAP4rev1 client that logs in over
-> TLS, lists folders, selects, fetches envelopes and `BODY.PEEK[]` bodies, stores flags and idles; and
-> `postino-sync` reconciles one account from a server into the encrypted store: folders with
-> special-use, UIDVALIDITY resets, incremental UID fetches, MIME bodies, attachment bytes in the blob
-> store, deletions, flags on first insert, a cancellable run and a persistent status. It is tested
-> against a scripted server only, including 2 000 messages in CI and 10 000 behind
-> `POSTINO_SLOW_TESTS=1`, and **no operation, CLI command or screen calls it yet**. Attachment bytes
-> are encrypted at rest in a content-addressed blob directory next to the database and only sync
-> writes them today. SMTP and the background daemon land in M2-M4. No real account is configured, no
-> mail leaves the machine, and the composer's send is a local move to Sent, never an SMTP submission.
+> store (P5b) + accounts, credentials and sync operations (P6a).** The shell, the operation registry,
+> the CLI and the MCP server work against a synthetic demo mailbox; `postino --store <path>` (or the
+> default `%LOCALAPPDATA%\Postino\mail.db`) runs the same operations on the encrypted SQLCipher
+> database, and the CLI can now add a real Aruba or Gmail account with an app password, test it, sync
+> it and remove it. Passwords live only in the OS keyring. The desktop app still boots on the demo
+> until onboarding (P6b). MIME parsing, sanitization and serialization exist as `postino-mime`;
+> `postino-net` is an IMAP4rev1 client that logs in over TLS, lists folders, selects, fetches
+> envelopes and `BODY.PEEK[]` bodies, stores flags and idles; and `postino-sync` reconciles one
+> account into the encrypted store: folders with special-use, UIDVALIDITY resets, incremental UID
+> fetches, MIME bodies, attachment bytes in the blob store, deletions, flags on first insert, a
+> cancellable run and a persistent status. Attachment bytes are encrypted at rest in a
+> content-addressed blob directory next to the database. Gmail OAuth is P12 and SMTP and the
+> background daemon land in M2-M4: no mail is sent, and the composer's send is still a local move to
+> Sent.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -44,15 +44,20 @@ MCP      ─┘
   and see label chips in the reading pane. A label view spans every folder by default and a folder
   narrows it; ids are stable and never reused. Rename, delete and apply/remove are undoable in the
   app; creating a label is not an undo step. Labels are in-memory metadata until M1.
-- Fifteen typed operations with JSON Schemas: `app_info`, `accounts_list`, `folders_list`,
-  `messages_list`, `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_send`,
-  `search`, `labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`.
+- Twenty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
+  `account_test`, `account_remove`, `sync_now`, `sync_status`, `folders_list`, `messages_list`,
+  `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_send`, `search`, `labels_list`,
+  `label_create`, `label_update`, `label_delete`, `label_apply`.
+- Real accounts from the CLI: Aruba and Gmail are discovered offline (Gmail needs 2FA + an app
+  password; OAuth is P12), `custom` takes host/port/TLS, a no-echo prompt or `--password-stdin` is the
+  only way in, and MCP cannot add or remove an account. Passwords live in the OS keyring, never in
+  the database, logs or tool output.
 - `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
 - The M1 persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema
-  v3 (draft revision sequence and label high-water mark), additive migrations and a typed repository
-  (`postino-store`), plus the Windows Credential Manager key seam (`postino-platform`). `Engine::open`
+  v4 (draft revision sequence, label high-water mark, per-account IMAP endpoint), additive migrations
+  and a typed repository (`postino-store`), plus the OS keyring seam (`postino-platform`). `Engine::open`
   loads the mailbox once, repairs orphan drafts, writes every mutation through in one transaction
   and keeps store errors categorised; `Engine::demo()` is unchanged and the desktop app still uses it.
 - The M1 MIME foundation as a crate (`postino-mime`, P4a): bounded RFC 5322/2045 parsing with
@@ -86,8 +91,8 @@ MCP      ─┘
   `SyncLimits`, and leave a JSON status under `meta`. Tested against the scripted server (initial,
   incremental, UIDVALIDITY, deletion, flags, oversized attachments, three network-drop points,
   cancellation + reopen, `BODY.PEEK`-only and an offline read through `Engine::open`), with a
-  2 000-message test in CI and 10 000 behind `POSTINO_SLOW_TESTS=1`. It has no operation, CLI, MCP
-  tool, UI or scheduler yet: P6 wires it.
+  2 000-message test in CI and 10 000 behind `POSTINO_SLOW_TESTS=1`. P6a wires it to `sync_now`, so
+  the CLI (`postino sync run`) and MCP can run it on demand; there is still no scheduler or daemon.
 - Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
   MCP protocol tests, and store round-trip tests at both the repository and engine level.
 
@@ -123,16 +128,30 @@ cargo run -p postino-cli -- --demo search preventivo --label lbl_1
 
 # Encrypted local store: the same operations, persisted across restarts
 cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" info
+
+# A real account: the password is prompted without echo (or pipe one line with --password-stdin)
+cargo run -p postino-cli -- account add --provider aruba --email me@example.it --name "Federico"
+cargo run -p postino-cli -- account list
+cargo run -p postino-cli -- account test acc_0123456789abcdef
+cargo run -p postino-cli -- sync run
+cargo run -p postino-cli -- sync status
+cargo run -p postino-cli -- account remove acc_0123456789abcdef --yes
 ```
 
 The app is `postino-app`; the command is `postino`. The product name stays Postino.
 
-`--store` opens or creates the SQLCipher database at that path and takes the key from the OS keyring
-(service `postino`, scope `default`); `--demo` and `--store` are mutually exclusive. First-run key
-creation is serialised with `<app local data>/Postino/keyring.lock` and verified by reading the key
-back. A fresh store has no accounts until onboarding (P6), so mail commands report that nothing is
-configured; the store is exercised end to end by the test suite today. One process owns the database:
-do not point two `postino --store` commands at the same file.
+Without `--store` and without `--demo`, the CLI uses the default encrypted store at
+`%LOCALAPPDATA%\Postino\mail.db` (or the platform equivalent) and takes the key from the OS keyring
+(service `postino`, scope `default`). `--store` picks another SQLCipher database; `--demo` and
+`--store` are mutually exclusive. First-run key creation is serialised with
+`<app local data>/Postino/keyring.lock` and verified by reading the key back. An IMAP credential is
+stored under `account:<id>:imap` in the same keyring, never in the database; the CLI's prompt does not
+echo and there is no `--password` argument. One process owns the database: do not point two
+`postino --store` commands at the same file.
+
+Exit codes are 0 for success, 1 for an operation failure and 2 for a usage error. The `add | test |
+list | remove` account commands and `sync run | status` are real, but the desktop app itself is still
+on the demo until P6b; Gmail OAuth is P12 and no SMTP connection is opened.
 
 ### MCP
 
@@ -156,9 +175,11 @@ Example client configuration:
 }
 ```
 
-Without `--demo`, the engine has no accounts and the tools return empty lists. With
-`--store <path>` the same tools read and write the encrypted database. Account onboarding, which
-creates the first account and folder tree in a fresh store, is the next milestone (P6).
+Without `--demo` and `--store`, `postino mcp` opens the default store. The tools are the same
+registry as the CLI, but `account_add` and `account_remove` are marked sensitive: they are absent
+from `tools/list` and refused by `tools/call`, so an agent can neither set nor see a password and
+cannot create or remove an account. `accounts_list`, `account_test`, `sync_now` and `sync_status` are
+available; none of their results contains a credential.
 
 ## Quality gates
 

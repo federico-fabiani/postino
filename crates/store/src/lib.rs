@@ -10,7 +10,8 @@
 //! `PRAGMA user_version` names the schema version; `MIGRATIONS` holds the ordered, additive
 //! migrations. Version 2 is the M1 mailbox schema: accounts, folders, messages, attachments, labels,
 //! message_labels, drafts, sync_state and the P3a `meta` table. Version 3 adds `draft_seq`, the
-//! monotonic draft revision counter that survives a send and a move back to Drafts.
+//! monotonic draft revision counter that survives a send and a move back to Drafts. Version 4 adds
+//! `account_servers`, the IMAP endpoint of each account, with no password column anywhere.
 //!
 //! Every date is a **Unix timestamp in milliseconds** (`i64`). The choice is deliberate:
 //!
@@ -46,8 +47,8 @@ mod repo;
 
 pub use blob::BlobStore;
 pub use model::{
-    Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label, LabelCount, Message, MessageCounts,
-    MessageFilter, MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
+    Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
+    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
 };
 
 use std::fmt;
@@ -57,11 +58,15 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
 /// label id is never handed out again.
 pub const LABEL_SEQ_KEY: &str = "label_seq";
+
+/// Prefix of the `meta` key that holds one account's persisted sync status. The account id follows.
+/// `postino-sync` writes the JSON value; `Store::delete_account` removes it with the account.
+pub const SYNC_STATUS_KEY_PREFIX: &str = "sync_status:";
 
 /// Migrations applied in order: index `n - 1` moves `PRAGMA user_version` from `n - 1` to `n`.
 ///
@@ -179,6 +184,18 @@ CREATE TABLE draft_seq(
 );
 
 INSERT INTO draft_seq(message_id, revision) SELECT id, revision FROM drafts;
+"#,
+    // v4 (P6a): where an account's mail comes from. The credential is deliberately absent: it lives
+    // in the OS keyring (scope `account:<id>:imap`), never in the encrypted database.
+    r#"
+CREATE TABLE account_servers(
+    account_id    TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    imap_host     TEXT NOT NULL,
+    imap_port     INTEGER NOT NULL CHECK(imap_port BETWEEN 1 AND 65535),
+    imap_tls      TEXT NOT NULL CHECK(imap_tls IN ('implicit', 'starttls')),
+    imap_username TEXT NOT NULL,
+    created_at    INTEGER NOT NULL
+);
 "#,
 ];
 

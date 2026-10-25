@@ -2,8 +2,9 @@
 
 > **Current milestone:** U0 — UI foundation (M0 skeleton done) · **Last updated:** 2026-10-25
 >
-> The M1 backend packages P3-P5b are ahead of the app: the store, MIME, blobs, IMAP and sync exist as
-> tested crates, while the desktop app still boots on demo data until onboarding (P6).
+> The M1 backend packages P3-P6a are ahead of the app: the store, MIME, blobs, IMAP, sync and the
+> account/sync operations exist as tested crates and CLI/MCP paths, while the desktop app still boots
+> on demo data until onboarding (P6b).
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.
@@ -67,7 +68,13 @@ interaction model before real mail makes them expensive to change. Full spec:
       bytes, ten synthetic fixtures and a mutation corpus.
 - [x] Encrypted attachment blob storage and the engine seam (P4b); received MIME is parsed by
       `postino-sync` (P5b). Local drafts still carry a plain-text body.
-- [ ] Account onboarding with autodiscovery and Aruba app-password flow.
+- [x] Accounts, credentials and sync operations (P6a): `accounts_list`, `account_add`,
+      `account_test`, `account_remove`, `sync_now` and `sync_status`; OS-keyring credentials under
+      `account:<id>:imap`, schema v4 `account_servers`, offline Aruba/Gmail autodiscovery, the
+      credential-first add and cache-first remove order, and sensitive-operation filtering in MCP.
+      The CLI can add, test, sync and remove an account; the app still boots on the demo.
+- [ ] Account onboarding UI and the app on real data (P6b): autodiscovery screen, Aruba app-password
+      flow, first-run store wiring in the desktop app.
 - [x] IMAP: CAPABILITY, LOGIN/AUTH, LIST, SELECT, UID FETCH envelope/flags/body, IDLE, as the
       `postino-net` client crate (P5a): TLS-only, bounded, typed errors, and a 54-case hostile corpus
       against the scripted TLS server now shared as `postino-testkit`.
