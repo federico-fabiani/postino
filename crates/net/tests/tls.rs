@@ -1,11 +1,9 @@
 //! TLS: implicit, STARTTLS, name verification and the plaintext traps.
 
-mod support;
-
 use std::time::Duration;
 
 use postino_net::{NetError, Secret, Session, TlsMode};
-use support::{FakeServer, TlsFixture, USER, expected_sasl};
+use postino_testkit::{FakeServer, PASSWORD, TlsFixture, USER, expected_sasl};
 
 #[tokio::test]
 async fn implicit_tls_verifies_the_test_ca() {
@@ -49,7 +47,7 @@ async fn starttls_upgrades_then_asks_for_capabilities_again() {
     })
     .await;
 
-    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::StartTls, USER, Secret::new(support::PASSWORD))
+    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::StartTls, USER, Secret::new(PASSWORD))
         .with_timeout(Duration::from_secs(5))
         .with_extra_root(tls.ca());
     let mut session = Session::connect(config).await.expect("STARTTLS");
@@ -73,7 +71,7 @@ async fn starttls_absent_is_refused_before_any_credential() {
     })
     .await;
 
-    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::StartTls, USER, Secret::new(support::PASSWORD))
+    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::StartTls, USER, Secret::new(PASSWORD))
         .with_timeout(Duration::from_secs(2))
         .with_extra_root(tls.ca());
     let error = Session::connect(config).await.expect_err("STARTTLS is mandatory");
@@ -92,7 +90,7 @@ async fn a_certificate_for_another_name_is_refused() {
     })
     .await;
 
-    let config = postino_net::ImapConfig::new("127.0.0.1", server.port(), TlsMode::Implicit, USER, Secret::new(support::PASSWORD))
+    let config = postino_net::ImapConfig::new("127.0.0.1", server.port(), TlsMode::Implicit, USER, Secret::new(PASSWORD))
         .with_timeout(Duration::from_secs(2))
         .with_extra_root(tls.ca());
     let error = Session::connect(config).await.expect_err("the name does not match");
@@ -118,7 +116,7 @@ async fn implicit_tls_against_a_plaintext_server_never_sends_a_command() {
     })
     .await;
 
-    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::Implicit, USER, Secret::new(support::PASSWORD))
+    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::Implicit, USER, Secret::new(PASSWORD))
         .with_timeout(Duration::from_secs(2))
         .with_extra_root(tls.ca());
     let error = Session::connect(config).await.expect_err("a plaintext server cannot speak implicit TLS");
@@ -142,7 +140,7 @@ async fn starttls_rejects_plaintext_pipelined_after_the_ok() {
     })
     .await;
 
-    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::StartTls, USER, Secret::new(support::PASSWORD))
+    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::StartTls, USER, Secret::new(PASSWORD))
         .with_timeout(Duration::from_secs(2))
         .with_extra_root(tls.ca());
     let error = Session::connect(config).await.expect_err("buffered plaintext after STARTTLS is refused");
@@ -163,7 +161,7 @@ async fn a_ca_outside_extra_roots_is_refused() {
     })
     .await;
 
-    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::Implicit, USER, Secret::new(support::PASSWORD))
+    let config = postino_net::ImapConfig::new("localhost", server.port(), TlsMode::Implicit, USER, Secret::new(PASSWORD))
         .with_timeout(Duration::from_secs(2))
         .with_extra_root(trusted.ca());
     let error = Session::connect(config).await.expect_err("the signing CA is not trusted");

@@ -111,8 +111,8 @@ needs.
 `cargo test -p postino-net`. Two zooms:
 
 - Unit tests in every module: UTF-7 vectors, `UidSet` grammar, flag parsing, the response parser,
-  literal-marker detection, limits, redaction.
-- Integration tests against `tests/support/`, a scripted TLS server with a throwaway `rcgen` CA
+  literal-marker detection, limits, redaction. 59 tests.
+- Integration tests against `postino-testkit`, a scripted TLS server with a throwaway `rcgen` CA
   (`extra_roots`), real sockets, exact command assertions, literals split across reads, delays,
   disconnects and STARTTLS mid-session:
   `connection.rs`, `auth.rs`, `mailbox.rs`, `fetch.rs`, `idle.rs`, `tls.rs`, `failures.rs` and a
@@ -126,8 +126,8 @@ production.
 
 ## Not implemented
 
-- Sync: no loop, no store writes, no reconciliation, no `APPEND`, no `COPY`/`MOVE`/`EXPUNGE`.
-  That is P5b.
+- Sync: this crate has no loop, no store writes and no reconciliation. `postino-sync` (P5b) is the
+  consumer; `APPEND`, `COPY`/`MOVE`/`EXPUNGE` and server-side flag pushes are still missing.
 - `QRESYNC`/`CONDSTORE` beyond parsing `HIGHESTMODSEQ` when the server reports it; no `VANISHED`.
 - `SORT`, `THREAD`, `METADATA`, `ACL`, `SIEVE`, `NOTIFY`, `ESEARCH`.
 - OAuth (SASL XOAUTH2) and `AUTHENTICATE` mechanisms other than PLAIN.

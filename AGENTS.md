@@ -202,3 +202,6 @@ Append one line when significant time is lost to an issue likely to recur. Forma
 - [SQLCipher/rusqlite] a bound `PRAGMA key = ?` is read at prepare time and silently ignored on an
   existing file ("file is not a database"). fix/avoid: literal raw key `PRAGMA key = "x'<hex>'"`,
   never `conn.pragma_update(..., "key", ...)`.
+- [cargo] a shared test helper stored as `tests/support.rs` is compiled as its own test binary, not
+  as a module of the tests that declare it. fix/avoid: keep it at `tests/support/mod.rs` and declare
+  `mod support;` in each integration test file.

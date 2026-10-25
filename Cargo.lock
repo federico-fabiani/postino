@@ -3326,7 +3326,7 @@ dependencies = [
  "base64",
  "chrono",
  "log",
- "rcgen",
+ "postino-testkit",
  "rustls",
  "rustls-platform-verifier",
  "thiserror 2.0.21",
@@ -3363,6 +3363,36 @@ dependencies = [
  "thiserror 2.0.21",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "postino-sync"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "log",
+ "postino-core",
+ "postino-mime",
+ "postino-net",
+ "postino-store",
+ "postino-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "postino-testkit"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "postino-net",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

@@ -4,12 +4,10 @@
 //! the client must return the expected class of [`NetError`] quickly. A case that panics, hangs,
 //! returns the wrong class or is accepted fails the test.
 
-mod support;
-
 use std::time::Duration;
 
 use postino_net::{NetError, Session, UidSet};
-use support::{FakeServer, TlsFixture};
+use postino_testkit::{FakeServer, TlsFixture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {

@@ -1,9 +1,7 @@
 //! FETCH parsing: literals, split reads, unsolicited responses, bounds and malformed replies.
 
-mod support;
-
 use postino_net::{NetError, Session, UidSet};
-use support::{FakeServer, TlsFixture};
+use postino_testkit::{FakeServer, TlsFixture, fetch_body_response};
 
 #[tokio::test]
 async fn literal_split_across_reads_is_reassembled() {
@@ -15,7 +13,7 @@ async fn literal_split_across_reads_is_reassembled() {
         conn.send_line("* OK [UIDVALIDITY 1] ok").await;
         conn.send_line("A0003 OK selected").await;
         conn.expect("A0004 UID FETCH 1 (BODY.PEEK[])").await;
-        let response = support::fetch_body_response(1, 1, b"Subject: split\r\n\r\nbody bytes");
+        let response = fetch_body_response(1, 1, b"Subject: split\r\n\r\nbody bytes");
         // Split the literal across two writes, with a pause in between.
         let (head, tail) = response.split_at(30);
         conn.send_bytes(head).await;
@@ -226,7 +224,7 @@ async fn fetch_body_refuses_a_body_with_another_uid() {
         conn.send_line("* OK [UIDVALIDITY 1] ok").await;
         conn.send_line("A0003 OK selected").await;
         conn.expect("A0004 UID FETCH 1 (BODY.PEEK[])").await;
-        conn.send_bytes(&support::fetch_body_response(1, 2, b"the wrong message")).await;
+        conn.send_bytes(&fetch_body_response(1, 2, b"the wrong message")).await;
         conn.send_line("A0004 OK done").await;
     })
     .await;
@@ -285,7 +283,7 @@ async fn a_buffered_literal_counts_against_the_response_budget() {
         conn.send_line("A0003 OK selected").await;
         conn.expect("A0004 UID FETCH 1 (BODY.PEEK[])").await;
         // One write, so the literal is already in the client's read buffer when the line is parsed.
-        conn.send_bytes(&support::fetch_body_response(1, 1, &[b'x'; 40])).await;
+        conn.send_bytes(&fetch_body_response(1, 1, &[b'x'; 40])).await;
         conn.send_line("A0004 OK done").await;
     })
     .await;

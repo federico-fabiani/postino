@@ -1,30 +1,21 @@
-//! A scripted IMAP server for integration tests.
-//!
-//! Every test drives a real TCP socket (TLS by default, with a throwaway CA from `rcgen`) and
-//! asserts the exact command lines the client writes. Helpers cover the details that are easy to
-//! get wrong in a server implementation: literals, raw byte payloads, delays, disconnects and the
-//! STARTTLS upgrade in the middle of a session.
-
-#![allow(dead_code)]
+//! The scripted server: one loopback listener, one connection, exact command recording.
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use postino_net::{ImapConfig, Secret, TlsMode};
-use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+
+use crate::tls::TlsFixture;
 
 /// Login name used by every test.
 pub const USER: &str = "user@example.com";
@@ -32,14 +23,16 @@ pub const USER: &str = "user@example.com";
 pub const PASSWORD: &str = "correct horse battery";
 
 /// The SASL PLAIN payload the client must send for [`USER`] and [`PASSWORD`].
+#[must_use]
 pub fn expected_sasl() -> String {
     STANDARD.encode(format!("\0{USER}\0{PASSWORD}"))
 }
 
 /// A server-side stream, plain or after the TLS handshake.
-pub enum Stream {
+enum Stream {
     Plain(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
+    /// Temporary value while the TLS handshake takes ownership of the socket.
     Placeholder,
 }
 
@@ -92,12 +85,14 @@ impl Conn {
         Self { stream, buffer: Vec::new(), position: 0, received: Vec::new() }
     }
 
-    /// Every line the client has sent so far.
+    /// Every line the client has sent so far, including command lines and SASL payloads.
+    #[must_use]
     pub fn received(&self) -> &[String] {
         &self.received
     }
 
     /// Whether the client sent a line starting with `prefix`.
+    #[must_use]
     pub fn sent_prefix(&self, prefix: &str) -> bool {
         self.received.iter().any(|line| line.starts_with(prefix))
     }
@@ -236,85 +231,6 @@ impl Conn {
     }
 }
 
-/// Quote an IMAP string, escaping backslashes and quotes.
-pub fn quoted(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        if ch == '"' || ch == '\\' {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    out
-}
-
-/// Build a `* LIST` line with attributes, an optional delimiter and a name.
-pub fn list_line(attributes: &[&str], delimiter: Option<char>, name: &str) -> String {
-    let delimiter = match delimiter {
-        Some(ch) => quoted(&ch.to_string()),
-        None => "NIL".to_owned(),
-    };
-    format!("* LIST ({}) {delimiter} {}", attributes.join(" "), quoted(name))
-}
-
-/// Build a `* n FETCH (UID u BODY[] {len}\r\n<body>)` response, literal included.
-pub fn fetch_body_response(sequence: u32, uid: u32, body: &[u8]) -> Vec<u8> {
-    let mut out = format!("* {sequence} FETCH (UID {uid} BODY[] {{{}}}\r\n", body.len()).into_bytes();
-    out.extend_from_slice(body);
-    out.extend_from_slice(b")\r\n");
-    out
-}
-
-/// Build an IDLE continuation line.
-pub fn idle_continuation(text: &str) -> String {
-    if text.is_empty() { "+".to_owned() } else { format!("+ {text}") }
-}
-
-/// A throwaway CA and the server half of a TLS configuration for `localhost`.
-pub struct TlsFixture {
-    acceptor: TlsAcceptor,
-    ca: CertificateDer<'static>,
-}
-
-impl TlsFixture {
-    /// Generate a CA and a leaf certificate for `localhost`.
-    pub fn generate() -> Self {
-        let ca_key = KeyPair::generate().expect("CA key");
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.distinguished_name.push(DnType::CommonName, "Postino P5a test CA");
-        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
-        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("CA certificate");
-
-        let leaf_key = KeyPair::generate().expect("leaf key");
-        let mut leaf_params = CertificateParams::new(vec!["localhost".to_owned()]).expect("leaf parameters");
-        leaf_params.distinguished_name.push(DnType::CommonName, "localhost");
-        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let leaf = leaf_params.signed_by(&leaf_key, &ca).expect("leaf certificate");
-
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-        let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions")
-            .with_no_client_auth()
-            .with_single_cert(vec![leaf.der().clone()], key)
-            .expect("server certificate");
-        Self { acceptor: TlsAcceptor::from(Arc::new(config)), ca: ca.der().clone() }
-    }
-
-    /// The CA certificate to trust on the client side.
-    pub fn ca(&self) -> CertificateDer<'static> {
-        self.ca.clone()
-    }
-
-    pub fn acceptor(&self) -> TlsAcceptor {
-        self.acceptor.clone()
-    }
-}
-
 /// A listener on `127.0.0.1` that runs one handler for one connection.
 pub struct FakeServer {
     address: SocketAddr,
@@ -358,11 +274,14 @@ impl FakeServer {
         Self { address, task }
     }
 
+    /// The port the listener was bound to.
+    #[must_use]
     pub fn port(&self) -> u16 {
         self.address.port()
     }
 
     /// Client configuration for this server: `localhost`, implicit TLS, the test CA trusted.
+    #[must_use]
     pub fn config(&self, fixture: &TlsFixture) -> ImapConfig {
         ImapConfig::new("localhost", self.port(), TlsMode::Implicit, USER, Secret::new(PASSWORD))
             .with_timeout(Duration::from_secs(5))
@@ -378,6 +297,7 @@ impl FakeServer {
 }
 
 /// Shorthand: a configured `ImapConfig` with a short timeout, for corpus and failure tests.
+#[must_use]
 pub fn config_with_timeout(server: &FakeServer, fixture: &TlsFixture, timeout: Duration) -> ImapConfig {
     server.config(fixture).with_timeout(timeout)
 }

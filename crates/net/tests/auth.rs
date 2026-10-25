@@ -1,9 +1,7 @@
 //! Authentication paths: SASL PLAIN, LOGIN, failures, LOGINDISABLED and PREAUTH.
 
-mod support;
-
 use postino_net::{NetError, Session};
-use support::{FakeServer, TlsFixture, expected_sasl};
+use postino_testkit::{FakeServer, TlsFixture, expected_sasl};
 
 #[tokio::test]
 async fn sasl_plain_is_preferred_and_the_password_never_reaches_a_command_line() {

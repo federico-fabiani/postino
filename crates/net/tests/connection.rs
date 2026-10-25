@@ -1,9 +1,7 @@
 //! One full session, asserting every command byte the client writes.
 
-mod support;
-
 use postino_net::{Flag, FlagMode, Session, UidSet, decode_utf7};
-use support::{FakeServer, PASSWORD, TlsFixture, USER, expected_sasl};
+use postino_testkit::{FakeServer, PASSWORD, TlsFixture, USER, expected_sasl, list_line};
 
 #[tokio::test]
 async fn full_session_sends_the_documented_commands() {
@@ -18,9 +16,9 @@ async fn full_session_sends_the_documented_commands() {
         conn.send_line("A0002 OK [CAPABILITY IMAP4rev1 IDLE] logged in").await;
 
         conn.expect("A0003 LIST \"\" \"*\"").await;
-        conn.send_line(&support::list_line(&["\\HasNoChildren", "\\Inbox"], Some('/'), "INBOX")).await;
-        conn.send_line(&support::list_line(&["\\HasNoChildren", "\\Sent"], Some('/'), "Sent")).await;
-        conn.send_line(&support::list_line(&["\\Noselect", "\\HasChildren"], Some('/'), "Archivio")).await;
+        conn.send_line(&list_line(&["\\HasNoChildren", "\\Inbox"], Some('/'), "INBOX")).await;
+        conn.send_line(&list_line(&["\\HasNoChildren", "\\Sent"], Some('/'), "Sent")).await;
+        conn.send_line(&list_line(&["\\Noselect", "\\HasChildren"], Some('/'), "Archivio")).await;
         conn.send_line("A0003 OK done").await;
 
         conn.expect("A0004 SELECT \"INBOX\"").await;

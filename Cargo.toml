@@ -18,6 +18,8 @@ postino-mime = { path = "crates/mime", version = "0.1.0" }
 postino-net = { path = "crates/net", version = "0.1.0" }
 postino-platform = { path = "crates/platform", version = "0.1.0" }
 postino-store = { path = "crates/store", version = "0.1.0" }
+postino-sync = { path = "crates/sync", version = "0.1.0" }
+postino-testkit = { path = "crates/testkit", version = "0.1.0" }
 
 # foundation
 mail-parser = { version = "=1.0.0", features = ["full_encoding"] }

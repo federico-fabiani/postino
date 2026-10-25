@@ -11,7 +11,7 @@ use rusqlite::{ErrorCode, OptionalExtension, Row, params, params_from_iter};
 
 use crate::model::{
     Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, Label, LabelCount, Message, MessageCounts, MessageFilter,
-    MessagePage, MessageSummary,
+    MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
 };
 use crate::{Store, StoreError};
 
@@ -143,7 +143,7 @@ impl Store {
     /// [`Store::replace_attachments`].
     pub fn upsert_message(&self, message: &Message) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        upsert_message_row(&tx, message)?;
+        upsert_message_row(&tx, message, true)?;
         tx.commit()?;
         Ok(())
     }
@@ -298,6 +298,121 @@ impl Store {
         }
         tx.commit()?;
         Ok(folder.is_some())
+    }
+
+    /// Insert or replace one synced message and its attachment metadata in a single transaction.
+    ///
+    /// This is the sync bulk path: folder `total`/`unread` are deliberately **not** refreshed per
+    /// message, because a count scan per message would make a large import quadratic. The caller
+    /// recounts the folder once after the pass ([`Store::recount_folder`]). A failure rolls the
+    /// message row and every attachment row back together; blob files already written are
+    /// unreferenced but harmless, because the blob store is content-addressed.
+    pub fn upsert_synced_message(&self, message: &Message, attachments: &[Attachment]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        upsert_message_row(&tx, message, false)?;
+        replace_attachments_in_tx(&tx, &message.summary.id, attachments)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The folder and local read/star flags of a cached message, or `None` when it is new.
+    pub fn message_flags(&self, id: &str) -> Result<Option<MessageFlags>, StoreError> {
+        self.conn
+            .query_row("SELECT folder_id, unread, starred FROM messages WHERE id = ?1", [id], |row| {
+                Ok(MessageFlags { folder_id: row.get(0)?, unread: row.get(1)?, starred: row.get(2)? })
+            })
+            .optional()
+            .map_err(|error| corrupt_on_decode("messages", error))
+    }
+
+    /// The cached UIDs of one folder, ascending, ignoring rows without a UID (local drafts).
+    ///
+    /// The deletion pass compares this list with the server's and removes the difference. Message
+    /// rows with `uid = NULL` were never on the server and are not candidates.
+    pub fn list_uids(&self, folder_id: &str) -> Result<Vec<UidEntry>, StoreError> {
+        require_folder(&self.conn, folder_id)?;
+        let mut stmt = self.conn.prepare("SELECT id, uid FROM messages WHERE folder_id = ?1 AND uid IS NOT NULL ORDER BY uid, id")?;
+        let rows = stmt.query_map([folder_id], |row| Ok(UidEntry { message_id: row.get(0)?, uid: get_u32(row, 1)? }))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("messages", error))
+    }
+
+    /// Delete cached messages that are gone from the server, in one transaction.
+    ///
+    /// A local draft is never deleted here even when its id is requested: a folder can hold local
+    /// drafts that the server has never seen, and a deletion pass must not be able to destroy work
+    /// that was never uploaded. Only rows in `folder_id` are touched; attachment rows and label
+    /// assignments go with the message via `ON DELETE CASCADE`. Returns the number removed and
+    /// refreshes the folder counts.
+    pub fn delete_synced_messages(&self, folder_id: &str, message_ids: &[String]) -> Result<u32, StoreError> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        require_folder(&tx, folder_id)?;
+        let mut removed = 0usize;
+        for id in message_ids {
+            let is_draft: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM drafts WHERE id = ?1)", [id], |row| row.get(0))?;
+            if is_draft {
+                continue;
+            }
+            removed += tx.execute("DELETE FROM messages WHERE id = ?1 AND folder_id = ?2", params![id, folder_id])?;
+        }
+        if removed > 0 {
+            refresh_folder_counts(&tx, folder_id)?;
+        }
+        tx.commit()?;
+        changed_count(removed)
+    }
+
+    /// Drop every cached server message of a folder and its sync cursor, in one transaction.
+    ///
+    /// This is the `UIDVALIDITY` reset: the server renumbered the folder, so every cached UID is
+    /// meaningless. Label assignments and attachment rows cascade; blob files stay (another message
+    /// may share the content and there is no collector yet). Rows without a UID were never on the
+    /// server and survive: local drafts and locally sent mail must not be discarded by a rebuild of
+    /// the server cache. Folder counts are refreshed in the same transaction.
+    pub fn reset_folder_messages(&self, folder_id: &str) -> Result<u32, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        require_folder(&tx, folder_id)?;
+        let removed =
+            tx.execute("DELETE FROM messages WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)", [folder_id])?;
+        tx.execute("DELETE FROM sync_state WHERE folder_id = ?1", [folder_id])?;
+        refresh_folder_counts(&tx, folder_id)?;
+        tx.commit()?;
+        changed_count(removed)
+    }
+
+    /// The per-folder sync cursor, or `None` when the folder has never been synced.
+    pub fn get_sync_state(&self, folder_id: &str) -> Result<Option<SyncState>, StoreError> {
+        self.conn
+            .query_row("SELECT folder_id, uid_next, highest_modseq, last_error FROM sync_state WHERE folder_id = ?1", [folder_id], |row| {
+                Ok(SyncState { folder_id: row.get(0)?, uid_next: get_u32(row, 1)?, highest_modseq: get_opt_u64(row, 2)?, last_error: row.get(3)? })
+            })
+            .optional()
+            .map_err(|error| corrupt_on_decode("sync_state", error))
+    }
+
+    /// Write the per-folder sync cursor. The folder must exist; one transaction, upsert semantics.
+    pub fn set_sync_state(&self, state: &SyncState) -> Result<(), StoreError> {
+        let highest = state.highest_modseq.map(|value| to_i64(value, "highest_modseq")).transpose()?;
+        let tx = self.conn.unchecked_transaction()?;
+        require_folder(&tx, &state.folder_id)?;
+        tx.execute(
+            "INSERT INTO sync_state(folder_id, uid_next, highest_modseq, last_error) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(folder_id) DO UPDATE SET
+                 uid_next = excluded.uid_next,
+                 highest_modseq = excluded.highest_modseq,
+                 last_error = excluded.last_error",
+            params![state.folder_id, i64::from(state.uid_next), highest, state.last_error],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove one folder's sync cursor, leaving its messages alone.
+    pub fn clear_sync_state(&self, folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute("DELETE FROM sync_state WHERE folder_id = ?1", [folder_id])?;
+        Ok(())
     }
 }
 
@@ -585,7 +700,7 @@ impl Store {
     pub fn save_draft_message(&self, message: &Message, attachments: &[Attachment]) -> Result<Draft, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         validate_attachment_ids(&tx, &message.summary.id, attachments)?;
-        upsert_message_row(&tx, message)?;
+        upsert_message_row(&tx, message, true)?;
         replace_attachments_in_tx(&tx, &message.summary.id, attachments)?;
         let draft = draft_update_from_message(message);
         let saved = save_draft_row(&tx, &draft)?;
@@ -599,7 +714,7 @@ impl Store {
     /// revision sequence instead of restarting at 1.
     pub fn send_draft_message(&self, message: &Message) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        upsert_message_row(&tx, message)?;
+        upsert_message_row(&tx, message, true)?;
         tx.execute("DELETE FROM drafts WHERE id = ?1", [&message.summary.id])?;
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
         tx.commit()?;
@@ -649,7 +764,7 @@ impl Store {
         for message in messages {
             let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)", [&message.summary.id], |row| row.get(0))?;
             if !exists {
-                upsert_message_row(&tx, message)?;
+                upsert_message_row(&tx, message, true)?;
                 repaired += 1;
             }
         }
@@ -675,7 +790,7 @@ impl Store {
 
 /// Upsert a message row inside an open transaction and keep the folder `total`/`unread` cache in
 /// step. The caller owns the transaction boundary.
-fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message) -> Result<(), StoreError> {
+fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh_counts: bool) -> Result<(), StoreError> {
     let to_json = serde_json::to_string(&message.summary.to)?;
     let cc_json = serde_json::to_string(&message.cc)?;
     let bcc_json = serde_json::to_string(&message.bcc)?;
@@ -748,6 +863,9 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message) -> Resu
     // sync must not rescan the folder for every message.
     let folder_changed = previous.as_ref().is_none_or(|(folder, _)| folder != &message.summary.folder_id);
     let unread_changed = previous.as_ref().is_none_or(|(_, unread)| *unread != message.summary.unread);
+    if !refresh_counts {
+        return Ok(());
+    }
     if folder_changed || unread_changed {
         refresh_folder_counts(tx, &message.summary.folder_id)?;
     }

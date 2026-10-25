@@ -1,9 +1,7 @@
 //! SELECT and EXAMINE: status fields, read-only and the folder errors that matter.
 
-mod support;
-
 use postino_net::{Flag, NetError, Session};
-use support::{FakeServer, TlsFixture};
+use postino_testkit::{FakeServer, TlsFixture};
 
 #[tokio::test]
 async fn select_reports_every_status_field() {

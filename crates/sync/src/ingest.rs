@@ -1,0 +1,244 @@
+//! Map one fetched RFC 5322 message onto a store row and its attachments.
+//!
+//! The envelope carries the cheap list fields and the flags; the MIME parse is authoritative for the
+//! body, the decoded headers and the attachment bytes. When a header is missing from the parse the
+//! envelope is the fallback, so a message with no `Date` header still gets its `INTERNALDATE`.
+
+use postino_mime::ParsedMessage;
+use postino_net::{Address as EnvelopeAddress, Envelope, Flag};
+use postino_store as store;
+
+use crate::ids;
+use crate::warnings::Warnings;
+use crate::{Context, SyncError, SyncLimits};
+
+/// One message that was written to the store.
+pub(crate) struct Ingested {
+    /// The stable local id.
+    pub(crate) message_id: String,
+    /// Whether this was the first time the message was cached.
+    pub(crate) new: bool,
+    /// Whether the server's flags disagree with the local read/star state.
+    pub(crate) drift: bool,
+    /// Attachment blobs written by this call.
+    pub(crate) attachments_stored: u32,
+}
+
+/// Parse and store one message. `Ok(None)` means the message was skipped and a warning explains why.
+///
+/// The message row, every attachment row and `has_attachments` are one transaction. Blob files are
+/// written before the row transaction; a failure after a blob write leaves an unreferenced,
+/// content-addressed file, which is harmless and reused by the next attempt.
+pub(crate) fn ingest(
+    context: &Context<'_>,
+    folder: &store::Folder,
+    uid_validity: u32,
+    envelope: &Envelope,
+    raw: &[u8],
+    warnings: &mut Warnings,
+) -> Result<Option<Ingested>, SyncError> {
+    let store = context.store;
+    let account = context.account;
+    let limits = context.limits;
+    let uid = envelope.uid;
+    let mut parsed = match postino_mime::parse(raw, &mime_limits(limits)) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warnings.push(format!("message UID {uid} could not be parsed and was skipped: {error}"));
+            return Ok(None);
+        }
+    };
+
+    let normalised = normalise_id(&parsed, envelope, uid, warnings);
+    let id = ids::message_id(&account.id, &folder.id, uid_validity, uid, normalised.as_deref());
+    // A reply points at a Message-ID, so a root's thread id must be its own Message-ID for children
+    // to link to it. Only a message without one falls back to the local id.
+    let thread = ids::thread_id(&parsed.references, parsed.in_reply_to.as_deref(), normalised.as_deref().unwrap_or(&id));
+
+    let server_unread = !envelope.flags.contains(&Flag::Seen);
+    let server_starred = envelope.flags.contains(&Flag::Flagged);
+    let existing = store.message_flags(&id)?;
+    let (unread, starred, new, drift) = match &existing {
+        Some(local) => (local.unread, local.starred, false, local.unread != server_unread || local.starred != server_starred),
+        None => (server_unread, server_starred, true, false),
+    };
+
+    let body_text = match parsed.text.take() {
+        Some(text) if !text.trim().is_empty() => text,
+        _ => parsed.html.as_deref().map(postino_mime::html_to_text).unwrap_or_default(),
+    };
+    let date = parsed
+        .date
+        .map(|date| date.timestamp_millis())
+        .or_else(|| envelope.internal_date.map(|date| date.timestamp_millis()))
+        .unwrap_or_else(crate::now_ms);
+    let size = if envelope.size > 0 { u64::from(envelope.size) } else { u64::try_from(raw.len()).unwrap_or(u64::MAX) };
+
+    let subject = if parsed.subject.is_empty() { envelope.subject.clone() } else { parsed.subject.clone() };
+    let from = parsed
+        .from
+        .first()
+        .map(parsed_address)
+        .or_else(|| envelope.from.first().map(envelope_address))
+        .unwrap_or_else(|| store::Address::new(String::new(), String::new()));
+    let to = address_list(&parsed, |message| &message.to, &envelope.to);
+    let cc = address_list(&parsed, |message| &message.cc, &envelope.cc);
+    let bcc = address_list(&parsed, |message| &message.bcc, &envelope.bcc);
+
+    let mut attachments = Vec::with_capacity(parsed.attachments.len());
+    let mut stored = 0u32;
+    for (index, part) in parsed.attachments.iter().enumerate() {
+        let attachment_id = ids::attachment_id(&id, index);
+        let over_limit = part.size > limits.max_attachment_bytes;
+        let mut row =
+            store::Attachment { id: attachment_id, filename: part.filename.clone(), mime: part.mime.clone(), size: part.size, blob_hash: None };
+        if part.truncated || over_limit {
+            let reason = if over_limit {
+                format!("it is {} bytes, over the {}-byte per-attachment limit", part.size, limits.max_attachment_bytes)
+            } else {
+                "the MIME parser did not decode all of it".to_owned()
+            };
+            warnings.push(format!(
+                "message UID {uid}: attachment {:?} was kept as metadata but its bytes were not stored because {reason}",
+                warning_name(&part.filename)
+            ));
+        } else {
+            let hash = store.blobs().put(&part.data).map_err(SyncError::Store)?;
+            row.size = u64::try_from(part.data.len()).unwrap_or(u64::MAX);
+            row.blob_hash = Some(hash);
+            stored = stored.saturating_add(1);
+        }
+        attachments.push(row);
+    }
+
+    let row = store::Message {
+        summary: store::MessageSummary {
+            id: id.clone(),
+            account_id: account.id.clone(),
+            folder_id: folder.id.clone(),
+            thread_id: thread,
+            from,
+            to,
+            subject,
+            snippet: snippet(&body_text),
+            date,
+            unread,
+            starred,
+            has_attachments: !attachments.is_empty(),
+            labels: Vec::new(),
+        },
+        uid: Some(uid),
+        message_id: normalised,
+        cc,
+        bcc,
+        body_text,
+        body_html: parsed.html.take(),
+        size: Some(size),
+    };
+    store.upsert_synced_message(&row, &attachments).map_err(SyncError::Store)?;
+    Ok(Some(Ingested { message_id: id, new, drift, attachments_stored: stored }))
+}
+
+/// The MIME bounds for a sync run: the per-message cap and the per-attachment cap, both clamped.
+fn mime_limits(limits: &SyncLimits) -> postino_mime::Limits {
+    let max_message = limits.max_message_bytes.min(postino_mime::Limits::HARD_MAX_BYTES);
+    let max_part = usize::try_from(limits.max_attachment_bytes).unwrap_or(usize::MAX).min(postino_mime::Limits::HARD_MAX_PART_BYTES);
+    postino_mime::Limits {
+        max_bytes: max_message,
+        max_part_bytes: max_part,
+        max_total_attachment_bytes: max_part.saturating_mul(4).min(postino_mime::Limits::HARD_MAX_TOTAL_ATTACHMENT_BYTES),
+        ..postino_mime::Limits::default()
+    }
+}
+
+/// Pick the Message-ID the parse and the envelope agree on, warning when the header is unusable.
+fn normalise_id(parsed: &ParsedMessage, envelope: &Envelope, uid: u32, warnings: &mut Warnings) -> Option<String> {
+    let candidate = parsed.message_id.as_deref().or(envelope.message_id.as_deref());
+    let normalised = candidate.and_then(ids::normalise_message_id);
+    if candidate.is_some() && normalised.is_none() {
+        warnings.push(format!("message UID {uid}: the Message-ID header is unusable; the local id is tied to the folder and UID"));
+    }
+    normalised
+}
+
+fn parsed_address(mailbox: &postino_mime::Mailbox) -> store::Address {
+    store::Address::new(mailbox.name.clone().unwrap_or_default(), mailbox.address.clone())
+}
+
+fn envelope_address(address: &EnvelopeAddress) -> store::Address {
+    let mailbox = address.mailbox.clone().unwrap_or_default();
+    let host = address.host.clone().unwrap_or_default();
+    let email = if host.is_empty() { mailbox } else { format!("{mailbox}@{host}") };
+    store::Address::new(address.name.clone().unwrap_or_default(), email)
+}
+
+/// Prefer the decoded MIME list; fall back to the envelope when the message had no such header.
+fn address_list(
+    parsed: &ParsedMessage,
+    mine: impl Fn(&ParsedMessage) -> &[postino_mime::Mailbox],
+    theirs: &[EnvelopeAddress],
+) -> Vec<store::Address> {
+    let list = mine(parsed);
+    if list.is_empty() { theirs.iter().map(envelope_address).collect() } else { list.iter().map(parsed_address).collect() }
+}
+
+/// A short, collapsed preview for the list row. `postino-core` owns the display policy; sync stores
+/// a bounded plain-text prefix so the engine can show a list without reading the body.
+fn snippet(text: &str) -> String {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+        if out.chars().count() >= 160 {
+            break;
+        }
+    }
+    out.chars().take(160).collect()
+}
+
+/// A server-controlled attachment name reduced to printable text for a warning.
+fn warning_name(name: &str) -> String {
+    name.chars().map(|ch| if ch.is_control() { '?' } else { ch }).take(80).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_snippet_collapses_whitespace_and_is_bounded() {
+        assert_eq!(snippet("hello\r\n\tworld  "), "hello world");
+        let long = "x".repeat(400);
+        assert_eq!(snippet(&long).len(), 160);
+        assert_eq!(snippet("   "), "");
+    }
+
+    #[test]
+    fn mime_limits_follow_the_sync_limits_and_the_hard_ceilings() {
+        let limits = SyncLimits { max_message_bytes: 1024, max_attachment_bytes: 2048, ..SyncLimits::default() };
+        let mime = mime_limits(&limits);
+        assert_eq!(mime.max_bytes, 1024);
+        assert_eq!(mime.max_part_bytes, 2048);
+        assert_eq!(mime.max_total_attachment_bytes, 8192);
+
+        let huge = SyncLimits { max_message_bytes: usize::MAX, max_attachment_bytes: u64::MAX, ..SyncLimits::default() };
+        let mime = mime_limits(&huge);
+        assert_eq!(mime.max_bytes, postino_mime::Limits::HARD_MAX_BYTES);
+        assert_eq!(mime.max_part_bytes, postino_mime::Limits::HARD_MAX_PART_BYTES);
+        assert_eq!(mime.max_total_attachment_bytes, postino_mime::Limits::HARD_MAX_TOTAL_ATTACHMENT_BYTES);
+    }
+
+    #[test]
+    fn an_envelope_address_joins_mailbox_and_host() {
+        let address =
+            EnvelopeAddress { name: Some("Giulia".to_owned()), adl: None, mailbox: Some("giulia".to_owned()), host: Some("example.com".to_owned()) };
+        let mapped = envelope_address(&address);
+        assert_eq!(mapped.name, "Giulia");
+        assert_eq!(mapped.email, "giulia@example.com");
+
+        let bare = EnvelopeAddress { name: None, adl: None, mailbox: Some("group".to_owned()), host: None };
+        assert_eq!(envelope_address(&bare).email, "group");
+    }
+}

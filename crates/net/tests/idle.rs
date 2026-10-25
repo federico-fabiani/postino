@@ -1,11 +1,9 @@
 //! IDLE: one cycle, continuation, events, DONE and the ways a server can end it.
 
-mod support;
-
 use std::time::Duration;
 
 use postino_net::{IdleEvent, NetError, Session};
-use support::{FakeServer, TlsFixture};
+use postino_testkit::{FakeServer, TlsFixture, expected_sasl, idle_continuation};
 
 async fn selected_session(server: &FakeServer, tls: &TlsFixture) -> Session {
     selected_session_with(server, tls, Duration::from_secs(5)).await
@@ -28,7 +26,7 @@ async fn idle_collects_events_then_done_and_tagged_ok() {
         conn.send_line("* OK [UIDVALIDITY 1] ok").await;
         conn.send_line("A0003 OK selected").await;
         conn.expect("A0004 IDLE").await;
-        conn.send_line(&support::idle_continuation("idling")).await;
+        conn.send_line(&idle_continuation("idling")).await;
         conn.delay(Duration::from_millis(20)).await;
         conn.send_line("* 3 EXISTS").await;
         conn.send_line("* 1 EXPUNGE").await;
@@ -171,7 +169,7 @@ async fn idle_without_the_capability_is_unsupported() {
         conn.send_line("A0001 OK done").await;
         conn.expect("A0002 AUTHENTICATE PLAIN").await;
         conn.send_line("+ ").await;
-        assert_eq!(conn.read_line().await, support::expected_sasl());
+        assert_eq!(conn.read_line().await, expected_sasl());
         // The tagged OK does not advertise IDLE, and the client adopts this list.
         conn.send_line("A0002 OK [CAPABILITY IMAP4rev1] logged in").await;
         conn.expect("A0003 SELECT \"INBOX\"").await;

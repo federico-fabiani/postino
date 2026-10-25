@@ -1,7 +1,8 @@
 # Development
 
 > **Status:** M0 + U0.5 labels + P3c engine on the encrypted store + P4a MIME crate + P4b encrypted
-> attachment blobs + P2b states/accessibility · **Last updated:** 2026-10-25
+> attachment blobs + P5a IMAP client + P5b sync into the store + P2b states/accessibility ·
+> **Last updated:** 2026-10-25
 
 ## 1. Toolchain
 
@@ -52,8 +53,11 @@ cargo xtask assets --write                    # regenerate ATTRIBUTION.md
 crates/core/        domain, engine (demo or store-backed), operation registry, store_map
 crates/crypto/      HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type
 crates/mime/        MIME parse/serialize, HTML sanitization, HTML-to-text, header guards
+crates/net/         IMAP4rev1 client over TLS, bounded and typed
 crates/platform/    OS seams: the store key in the Windows Credential Manager
 crates/store/       encrypted SQLCipher store, schema v3, repository, encrypted blob directory
+crates/sync/        one IMAP account into the store: folders, UIDs, MIME, blobs, status
+crates/testkit/     test-only fake IMAP server, TLS fixture and synthetic mail
 apps/postino-app/   egui shell (demo data until P6)
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks

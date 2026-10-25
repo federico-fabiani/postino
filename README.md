@@ -4,17 +4,21 @@
 registry shared by the desktop app, the CLI and an MCP server.
 
 > **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
-> the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a).** The shell, the
-> operation registry, the CLI and the MCP server work against a synthetic demo mailbox, and
-> `postino --store <path>` can now run the same operations on the encrypted SQLCipher database:
-> accounts, folders, messages, labels, drafts and flags survive a restart. The desktop app still
-> boots on the demo until onboarding (P6). MIME parsing, sanitization and serialization exist as
-> `postino-mime` but are not wired into the engine yet; `postino-net` is an IMAP4rev1 client that can
-> log in over TLS, list folders, select, fetch envelopes and `BODY.PEEK[]` bodies, store flags and
-> idle, but no sync loop calls it yet. Attachment bytes are encrypted at rest in a content-addressed
-> blob directory next to the database; the app does not ingest real mail yet, so nothing writes them
-> automatically. SMTP and the background daemon land in M2-M4. No real account is configured, no mail
-> leaves the machine, and the composer's send is a local move to Sent, never an SMTP submission.
+> the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
+> store (P5b).** The shell, the operation registry, the CLI and the MCP server work against a
+> synthetic demo mailbox, and `postino --store <path>` can now run the same operations on the
+> encrypted SQLCipher database: accounts, folders, messages, labels, drafts and flags survive a
+> restart. The desktop app still boots on the demo until onboarding (P6). MIME parsing, sanitization
+> and serialization exist as `postino-mime`; `postino-net` is an IMAP4rev1 client that logs in over
+> TLS, lists folders, selects, fetches envelopes and `BODY.PEEK[]` bodies, stores flags and idles; and
+> `postino-sync` reconciles one account from a server into the encrypted store: folders with
+> special-use, UIDVALIDITY resets, incremental UID fetches, MIME bodies, attachment bytes in the blob
+> store, deletions, flags on first insert, a cancellable run and a persistent status. It is tested
+> against a scripted server only, including 2 000 messages in CI and 10 000 behind
+> `POSTINO_SLOW_TESTS=1`, and **no operation, CLI command or screen calls it yet**. Attachment bytes
+> are encrypted at rest in a content-addressed blob directory next to the database and only sync
+> writes them today. SMTP and the background daemon land in M2-M4. No real account is configured, no
+> mail leaves the machine, and the composer's send is a local move to Sent, never an SMTP submission.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -69,8 +73,21 @@ MCP      ─┘
   UTF-7 names, selects and examines, fetches envelopes and whole bodies with `BODY.PEEK[]` (never
   setting `\Seen`), stores flags by UID, runs one `IDLE` cycle and logs out. Every line, literal,
   command and response is bounded, the password is zeroised and redacted, and a scripted TLS server
-  with a 54-case hostile corpus proves each path. It is tested against that fake server only and is
-  not wired into the engine, the app or a sync loop yet.
+  in `postino-testkit` proves each path, including a 54-case hostile corpus. It is not wired into the
+  app or a scheduler yet.
+- The M1 synchronization crate (`postino-sync`, P5b): `sync_account` reconciles one IMAP account into
+  one encrypted store. It lists folders once and maps RFC 6154 special-use (`\Inbox`, `\Sent`,
+  `\Drafts`, `\Trash`, `\Junk`, `\Archive`, `\Flagged`), resets a folder when `UIDVALIDITY` changes,
+  fetches only new UIDs in bounded windows, parses each body with `postino-mime`, stores attachment
+  bytes through the encrypted blob seam only within the per-attachment limit, removes cached messages
+  whose UID disappeared, applies server flags on first insert and reports later drift without
+  overwriting local read/star state. One transaction per message and a cursor that advances only after
+  commit make a crash or a cancellation resume without a gap. Runs are cancellable, bounded by
+  `SyncLimits`, and leave a JSON status under `meta`. Tested against the scripted server (initial,
+  incremental, UIDVALIDITY, deletion, flags, oversized attachments, three network-drop points,
+  cancellation + reopen, `BODY.PEEK`-only and an offline read through `Engine::open`), with a
+  2 000-message test in CI and 10 000 behind `POSTINO_SLOW_TESTS=1`. It has no operation, CLI, MCP
+  tool, UI or scheduler yet: P6 wires it.
 - Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
   MCP protocol tests, and store round-trip tests at both the repository and engine level.
 

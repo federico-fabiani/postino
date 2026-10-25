@@ -6,7 +6,9 @@ no UI toolkit.
 The encrypted local store. One SQLCipher database with schema **v3**, a migration runner on
 `PRAGMA user_version`, a typed repository for the M1 mailbox, and a content-addressed encrypted blob
 store for attachment bytes. The engine drives it through `Engine::open` (P3c) and the attachment
-seam (P4b): the store stays independent of `postino-core` and never reads a keyring.
+seam (P4b), and `postino-sync` (P5b) is the writer for received mail: folders, messages, attachment
+metadata/hashes and the per-folder sync cursor. The store stays independent of `postino-core` and
+never reads a keyring.
 
 `docs/architecture.md` §4.1-§4.5 describe the schema, key flow and blob format;
 `docs/store-spike.md` records why SQLCipher and how the blobs were added.
@@ -36,7 +38,11 @@ seam (P4b): the store stays independent of `postino-core` and never reads a keyr
   2038 problem. IMAP/MIME dates are converted at the sync boundary.
 - **Transactions.** Label delete + detach, label batch apply/remove, flag batch, message move,
   attachment replacement, whole-draft save and any message upsert that changes folders run in one
-  transaction. A bad id rolls the whole batch back.
+  transaction. A bad id rolls the whole batch back. The sync bulk path
+  (`upsert_synced_message`) writes the message and its attachment rows in one transaction but
+  deliberately skips the folder recount, because a full count per message would make a large import
+  quadratic; sync recounts once per folder. `reset_folder_messages` and `delete_synced_messages` are
+  one transaction each and refresh counts themselves.
 - **Upserts preserve what they do not own.** `upsert_message` replaces the message row only; label
   assignments and attachment rows survive a sync refresh. `save_draft_row` keeps the stored
   `in_reply_to` when the update passes `None`; clearing it needs an explicit field, which does not
@@ -106,8 +112,8 @@ v3 is additive from v2: it adds `draft_seq`, the draft revision high-water mark,
 | `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |
 | `drafts` | revision, updated_at, body, recipients, subject, in_reply_to |
 | `draft_seq` | message id → highest revision ever written; survives a send and a move back |
-| `sync_state` | per-folder uid_next, highest_modseq, last_error (IMAP writers arrive with P5) |
-| `meta` | key/value store from P3a; holds the `label_seq` high-water mark |
+| `sync_state` | per-folder sync cursor: next UID to fetch, `highest_modseq`, `last_error` |
+| `meta` | key/value store from P3a; holds the `label_seq` high-water mark and `sync_status:<account>` |
 
 Indexes cover the hot reads: `messages(folder_id, date DESC)`, `messages(account_id, date DESC)`,
 `message_labels(label_id)`, `attachments(message_id)`, `drafts(updated_at DESC)` and
@@ -123,6 +129,12 @@ Plain data structs in `model.rs` (no `postino-core` dependency), methods in `rep
 - messages: `upsert_message`, `get_message`, `list_messages` (folder/label/all, unread/starred/
   attachment filters, limit/offset), `list_all_messages`, `counts`, `set_flags`, `move_messages`,
   `delete_message`.
+- sync support: `upsert_synced_message` (message + attachments in one transaction, no per-message
+  recount), `message_flags` (folder and local flags only), `list_uids`, `delete_synced_messages`
+  (never deletes a local draft), `reset_folder_messages` (UIDVALIDITY reset; keeps rows without a
+  server UID, so local drafts and locally sent mail survive), `get_sync_state`/`set_sync_state`/
+  `clear_sync_state`. The cursor's `uid_next` is the next UID to fetch; `folders.uid_next` is the
+  server's advertised `UIDNEXT`, a different value.
 - labels: `create_label`, `update_label`, `delete_label`, `get_label`, `list_labels` (live counts),
   `apply_label`, `remove_label`, `messages_by_label`, `labels_for`.
 - attachments: `replace_attachments`, `attachments`, `list_all_attachments`, `find_attachment`
@@ -170,16 +182,21 @@ cargo test -p postino-store
   two labels), filters/paging, counts after read/move/delete, cached-count repair, atomic batches,
   label delete detach, draft revisions across reopen, reopen persistence, unknown-id errors and the
   no-plaintext scan over DB/WAL/SHM with repository data.
+- `tests/sync_support.rs`: the sync cursor round trip, the one-transaction message+attachment upsert
+  (including a rollback on a duplicate attachment id), `message_flags`, the UID list ignoring local
+  rows, a deletion pass that cascades assignments/attachments but keeps local drafts, and a
+  UIDVALIDITY reset that leaves other folders, their labels and local drafts untouched.
 - unit tests in `src/repo.rs`: a temporary SQLite trigger aborts the `drafts` or `draft_seq` insert,
   proving the whole save rolls back (message, attachment, draft, sequence and folder counts) and
   that the same save succeeds once the trigger is dropped.
 
 ## Not here yet
 
-Desktop-app wiring (P6 onboarding), IMAP sync writers, MIME parsing, FTS5, body/raw-message blobs
-(P9), outbox (P7), daemon (M4), key rotation and blob garbage collection. `sync_state` has its table
-but no repository writer until P5. The engine (P3c, P4b) is a client of this crate; this crate never
-depends on it.
+Desktop-app wiring (P6 onboarding), FTS5, body/raw-message blobs (P9), outbox (P7), daemon (M4),
+key rotation and blob garbage collection. `sync_state` and the sync-status `meta` key have writers
+now: `postino-sync` (P5b) is the client of this crate for received mail. Parsing MIME is not here:
+sync parses and hands over rows and blob hashes. The engine (P3c, P4b) is another client; this crate
+never depends on it.
 
 ## Build prerequisite (Windows GNU)
 

@@ -1,8 +1,8 @@
 # Postino threat model
 
-> **Status:** M0 + M1 MIME parser (P4a) + encrypted attachment blobs (P4b) · **Last updated:**
-> 2026-10-25 · **Review:** before every release that touches networking, storage, HTML rendering or
-> MCP.
+> **Status:** M0 + M1 MIME parser (P4a) + encrypted attachment blobs (P4b) + IMAP sync into the store
+> (P5b) · **Last updated:** 2026-10-25 · **Review:** before every release that touches networking,
+> storage, HTML rendering or MCP.
 
 ## 1. What we protect
 
@@ -82,6 +82,22 @@
 - IMAP commands (`postino-net`, P5a): mailbox names, user names and passwords are quoted with `"`
   and backslash escaping; CR, LF and NUL are refused instead of escaped, so no value can become a
   second command. A UID set is parsed, not expanded, so `1:*` on a huge mailbox is one range.
+- Sync (`postino-sync`, P5b): reconciliation is read-only against the server. Bodies are fetched only
+  with `BODY.PEEK[]`, so reading never sets `\Seen`, and the reconciler never sends `STORE`,
+  `EXPUNGE`, `COPY`, `MOVE` or `APPEND`; the scripted server answers those with `BAD` so a regression
+  fails the suite. Attachment bytes are accepted only for a part the MIME parser decoded completely
+  and whose decoded size is within `max_attachment_bytes` (default 25 MiB); a larger or truncated
+  part is kept as metadata with no bytes and a warning. The effective single-part cap is the smaller
+  of that limit and the MIME crate's 32 MiB hard part limit; the blob format refuses anything above
+  64 MiB. Attachment names come from the server, are sanitized by the MIME parser before they become
+  row data, and are reduced to printable text and 80 characters before they enter a warning. Sync
+  opens no file and never launches a viewer: an attachment is bytes in the encrypted blob store
+  until the user asks for it. Message bodies are parsed with the sync limits, HTML is sanitized on
+  receipt and remote images are removed, and a malformed message becomes a warning rather than a
+  failed run. The status record (`meta` key `sync_status:<account_id>`) carries counts and a fixed
+  failure sentence, never a server name, an address, a credential or message content; the typed
+  `SyncError` returned to the caller may name the host, exactly as a session error does. Logs carry
+  account and folder ids and counts, never subjects, addresses or bodies.
 
 ### 4.2 Account compromise
 
@@ -108,7 +124,9 @@ Exactly what is encrypted, and with what:
 - **The database** (`<path>`): SQLCipher encrypts every page and WAL frame, and the temp store is
   configured in memory so temp tables never reach disk. Subjects, addresses, bodies, flags, labels,
   folder names, draft revisions, attachment names/types/sizes and their blob hashes are ciphertext on
-  disk. The file begins with a random per-database salt, not `SQLite format 3`.
+  disk. The file begins with a random per-database salt, not `SQLite format 3`. Sync adds the cached
+  server UIDs, the local cursor and the status JSON (`sync_status:<account>`) to the same encrypted
+  pages; the status contains counts and a failure category, not the server's name or any content.
 - **Attachment bytes** (`<db file>.blobs/<xx>/<hash>.blob`, for example `mail.db.blobs/…`):
   XChaCha20-Poly1305 under a subkey
   derived with HKDF-SHA256 (salt `postino.v1`, label `blob`) from the same 256-bit store key. The file
@@ -186,7 +204,12 @@ crash-dump entry above.
 - Saves are atomic: write a temp file, fsync it, then publish (rename or hard link).
 - The outbox is a journal; a crash replays idempotently.
 - Drafts keep revisions and recover after restart.
-- A sync bug must never delete server mail. Expunge is explicit.
+- A sync bug must never delete server mail. Expunge is explicit. `postino-sync` never issues a
+  mutating command; its deletion pass only removes rows from the local cache after a complete UID
+  list, and it skips that pass when a run stopped at the message limit.
+- Sync resumes without gaps: the per-folder cursor advances only after a message transaction commits,
+  so a crash re-fetches one message at most. A `UIDVALIDITY` change discards that folder's cache but
+  keeps local drafts, which were never on the server.
 - Backups are the user's responsibility, but export/import is a first-class feature.
 
 ## 5. Out of scope

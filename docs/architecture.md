@@ -1,7 +1,8 @@
 # Postino architecture
 
 > **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c/P3d) + MIME
-> crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) · **Last updated:** 2026-10-25 ·
+> crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) + sync into the store (P5b) ·
+> **Last updated:** 2026-10-25 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
 ## 1. Shape today
@@ -15,6 +16,8 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/platform` | OS seams; today the store key in the Windows Credential Manager |
 | `crates/store` | SQLCipher schema v3, migrations, the repository and the encrypted blob store (P3b, P4b) |
+| `crates/sync` | One account from IMAP into the store: folders, UIDVALIDITY, incremental fetch, MIME, blobs, deletions, status (P5b) |
+| `crates/testkit` | Test-only fake IMAP server, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
 | `apps/postino-cli` | `postino` command line and the opt-in MCP server |
 | `xtask` | `ci`, `layers`, `assets` |
@@ -105,12 +108,12 @@ decision and the migration path.
 | `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 later |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
 | `postino-net` | IMAP4rev1 client (P5a): TLS, bounded responses, testable against a scripted server. SMTP submission, autodiscovery, QRESYNC later |
-| `postino-sync` | reconciliation, outbox with idempotency keys, drafts, flags, threading |
+| `postino-sync` | Reconciliation (P5b: folders, UIDVALIDITY, incremental UID fetch, MIME, blobs, deletions, status); outbox, scheduler, full threading later |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
 | `postino-rules` | local rules and Sieve generation |
 | `postino-ipc` | JSON-RPC over pipe/socket, token, versioning |
 | `postino-platform` | keyring (P3b); paths, notifications, tray, autostart, single instance later |
-| `postino-testkit` | fake IMAP/SMTP, MIME fixtures, golden messages |
+| `postino-testkit` | fake IMAP/SMTP, TLS fixture, response builders and synthetic messages (P5b; dev-dependency only) |
 
 Layers: foundation (platform, store, mime, crypto) → network (net) and sync → features (compose,
 rules) → engine → frontends. `postino-net` depends on no other workspace crate: it speaks to the
@@ -205,10 +208,13 @@ it from `drafts.revision`, so an existing store keeps its revision numbers.
 not depend on `postino-core`: accounts upsert/list/get; folders upsert/list/get/recount; messages
 upsert/get/list with folder, label, unread, starred and attachment filters plus limit/offset, flag
 batch, move, delete and counts; labels CRUD with live counts, batch apply/remove, messages by label;
-attachment replacement/listing; drafts save/get/list/delete with store-owned revisions; meta.
-Every multi-row mutation is one transaction, and a bad id rolls the batch back. Message upserts
-leave labels and attachments alone unless the caller replaces them, and a message cannot be placed
-in another account's folder (`AccountMismatch`).
+attachment replacement/listing; drafts save/get/list/delete with store-owned revisions; meta; and the
+sync support added in P5b: `upsert_synced_message` (message and attachment rows in one transaction,
+without a per-message recount), `message_flags`, `list_uids`, `delete_synced_messages` (never a local
+draft), `reset_folder_messages` (a UIDVALIDITY reset that keeps local drafts) and the
+`sync_state` cursor read/write/clear. Every multi-row mutation is one transaction, and a bad id rolls
+the batch back. Message upserts leave labels and attachments alone unless the caller replaces them,
+and a message cannot be placed in another account's folder (`AccountMismatch`).
 
 `save_draft_message` is the one whole-draft transaction: it validates attachment ids, upserts the
 message row, replaces attachments, writes the `drafts` revision and `draft_seq`, and refreshes the
@@ -263,18 +269,18 @@ cache; the engine is authoritative for it.
 
 **Residual windows.** Each engine mutation is one repository transaction, so a crash or disk
 failure cannot leave the store one step ahead of memory within an operation. Activations and the
-app are still demo-only; the engine writes attachment bytes only through the P4b seam (sync does not
-call it yet) and IMAP `uid`/`Message-ID` and `size` are not written by the engine yet (P5), and the
-keyring lock protects first-run key creation, not the store file itself. There is no cross-process
+app are still demo-only; the engine writes attachment bytes only through the P4b seam, and it writes
+local drafts with `uid`, `Message-ID` and `size` empty. Received mail is different: `postino-sync`
+(P5b) fills those columns, parses the MIME body and stores attachment bytes through the same seam.
+The keyring lock protects first-run key creation, not the store file itself. There is no cross-process
 locking story beyond SQLite's WAL, busy timeout and the keyring lock: one process owns the store
 until the daemon (M4), and the desktop app does not open it yet. The repository returns folders and
 labels ordered by name, so a store engine sees alphabetical order where the demo saw creation order;
 P6 decides the real folder-tree order when onboarding writes it.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
-a store. **Still missing:** onboarding and the default store path (P6), IMAP writers for
-`sync_state` (P5), MIME wiring into the engine and the sync call that feeds the P4b attachment seam
-(P5b), FTS5 (P9), outbox (P7), the daemon (M4).
+a store. **Still missing:** onboarding and the default store path (P6), the operation/CLI/UI that
+calls `postino-sync`, FTS5 (P9), outbox (P7), the daemon (M4).
 
 ### 4.3 Implemented in P4a: the MIME crate
 
@@ -307,9 +313,9 @@ the generated `Message-ID`. Header injection is `MimeError::HeaderInjection`, ne
 is validated, deduplicated into `Envelope.recipients`, and never appears in `raw`.
 
 **Next.** P4b stores the bounded attachment bytes as encrypted blobs and exposes the engine seam;
-mapping `ParsedMessage` onto the core `Address`/`Attachment` shapes and feeding those bytes is P5b.
-P5 supplies the IMAP bytes and P7 uses `serialize` for submission. The crate has no dependency on
-`postino-core`, so the mapping stays in the engine layer.
+P5b maps `ParsedMessage` onto store rows and feeds those bytes from `postino-sync`. The engine's own
+local drafts still carry a plain-text body. P5 supplies the IMAP bytes and P7 uses `serialize` for
+submission. The crate has no dependency on `postino-core`, so the mapping stays in the sync layer.
 
 ### 4.4 Implemented in P5a: the IMAP client
 
@@ -368,8 +374,9 @@ bodies or credentials. Server text in errors is cut to printable ASCII.
 **Not implemented.** Sync loops, store writes, engine operations, `APPEND`/`COPY`/`MOVE`/`EXPUNGE`,
 QRESYNC/CONDSTORE beyond reading `HIGHESTMODSEQ` when the server volunteers it, SORT/THREAD,
 METADATA, ACL, SIEVE, NOTIFY, ESEARCH, `BODYSTRUCTURE` and per-part fetches, OAuth/SASL XOAUTH2 and
-any mechanism other than PLAIN, SMTP, autodiscovery and MIME parsing. The fake server lives in
-`crates/net/tests/support/`; it is promoted to `postino-testkit` only when SMTP needs it.
+any mechanism other than PLAIN, SMTP, autodiscovery and MIME parsing. The fake server and its TLS
+fixture live in `postino-testkit` (P5b), a dev-dependency shared with `postino-sync`; the reconciler
+that consumes this client is `postino-sync`, not part of this crate.
 
 ### 4.5 Implemented in P4b: encrypted attachment blobs
 
@@ -478,37 +485,157 @@ the next attempt). `has_attachments` never changes on this path because the row 
 draft re-save replaces the attachment rows from metadata that carries no hash and may carry a stale
 size; the repository keeps the stored hash **and** the stored size for an id that survives, and the
 engine re-reads the rows after the write so memory cannot disagree with the bytes on disk. The demo
-engine and a store-less engine answer with a readable `OpError::Failed`. Consumers: sync (P5b) calls
-the write for every ingested attachment; the reading pane (P6) calls the read to preview or save.
+engine and a store-less engine answer with a readable `OpError::Failed`. Consumers: sync (P5b) now
+calls the write for every ingested attachment; the reading pane (P6) will call the read to preview or
+save.
 
 **Cleanup.** There is no garbage collection yet: deleting a message leaves its blob file, because
 another message may reference the same content; P9 or the daemon will sweep unreferenced hashes.
 `BlobStore::remove` exists for an explicit delete and for tests, not as a repair step.
 
+### 4.6 Implemented in P5b: syncing an account into the store
+
+`postino-sync` is the reconciler between one `postino-net` session and the encrypted repository. It
+ships no operation, CLI command, scheduler or screen: `sync_account(store, account, config, limits,
+cancel)` is called by whoever owns those in P6. It runs a private current-thread Tokio runtime and
+blocks; the `Store` stays on the caller thread and one connection serves the whole run.
+
+```text
+LIST "" "*"                 ──▶ folders, special-use, \Noselect skipped
+SELECT <wire name>          ──▶ UIDVALIDITY, UIDNEXT
+  UIDVALIDITY changed       ──▶ drop that folder's cached messages, cursor = 1
+UID FETCH <cursor>:<end> (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)   (bounded windows)
+UID FETCH <uid> (BODY.PEEK[])  ──▶ postino-mime ──▶ one transaction: message + attachments
+UID FETCH 1:* (…ENVELOPE)      ──▶ full UID list: delete gone rows, observe flag drift
+recount                        ──▶ folder counts, last_sync_at
+```
+
+**Batches and the cursor.** `UID FETCH n:*` includes the last message even when it is below `n`
+(RFC 3501 §6.4.8), so each window has an explicit end: `min(cursor + batch - 1, UIDNEXT - 1)` when
+the server reports `UIDNEXT`, otherwise `cursor + batch - 1` and an empty window ends the pass.
+`sync_state.uid_next` (the next UID to fetch) advances after each committed message and after each
+completed window; `folders.uid_next` holds the server's advertised `UIDNEXT`. A crash between the
+message transaction and the cursor write re-fetches one message; the upsert is idempotent.
+
+**Folders.** `LIST` once. `\Noselect` is skipped; `\Inbox`, `\Sent`, `\Drafts`, `\Trash`, `\Junk`,
+`\Archive` and `\Flagged` map to the store roles, and a folder named `INBOX` is the inbox even when
+the server omits the attribute (RFC 3501 fixes the name). Everything else selectable is `Custom`.
+Roles are never guessed from names: a server with no `\Sent` or no `\Drafts` gets a warning instead of
+an invented folder. `\All` and `\Flagged` are aggregate views (RFC 6154): their local rows are created
+so the role is visible, but their messages are not fetched, because they contain mail that already
+lives in a concrete folder and a mailbox-wide `Message-ID` identity would otherwise move every
+message into the view. The local folder id is `fld_` plus 16 hex of `BLAKE3(account, wire name)`, so a
+display-name rename does not orphan the cache. Local labels and drafts are untouched. A server's
+`\Flagged` folder is stored as `FolderKind::Starred`; the engine's virtual starred view is derived
+from message flags, so P6 must decide which of the two the sidebar shows.
+
+**Message ids.** `msg_` plus 16 hex of `BLAKE3(account, Message-ID)` when a usable header exists,
+otherwise `msg_{folder}_{uidvalidity}_{uid}`. A message with a Message-ID keeps its local row across
+a folder move, a re-download and a UIDVALIDITY change; one without one cannot be recognised after
+those events and is re-created (documented trade-off). The same Message-ID in two folders maps to one
+local message: the later folder wins `folder_id`, label assignments survive and the row's UID becomes
+the later copy's. If that surviving folder then loses the message, the deletion pass removes the row;
+the other folder still holds it on the server, but the cache will not recreate it until that folder is
+fetched from scratch. This is the price of a mailbox-wide identity, and it is why sync never deletes
+on the server.
+
+**Threading.** `thread_id` is the first `References` entry, else `In-Reply-To`, else the message's own
+Message-ID (or the local id when it has none), all without angle brackets. That is a stable
+placeholder that links a reply to a root; full JWZ threading is P9.
+
+**Flags.** Server flags are applied only when a message is first inserted: `\Seen` becomes
+`unread = false`, `\Flagged` becomes `starred = true`. On later runs the local `unread`/`starred` are
+kept because M1 flags are local-only and M2 will push them. The deletion pass compares the server's
+flags with the local state and increments `SyncOutcome::updated_flags` for every difference; one
+warning per run says that local flags were kept. Sync never sends `STORE`, so a run cannot change the
+user's mail state on the server.
+
+**UIDVALIDITY.** A different value means every cached UID describes a mailbox state that no longer
+exists. `reset_folder_messages` deletes the folder's server messages, attachments and label
+assignments in one transaction (blob files stay because another message may share the content),
+clears the folder's `sync_state` and recounts the folder; the run records a warning and fetches from
+UID 1. Rows without a UID survive every reset: local drafts and locally sent mail were never on the
+server, and rebuilding its cache must not discard them.
+
+**Deletions.** After a complete new-mail pass the reconciler fetches the full UID list per folder in
+the same bounded windows, removes cached rows whose UID is gone in one transaction
+(`delete_synced_messages`, which never touches a draft), and leaves the server untouched: no
+`EXPUNGE`, no `STORE`, no `DELETE`. The network client has no flags-only `FETCH`, so the list uses
+the envelope items it exposes and the extra fields are discarded. A run that stopped at
+`max_messages` has an incomplete view and skips the deletion pass for that folder, so a truncated
+pass cannot empty the cache.
+
+**Attachments.** Each MIME part gets a deterministic id `att_{message_id}_{index}`. Bytes go through
+`Store::blobs().put` only when the part was decoded completely and is within
+`SyncLimits::max_attachment_bytes`; the row then carries the BLAKE3 hash and the exact stored size. An
+oversized or truncated part keeps its metadata with `blob_hash = NULL` and produces a warning: the
+message is still readable. The effective single-part cap is the smaller of the sync limit and the MIME
+crate's 32 MiB hard part limit; the blob format's 64 MiB ceiling is the storage backstop.
+
+**Status.** `meta` key `sync_status:<account_id>` holds
+`{"state":"idle|syncing|error","last_attempt":ms,"last_success":ms|null,"error":sentence|null,
+"folders_done":n,"folders_total":n,"messages":n}`. It is written when a run starts, after each folder
+and at the end; a crash leaves `syncing` and the next run resets it. `error` is a fixed sentence for
+the failure category, never a server name, an address or message text; `read_status(store, account)`
+is the read-only helper for P6 and the CLI. `messages` counts messages ingested by the run, including
+those committed before a cancellation.
+
+**Cancellation.** The caller passes an `AtomicBool`; it is checked before connecting, before each
+folder, between batches and before each message. A cancelled run returns `SyncError::Cancelled` and
+every committed message stays. The next run resumes from `sync_state.uid_next`; the deletion pass is
+skipped for the interrupted folder because its UID list was never completed.
+
+**Limits and counts.** `SyncLimits` defaults are 100 envelopes per fetch, 25 MiB per message, 25 MiB
+per attachment and 50 000 messages per run; every field is clamped to a usable range and the message
+cap is further clamped to the network client's `max_literal`, so sync never chooses a body the session
+would refuse. A message over the message cap is skipped with a warning and the cursor advances; a run
+that reaches `max_messages` stops with a warning and resumes next time. Folder counts are refreshed
+once per folder (`recount_folder`), not once per message: a full scan per upsert would make a large
+import quadratic. The price is that a crash can leave `folders.unread`/`total` stale until the next
+run or an explicit `recount_folder`.
+
+**Not synced.** Server-side filters and rules, flag changes pushed out, `EXPUNGE`, `APPEND` of drafts
+or sent mail, `CONDSTORE`/`QRESYNC` increments, a folder-removal pass (a folder deleted on the server
+keeps its cached rows until P6 decides), full JWZ threading, FTS5 and any scheduled loop. There is no
+operation, CLI command, MCP tool or UI binding yet: P6 owns onboarding and those surfaces.
+
+**Evidence.** The scripted server moved to `postino-testkit`, and the sync tests script real protocol
+exchanges: initial sync, incremental UIDs, UIDVALIDITY, deletion, flag drift, oversized attachment,
+message limit, three disconnect points, cancellation plus reopen, `BODY.PEEK`-only and an offline read
+through `Engine::open`. On the Windows GNU host in a debug build (opt-level 1, dependencies at 2), a
+2 000-message sync took 10.9-11.7 s with a 22.9 MB peak working set; 10 000 messages (behind
+`POSTINO_SLOW_TESTS=1`) took 47-56 s with 38.6 MB. The 2 000-message test asserts a 180 s budget.
+
 ## 5. Synchronization
 
 IMAP is the synchronization protocol. There is no Postino server.
 
-P5a ships the client (`postino-net`): one connection, TLS, the commands in §4.4, typed data out.
-P5b adds everything below: the loop, the store writes, reconciliation and the scheduler binding.
+P5a ships the client (`postino-net`): one connection, TLS, the commands in §4.4, typed data out. P5b
+ships the reconciler (`postino-sync`) described in §4.6: one account, one store connection, one run at
+a time. It is not scheduled and not wired to the engine, the CLI, MCP or a UI; P6 adds onboarding and
+the first operation that calls it.
+
+The target loop, most of which does not exist yet:
 
 - Discover settings with RFC 6186 SRV records, autoconfig, then a manual fallback.
 - One connection per account for IDLE; separate short-lived connections for bulk fetch.
-- `UIDVALIDITY` changes invalidate the folder cache. `CONDSTORE`/`QRESYNC` where supported;
-  otherwise UID ranges and flag fetches.
-- Fetch envelopes and flags first; bodies on demand, with a bounded prefetch of recent mail.
+- `UIDVALIDITY` changes invalidate the folder cache. `CONDSTORE`/`QRESYNC` where supported; otherwise
+  UID ranges and flag fetches (P5b implements the UID-range half, no QRESYNC).
+- Fetch envelopes and flags first; bodies on demand, with a bounded prefetch of recent mail. P5b
+  downloads each body during the reconciliation pass; on-demand reads are P6.
 - Local intents (send, flag, move, draft save) are optimistic and queued in `outbox` with an
-  idempotency key. On reconnect, the daemon replays them and reconciles.
+  idempotency key. On reconnect, the daemon replays them and reconciles. Not implemented.
 - Sent mail is `APPEND`ed to the Sent folder, deduplicated by `Message-ID` when the provider also
-  saves it.
+  saves it. Not implemented.
 - Drafts are appended with a stable client `Message-ID` and revision; IMAP has no atomic update, so
   two devices can briefly create two copies. This is a protocol limit, documented rather than
-  hidden.
-- Two devices converge through the server: IDLE pushes within seconds when the network and
-  provider cooperate; otherwise polling (default 60 s) is the floor.
+  hidden. Not implemented.
+- Two devices converge through the server: IDLE pushes within seconds when the network and provider
+  cooperate; otherwise polling (default 60 s) is the floor. Not implemented; P5b is a one-shot run
+  with no scheduler.
 
-ADR-0003 records the decision and the rejected alternatives (POP3, a custom sync service, Gmail
-API as the primary protocol).
+ADR-0003 records the decision and the rejected alternatives (POP3, a custom sync service, Gmail API
+as the primary protocol).
 
 ## 6. Rendering mail
 
@@ -539,6 +666,9 @@ ADR-0001.
 
 - TLS only; certificate validation cannot be disabled from the UI. The IMAP client verifies with
   the operating system's verifier, refuses STARTTLS downgrades, and has no plaintext mode at all.
+- Sync is read-only against the server: bodies arrive only through `BODY.PEEK[]`, and the reconciler
+  never sends `STORE`, `EXPUNGE`, `COPY`, `MOVE` or `APPEND`. Its status record holds counts and a
+  fixed failure sentence, never a server name, an address, a credential or message text.
 - Credentials in the OS keyring; OAuth2 PKCE with a loopback redirect for providers that require it.
 - Store encrypted at rest: SQLCipher for the database, XChaCha20-Poly1305 under an HKDF subkey for
   attachment blobs; the key is generated on first run and kept in the keyring.
@@ -573,3 +703,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P4b: `postino-crypto` derives HKDF subkeys and seals with XChaCha20-Poly1305; `postino-store` gains a deduplicated, compressed, encrypted blob directory for attachment bytes and the engine gains the attachment read/write seam |
 | 2026-10-25 | minor | P4c: blob review closure — per-database-file blob namespace, authenticated dedup that heals a corrupt file, BLAKE3 verification on read, durable publish, size-preserving attachment patches, no echoed ids |
 | 2026-10-25 | major | P5a: `postino-net` speaks IMAP4rev1 over implicit TLS or STARTTLS with OS verification, bounded lines/literals/commands, typed errors and a scripted hostile-server corpus; the sync loop and store writes are still missing |
+| 2026-10-25 | major | P5b: `postino-testkit` moves the scripted server and TLS CA out of the net tests; `postino-sync` reconciles folders, UIDVALIDITY, incremental UID windows, MIME bodies, attachment blobs, deletions, flags and a persistent status with cancellation. No operation, CLI or UI calls it yet. |

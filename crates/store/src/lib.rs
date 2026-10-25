@@ -47,7 +47,7 @@ mod repo;
 pub use blob::BlobStore;
 pub use model::{
     Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, Label, LabelCount, Message, MessageCounts, MessageFilter,
-    MessagePage, MessageSummary,
+    MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
 };
 
 use std::fmt;

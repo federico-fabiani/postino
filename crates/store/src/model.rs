@@ -137,6 +137,36 @@ pub struct FlagUpdate {
     pub starred: Option<bool>,
 }
 
+/// What a sync pass needs to know about a message that may already be cached: where it lives and
+/// which flags the user sees. Reading only this keeps a per-message drift check cheap; the body and
+/// label queries are not needed for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageFlags {
+    pub folder_id: String,
+    pub unread: bool,
+    pub starred: bool,
+}
+
+/// The per-folder sync cursor.
+///
+/// `uid_next` is the next UID the reconciler still has to fetch: the highest committed UID plus one,
+/// advanced only after a message transaction succeeds. It is deliberately separate from
+/// [`Folder::uid_next`], which is the raw `UIDNEXT` the server advertised at `SELECT` time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncState {
+    pub folder_id: String,
+    pub uid_next: u32,
+    pub highest_modseq: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+/// One cached server UID: the identity a deletion pass compares against the server's UID list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UidEntry {
+    pub message_id: String,
+    pub uid: u32,
+}
+
 /// The message-list query. Folder, label and flag filters combine with `AND`; `None` means "every".
 /// `limit` is clamped to 1..=500 (over the cap included) and `offset` is a row offset, not a page.
 #[derive(Debug, Clone, PartialEq, Eq)]

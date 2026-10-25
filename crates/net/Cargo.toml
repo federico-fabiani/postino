@@ -18,7 +18,7 @@ tokio-rustls.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-rcgen.workspace = true
+postino-testkit.workspace = true
 
 [lints]
 workspace = true

@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
+use cargo_metadata::DependencyKind;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -84,15 +85,29 @@ fn layers() -> Result<()> {
         ("postino-core", &["postino-store"][..]),
         ("postino-crypto", &[][..]),
         ("postino-mime", &[][..]),
-        ("postino-net", &[][..]),
+        // The network layer knows nothing above it. Its tests use the shared fake server, which is a
+        // dev-dependency and is checked as such below.
+        ("postino-net", &["postino-testkit"][..]),
         ("postino-platform", &[][..]),
         // The store encrypts attachment blobs with a subkey from the crypto crate.
         ("postino-store", &["postino-crypto"][..]),
+        // Reconciliation drives the store and speaks IMAP through the network crate; MIME turns
+        // bodies into rows. `postino-core` is a dev-dependency for the offline engine test only.
+        ("postino-sync", &["postino-core", "postino-mime", "postino-net", "postino-store", "postino-testkit"][..]),
+        // Test infrastructure: it may use the network types it scripts, and nothing may link it in
+        // a production binary (enforced below).
+        ("postino-testkit", &["postino-net"][..]),
         ("postino-app", &["postino-core"][..]),
         ("postino-cli", &["postino-core", "postino-store", "postino-platform"][..]),
         ("xtask", &[][..]),
     ]);
     let ui_crates = ["eframe", "egui", "egui_extras", "winit", "rfd"];
+
+    // Crates that may only enter a package through `[dev-dependencies]`. The fake server and its
+    // TLS fixture must never be reachable from a production build, and `postino-sync` uses the
+    // engine only to prove an offline read.
+    let dev_only: HashMap<&str, &[&str]> =
+        HashMap::from([("postino-net", &["postino-testkit"][..]), ("postino-sync", &["postino-core", "postino-testkit"][..])]);
 
     for package in &metadata.packages {
         let Some(permitted) = allowed.get(package.name.as_str()) else {
@@ -105,8 +120,16 @@ fn layers() -> Result<()> {
             if !permitted.contains(&dependency.name.as_str()) {
                 bail!("layering: {} may not depend on workspace crate {}", package.name, dependency.name);
             }
+            let test_only = dependency.name == "postino-testkit"
+                || dev_only.get(package.name.as_str()).is_some_and(|names| names.contains(&dependency.name.as_str()));
+            if test_only && dependency.kind != DependencyKind::Development {
+                bail!("layering: {} may use {} only as a dev-dependency", package.name, dependency.name);
+            }
         }
-        if matches!(package.name.as_str(), "postino-core" | "postino-mime" | "postino-platform" | "postino-store") {
+        if matches!(
+            package.name.as_str(),
+            "postino-core" | "postino-mime" | "postino-platform" | "postino-store" | "postino-sync" | "postino-testkit"
+        ) {
             for dependency in &package.dependencies {
                 if ui_crates.contains(&dependency.name.as_str()) {
                     bail!("layering: {} must stay headless, but depends on {}", package.name, dependency.name);

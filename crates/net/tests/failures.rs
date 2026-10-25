@@ -1,11 +1,9 @@
 //! Timeouts and abrupt closes at every phase: always a typed error, never a panic or a hang.
 
-mod support;
-
 use std::time::Duration;
 
 use postino_net::{NetError, Session, UidSet};
-use support::{FakeServer, TlsFixture};
+use postino_testkit::{FakeServer, PASSWORD, TlsFixture, USER};
 
 const SHORT: Duration = Duration::from_millis(250);
 
@@ -48,15 +46,9 @@ async fn tls_handshake_timeout() {
         conn.delay(Duration::from_secs(3)).await;
     })
     .await;
-    let config = postino_net::ImapConfig::new(
-        "localhost",
-        server.port(),
-        postino_net::TlsMode::Implicit,
-        support::USER,
-        postino_net::Secret::new(support::PASSWORD),
-    )
-    .with_timeout(SHORT)
-    .with_extra_root(tls.ca());
+    let config = postino_net::ImapConfig::new("localhost", server.port(), postino_net::TlsMode::Implicit, USER, postino_net::Secret::new(PASSWORD))
+        .with_timeout(SHORT)
+        .with_extra_root(tls.ca());
     let error = Session::connect(config).await.expect_err("the server never speaks TLS");
     match error {
         NetError::Timeout { phase, .. } => assert_eq!(phase, "tls"),
@@ -186,7 +178,7 @@ async fn connecting_to_a_closed_port_is_a_typed_error() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
-    let config = postino_net::ImapConfig::new("127.0.0.1", port, postino_net::TlsMode::Implicit, support::USER, postino_net::Secret::new("x"))
+    let config = postino_net::ImapConfig::new("127.0.0.1", port, postino_net::TlsMode::Implicit, USER, postino_net::Secret::new("x"))
         .with_timeout(SHORT)
         .with_extra_root(tls.ca());
     let error = Session::connect(config).await.expect_err("nothing listens there");
@@ -196,10 +188,9 @@ async fn connecting_to_a_closed_port_is_a_typed_error() {
 #[tokio::test]
 async fn an_unresolvable_host_is_a_dns_error() {
     let tls = TlsFixture::generate();
-    let config =
-        postino_net::ImapConfig::new("no-such-host.invalid", 993, postino_net::TlsMode::Implicit, support::USER, postino_net::Secret::new("x"))
-            .with_timeout(Duration::from_secs(5))
-            .with_extra_root(tls.ca());
+    let config = postino_net::ImapConfig::new("no-such-host.invalid", 993, postino_net::TlsMode::Implicit, USER, postino_net::Secret::new("x"))
+        .with_timeout(Duration::from_secs(5))
+        .with_extra_root(tls.ca());
     let error = Session::connect(config).await.expect_err("the name does not resolve");
     assert!(matches!(error, NetError::Dns { .. }), "{error:?}");
 }

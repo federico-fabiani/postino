@@ -1,6 +1,9 @@
 # Postino roadmap
 
 > **Current milestone:** U0 — UI foundation (M0 skeleton done) · **Last updated:** 2026-10-25
+>
+> The M1 backend packages P3-P5b are ahead of the app: the store, MIME, blobs, IMAP and sync exist as
+> tested crates, while the desktop app still boots on demo data until onboarding (P6).
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.
@@ -62,16 +65,26 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] MIME parsing, allowlist HTML sanitization, HTML-to-text and RFC 5322 serialization as the
       `postino-mime` crate (P4a): bounded input, warnings, header-injection guards, deterministic
       bytes, ten synthetic fixtures and a mutation corpus.
-- [ ] Attachment blob storage and MIME wiring into the engine/store (P4b).
+- [x] Encrypted attachment blob storage and the engine seam (P4b); received MIME is parsed by
+      `postino-sync` (P5b). Local drafts still carry a plain-text body.
 - [ ] Account onboarding with autodiscovery and Aruba app-password flow.
 - [x] IMAP: CAPABILITY, LOGIN/AUTH, LIST, SELECT, UID FETCH envelope/flags/body, IDLE, as the
-      `postino-net` client crate (P5a): TLS-only, bounded, typed errors, scripted TLS server and a
-      54-case hostile corpus. The sync loop, cache and offline mode are still open.
-- [ ] Local cache and offline mode; folder tree from special-use attributes.
+      `postino-net` client crate (P5a): TLS-only, bounded, typed errors, and a 54-case hostile corpus
+      against the scripted TLS server now shared as `postino-testkit`.
+- [x] Sync into the encrypted store as the `postino-sync` crate (P5b): folder discovery with
+      special-use, UIDVALIDITY resets, incremental UID windows, MIME bodies, attachment blobs,
+      deletion pass, flags on first insert with drift reporting, cancellable runs and a persistent
+      status. 111 net tests plus the sync suite, a 2 000-message test in CI and 10 000 behind
+      `POSTINO_SLOW_TESTS=1`. **No operation, CLI command, MCP tool, UI or scheduler calls it yet.**
+- [x] Local cache and offline read: a synced mailbox opened through `Engine::open` serves bodies and
+      attachment bytes with the network off (proved by the sync suite). The folder tree comes from
+      the server's special-use attributes.
+- [ ] Wire sync to the operation registry and the CLI, so a user can start a run (P6).
 - [ ] Message list and reading pane fed by the store, not demo data.
 - [ ] Sync status and errors the user can act on.
-- [ ] Verify: 10,000-message sync under a time/memory budget; kill mid-sync and resume without
-      duplicates; read a message with the network off.
+- [x] Verify at crate level: 10 000-message sync under a time/memory budget (56 s / 38.6 MB peak
+      working set on the Windows GNU host), cancel mid-sync and resume without duplicates, and read a
+      message with the network off. The app-level verify waits for P6.
 
 ## M2 — write real mail
 

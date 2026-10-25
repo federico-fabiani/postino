@@ -1,0 +1,18 @@
+[package]
+name = "postino-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test-only fake IMAP server, TLS fixture, response builders and synthetic mail"
+
+[dependencies]
+base64.workspace = true
+postino-net.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+
+[lints]
+workspace = true
