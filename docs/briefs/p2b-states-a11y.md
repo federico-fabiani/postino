@@ -51,6 +51,15 @@ Rows never call `widget_info`; the star is a bare label; the focus ring conditio
 - Test with the probe: row rect, star rect >= 28, accessible label text, focus ring state reachable
   by keyboard.
 
+## 4. MINOR — the list loses every date at 1280×720
+
+P2a drops the date column below 560 pt of list width. At 1280×720 the list is ~499 pt, so the
+default laptop window shows no date at all; “when” is a primary scanning axis in mail.
+
+**Fix.** Keep a compact date column at 1280: `HH:MM` for today, `dd/MM` for this year, `dd/MM/yy`
+otherwise (monospace, 44 pt). Drop it only below 480 pt of list width, and prove the subject still
+gets at least 260 pt at a 499 pt list. Update the screenshot and the plan's column rule.
+
 ## 5. MINOR — `U` right after opening is overridden by the auto-read timer
 
 `mark_unread` does not cancel `pending_read`; 600 ms later the message is marked read and the toast
