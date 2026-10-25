@@ -5,6 +5,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,6 +15,8 @@ use postino_net::CertificateDer;
 use postino_store::{Account, AccountServer, AccountTls, Store};
 use postino_testkit::{FakeServer, TestFolder, USER, serve_mailbox};
 use zeroize::Zeroizing;
+
+use crate::seams::{FileSaver, FolderOpener, LinkOpener};
 
 #[derive(Default)]
 pub struct MemoryVault {
@@ -252,4 +256,112 @@ pub fn three_folders() -> Vec<TestFolder> {
             .with_messages(vec![postino_testkit::TestMessage::synthetic(postino_testkit::synthetic_message(3))]),
         TestFolder::new("Trash", 30).with_special_use("\\Trash"),
     ]
+}
+
+/// A private test directory for P6c files. Nothing outside it may be removed.
+pub fn directory(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join("opencode").join("p6c-postino").join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&path);
+    path
+}
+
+#[derive(Default)]
+pub struct RecordingLinkOpener {
+    opened: Mutex<Vec<String>>,
+}
+
+impl RecordingLinkOpener {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn opened(&self) -> Vec<String> {
+        self.opened.lock().map(|opened| opened.clone()).unwrap_or_default()
+    }
+}
+
+impl LinkOpener for RecordingLinkOpener {
+    fn open(&self, url: &str) -> Result<(), String> {
+        if let Ok(mut opened) = self.opened.lock() {
+            opened.push(url.to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct RecordingFileSaver {
+    path: Mutex<Option<PathBuf>>,
+    writes: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+    choose_calls: AtomicUsize,
+    fail: Mutex<Option<String>>,
+}
+
+impl RecordingFileSaver {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn set_path(&self, path: Option<PathBuf>) {
+        if let Ok(mut target) = self.path.lock() {
+            *target = path;
+        }
+    }
+
+    pub fn choose_calls(&self) -> usize {
+        self.choose_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        self.writes.lock().map(|writes| writes.clone()).unwrap_or_default()
+    }
+
+    pub fn fail_with(&self, error: &str) {
+        if let Ok(mut fail) = self.fail.lock() {
+            *fail = Some(error.to_owned());
+        }
+    }
+}
+
+impl FileSaver for RecordingFileSaver {
+    fn choose_path(&self, _suggested_name: &str) -> Result<Option<PathBuf>, String> {
+        self.choose_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.path.lock().ok().and_then(|path| path.clone()))
+    }
+
+    fn write(&self, path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+        if let Ok(fail) = self.fail.lock()
+            && let Some(error) = fail.as_ref()
+        {
+            return Err(error.clone());
+        }
+        if let Ok(mut writes) = self.writes.lock() {
+            writes.push((path.to_path_buf(), bytes.to_vec()));
+        }
+        std::fs::write(path, bytes).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Default)]
+pub struct RecordingFolderOpener {
+    opened: Mutex<Vec<PathBuf>>,
+}
+
+impl RecordingFolderOpener {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn opened(&self) -> Vec<PathBuf> {
+        self.opened.lock().map(|opened| opened.clone()).unwrap_or_default()
+    }
+}
+
+impl FolderOpener for RecordingFolderOpener {
+    fn open(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Ok(mut opened) = self.opened.lock() {
+            opened.push(path.to_path_buf());
+        }
+        Ok(())
+    }
 }

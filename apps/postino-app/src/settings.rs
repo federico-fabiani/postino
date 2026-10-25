@@ -23,6 +23,8 @@ const MAX_ACCOUNT_ID: usize = 64;
 pub struct Settings {
     pub version: u32,
     pub dark: bool,
+    /// Follow the operating system theme instead of forcing `dark`.
+    pub system_theme: bool,
     /// The reading pane as a fraction of the width left by the sidebar.
     pub reading_pane_ratio: f32,
     pub folder: String,
@@ -36,6 +38,7 @@ impl Default for Settings {
         Self {
             version: SETTINGS_VERSION,
             dark: false,
+            system_theme: false,
             reading_pane_ratio: DEFAULT_READING_PANE_RATIO,
             folder: "inbox".to_owned(),
             reduced_motion: false,
@@ -151,6 +154,7 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.version, SETTINGS_VERSION);
         assert!(!settings.dark);
+        assert!(!settings.system_theme);
         assert_eq!(settings.reading_pane_ratio, 0.52);
         assert_eq!(settings.folder, "inbox");
         assert!(!settings.reduced_motion);
@@ -162,6 +166,7 @@ mod tests {
         let path = path("round-trip");
         let saved = Settings {
             dark: true,
+            system_theme: true,
             reading_pane_ratio: 0.47,
             folder: "archive".to_owned(),
             reduced_motion: true,
@@ -210,7 +215,7 @@ mod tests {
         }
         let fields = serde_json::from_str::<serde_json::Value>(&text).expect("valid JSON");
         let keys = fields.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-        assert_eq!(keys.len(), 6, "only the six documented settings: {keys:?}");
+        assert_eq!(keys.len(), 7, "only the seven documented settings: {keys:?}");
         let _ = std::fs::remove_file(&path);
     }
 

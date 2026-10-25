@@ -6,9 +6,10 @@ registry shared by the desktop app, the CLI and an MCP server.
 > **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
 > the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
 > store (P5b/P5c) + accounts, credentials and sync operations (P6a) + onboarding and the app on real
-> data (P6b).** The desktop app opens the encrypted SQLCipher store by default, offers a guided
-> Aruba/Gmail/custom onboarding with a real connection test and background sync, and reads cached
-> mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI and the MCP
+> data (P6b) + the text reading pane, safe links, attachment Save and full settings (P6c).** The
+> desktop app opens the encrypted SQLCipher store by default, offers a guided Aruba/Gmail/custom
+> onboarding with a real connection test and background sync, and reads cached mail offline; `--demo`
+> keeps the synthetic mailbox for screenshots and trials. The CLI and the MCP
 > server use the same operation registry: `postino --store <path>` (or the default
 > `%LOCALAPPDATA%\Postino\mail.db` on Windows) runs the same operations on the encrypted database,
 > and the CLI can add a real Aruba or Gmail account with an app password, test it, sync it and remove
@@ -48,6 +49,17 @@ MCP      ─┘
   and see label chips in the reading pane. A label view spans every folder by default and a folder
   narrows it; ids are stable and never reused. Rename, delete and apply/remove are undoable in the
   app; creating a label is not an undo step. Labels are in-memory metadata until M1.
+- A text reading pane with sender, recipients, Cc, date, subject and label chips, a quiet “Vista
+  testo” note, the remote-content references still visible in the cached HTML, and safe links. Only
+  absolute `http`, `https` and `mailto` are clickable; the full destination appears on hover and in a
+  confirmation sheet, and only **Apri** hands it to the system browser. A punycode (`xn--`) host
+  warns first. No `javascript:`, `file:`, `data:`, `vbscript:` or relative target is ever a link.
+- Attachment Save through the native Save dialog writes the exact blob bytes, warns before saving an
+  executable or macro-enabled file, refuses to replace an existing file until confirmed, and reports
+  a missing blob as a readable toast. Settings covers accounts (add, remove, active, last sync),
+  appearance (light/dark/system, reduced motion, reading width), data (store and blob paths, open the
+  blob folder) and version, licences and shortcuts; every section fits 980×600 and returns focus to
+  the account switcher on `Esc`.
 - Twenty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_test`, `account_remove`, `sync_now`, `sync_status`, `folders_list`, `messages_list`,
   `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_send`, `search`, `labels_list`,
@@ -67,15 +79,15 @@ MCP      ─┘
 - The M1 MIME foundation as a crate (`postino-mime`, P4a): bounded RFC 5322/2045 parsing with
   recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
-  guards and `Bcc` kept in the envelope. It is not wired into the engine or the app yet, so the
-  shell still shows demo mail.
+  guards and `Bcc` kept in the envelope. It is wired into sync and the engine; the desktop reading
+  pane shows its text alternative and does not render HTML yet.
 - Encrypted attachment bytes (P4b): `postino-crypto` derives an HKDF-SHA256 `blob` subkey from the
   store key and seals bytes with XChaCha20-Poly1305; `postino-store` keeps each distinct attachment
   content once under `<db file>.blobs/<xx>/<hash>.blob` (BLAKE3 name, zstd only when it helps,
   authenticated dedup that heals a damaged file, bounded reads, atomic writes), and
   `attachments.blob_hash` finally points at something. The engine exposes `attachment_bytes` and
-  `store_attachment_bytes`, with tests across a reopen; sync (P5b) and the reading pane (P6) are the
-  consumers, so no operation, CLI command or screen uses it yet.
+  `store_attachment_bytes`, with tests across a reopen; sync writes the bytes and the P6c reading
+  pane reads them through `attachment_bytes` when a person saves an attachment.
 - The M1 network foundation as a crate (`postino-net`, P5a): an IMAP4rev1 client over implicit TLS
   or STARTTLS, with the operating system's certificate verifier and no way to switch verification
   off. It logs in with `AUTHENTICATE PLAIN` or `LOGIN`, lists folders with special-use and modified
@@ -97,14 +109,19 @@ MCP      ─┘
   cancellation + reopen, `BODY.PEEK`-only and an offline read through `Engine::open`), with a
   2 000-message test in CI and 10 000 behind `POSTINO_SLOW_TESTS=1`. P6a wires it to `sync_now`, so
   the CLI (`postino sync run`) and MCP can run it on demand; there is still no scheduler or daemon.
-- Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
-  MCP protocol tests, and store round-trip tests at both the repository and engine level.
+- Headless rendering tests of the shell, gallery, composer and label flows, the reading pane's
+  link/attachment/settings paths with injected opener/saver recorders, operation-schema tests, MCP
+  protocol tests, and store round-trip tests at both the repository and engine level.
 
 ![Postino composer: recipients, subject, Markdown formatting bar, body and attachment, with the draft save state in the footer](docs/images/postino-u04-compose.png)
 
 ![Postino labels: the Lavoro view with the mailbox-wide scope in the header, the filtered message list and the coloured label rows in the ETICHETTE sidebar](docs/images/postino-u05-labels.png)
 
 ![Postino label menu: the modal label picker with its scrim over the list, Lavoro already applied and visible in the reading-pane chip](docs/images/postino-u05-label-menu.png)
+
+![Postino reading pane: sender and recipients, label chip, remote-content line, the text view note, a safe link and an attachment with Save](docs/images/postino-p6c-reading-attachments.png)
+
+![Postino settings: accounts with the active badge, appearance choices, store and blob paths, last sync, and the licences and shortcut entries](docs/images/postino-p6c-settings.png)
 
 Everything below the UI is headless and has no egui dependency.
 
@@ -235,7 +252,10 @@ The GNU toolchain plus MSYS2 is the path documented here.
   fidelity without letting a browser engine into the rest of the app.
 - **Honest limits.** IMAP is the sync protocol; the server stays the source of truth. Avatars shown
   to recipients depend on BIMI or a signature, not on this client. Auto-reply and server-side
-  filters are provider features. See [docs/product.md](docs/product.md).
+  filters are provider features. The reading pane shows the plain-text alternative: it does not
+  render HTML and never loads remote images. A link reaches the system browser only after the
+  confirmation sheet, and Save writes attachment bytes to the chosen path without opening the file.
+  See [docs/product.md](docs/product.md).
 
 ## Documentation
 

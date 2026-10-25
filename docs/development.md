@@ -211,9 +211,33 @@ they have a reason to exist.
   undo path, the empty-state resolver and its three rendered filter states, contrast tokens and
   computed button hints, accessible row names and star targets, keyboard focus, the auto-read
   cancellation, the settings round trip and the plain/Shift J/K anchor. The test asserts the shell
-  paints at least one shape.
+  paints at least one shape. P6c adds the link scanner and its action-boundary recheck, IDN and
+  dangerous-extension classification, exact attachment bytes, overwrite refusal then confirmation,
+  cancel/missing blob, the keyboard Save path, the link sheet and its recorder, every settings
+  section at 980×600 in both themes, focus return, the injected folder opener, one identity and one
+  Retry, and compose/reply identity. No UI test opens a browser, a native dialog or a shell.
 - **Future:** a fake IMAP/SMTP server, property tests for the network parsers, fuzzing for MIME and
   HTML.
+
+### Desktop OS seams (P6c)
+
+The desktop shell is the only place that leaves Rust for a user action. Each exit is a trait in
+`apps/postino-app/src/seams.rs`; production installs the real adapter, tests and screenshots install
+an unavailable or recording one:
+
+- `LinkOpener` — `webbrowser` in production; `RecordingLinkOpener` in tests. The UI allowlists the
+  scheme in `reading::find_links` and rechecks it before the confirmation sheet, so a recorder only
+  ever sees an allowed URL the person confirmed.
+- `FileSaver` — `rfd`'s native Save dialog plus `std::fs::write` in production; `RecordingFileSaver`
+  in tests. The app checks overwrite itself and calls `write` once with the exact blob bytes;
+  `CancellingFileSaver` is the default in demo/screenshot state so a stray click cannot open a
+  dialog.
+- `FolderOpener` — the platform file manager in production; `RecordingFolderOpener` in tests and an
+  unavailable adapter elsewhere. It only receives the blob directory derived from the store path.
+
+Keeping the seam at the action boundary, not inside the engine, is deliberate: the scanner, filename
+rules and warnings stay pure and testable, and no native dialog, browser or shell runs in CI. The
+only new dependencies are `rfd` and `webbrowser`, both in `apps/postino-app` only.
 
 Run the full suite before a commit:
 
@@ -258,6 +282,11 @@ cargo run -p postino-app -- --screenshot mailbox --dark --out docs/images/postin
 cargo run -p postino-app -- --screenshot offline --dark --out docs/images/postino-p6b-offline-dark.png
 cargo run -p postino-app -- --screenshot mailbox --size 980x600 --out docs/images/postino-p6b-mailbox-980.png
 cargo run -p postino-app -- --screenshot onboarding_folders --size 980x600 --out docs/images/postino-p6b-onboarding-folders-980.png
+cargo run -p postino-app -- --screenshot reading_attachments --out docs/images/postino-p6c-reading-attachments.png
+cargo run -p postino-app -- --screenshot link_confirm --out docs/images/postino-p6c-link-confirm.png
+cargo run -p postino-app -- --screenshot settings --out docs/images/postino-p6c-settings.png
+cargo run -p postino-app -- --screenshot settings --dark --out docs/images/postino-p6c-settings-dark.png
+cargo run -p postino-app -- --screenshot settings --size 980x600 --out docs/images/postino-p6c-settings-980.png
 ```
 
 The states are `shell` (demo inbox, no selection), `reading` (first inbox message open),
@@ -269,9 +298,12 @@ the docs fixture), `palette` (command palette open), `labels` (Lavoro filter act
 (inbox mail with attachments moved out and the attachments filter on), `empty_label_unread`
 (Lavoro selected, its unread mail read, the unread filter on), `onboarding_welcome`, `onboarding_provider`,
 `onboarding_form`, `onboarding_error`, `onboarding_folders`, `onboarding_sync`, `mailbox` (the shell
-with a seeded updated-at state) and `offline` (a cached message open under the offline banner). The
-onboarding and mailbox scenes are deterministic fixtures; they do not read a store or touch the
-network. `--dark` applies the dark theme.
+with a seeded updated-at state), `offline` (a cached message open under the offline banner),
+`reading_attachments` (a deterministic message with a safe link, a remote-content line and one PDF
+attachment), `link_confirm` (the same message under the full-destination sheet) and `settings` (the
+full settings dialog). The onboarding, mailbox and P6c scenes are deterministic fixtures; they do not
+read a store or touch the network, and the P6c scenes install the unavailable/cancelling seams so no
+native dialog or browser can open. `--dark` applies the dark theme.
 `--gallery` is a separate component review window, not a screenshot state, and cannot be combined
 with `--screenshot`.
 

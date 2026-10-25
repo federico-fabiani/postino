@@ -21,6 +21,11 @@ use serde_json::json;
 
 use crate::boot::{self, BootFailure, Launch, StoreHandle};
 use crate::onboarding::{self, ConnectionError, ErrorKind, FocusField, FolderPreview, FolderRole, FoldersPreview, Onboarding, ProviderChoice, Stage};
+use crate::reading::{self, DangerousKind, ExtractedLink};
+use crate::seams::{
+    CancellingFileSaver, FileSaver, FolderOpener, LinkOpener, RfdFileSaver, SystemFolderOpener, SystemLinkOpener, UnavailableFolderOpener,
+    UnavailableLinkOpener,
+};
 use crate::settings::Settings;
 use crate::sync_worker::{SyncEvent, SyncProgress, SyncRequest, SyncWorker};
 use crate::theme::{self, GOLD, IVORY, Tokens};
@@ -58,6 +63,9 @@ pub enum ScreenshotState {
     OnboardingSync,
     Mailbox,
     Offline,
+    ReadingAttachments,
+    LinkConfirm,
+    Settings,
 }
 
 impl ScreenshotState {
@@ -82,10 +90,13 @@ impl ScreenshotState {
             "onboarding_sync" => Ok(Self::OnboardingSync),
             "mailbox" => Ok(Self::Mailbox),
             "offline" => Ok(Self::Offline),
+            "reading_attachments" => Ok(Self::ReadingAttachments),
+            "link_confirm" => Ok(Self::LinkConfirm),
+            "settings" => Ok(Self::Settings),
             other => Err(format!(
                 "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
                  empty_unread, empty_attachments, empty_label_unread, onboarding_welcome, onboarding_provider, onboarding_form, onboarding_error, \
-                 onboarding_folders, onboarding_sync, mailbox, offline"
+                 onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, link_confirm, settings"
             )),
         }
     }
@@ -236,6 +247,34 @@ pub struct PostinoApp {
     focus_selected_row: bool,
     /// Deterministic PNG capture, set only by `--screenshot`.
     screenshot: Option<ScreenshotMode>,
+    /// The operating-system seams. Tests replace the defaults with recorders; production launch
+    /// installs the browser, rfd and file-manager adapters.
+    link_opener: Arc<dyn LinkOpener>,
+    file_saver: Arc<dyn FileSaver>,
+    folder_opener: Arc<dyn FolderOpener>,
+    /// A link waiting for the confirmation sheet. The URL has already passed the allowlist.
+    pending_link: Option<PendingLink>,
+    /// A dangerous attachment waiting for the explicit warning.
+    attachment_warning: Option<PendingAttachment>,
+    /// An attachment whose chosen path already exists and waits for overwrite confirmation.
+    attachment_overwrite: Option<PendingAttachment>,
+    /// Stable Save-button ids so a headless test can drive the keyboard path.
+    attachment_save_ids: BTreeMap<String, Id>,
+    /// A message override used only by deterministic screenshots (HTML plus attachment fixtures).
+    screenshot_message: Option<Message>,
+    /// The sidebar account row, used to return focus when settings closes.
+    account_switcher_id: Option<Id>,
+    /// The widget to restore when the settings dialog closes.
+    settings_return_focus: Option<Id>,
+    settings_focus_pending: bool,
+    /// Request focus on the sidebar account row on the next frame. Used after closing settings.
+    focus_account_switcher: bool,
+    /// The attribution document is a nested dialog, not a browser or a shell.
+    show_licences: bool,
+    licences_return_focus: Option<Id>,
+    licences_focus_pending: bool,
+    /// Whether the theme follows the operating system instead of `dark`.
+    system_theme: bool,
 }
 
 impl PostinoApp {
@@ -257,6 +296,15 @@ impl PostinoApp {
         app.apply_settings(settings);
         app.reduced_motion = reduced;
         app.settings_path = settings_path;
+        app.link_opener = Arc::new(SystemLinkOpener);
+        app.file_saver = Arc::new(RfdFileSaver);
+        app.folder_opener = Arc::new(SystemFolderOpener);
+        if app.system_theme
+            && let Some(theme) = cc.egui_ctx.system_theme()
+        {
+            app.dark = theme == egui::Theme::Dark;
+            theme::apply(&cc.egui_ctx, app.dark);
+        }
         // A later launch shows the cache first and refreshes it in the background; first-run
         // onboarding has no account yet, and the demo has no server.
         if !app.demo
@@ -358,6 +406,22 @@ impl PostinoApp {
             row_ids: BTreeMap::new(),
             focus_selected_row: false,
             screenshot: None,
+            link_opener: Arc::new(UnavailableLinkOpener),
+            file_saver: Arc::new(CancellingFileSaver),
+            folder_opener: Arc::new(UnavailableFolderOpener),
+            pending_link: None,
+            attachment_warning: None,
+            attachment_overwrite: None,
+            attachment_save_ids: BTreeMap::new(),
+            screenshot_message: None,
+            account_switcher_id: None,
+            settings_return_focus: None,
+            settings_focus_pending: false,
+            focus_account_switcher: false,
+            show_licences: false,
+            licences_return_focus: None,
+            licences_focus_pending: false,
+            system_theme: false,
         }
     }
 
@@ -390,6 +454,7 @@ impl PostinoApp {
     /// Apply the state named on the command line. Every scene is deterministic: no timer, no
     /// pointer and no focus side effect may change it between the first frame and the capture.
     fn seed_screenshot(&mut self, state: ScreenshotState) {
+        self.screenshot_message = None;
         match state {
             ScreenshotState::Shell => {}
             ScreenshotState::Reading => {
@@ -560,6 +625,56 @@ impl PostinoApp {
                     self.status.clear();
                 }
             }
+            ScreenshotState::ReadingAttachments | ScreenshotState::LinkConfirm => {
+                self.demo = false;
+                let last = self.now_utc.timestamp_millis() - 12 * 60 * 1000;
+                self.sync_view = SyncView::Idle { last_sync: Some(last) };
+                self.last_sync = Some(last);
+                self.status.clear();
+                let first = self.visible_messages().0.first().map(|message| message.id.clone());
+                if let Some(id) = first {
+                    self.open_message(id.clone());
+                    self.now = 1.0;
+                    self.maybe_complete_read();
+                    self.toast = None;
+                    self.status.clear();
+                    if let Some(mut message) = self.engine.message(&id).cloned() {
+                        message.body_text = "Ciao Federico,\n\nho caricato il PDF del preventivo nella cartella condivisa.\n\nDettaglio: https://example.com/preventivo/postino-2026?token=anteprima\n\nScrivimi a mailto:giulia.ferri@example.com.\n\nGrazie,\nGiulia"
+                            .to_owned();
+                        message.body_html = Some(
+                            "<p>Ciao Federico,</p><p>ho rivisto il preventivo.</p><img src=\"https://tracker.example/pixel.png\" alt=\"\"><p><a href=\"https://example.com/preventivo/postino-2026\">Dettaglio</a></p>"
+                                .to_owned(),
+                        );
+                        if message.attachments.is_empty() {
+                            message.attachments.push(Attachment {
+                                id: "att_screenshot".to_owned(),
+                                filename: "preventivo-postino.pdf".to_owned(),
+                                mime: "application/pdf".to_owned(),
+                                size: 248_320,
+                            });
+                            message.summary.has_attachments = true;
+                        }
+                        self.screenshot_message = Some(message);
+                    }
+                }
+                if state == ScreenshotState::LinkConfirm {
+                    self.pending_link = Some(PendingLink {
+                        url: "https://example.com/preventivo/postino-2026?token=anteprima".to_owned(),
+                        idn: false,
+                        focus_cancel: false,
+                    });
+                }
+            }
+            ScreenshotState::Settings => {
+                self.demo = false;
+                let last = self.now_utc.timestamp_millis() - 12 * 60 * 1000;
+                self.sync_view = SyncView::Idle { last_sync: Some(last) };
+                self.last_sync = Some(last);
+                self.store_path = Some(PathBuf::from("C:/Users/demo/AppData/Local/Postino/mail.db"));
+                self.show_accounts_dialog = true;
+                self.settings_focus_pending = false;
+                self.status.clear();
+            }
         }
     }
 
@@ -603,6 +718,7 @@ impl PostinoApp {
     /// inbox instead of opening a blank view.
     fn apply_settings(&mut self, settings: Settings) {
         self.dark = settings.dark;
+        self.system_theme = settings.system_theme;
         if let Some(account) = settings.account
             && self.engine.accounts().iter().any(|candidate| candidate.id == account)
         {
@@ -630,6 +746,7 @@ impl PostinoApp {
         Settings {
             version: crate::settings::SETTINGS_VERSION,
             dark: self.dark,
+            system_theme: self.system_theme,
             reading_pane_ratio: self.reading_ratio,
             folder: self.folder.clone(),
             reduced_motion: self.reduced_motion,
@@ -662,9 +779,34 @@ impl PostinoApp {
 
     fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
         self.dark = dark;
+        self.system_theme = false;
         self.apply_theme(ctx);
         self.mark_settings_dirty();
         self.persist_settings();
+    }
+
+    fn set_system_theme(&mut self, ctx: &egui::Context, system: bool) {
+        self.system_theme = system;
+        if system && let Some(theme) = ctx.system_theme() {
+            self.dark = theme == egui::Theme::Dark;
+        }
+        self.apply_theme(ctx);
+        self.mark_settings_dirty();
+        self.persist_settings();
+    }
+
+    /// Keep the explicit styles aligned with the operating system while the preference is System.
+    fn follow_system_theme(&mut self, ctx: &egui::Context) {
+        if !self.system_theme {
+            return;
+        }
+        if let Some(theme) = ctx.system_theme() {
+            let dark = theme == egui::Theme::Dark;
+            if dark != self.dark {
+                self.dark = dark;
+                self.apply_theme(ctx);
+            }
+        }
     }
 
     fn set_reduced_motion(&mut self, ctx: &egui::Context, reduced: bool) {
@@ -1199,8 +1341,8 @@ impl PostinoApp {
         }
     }
 
-    fn sync_needs_retry(&self) -> bool {
-        matches!(self.sync_view, SyncView::Offline { .. } | SyncView::Error { .. })
+    fn sync_error_needs_retry(&self) -> bool {
+        matches!(self.sync_view, SyncView::Error { .. })
     }
 
     fn account_unread(&self, account_id: &str) -> u32 {
@@ -2187,15 +2329,25 @@ impl PostinoApp {
 
     fn push_toast(&mut self, message: impl Into<String>, undo: UndoAction) {
         self.failure = None;
-        self.toast = Some(ToastState { message: message.into(), undo, until: self.now + 8.0 });
+        self.toast = Some(ToastState { message: message.into(), undo: Some(undo), until: self.now + 8.0, kind: ToastKind::Info });
+    }
+
+    /// A one-shot confirmation or failure without an undo step. The error variant is dismissable;
+    /// the success/info variants disappear after eight seconds.
+    fn push_info_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
+        self.failure = None;
+        self.toast = Some(ToastState { message: message.into(), undo: None, until: self.now + 8.0, kind });
     }
 
     fn undo_last(&mut self) {
         let Some(toast) = self.toast.take() else {
             return;
         };
+        let Some(undo) = toast.undo else {
+            return;
+        };
         let mut failed = false;
-        match toast.undo {
+        match undo {
             UndoAction::Unread(changes) => {
                 for (id, unread) in changes {
                     if self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": null })).is_err() {
@@ -2364,6 +2516,10 @@ impl PostinoApp {
             || self.show_accounts_menu
             || self.show_accounts_dialog
             || self.account_remove.is_some()
+            || self.show_licences
+            || self.pending_link.is_some()
+            || self.attachment_warning.is_some()
+            || self.attachment_overwrite.is_some()
         {
             return;
         }
@@ -2826,6 +2982,7 @@ impl PostinoApp {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        self.follow_system_theme(ctx);
         // A screenshot owns a frozen clock: the frame budget, not the wall clock, decides when the
         // capture happens, and every date must render against the same instant twice in a row.
         if self.screenshot.is_none() {
@@ -2885,8 +3042,14 @@ impl PostinoApp {
             return;
         };
         let message = state.message.clone();
-        if let Some(ToastResult::Undo) = Toast::new(&message).undo("Annulla").show_overlay(ctx, "postino-toast") {
-            self.undo_last();
+        let kind = state.kind;
+        let has_undo = state.undo.is_some();
+        let toast = Toast::new(&message).kind(kind);
+        let toast = if has_undo { toast.undo("Annulla") } else { toast.dismiss() };
+        match toast.show_overlay(ctx, "postino-toast") {
+            Some(ToastResult::Undo) => self.undo_last(),
+            Some(ToastResult::Dismiss) => self.toast = None,
+            _ => {}
         }
     }
 
@@ -3086,20 +3249,13 @@ impl PostinoApp {
                 let right_rect = Rect::from_min_max(egui::pos2(rect.max.x - side_width, rect.min.y), rect.max);
 
                 ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-                    if let Some(account) = self.active_account() {
-                        let details = if account.provider.trim().is_empty() {
-                            account.email.clone()
-                        } else {
-                            format!("{} · {}", account.email, account.provider)
-                        };
-                        avatar(ui, 24.0, &initials(&account.name), t.gold, theme::FOREST);
-                        ui.add_space(space::SM);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.label(typography::strong(Role::BodySmall, account.name.clone(), t.text));
-                            ui.label(typography::text(Role::Caption, details, t.text_faint));
-                        });
-                    }
+                    logo(ui, 24.0);
+                    ui.add_space(space::SM);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new("postino").font(FontId::new(15.0, theme::display())).color(t.text));
+                        ui.label(typography::text(Role::Caption, "posta locale", t.text_faint));
+                    });
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(search_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
                     let placeholder = self.search_placeholder();
@@ -3138,32 +3294,32 @@ impl PostinoApp {
 
     /// The account switcher in the sidebar header. It is a two-line account row, not a message row:
     /// clicking it opens the account menu, and the keyboard reaches it with Tab and Enter.
-    fn sidebar_account(&mut self, ui: &mut Ui, t: &Tokens) {
+    fn sidebar_account(&mut self, ui: &mut Ui) {
         let Some(account) = self.active_account().cloned() else {
             return;
         };
         let unread = self.account_unread(&account.id);
-        let detail = if account.provider.trim().is_empty() { account.email.clone() } else { format!("{} · {}", account.email, account.provider) };
-        let meta = if unread > 0 { unread.to_string() } else { String::new() };
-        let detail_clone = detail.clone();
-        let row = ListRow::account(account.name.as_str(), detail_clone.as_str(), meta.as_str()).icon(icons::USER).height(40.0);
+        let provider = account.provider.trim();
+        let title = if provider.is_empty() { account.name.clone() } else { format!("{} · {}", account.name, provider) };
+        let meta = if unread > 0 { format!("{unread} totali") } else { String::new() };
+        let row = ListRow::account(title.as_str(), account.email.as_str(), meta.as_str()).icon(icons::USER).height(40.0);
         let response = row.show(ui);
-        let accessible = format!(
-            "Account {} — {} · {} non lett{}. Premi Invio per cambiare account.",
-            account.name,
-            detail,
-            unread,
-            if unread == 1 { "o" } else { "i" }
-        );
+        let accessible = format!("Account {} — {} · {}. Premi Invio per cambiare account.", title, account.email, account_unread_tooltip(unread));
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
         let response = response.on_hover_text(accessible);
+        self.account_switcher_id = Some(response.id);
+        if self.focus_account_switcher {
+            response.request_focus();
+            self.focus_account_switcher = false;
+        }
+        #[cfg(test)]
+        probe::identity(ui, response.rect);
         if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
             self.show_accounts_menu = true;
         }
         if response.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        let _ = t;
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
@@ -3208,7 +3364,7 @@ impl PostinoApp {
 
                 #[cfg(test)]
                 probe::clear_rows(ui);
-                self.sidebar_account(ui, &t);
+                self.sidebar_account(ui);
                 ui.add_space(space::XS);
                 // A visible bar, local to the sidebar: egui's default is a 2 pt floating sliver
                 // that only appears on hover, which at 980×600 hid the overflow instead of
@@ -3378,7 +3534,10 @@ impl PostinoApp {
                     };
                     ui.add(egui::Label::new(typography::text(Role::Meta, detail, t.text_muted)).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if Button::ghost("Riprova").size(ButtonSize::Sm).show(ui).clicked() {
+                        let retry = Button::ghost("Riprova").size(ButtonSize::Sm).show(ui);
+                        #[cfg(test)]
+                        probe::retry(ui, retry.rect);
+                        if retry.clicked() {
                             self.request_sync();
                         }
                     });
@@ -3901,7 +4060,12 @@ impl PostinoApp {
     }
 
     fn reading_content(&mut self, ui: &mut Ui, t: &Tokens, full: bool) {
-        let message = self.selected.as_deref().and_then(|id| self.engine.message(id)).cloned();
+        let selected = self.selected.clone();
+        let message = self
+            .screenshot_message
+            .clone()
+            .filter(|message| selected.as_deref() == Some(message.summary.id.as_str()))
+            .or_else(|| selected.as_deref().and_then(|id| self.engine.message(id)).cloned());
         let now_utc = self.now_utc;
         let Some(message) = message else {
             self.close_reading();
@@ -3909,6 +4073,8 @@ impl PostinoApp {
         };
         #[cfg(test)]
         probe::clear_actions(ui);
+        #[cfg(test)]
+        probe::clear_attachment_saves(ui);
         let is_draft = self
             .engine
             .folders()
@@ -4054,7 +4220,8 @@ impl PostinoApp {
         reading_context_menu(subject, message.summary.subject.clone(), message.summary.from.display());
         ui.add_space(space::MD);
         let to = message.summary.to.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
-        Sides::new().height(38.0).show(
+        let cc = message.cc.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
+        Sides::new().height(if cc.is_empty() { 38.0 } else { 52.0 }).show(
             ui,
             |ui| {
                 ui.horizontal(|ui| {
@@ -4065,6 +4232,9 @@ impl PostinoApp {
                         let sender = ui.label(typography::strong(Role::BodySmall, message.summary.from.display(), t.text));
                         reading_context_menu(sender, message.summary.subject.clone(), message.summary.from.display());
                         ui.label(typography::text(Role::Meta, format!("a {to}"), t.text_muted));
+                        if !cc.is_empty() {
+                            ui.label(typography::text(Role::Meta, format!("Cc: {cc}"), t.text_muted));
+                        }
                     });
                 });
             },
@@ -4090,14 +4260,33 @@ impl PostinoApp {
             self.select_label(id);
             return;
         }
-        ui.add_space(space::MD);
-        ui.separator();
-        if message.body_html.is_some() {
-            ui.add_space(space::SM);
-            ui.label(typography::text(Role::Caption, "Vista testo · il rendering HTML arriverà con il visualizzatore isolato.", t.text_faint));
+        let remote_count = message.body_html.as_deref().map_or(0, reading::remote_content_count);
+        if remote_count > 0 {
+            ui.add_space(space::XS);
+            ui.horizontal(|ui| {
+                ui.label(icons::icon(icons::EYE_OFF, 14.0, t.gold_ink));
+                ui.add_space(space::SM);
+                ui.label(typography::text(
+                    Role::Caption,
+                    format!(
+                        "{remote_count} immagin{} remot{} bloccat{} · il contenuto arriva dal server e non viene caricato",
+                        if remote_count == 1 { "e" } else { "i" },
+                        if remote_count == 1 { "a" } else { "e" },
+                        if remote_count == 1 { "a" } else { "e" }
+                    ),
+                    t.text_faint,
+                ));
+            });
         }
         ui.add_space(space::MD);
+        ui.separator();
+        ui.add_space(space::SM);
+        ui.label(typography::text(Role::Caption, "Vista testo · il rendering HTML arriverà con il visualizzatore isolato.", t.text_faint));
+        ui.add_space(space::MD);
         egui::ScrollArea::vertical().id_salt(("reading-scroll", message.summary.id.as_str())).auto_shrink([false, false]).show(ui, |ui| {
+            let mut clicked_link = None;
+            let mut requested_save = None;
+            let mut save_ids = BTreeMap::new();
             for paragraph in message.body_text.split("\n\n") {
                 let paragraph = paragraph.trim();
                 if paragraph.is_empty() {
@@ -4107,11 +4296,13 @@ impl PostinoApp {
                     Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
                         ui,
                         |ui| {
-                            ui.label(typography::text(Role::Secondary, paragraph, t.text_muted));
+                            if let Some(link) = link_paragraph(ui, paragraph, t, true) {
+                                clicked_link = Some(link);
+                            }
                         },
                     );
-                } else {
-                    ui.label(typography::text(Role::Body, paragraph, t.text));
+                } else if let Some(link) = link_paragraph(ui, paragraph, t, false) {
+                    clicked_link = Some(link);
                 }
                 ui.add_space(space::LG);
             }
@@ -4120,6 +4311,7 @@ impl PostinoApp {
                 ui.label(typography::strong(Role::Caption, "ALLEGATI", t.text_faint));
                 ui.add_space(space::XS);
                 for attachment in &message.attachments {
+                    let mut save_clicked = false;
                     Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
                         ui,
                         |ui| {
@@ -4135,11 +4327,30 @@ impl PostinoApp {
                                         t.text_faint,
                                     ));
                                 });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let save = Button::new("Salva").icon(icons::DOWNLOAD).size(ButtonSize::Sm).show(ui);
+                                    save_ids.insert(attachment.id.clone(), save.id);
+                                    #[cfg(test)]
+                                    probe::attachment_save(ui, &attachment.id, save.rect);
+                                    if save.clicked() || (save.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
+                                        save_clicked = true;
+                                    }
+                                });
                             });
                         },
                     );
+                    if save_clicked {
+                        requested_save = Some(attachment.clone());
+                    }
                     ui.add_space(space::SM);
                 }
+            }
+            self.attachment_save_ids = save_ids;
+            if let Some(link) = clicked_link {
+                self.request_link_open(&link);
+            }
+            if let Some(attachment) = requested_save {
+                self.request_attachment_save(&attachment);
             }
         });
 
@@ -4177,6 +4388,180 @@ impl PostinoApp {
                 }
             }
             None => {}
+        }
+    }
+
+    /// The only way a link reaches the injected browser: the allowlist runs first, then this sheet,
+    /// then `confirm_pending_link`.
+    fn request_link_open(&mut self, link: &ExtractedLink) {
+        if !reading::is_allowed_url(&link.url) {
+            self.push_info_toast("Questo link non è apribile: sono ammessi solo http, https e mailto.", ToastKind::Error);
+            return;
+        }
+        self.pending_link = Some(PendingLink { url: link.url.clone(), idn: link.idn, focus_cancel: true });
+    }
+
+    fn confirm_pending_link(&mut self) {
+        let Some(pending) = self.pending_link.take() else {
+            return;
+        };
+        match self.link_opener.open(&pending.url) {
+            Ok(()) => self.push_info_toast("Link aperto nel browser", ToastKind::Success),
+            Err(error) => self.push_info_toast(format!("Non è stato possibile aprire il link: {error}"), ToastKind::Error),
+        }
+    }
+
+    fn link_confirmation(&mut self, ui: &mut Ui) {
+        let Some(pending) = self.pending_link.clone() else {
+            return;
+        };
+        let focus_cancel = pending.focus_cancel;
+        if let Some(link) = self.pending_link.as_mut() {
+            link.focus_cancel = false;
+        }
+        let body = if pending.idn {
+            format!(
+                "Aprire questo indirizzo nel browser?\n\n{}\n\nAttenzione: il dominio usa la codifica punycode (xn--). Verifica che sia il sito che ti aspetti.",
+                pending.url
+            )
+        } else {
+            format!("Aprire questo indirizzo nel browser?\n\n{}", pending.url)
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let response =
+            egui::Modal::new(Id::new("postino-link-confirm")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
+                let response = Dialog::new("Aprire il link?", &body, "Apri").secondary("Annulla").width(520.0).focus_secondary(focus_cancel).show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            });
+        if confirm {
+            self.confirm_pending_link();
+        } else if cancel || response.should_close() {
+            self.pending_link = None;
+        }
+    }
+
+    fn request_attachment_save(&mut self, attachment: &Attachment) {
+        let bytes = match self.engine.attachment_bytes(&attachment.id) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.push_info_toast("L'allegato non è disponibile nell'archivio locale: il file è mancante o danneggiato.", ToastKind::Error);
+                return;
+            }
+        };
+        let pending = PendingAttachment {
+            filename: attachment.filename.clone(),
+            bytes,
+            path: None,
+            dangerous: reading::dangerous_kind(&attachment.filename),
+            focus_cancel: true,
+        };
+        if pending.dangerous.is_some() {
+            self.attachment_warning = Some(pending);
+        } else {
+            self.choose_attachment_path(pending);
+        }
+    }
+
+    fn choose_attachment_path(&mut self, pending: PendingAttachment) {
+        let suggested = reading::safe_filename(&pending.filename);
+        match self.file_saver.choose_path(&suggested) {
+            Ok(Some(path)) => {
+                if path.is_dir() {
+                    self.push_info_toast("La destinazione scelta è una cartella, non un file.", ToastKind::Error);
+                    return;
+                }
+                let mut pending = pending;
+                pending.path = Some(path.clone());
+                if path.exists() {
+                    pending.focus_cancel = true;
+                    self.attachment_overwrite = Some(pending);
+                } else {
+                    self.write_attachment(pending);
+                }
+            }
+            Ok(None) => self.status = "Salvataggio annullato".to_owned(),
+            Err(error) => self.push_info_toast(format!("Non è stato possibile aprire la finestra di salvataggio: {error}"), ToastKind::Error),
+        }
+    }
+
+    fn write_attachment(&mut self, pending: PendingAttachment) {
+        let Some(path) = pending.path.as_ref() else {
+            return;
+        };
+        match self.file_saver.write(path, &pending.bytes) {
+            Ok(()) => self.push_info_toast(format!("Allegato “{}” salvato", pending.filename), ToastKind::Success),
+            Err(error) => self.push_info_toast(format!("Non è stato possibile salvare “{}”: {error}", pending.filename), ToastKind::Error),
+        }
+    }
+
+    fn attachment_warning_dialog(&mut self, ui: &mut Ui) {
+        let Some(pending) = self.attachment_warning.as_ref() else {
+            return;
+        };
+        let filename = pending.filename.clone();
+        let message = pending.dangerous.unwrap_or(DangerousKind::Executable).message();
+        let focus_cancel = pending.focus_cancel;
+        if let Some(pending) = self.attachment_warning.as_mut() {
+            pending.focus_cancel = false;
+        }
+        let body = format!("“{}”\n\n{}", filename, message);
+        let mut confirm = false;
+        let mut cancel = false;
+        let response =
+            egui::Modal::new(Id::new("postino-attachment-warning")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
+                let response = Dialog::new("Salvare un file potenzialmente pericoloso?", &body, "Salva comunque")
+                    .secondary("Annulla")
+                    .danger(true)
+                    .width(520.0)
+                    .focus_secondary(focus_cancel)
+                    .show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            });
+        if confirm {
+            if let Some(pending) = self.attachment_warning.take() {
+                self.choose_attachment_path(pending);
+            }
+        } else if cancel || response.should_close() {
+            self.attachment_warning = None;
+            self.status = "Salvataggio annullato".to_owned();
+        }
+    }
+
+    fn attachment_overwrite_dialog(&mut self, ui: &mut Ui) {
+        let Some(pending) = self.attachment_overwrite.as_ref() else {
+            return;
+        };
+        let path = pending.path.as_ref().map_or_else(|| pending.filename.clone(), |path| path.display().to_string());
+        let focus_cancel = pending.focus_cancel;
+        if let Some(pending) = self.attachment_overwrite.as_mut() {
+            pending.focus_cancel = false;
+        }
+        let body = format!("Il file esiste già:\n\n{path}\n\nSostituirlo? I dati del file esistente saranno persi.");
+        let mut confirm = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(Id::new("postino-attachment-overwrite")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(
+            ui.ctx(),
+            |ui| {
+                let response = Dialog::new("Sostituire il file?", &body, "Sostituisci")
+                    .secondary("Annulla")
+                    .danger(true)
+                    .width(520.0)
+                    .focus_secondary(focus_cancel)
+                    .show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            },
+        );
+        if confirm {
+            if let Some(pending) = self.attachment_overwrite.take() {
+                self.write_attachment(pending);
+            }
+        } else if cancel || response.should_close() {
+            self.attachment_overwrite = None;
+            self.status = "Salvataggio annullato".to_owned();
         }
     }
 
@@ -4241,7 +4626,63 @@ impl PostinoApp {
         }
         if manage {
             self.show_accounts_menu = false;
-            self.show_accounts_dialog = true;
+            self.open_settings(ui.ctx(), self.account_switcher_id);
+        }
+    }
+
+    fn open_settings(&mut self, ctx: &egui::Context, opener: Option<Id>) {
+        let return_focus = opener.or(self.account_switcher_id).or_else(|| ctx.memory(|memory| memory.focused()));
+        self.settings_return_focus = return_focus;
+        self.settings_focus_pending = true;
+        self.show_accounts_menu = false;
+        self.show_accounts_dialog = true;
+        self.show_licences = false;
+    }
+
+    fn close_settings(&mut self, ctx: &egui::Context) {
+        self.show_accounts_dialog = false;
+        self.show_licences = false;
+        self.focus_account_switcher = true;
+        if let Some(id) = self.settings_return_focus.take() {
+            ctx.memory_mut(|memory| memory.request_focus(id));
+        }
+    }
+
+    fn open_licences(&mut self, ctx: &egui::Context) {
+        self.licences_return_focus = ctx.memory(|memory| memory.focused());
+        self.licences_focus_pending = true;
+        self.show_licences = true;
+    }
+
+    fn close_licences(&mut self, ctx: &egui::Context) {
+        self.show_licences = false;
+        if let Some(id) = self.licences_return_focus.take() {
+            ctx.memory_mut(|memory| memory.request_focus(id));
+        }
+    }
+
+    fn account_last_sync(&self, account_id: &str) -> Option<i64> {
+        self.engine
+            .account_views()
+            .ok()
+            .and_then(|views| views.into_iter().find(|view| view.account.id == account_id))
+            .and_then(|view| view.sync)
+            .and_then(|status| status.last_success)
+            .or_else(|| (self.active_account.as_deref() == Some(account_id)).then_some(self.last_sync).flatten())
+    }
+
+    fn open_data_folder(&mut self) {
+        let Some(store_path) = self.store_path.as_ref() else {
+            self.status = "La modalità demo non ha una cartella dati".to_owned();
+            return;
+        };
+        let directory = postino_store::blob_root(store_path);
+        if !directory.is_dir() {
+            self.push_info_toast("La cartella degli allegati non esiste ancora.", ToastKind::Error);
+            return;
+        }
+        if let Err(error) = self.folder_opener.open(&directory) {
+            self.push_info_toast(format!("Non è stato possibile aprire la cartella: {error}"), ToastKind::Error);
         }
     }
 
@@ -4255,108 +4696,279 @@ impl PostinoApp {
         let mut remove = None;
         let mut add = false;
         let mut close = false;
-        let mut dark = self.dark;
+        let mut theme_choice: Option<(bool, bool)> = None;
         let mut reduced = self.reduced_motion;
+        let mut reset_pane = false;
+        let mut open_folder = false;
+        let mut licences = false;
+        let mut shortcuts = false;
+        let focus_close = self.settings_focus_pending;
+        self.settings_focus_pending = false;
+        let window = ui.ctx().content_rect();
+        let width = (window.width() - 2.0 * space::HUGE).clamp(520.0, 720.0);
+        let scroll_height = (window.height() - 160.0).clamp(240.0, 520.0);
         let response = egui::Modal::new(Id::new("postino-settings"))
             .backdrop_color(theme::scrim(self.dark))
             .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
             .show(ui.ctx(), |ui| {
-                ui.set_width(520.0);
+                ui.set_width(width);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(typography::strong(Role::Section, "Account e impostazioni", t.text));
-                        ui.label(typography::text(Role::Meta, "La pagina completa arriva con le prossime impostazioni.", t.text_faint));
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(typography::strong(Role::Section, "Impostazioni", t.text));
+                        ui.label(typography::text(Role::Meta, "Account, aspetto, dati e informazioni su Postino.", t.text_faint));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if Button::ghost("Chiudi").show(ui).clicked() {
+                        let button = Button::ghost("Chiudi").show(ui);
+                        if focus_close {
+                            button.request_focus();
+                        }
+                        if button.clicked() {
                             close = true;
                         }
                     });
                 });
-                ui.add_space(space::LG);
-                ui.label(typography::strong(Role::BodySmall, "ACCOUNT", t.text_faint));
-                ui.add_space(space::XS);
-                if accounts.is_empty() {
-                    ui.label(typography::text(Role::BodySmall, "Nessun account configurato.", t.text_muted));
-                }
-                for account in &accounts {
-                    ui.horizontal(|ui| {
-                        ui.label(icons::icon(icons::MAIL, 16.0, t.text_faint));
-                        ui.add_space(space::SM);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(typography::text(Role::BodySmall, account.name.as_str(), t.text));
-                            ui.label(typography::text(Role::Caption, account.email.as_str(), t.text_faint));
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if Button::danger("Rimuovi")
-                                .size(ButtonSize::Sm)
-                                .enabled(self.can_add_account())
-                                .disabled_reason("La modalità demo non ha un archivio locale")
-                                .show(ui)
-                                .clicked()
-                            {
-                                remove = Some(AccountRemoveState {
-                                    id: account.id.clone(),
-                                    name: account.name.clone(),
-                                    email: account.email.clone(),
-                                    last,
-                                    focus_primary: true,
-                                });
-                            }
-                        });
-                    });
+                ui.add_space(space::SM);
+                egui::ScrollArea::vertical().id_salt("settings-scroll").max_height(scroll_height).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().scroll = crate::ui::tokens::scroll_style();
+                    ui.label(typography::strong(Role::BodySmall, "ACCOUNT", t.text_faint));
                     ui.add_space(space::XS);
-                }
-                ui.add_space(space::XS);
-                if Button::new("Aggiungi account")
-                    .icon(icons::PLUS)
-                    .enabled(self.can_add_account())
-                    .disabled_reason("La modalità demo non ha un archivio locale")
-                    .show(ui)
-                    .clicked()
-                {
-                    add = true;
-                }
-                ui.add_space(space::LG);
-                ui.label(typography::strong(Role::BodySmall, "ASPETTO", t.text_faint));
-                ui.add_space(space::XS);
-                ui.horizontal(|ui| {
-                    if Button::new(if dark { "Tema scuro" } else { "Tema chiaro" })
-                        .icon(if dark { icons::MOON } else { icons::SUN })
+                    if accounts.is_empty() {
+                        ui.label(typography::text(Role::BodySmall, "Nessun account configurato.", t.text_muted));
+                    }
+                    for account in &accounts {
+                        let active = self.active_account.as_deref() == Some(account.id.as_str());
+                        Frame::new()
+                            .fill(if active { t.panel_alt } else { t.panel })
+                            .stroke(Stroke::new(1.0, if active { t.border } else { Color32::TRANSPARENT }))
+                            .corner_radius(radius::CONTROL)
+                            .inner_margin(Margin::symmetric(inset::LG, inset::XS))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(icons::icon(icons::MAIL, 16.0, if active { t.gold_ink } else { t.text_faint }));
+                                    ui.add_space(space::SM);
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 1.0;
+                                        ui.horizontal(|ui| {
+                                            ui.label(typography::text(Role::BodySmall, account.name.as_str(), t.text));
+                                            if active {
+                                                let badge = Badge::new("Attivo").kind(BadgeKind::Accent).show(ui);
+                                                badge.on_hover_text("L'account che stai leggendo");
+                                            }
+                                        });
+                                        ui.label(typography::text(Role::Caption, account.email.as_str(), t.text_faint));
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if Button::danger("Rimuovi")
+                                            .size(ButtonSize::Sm)
+                                            .enabled(self.can_add_account())
+                                            .disabled_reason("La modalità demo non ha un archivio locale")
+                                            .show(ui)
+                                            .clicked()
+                                        {
+                                            remove = Some(AccountRemoveState {
+                                                id: account.id.clone(),
+                                                name: account.name.clone(),
+                                                email: account.email.clone(),
+                                                last,
+                                                focus_primary: true,
+                                            });
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(space::XS);
+                    }
+                    if Button::new("Aggiungi account")
+                        .icon(icons::PLUS)
+                        .enabled(self.can_add_account())
+                        .disabled_reason("La modalità demo non ha un archivio locale")
                         .show(ui)
                         .clicked()
                     {
-                        dark = !dark;
+                        add = true;
                     }
-                    if Button::new(if reduced { "Animazioni ridotte" } else { "Animazioni attive" }).icon(icons::CLOCK).show(ui).clicked() {
-                        reduced = !reduced;
+
+                    ui.add_space(space::SM);
+                    ui.label(typography::strong(Role::BodySmall, "ASPETTO", t.text_faint));
+                    ui.add_space(space::XS);
+                    ui.horizontal(|ui| {
+                        let system = self.system_theme;
+                        for (label, icon, selected, choice) in [
+                            ("Chiaro", icons::SUN, !system && !self.dark, Some((false, false))),
+                            ("Scuro", icons::MOON, !system && self.dark, Some((false, true))),
+                            ("Sistema", icons::DESKTOP, system, Some((true, self.dark))),
+                        ] {
+                            if Button::new(label).icon(icon).selected(selected).show(ui).clicked()
+                                && let Some(choice) = choice
+                            {
+                                theme_choice = Some(choice);
+                            }
+                        }
+                    });
+                    ui.add_space(space::XS);
+                    ui.horizontal(|ui| {
+                        if Button::new(if reduced { "Riduci le animazioni" } else { "Animazioni attive" })
+                            .icon(icons::CLOCK)
+                            .selected(reduced)
+                            .show(ui)
+                            .clicked()
+                        {
+                            reduced = !reduced;
+                        }
+                        if Button::new("Reimposta larghezza lettura").icon(icons::SIDEBAR).show(ui).clicked() {
+                            reset_pane = true;
+                        }
+                    });
+
+                    ui.add_space(space::SM);
+                    let active = self.active_account.clone();
+                    let last_text = active
+                        .as_deref()
+                        .and_then(|id| self.account_last_sync(id))
+                        .map_or_else(|| "Ultimo sync: mai".to_owned(), |ms| format!("Ultimo sync: {}", format_millis(ms)));
+                    ui.horizontal(|ui| {
+                        ui.label(typography::strong(Role::BodySmall, "DATI", t.text_faint));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(typography::text(Role::Caption, last_text, t.text_faint));
+                        });
+                    });
+                    ui.add_space(space::XS);
+                    let path = self
+                        .store_path
+                        .as_ref()
+                        .map_or_else(|| "Modalità demo: nessun archivio locale".to_owned(), |path| path.display().to_string());
+                    ui.add(egui::Label::new(typography::mono(path.as_str(), type_size::CAPTION, t.text_faint)).truncate())
+                        .on_hover_text(path.as_str());
+                    let blob = self.store_path.as_ref().map(|path| postino_store::blob_root(path).display().to_string());
+                    if let Some(blob) = &blob {
+                        ui.add(egui::Label::new(typography::mono(blob.as_str(), type_size::CAPTION, t.text_faint)).truncate())
+                            .on_hover_text(blob.as_str());
                     }
+                    ui.add_space(space::XS);
+                    let can_open = self.store_path.is_some();
+                    if Button::new("Apri la cartella degli allegati")
+                        .icon(icons::FOLDER)
+                        .enabled(can_open)
+                        .disabled_reason("La modalità demo non ha una cartella dati")
+                        .show(ui)
+                        .clicked()
+                    {
+                        open_folder = true;
+                    }
+
+                    ui.add_space(space::SM);
+                    ui.label(typography::mono(format!("INFORMAZIONI · Postino {}", env!("CARGO_PKG_VERSION")), type_size::CAPTION, t.text_muted));
+                    ui.add_space(space::XS);
+                    ui.horizontal(|ui| {
+                        let licences_button = Button::ghost("Licenze e attribuzioni").icon(icons::INFO).show(ui);
+                        if licences_button.clicked() {
+                            licences = true;
+                        }
+                        if Button::ghost("Scorciatoie da tastiera").icon(icons::KEYBOARD).show(ui).clicked() {
+                            shortcuts = true;
+                        }
+                    });
                 });
-                ui.add_space(space::LG);
-                ui.label(typography::strong(Role::BodySmall, "ARCHIVIO", t.text_faint));
-                ui.add_space(space::XS);
-                let path =
-                    self.store_path.as_ref().map_or_else(|| "Modalità demo: nessun archivio locale".to_owned(), |path| path.display().to_string());
-                ui.add(egui::Label::new(typography::mono(path.as_str(), type_size::CAPTION, t.text_faint)).truncate());
                 ui.add_space(space::SM);
-                ui.label(typography::mono(format!("Postino {}", env!("CARGO_PKG_VERSION")), type_size::CAPTION, t.text_faint));
+                ui.horizontal(|ui| {
+                    ui.label(typography::text(Role::Caption, "Esc chiude e riporta al punto precedente", t.text_faint));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if Button::new("Chiudi").show(ui).clicked() {
+                            close = true;
+                        }
+                    });
+                });
             });
-        if dark != self.dark {
-            self.set_dark(ui.ctx(), dark);
+        if let Some((system, dark)) = theme_choice {
+            if system {
+                self.set_system_theme(ui.ctx(), true);
+            } else {
+                self.set_dark(ui.ctx(), dark);
+            }
         }
         if reduced != self.reduced_motion {
             self.set_reduced_motion(ui.ctx(), reduced);
         }
+        if reset_pane {
+            self.reading_ratio = crate::settings::DEFAULT_READING_PANE_RATIO;
+            self.mark_settings_dirty();
+            self.persist_settings();
+            self.status = "Larghezza lettura reimpostata".to_owned();
+        }
+        if open_folder {
+            self.open_data_folder();
+        }
+        if licences {
+            self.open_licences(ui.ctx());
+        }
+        if shortcuts {
+            self.close_settings(ui.ctx());
+            self.show_shortcuts = true;
+            self.shortcut_query.clear();
+            self.shortcut_focus = true;
+        }
         if close || response.should_close() {
-            self.show_accounts_dialog = false;
+            self.close_settings(ui.ctx());
         }
         if add {
             self.show_accounts_dialog = false;
+            self.settings_return_focus = None;
             self.onboarding = Some(Onboarding::add_account());
         }
         if let Some(state) = remove {
             self.account_remove = Some(state);
+        }
+    }
+
+    fn licences_dialog(&mut self, ui: &mut Ui) {
+        if !self.show_licences {
+            return;
+        }
+        let t = theme::tokens(self.dark);
+        let focus_close = self.licences_focus_pending;
+        self.licences_focus_pending = false;
+        let width = (ui.ctx().content_rect().width() - 2.0 * space::HUGE).clamp(420.0, 640.0);
+        let height = (ui.ctx().content_rect().height() - 2.0 * space::XL).clamp(280.0, 560.0);
+        let mut close = false;
+        let response = egui::Modal::new(Id::new("postino-licences"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(width);
+                ui.horizontal(|ui| {
+                    ui.label(typography::strong(Role::Section, "Licenze e attribuzioni", t.text));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let button = Button::ghost("Chiudi").show(ui);
+                        if focus_close {
+                            button.request_focus();
+                        }
+                        if button.clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(space::SM);
+                ui.label(typography::text(Role::Meta, "Il documento generato da ATTRIBUTION.toml per questa build.", t.text_muted));
+                ui.add_space(space::SM);
+                egui::ScrollArea::vertical().id_salt("licences-scroll").max_height((height - 120.0).max(160.0)).auto_shrink([false, false]).show(
+                    ui,
+                    |ui| {
+                        ui.add(egui::Label::new(typography::mono(include_str!("../../../ATTRIBUTION.md"), 10.5, t.text_muted)).selectable(true));
+                    },
+                );
+                ui.add_space(space::SM);
+                ui.horizontal(|ui| {
+                    ui.label(typography::text(Role::Caption, "Esc chiude", t.text_faint));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if Button::new("Chiudi").show(ui).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if close || response.should_close() {
+            self.close_licences(ui.ctx());
         }
     }
 
@@ -4449,9 +5061,12 @@ impl PostinoApp {
                             _ => t.text_muted,
                         };
                         ui.add(egui::Label::new(typography::text(Role::Meta, text, color)).truncate());
-                        if self.sync_needs_retry() && self.can_add_account() {
+                        if self.sync_error_needs_retry() && self.can_add_account() {
                             ui.add_space(space::XS);
-                            if Button::ghost("Riprova").size(ButtonSize::Sm).show(ui).clicked() {
+                            let retry = Button::ghost("Riprova").size(ButtonSize::Sm).show(ui);
+                            #[cfg(test)]
+                            probe::retry(ui, retry.rect);
+                            if retry.clicked() {
                                 self.request_sync();
                             }
                         }
@@ -5011,7 +5626,7 @@ impl PostinoApp {
             }
             "undo" => self.undo_last(),
             "sync" => self.request_sync(),
-            "accounts" => self.show_accounts_dialog = true,
+            "settings" => self.open_settings(ctx, self.account_switcher_id),
             "add_account" => {
                 if self.can_add_account() {
                     self.onboarding = Some(Onboarding::add_account());
@@ -5075,6 +5690,11 @@ impl PostinoApp {
     }
 
     fn show_inner(&mut self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        {
+            probe::clear_identity(ui);
+            probe::clear_retries(ui);
+        }
         self.poll_add_account();
         self.handle_sync_events();
         let composer_was_open = self.composer.open;
@@ -5129,6 +5749,10 @@ impl PostinoApp {
         self.account_menu(ui);
         self.accounts_dialog(ui);
         self.account_remove_dialog(ui);
+        self.link_confirmation(ui);
+        self.attachment_warning_dialog(ui);
+        self.attachment_overwrite_dialog(ui);
+        self.licences_dialog(ui);
         // The composer owns the keyboard while it is open. Capture the widget that had it before
         // the composer requests focus, so closing returns the user exactly where they were.
         if self.composer.open && self.composer_focus_pending {
@@ -5313,6 +5937,16 @@ fn format_millis(ms: i64) -> String {
     DateTime::<Utc>::from_timestamp_millis(ms).map_or_else(|| "—".to_owned(), format_time)
 }
 
+/// The account badge counts every folder of the account, not the open folder. Both the tooltip and
+/// the accessible name use this exact sentence.
+fn account_unread_tooltip(unread: u32) -> String {
+    match unread {
+        0 => "Nessuna non letta in tutte le cartelle".to_owned(),
+        1 => "1 non letta in tutte le cartelle".to_owned(),
+        count => format!("{count} non lette in tutte le cartelle"),
+    }
+}
+
 /// The folder preview a docs screenshot shows. It is synthetic, like the demo mailbox.
 fn demo_folders_preview() -> FoldersPreview {
     FoldersPreview {
@@ -5369,6 +6003,28 @@ enum SyncView {
     },
 }
 
+/// A link the reader asked to open. The confirmation sheet is the only path to the opener.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingLink {
+    url: String,
+    idn: bool,
+    /// Request focus on "Annulla" on the first frame, then let the keyboard move freely.
+    focus_cancel: bool,
+}
+
+/// An attachment whose bytes are already read from the blob store and whose destination is being
+/// confirmed. The bytes are kept only for the lifetime of the dialog.
+#[derive(Clone, Debug)]
+struct PendingAttachment {
+    filename: String,
+    bytes: Vec<u8>,
+    /// `Some` only in the overwrite stage.
+    path: Option<PathBuf>,
+    dangerous: Option<DangerousKind>,
+    /// Request focus on "Annulla" on the first frame of a sheet.
+    focus_cancel: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AccountRemoveState {
     id: String,
@@ -5411,8 +6067,9 @@ struct PendingRead {
 
 struct ToastState {
     message: String,
-    undo: UndoAction,
+    undo: Option<UndoAction>,
     until: f64,
+    kind: ToastKind,
 }
 
 enum UndoAction {
@@ -5621,7 +6278,7 @@ const COMMANDS: &[Command] = &[
     Command { id: "undo", label: "Annulla ultima azione", icon: icons::UNDO, shortcut: "Z", rule: CommandRule::Always, in_palette: false },
     Command { id: "palette", label: "Apri i comandi", icon: icons::COMMAND, shortcut: "Ctrl+K", rule: CommandRule::Always, in_palette: false },
     Command { id: "sync", label: "Aggiorna la posta", icon: icons::SYNC, shortcut: "", rule: CommandRule::Sync, in_palette: true },
-    Command { id: "accounts", label: "Account e impostazioni", icon: icons::USER, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "settings", label: "Impostazioni", icon: icons::SETTINGS, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command { id: "add_account", label: "Aggiungi account", icon: icons::PLUS, shortcut: "", rule: CommandRule::Store, in_palette: true },
     Command { id: "reduced_motion", label: "Riduci le animazioni", icon: icons::CLOCK, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
@@ -5682,6 +6339,48 @@ fn window_control(ui: &mut Ui, glyph: &str, label: &str, close: bool) -> egui::R
     ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
     response.on_hover_text(label)
+}
+
+/// Render one paragraph with clickable links. Only `reading::find_links` decides what is a link;
+/// everything else stays ordinary selectable text. The caller opens the confirmation sheet.
+fn link_paragraph(ui: &mut Ui, paragraph: &str, t: &Tokens, muted: bool) -> Option<ExtractedLink> {
+    let links = reading::find_links(paragraph);
+    if links.is_empty() {
+        let color = if muted { t.text_muted } else { t.text };
+        ui.add(egui::Label::new(typography::text(Role::Body, paragraph, color)).selectable(true));
+        return None;
+    }
+    let text_color = if muted { t.text_muted } else { t.text };
+    let font = FontId::new(type_size::BODY, FontFamily::Proportional);
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let mut cursor = 0;
+        for link in links {
+            if let Some(before) = paragraph.get(cursor..link.range.start)
+                && !before.is_empty()
+            {
+                ui.add(
+                    egui::Label::new(RichText::new(before).font(font.clone()).color(text_color)).wrap_mode(egui::TextWrapMode::Wrap).selectable(true),
+                );
+            }
+            let Some(label) = paragraph.get(link.range.clone()) else {
+                continue;
+            };
+            let rich = RichText::new(label).font(font.clone()).color(t.gold_ink).underline();
+            let response = ui.add(egui::Link::new(rich)).on_hover_text(link.url.as_str());
+            if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
+                clicked = Some(link.clone());
+            }
+            cursor = link.range.end;
+        }
+        if let Some(after) = paragraph.get(cursor..)
+            && !after.is_empty()
+        {
+            ui.add(egui::Label::new(RichText::new(after).font(font).color(text_color)).wrap_mode(egui::TextWrapMode::Wrap).selectable(true));
+        }
+    });
+    clicked
 }
 
 fn reading_context_menu(response: egui::Response, subject: String, sender: String) {
@@ -6084,14 +6783,6 @@ fn reading_overlay(available: f32) -> bool {
     available < READING_PANE_MIN_WIDTH
 }
 
-fn initials(name: &str) -> String {
-    let mut letters = name.split_whitespace().filter_map(|word| word.chars().next()).filter(|c| c.is_alphanumeric()).take(2).collect::<String>();
-    if letters.is_empty() {
-        letters = name.chars().filter(|c| c.is_alphanumeric()).take(1).collect();
-    }
-    letters.to_uppercase()
-}
-
 fn avatar(ui: &mut Ui, size: f32, initials: &str, bg: Color32, fg: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     ui.painter().circle_filled(rect.center(), size * 0.5, bg);
@@ -6259,6 +6950,52 @@ pub(crate) mod probe {
 
     pub fn sidebar_panel_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("sidebar-panel")))
+    }
+
+    pub fn clear_identity(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("identity-blocks"), Vec::<Rect>::new()));
+    }
+
+    pub fn identity(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            let mut blocks = data.get_temp::<Vec<Rect>>(id("identity-blocks")).unwrap_or_default();
+            blocks.push(rect);
+            data.insert_temp(id("identity-blocks"), blocks);
+        });
+    }
+
+    pub fn identity_count(ctx: &Context) -> usize {
+        ctx.data(|data| data.get_temp::<Vec<Rect>>(id("identity-blocks"))).map_or(0, |blocks| blocks.len())
+    }
+
+    pub fn clear_retries(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("retry-buttons"), Vec::<Rect>::new()));
+    }
+
+    pub fn retry(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            let mut buttons = data.get_temp::<Vec<Rect>>(id("retry-buttons")).unwrap_or_default();
+            buttons.push(rect);
+            data.insert_temp(id("retry-buttons"), buttons);
+        });
+    }
+
+    pub fn retry_count(ctx: &Context) -> usize {
+        ctx.data(|data| data.get_temp::<Vec<Rect>>(id("retry-buttons"))).map_or(0, |buttons| buttons.len())
+    }
+
+    pub fn clear_attachment_saves(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("attachment-saves"), BTreeMap::<String, Rect>::new()));
+    }
+
+    pub fn attachment_save(ui: &Ui, attachment_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("attachment-saves")).insert(attachment_id.to_owned(), rect);
+        });
+    }
+
+    pub fn attachment_save_rect(ctx: &Context, attachment_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("attachment-saves"))).and_then(|rows| rows.get(attachment_id).copied())
     }
 
     pub fn sidebar_header(ui: &Ui, name: &str, rect: Rect) {
@@ -6569,14 +7306,47 @@ mod tests {
 
     use postino_core::CredentialVault;
     use postino_store::{
-        Account as StoreAccount, AccountServer, AccountTls, Address as StoreAddress, Folder as StoreFolder, FolderKind as StoreFolderKind,
+        Account as StoreAccount, AccountServer, AccountTls, Address as StoreAddress, Attachment as StoreAttachment, Folder as StoreFolder,
+        FolderKind as StoreFolderKind,
     };
     use postino_store::{Message as StoreMessage, MessageSummary as StoreMessageSummary};
 
     use crate::boot::{BootStage, KeySource};
-    use crate::test_support::{MemoryVault, RunningServer, three_folders};
+    use crate::test_support::{MemoryVault, RecordingFileSaver, RecordingFolderOpener, RecordingLinkOpener, RunningServer, directory, three_folders};
 
     use super::*;
+
+    /// The text actually painted by one frame, for assertions that a settings section or a warning
+    /// reached the screen rather than only the state.
+    fn painted_text(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2) -> Vec<String> {
+        fn collect(shape: &egui::epaint::Shape, text: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => text.push(shape.galley.text().to_owned()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = Vec::new();
+        // A modal animates in; tests need its settled layout, not a translated frame mid-animation.
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        // A modal is laid out on its own layer and enters with a short offset; the first frames
+        // create the area and settle it, then the content paints. Real windows run them, so tests
+        // read the settled frame.
+        for _ in 0..4 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+            text.clear();
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut text);
+            }
+            output.textures_delta.clear();
+        }
+        text
+    }
 
     fn frame_at(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, events: Vec<egui::Event>) {
         let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
@@ -7080,6 +7850,9 @@ mod tests {
             ("onboarding_sync", ScreenshotState::OnboardingSync),
             ("mailbox", ScreenshotState::Mailbox),
             ("offline", ScreenshotState::Offline),
+            ("reading_attachments", ScreenshotState::ReadingAttachments),
+            ("link_confirm", ScreenshotState::LinkConfirm),
+            ("settings", ScreenshotState::Settings),
         ] {
             assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
         }
@@ -7512,6 +8285,7 @@ mod tests {
         app.composer.body = "CORPO SEGRETO".to_owned();
         app.composer.touch(0.0);
         app.dark = true;
+        app.system_theme = true;
         app.folder = "archive".to_owned();
         app.reading_ratio = 0.44;
         app.reduced_motion = true;
@@ -7521,6 +8295,7 @@ mod tests {
 
         let loaded = Settings::load_from(&path);
         assert!(loaded.dark);
+        assert!(loaded.system_theme, "the OS-following choice is a preference");
         assert_eq!(loaded.folder, "archive");
         assert_eq!(loaded.account.as_deref(), Some("acc_demo"), "the active account is a preference");
         assert!((loaded.reading_pane_ratio - 0.44).abs() < f32::EPSILON);
@@ -7534,6 +8309,7 @@ mod tests {
         assert_eq!(restored.folder, "archive");
         assert_eq!(restored.active_account.as_deref(), Some("acc_demo"));
         assert!(restored.dark);
+        assert!(restored.system_theme);
         assert!(restored.reduced_motion);
 
         // A folder or account the engine does not know falls back to the current account and its
@@ -7756,7 +8532,7 @@ mod tests {
         app.commit_label_editor();
         assert_eq!(app.engine.label("lbl_1").map(|label| label.name.as_str()), Some("Lavoro clienti"));
         assert_eq!(app.engine.label("lbl_1").map(|label| label.color), Some(LabelColor::Danger));
-        assert!(matches!(app.toast.as_ref().map(|toast| &toast.undo), Some(UndoAction::LabelRename { .. })), "rename offers an undo");
+        assert!(matches!(app.toast.as_ref().and_then(|toast| toast.undo.as_ref()), Some(UndoAction::LabelRename { .. })), "rename offers an undo");
         app.undo_last();
         assert_eq!(app.engine.label("lbl_1").map(|label| label.name.as_str()), Some("Lavoro"), "undo restores the previous name");
         assert_eq!(app.engine.label("lbl_1").map(|label| label.color), Some(LabelColor::Gold), "undo restores the previous colour");
@@ -7911,7 +8687,7 @@ mod tests {
         assert_eq!(created.color, LabelColor::Forest);
         let created_id = created.id.clone();
         assert!(targets.iter().all(|id| has_label(&app, id, &created_id)), "the new label lands on the captured messages");
-        assert!(matches!(app.toast.as_ref().map(|toast| &toast.undo), Some(UndoAction::Labels(_))), "the apply is one undo step");
+        assert!(matches!(app.toast.as_ref().and_then(|toast| toast.undo.as_ref()), Some(UndoAction::Labels(_))), "the apply is one undo step");
         app.undo_last();
         assert!(targets.iter().all(|id| !has_label(&app, id, &created_id)));
         assert!(app.engine.labels().iter().any(|label| label.name == "Cliente"), "undo removes the assignment, not the label");
@@ -8515,6 +9291,21 @@ mod tests {
         }
     }
 
+    fn seed_attachment(store: &postino_store::Store, message_id: &str, id: &str, filename: &str) {
+        store
+            .replace_attachments(
+                message_id,
+                &[StoreAttachment {
+                    id: id.to_owned(),
+                    filename: filename.to_owned(),
+                    mime: "application/pdf".to_owned(),
+                    size: 11,
+                    blob_hash: None,
+                }],
+            )
+            .expect("attachment row");
+    }
+
     /// Seed one account, its inbox folder and one local message. `port` adds the IMAP server row.
     fn seed_account_rows(store: &postino_store::Store, id: &str, email: &str, port: Option<u16>) {
         store
@@ -8884,6 +9675,315 @@ mod tests {
         assert_eq!(app.starred_counts("acc_a"), (0, 0));
         app.select_folder("fld_acc_a_starred");
         assert!(app.visible_messages().0.is_empty(), "another account's star must not leak into Preferiti");
+    }
+
+    fn seeded_attachment_app(name: &str, filename: &str, bytes: Option<&[u8]>) -> (PostinoApp, String, Attachment) {
+        let filename = filename.to_owned();
+        let mut app = booted_app(name, Vec::new(), move |store| {
+            seed_account_rows(store, "acc_save", "save@example.com", None);
+            seed_attachment(store, "msg_acc_save_1", "att_save", &filename);
+        });
+        let message_id = "msg_acc_save_1".to_owned();
+        let attachment = app.engine.message(&message_id).and_then(|message| message.attachments.first()).cloned().expect("the seeded attachment");
+        if let Some(bytes) = bytes {
+            app.engine.store_attachment_bytes(&message_id, &attachment.id, bytes).expect("store the test blob");
+        }
+        (app, message_id, attachment)
+    }
+
+    #[test]
+    fn saving_an_attachment_writes_exact_blob_bytes() {
+        let path = directory("save-exact").join("report.pdf");
+        let _ = std::fs::remove_file(&path);
+        let (mut app, message_id, attachment) = seeded_attachment_app("p6c-save-exact", "report.pdf", Some(b"blob esatto\nseconda riga"));
+        let saver = RecordingFileSaver::new();
+        saver.set_path(Some(path.clone()));
+        app.file_saver = saver.clone();
+        app.open_message(message_id.clone());
+        app.request_attachment_save(&attachment);
+        assert!(!app.attachment_warning.is_some(), "a PDF needs no warning");
+        assert!(!app.attachment_overwrite.is_some(), "a new path needs no overwrite confirmation");
+        assert_eq!(std::fs::read(&path).expect("the saved file"), b"blob esatto\nseconda riga");
+        assert_eq!(saver.writes(), vec![(path.clone(), b"blob esatto\nseconda riga".to_vec())]);
+        assert_eq!(app.toast.as_ref().map(|toast| toast.kind), Some(ToastKind::Success));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_existing_file_is_not_overwritten_until_confirmed() {
+        let path = directory("save-overwrite").join("report.pdf");
+        std::fs::write(&path, b"vecchio contenuto").expect("an existing file");
+        let (mut app, _, attachment) = seeded_attachment_app("p6c-overwrite", "report.pdf", Some(b"nuovo contenuto"));
+        let saver = RecordingFileSaver::new();
+        saver.set_path(Some(path.clone()));
+        app.file_saver = saver.clone();
+        app.request_attachment_save(&attachment);
+        assert!(app.attachment_overwrite.is_some(), "the sheet must stop before writing");
+        assert_eq!(std::fs::read(&path).expect("old content is intact"), b"vecchio contenuto");
+        assert!(saver.writes().is_empty());
+        let pending = app.attachment_overwrite.take().expect("overwrite state");
+        app.write_attachment(pending);
+        assert_eq!(std::fs::read(&path).expect("new content"), b"nuovo contenuto");
+        assert_eq!(app.toast.as_ref().map(|toast| toast.kind), Some(ToastKind::Success));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dangerous_attachments_warn_before_choosing_a_path() {
+        for (filename, kind) in [("setup.exe", DangerousKind::Executable), ("report.docm", DangerousKind::Macro)] {
+            let path = directory("save-warning").join(filename);
+            let _ = std::fs::remove_file(&path);
+            let (mut app, _, attachment) = seeded_attachment_app(&format!("p6c-warning-{filename}"), filename, Some(b"warning bytes"));
+            let saver = RecordingFileSaver::new();
+            saver.set_path(Some(path.clone()));
+            app.file_saver = saver.clone();
+            app.request_attachment_save(&attachment);
+            let warning = app.attachment_warning.as_ref().expect("a warning before the native dialog");
+            assert_eq!(warning.dangerous, Some(kind));
+            assert_eq!(saver.choose_calls(), 0, "the path must not be chosen before the warning");
+            let pending = app.attachment_warning.take().expect("warning state");
+            app.choose_attachment_path(pending);
+            assert_eq!(std::fs::read(&path).expect("saved after confirmation"), b"warning bytes");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn cancelling_a_save_writes_nothing_and_a_missing_blob_is_readable() {
+        let path = directory("save-cancel").join("report.pdf");
+        let (mut app, _, attachment) = seeded_attachment_app("p6c-cancel", "report.pdf", Some(b"bytes"));
+        let saver = RecordingFileSaver::new();
+        saver.set_path(None);
+        app.file_saver = saver.clone();
+        app.request_attachment_save(&attachment);
+        assert_eq!(saver.choose_calls(), 1);
+        assert!(saver.writes().is_empty());
+        assert_eq!(app.status, "Salvataggio annullato");
+
+        let (mut missing, _, attachment) = seeded_attachment_app("p6c-missing", "report.pdf", None);
+        let saver = RecordingFileSaver::new();
+        saver.set_path(Some(path));
+        missing.file_saver = saver.clone();
+        missing.request_attachment_save(&attachment);
+        assert_eq!(saver.choose_calls(), 0);
+        assert!(saver.writes().is_empty());
+        let toast = missing.toast.as_ref().expect("a readable missing-blob toast");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert!(toast.message.contains("non è disponibile"));
+    }
+
+    #[test]
+    fn the_attachment_save_button_is_keyboard_reachable() {
+        let path = directory("save-keyboard").join("report.pdf");
+        let _ = std::fs::remove_file(&path);
+        let (mut app, message_id, attachment) = seeded_attachment_app("p6c-keyboard-save", "report.pdf", Some(b"keyboard bytes"));
+        let saver = RecordingFileSaver::new();
+        saver.set_path(Some(path.clone()));
+        app.file_saver = saver.clone();
+        app.open_message(message_id);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        assert!(probe::attachment_save_rect(&ctx, &attachment.id).is_some());
+        let save_id = app.attachment_save_ids.get(&attachment.id).copied().expect("the Save button id");
+        ctx.memory_mut(|memory| memory.request_focus(save_id));
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(saver.writes().len(), 1, "Enter on the focused Save button saves");
+        assert_eq!(std::fs::read(&path).expect("the keyboard-saved file"), b"keyboard bytes");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_link_requires_confirmation_and_reaches_the_injected_opener_exactly() {
+        let mut app = PostinoApp::demo(true);
+        let opener = RecordingLinkOpener::new();
+        app.link_opener = opener.clone();
+        let link = reading::find_links("Vai su https://example.com/preventivo?token=abc, grazie.").pop().expect("a link");
+        app.request_link_open(&link);
+        assert_eq!(app.pending_link.as_ref().map(|pending| pending.url.as_str()), Some("https://example.com/preventivo?token=abc"));
+        assert!(opener.opened().is_empty(), "the sheet has not been confirmed");
+        app.confirm_pending_link();
+        assert_eq!(opener.opened(), vec!["https://example.com/preventivo?token=abc".to_owned()]);
+        assert!(app.pending_link.is_none());
+
+        let bad = ExtractedLink { range: 0..10, url: "javascript:alert(1)".to_owned(), idn: false };
+        app.request_link_open(&bad);
+        assert!(app.pending_link.is_none(), "a hostile scheme never reaches the sheet");
+        assert_eq!(app.toast.as_ref().map(|toast| toast.kind), Some(ToastKind::Error));
+
+        let valid = reading::find_links("https://xn--bcher-kva.example/").pop().expect("an IDN link");
+        app.request_link_open(&valid);
+        assert!(app.pending_link.as_ref().is_some_and(|pending| pending.idn));
+        app.pending_link = None;
+        assert_eq!(opener.opened().len(), 1, "cancel calls nothing");
+    }
+
+    #[test]
+    fn the_link_sheet_shows_the_full_destination_and_the_idn_warning() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let mut app = PostinoApp::demo(true);
+        let link = reading::find_links("https://xn--bcher-kva.example/preventivo").pop().expect("an IDN link");
+        app.request_link_open(&link);
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("xn--bcher-kva.example/preventivo")), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("punycode")), "the IDN warning must be visible");
+    }
+
+    #[test]
+    fn settings_renders_every_section_at_the_minimum_size_light_and_dark() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = PostinoApp::demo(true);
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), Vec::new());
+        app.open_settings(&ctx, None);
+        for dark in [false, true] {
+            app.dark = dark;
+            theme::apply(&ctx, dark);
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            for section in ["ACCOUNT", "ASPETTO", "DATI", "INFORMAZIONI", "Licenze e attribuzioni", "Scorciatoie da tastiera"] {
+                assert!(text.iter().any(|line| line.contains(section)), "missing {section}: {text:?}");
+            }
+            assert!(text.iter().any(|line| line.contains("Ultimo sync")), "the data section names the last sync: {text:?}");
+        }
+    }
+
+    #[test]
+    fn settings_closes_with_escape_and_returns_focus_to_the_account_switcher() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let mut app = PostinoApp::demo(true);
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        let switcher = app.account_switcher_id.expect("the sidebar account row");
+        app.open_settings(&ctx, None);
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        assert!(app.show_accounts_dialog);
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.show_accounts_dialog);
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(switcher), "focus returns to the opener");
+    }
+
+    #[test]
+    fn settings_shows_the_store_path_and_uses_the_injected_folder_opener() {
+        let (mut app, _, _) = seeded_attachment_app("p6c-settings-data", "report.pdf", None);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.open_settings(&ctx, None);
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("mail.db")), "the store path is visible: {text:?}");
+        let opener = RecordingFolderOpener::new();
+        app.folder_opener = opener.clone();
+        app.open_data_folder();
+        let opened = opener.opened();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].ends_with("mail.db.blobs"), "{:?}", opened[0]);
+    }
+
+    #[test]
+    fn the_palette_entry_opens_settings_and_the_licences_dialog_is_local() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let mut app = PostinoApp::demo(true);
+        assert!(command("settings").is_some());
+        app.execute_command("settings", &ctx);
+        assert!(app.show_accounts_dialog);
+        app.open_licences(&ctx);
+        let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
+        assert!(text.iter().any(|line| line.contains("Licenze e attribuzioni")));
+        assert!(text.iter().any(|line| line.contains("Postino P6b") || line.contains("Phosphor")), "the embedded attribution is shown");
+    }
+
+    #[test]
+    fn the_account_removal_confirmation_is_reachable_from_settings() {
+        let (mut app, _, _) = seeded_attachment_app("p6c-settings-remove", "report.pdf", None);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.open_settings(&ctx, None);
+        app.account_remove = Some(AccountRemoveState {
+            id: "acc_save".to_owned(),
+            name: "Account acc_save".to_owned(),
+            email: "save@example.com".to_owned(),
+            last: true,
+            focus_primary: true,
+        });
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("Rimuovere l'account?")));
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.account_remove.is_none());
+    }
+
+    #[test]
+    fn the_text_view_label_explains_the_mode_for_plain_text_mail_too() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let mut app = PostinoApp::demo(true);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        app.open_message(id);
+        let text = painted_text(&ctx, &mut app, Vec2::new(1280.0, 720.0));
+        assert!(text.iter().any(|line| line.contains("Vista testo")), "the reading pane names its text view: {text:?}");
+    }
+
+    #[test]
+    fn a_long_link_paragraph_wraps_inside_the_reading_column() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let t = theme::tokens(false);
+        let text = format!("{} https://example.com/preventivo", "parola ".repeat(80));
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(320.0, 600.0))), ..Default::default() };
+        let mut width = 0.0;
+        let mut output = ctx.run_ui(raw, |ui| {
+            ui.set_max_width(320.0);
+            link_paragraph(ui, &text, &t, false);
+            width = ui.min_rect().width();
+        });
+        output.textures_delta.clear();
+        assert!(width <= 320.0, "a long paragraph must wrap, not extend past the column: {width}");
+    }
+
+    #[test]
+    fn there_is_one_identity_and_one_offline_retry() {
+        let (mut app, _, _) = seeded_attachment_app("p6c-chrome", "report.pdf", None);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        assert_eq!(probe::identity_count(&ctx), 1, "the account identity exists once (sidebar)");
+        let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
+        assert!(text.iter().any(|line| line.contains("totali")), "the unread badge says it is a total: {text:?}");
+        assert!(account_unread_tooltip(1).contains("tutte le cartelle"));
+        app.sync_view = SyncView::Offline { last_sync: Some(1_700_000_000_000) };
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        assert_eq!(probe::retry_count(&ctx), 1, "only the offline banner offers Retry");
+        app.sync_view = SyncView::Error { reason: "credenziali rifiutate".to_owned(), last_sync: None };
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        assert_eq!(probe::retry_count(&ctx), 1, "only the status bar offers Retry for an error");
+    }
+
+    #[test]
+    fn a_reply_uses_the_active_account_identity() {
+        let mut app = booted_app("p6c-reply-identity", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+        });
+        app.switch_account("acc_b".to_owned());
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("an acc_b message");
+        app.reply_to(&id, ComposeMode::Reply);
+        assert!(app.composer.open);
+        assert_eq!(app.account().map(|account| account.id.as_str()), Some("acc_b"));
+        app.composer.body.push_str("\nRisposta");
+        app.composer.touch(0.0);
+        assert!(app.save_composer(false));
+        let draft = app.composer.draft_id.clone().expect("the reply draft");
+        assert_eq!(app.engine.message(&draft).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_b_drafts"));
     }
 
     fn label_unread(app: &PostinoApp, id: &str) -> Option<u32> {

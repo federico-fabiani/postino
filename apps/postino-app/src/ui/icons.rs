@@ -78,6 +78,7 @@ pub const QUOTES: &str = regular::QUOTES;
 pub const LINK: &str = regular::LINK;
 pub const LOCK: &str = regular::LOCK_SIMPLE;
 pub const GLOBE: &str = regular::GLOBE;
+pub const DESKTOP: &str = regular::DESKTOP;
 
 /// An icon as rich text. Use with `ui.label`, a button label, or a painter galley.
 #[must_use]

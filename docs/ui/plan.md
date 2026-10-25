@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1–U0.5 foundations, P2a/P2b and P6b onboarding/sync done · **Last updated:** 2026-10-25
+> **Status:** U0.1–U0.5 foundations, P2a/P2b, P6b onboarding/sync and P6c reading/settings done · **Last updated:** 2026-10-25
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
@@ -462,9 +462,9 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   drafts in that account and keeps the local-move send notice.
 - **Account management.** The account dialog lists accounts, adds one through the same onboarding,
   removes one with a destructive confirmation that names the local cache and keyring credential,
-  and explains the return to onboarding when the last account goes. Theme and reduced motion stay in
-  the existing settings file, which now also remembers the opaque active account id; store path and
-  version stay read-only. The full settings page and licences remain P6c.
+  and explains the return to onboarding when the last account goes. Theme and reduced motion live in
+  the settings file, which also remembers the opaque active account id; P6c replaces this reduced
+  dialog with the full settings page and licences.
 - **Tests.** Headless boot (demo/store/empty/recovery), a fake-server onboarding run with the test
   CA and an in-memory vault, each connection error class, cancel at every stage, keyboard-only
   onboarding, 980×600 light/dark renders, worker progress/cancel/failure/second request/coalescing,
@@ -476,9 +476,63 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   form, folders, mailbox and offline states, and the 980×600 folders and mailbox shots. The images
   use the deterministic demo mailbox with seeded sync states; no real address, credential or store
   is captured.
-- **Deferred to P6c.** Link opening with a scheme allowlist and destination preview, attachment Save
-  through rfd and its safety warnings, the full settings page and the remaining reading-pane
-  attachment affordances. HTML rendering, SMTP and OAuth remain later milestones.
+- **Closed by P6c.** Link opening, attachment Save, the full settings page and the remaining
+  reading-pane attachment affordances. HTML rendering, SMTP and OAuth remain later milestones.
+
+### P6c Reading pane, attachments and settings — done
+
+- **Reading pane.** The body is the plain-text alternative (already HTML-to-text when only HTML
+  exists) under a quiet `Vista testo` line that explains the HTML renderer arrives with the isolated
+  viewer. The header shows sender, recipients, an optional Cc line, date, subject, label chips and a
+  remote-content line; selecting a label chip filters the mailbox.
+- **Safe links.** `reading::find_links` is a pure scanner over the body: only absolute `http`,
+  `https` and `mailto` URLs at a word boundary survive; trailing punctuation is trimmed and
+  `javascript:`, `file:`, `data:`, `vbscript:` and relative targets stay ordinary text. A link shows
+  its destination on hover; activating it opens a confirmation sheet with the full URL and, for a
+  host with an `xn--` label, a punycode warning. Only the sheet's **Apri** reaches the injected
+  `LinkOpener` (production: the system browser; tests: a recorder). Cancelling opens nothing and a
+  failure is a readable toast.
+- **Attachments.** The ALLEGATI section lists filename, MIME and size, with a **Salva** button per
+  row. Save reads the engine's exact blob bytes, warns before choosing a path when the
+  extension is executable (`.exe`, `.msi`, `.bat`, `.cmd`, `.ps1`, `.js`, `.vbs`, `.scr`, `.jar`)
+  or macro-enabled (`.docm`, `.xlsm`, `.pptm`), then asks for a destination through the injected
+  `FileSaver` (production: `rfd`). An existing file is never replaced without a second confirmation;
+  Cancel writes nothing; a missing or corrupt blob is a readable toast. A suggested filename loses
+  directories, control characters and Windows-reserved punctuation, and is length-bounded. Enter on
+  the focused Save button is the keyboard path.
+- **Settings.** One dialog has four sections. **Account** lists accounts with the active badge,
+  adds through onboarding, removes with a destructive confirmation that names what leaves the
+  machine, and names the active account's last sync under Data. **Aspetto** chooses Chiaro, Scuro or
+  Sistema (the preference is persisted and follows the OS while selected), toggles reduced motion
+  and resets the reading-pane width. **Dati** shows the store and blob paths, the last sync, and
+  opens the blob directory through the injected `FolderOpener` (production: the platform file
+  manager). **Informazioni** shows the version, opens the embedded `ATTRIBUTION.md` in a local
+  dialog and links to the shortcut sheet. `Esc`, the header button and the footer button close it;
+  focus returns to the account switcher, the palette entry is **Impostazioni**, and the layout is
+  verified at 1280×720 and 980×600 in both themes.
+- **Chrome and identity.** The toolbar shows only the product mark; the sidebar account row is the
+  single identity and opens the switcher. Its badge reads `N totali` with a tooltip and accessible
+  name that say `in tutte le cartelle`. The offline banner is the only owner of **Riprova**; the
+  status bar is informational for offline and keeps **Riprova** only for an error. No milestone code
+  or status duplication remains in the chrome. Compose's `Da` and replies use the active account and
+  its Drafts folder.
+- **Tests.** The pure scanner (allowlist, word boundary, IDN, second action gate), safe filenames,
+  dangerous extensions, remote counts, a long inline paragraph staying inside the column; exact saved
+  bytes, overwrite refusal then confirmation,
+  executable/macro warning ordering, cancel writes nothing, missing blob, keyboard Save; link
+  sheet and confirmation before the recorder; settings sections, store path, injected folder opener,
+  focus return, Esc, palette entry, licences and account removal; one identity and one Retry;
+  compose/reply identity. No test opens a browser, a native dialog or a shell.
+- **Screenshots.** `docs/images/postino-p6c-reading-attachments.png` (text view, safe link,
+  remote-content line, attachment Save), `postino-p6c-link-confirm.png`, `postino-p6c-settings.png`,
+  `-settings-dark.png` and `-settings-980.png`. The P6b mailbox and offline images were regenerated
+  for the single identity, the mailbox-wide badge and the single Retry.
+- **Honest limits.** HTML is not rendered in this slice: the pane shows the text alternative and
+  never requests remote images. The remote-content count can only count references still present in
+  the cached HTML; a synced message is sanitized before storage, so the line is usually visible only
+  for fixtures or a store shape that retains them. Save writes the exact bytes to the path the
+  person chooses and never opens or executes the file; the extension warning is advisory. Links only
+  reach the system browser after the confirmation sheet.
 
 Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 
@@ -498,6 +552,13 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   called empty because of a filter.
 - The composer fits 980×600, from the header to Send/Cancel, with a body that scrolls and a scrim that
   blocks the shell; Esc keeps the unsaved guard.
+- A link is clickable only for absolute `http`, `https` or `mailto`; its full destination is visible
+  before **Apri**, and cancelling never calls the opener. An attachment Save writes the exact blob
+  bytes, refuses an existing file until confirmed, warns on executable and macro-enabled names and
+  cancels without a write. No test opens a browser, a native dialog or a shell.
+- Settings fits 980×600 in light and dark, shows Account/Aspetto/Dati/Informazioni, uses the injected
+  folder opener and returns focus to the account switcher on Esc. The sidebar is the only account
+  identity and the offline banner is the only Retry; the status bar keeps Retry only for an error.
 - Contrast and focus pass the checks in `docs/design.md`; every gold mark on ivory uses `GOLD_INK`,
   shortcut hints and placeholders clear 4.5:1.
 - Message rows are named buttons; the star has a 28×28 target and its own name; the focus ring is

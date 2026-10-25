@@ -20,13 +20,14 @@ pub struct Dialog<'a> {
     secondary: Option<&'a str>,
     danger: bool,
     focus_primary: bool,
+    focus_secondary: bool,
     width: f32,
 }
 
 impl<'a> Dialog<'a> {
     #[must_use]
     pub fn new(title: &'a str, body: &'a str, primary: &'a str) -> Self {
-        Self { title, body, primary, secondary: None, danger: false, focus_primary: false, width: 420.0 }
+        Self { title, body, primary, secondary: None, danger: false, focus_primary: false, focus_secondary: false, width: 420.0 }
     }
 
     #[must_use]
@@ -47,6 +48,14 @@ impl<'a> Dialog<'a> {
     #[must_use]
     pub fn focus_primary(mut self, focus: bool) -> Self {
         self.focus_primary = focus;
+        self
+    }
+
+    /// Give the non-destructive action focus. Link and overwrite sheets use it so Enter does not
+    /// open a destination or replace a file by accident.
+    #[must_use]
+    pub fn focus_secondary(mut self, focus: bool) -> Self {
+        self.focus_secondary = focus;
         self
     }
 
@@ -75,7 +84,11 @@ impl<'a> Dialog<'a> {
                     }
                     result.primary = response.clicked();
                     if let Some(label) = self.secondary {
-                        result.secondary = Button::new(label).kind(ButtonKind::Ghost).show(ui).clicked();
+                        let response = Button::new(label).kind(ButtonKind::Ghost).show(ui);
+                        if self.focus_secondary {
+                            response.request_focus();
+                        }
+                        result.secondary = response.clicked();
                     }
                 });
             },

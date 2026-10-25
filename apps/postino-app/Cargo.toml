@@ -23,8 +23,10 @@ egui-phosphor.workspace = true
 env_logger.workspace = true
 log.workspace = true
 png.workspace = true
+rfd = "0.15"
 serde.workspace = true
 serde_json.workspace = true
+webbrowser = "1"
 zeroize.workspace = true
 
 [dev-dependencies]

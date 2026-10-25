@@ -387,7 +387,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "ee542dcc358024d996d06dd5d511fdfab2d44d48a7f4a67a2eb427d93d257153"
+sha256 = "46897c6b93f8d60d2a816c760a646ca0544f6882cfa56a0dda36fba44a3c9745"
 usage = "Documentation screenshot of the account switcher, store folders and sync status"
 
 [[asset]]
@@ -397,7 +397,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "7528e62474af7d555a74fb41666ab3291482caaa20cb72be09f183c09c0eb73d"
+sha256 = "5a9602a69eb2243fc024a021edd10bb80b4b1d9954355f90e8f0dfb7c8809ff2"
 usage = "Documentation screenshot of the offline banner with cached mail still readable"
 
 [[asset]]
@@ -427,7 +427,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "60a07de654e4382fd50d2341589492d4ccd88f19a82eefbcb54eba16f787d38e"
+sha256 = "6bc53f2b43bc55428c6fb38b708605d83895b6f5b1b2fbd5aef877a9bf6dc23e"
 usage = "Documentation screenshot of the dark mailbox"
 
 [[asset]]
@@ -437,7 +437,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "1590c53130f341dbc465c71b2fee515e14cc815edff5050b379699c8a8d73521"
+sha256 = "c495f28d1955f09898bfa460f911b882021e5bf6d7160a3d11490ac7c45a7052"
 usage = "Documentation screenshot of the dark offline state"
 
 [[asset]]
@@ -447,7 +447,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "10e145eb2b1af1364cd816d284795447ccfa67e2565a1c5449c1940f3048bc58"
+sha256 = "56bfb45c0bb378201e28d12f27a3a0a300ff67faf2211204ffcd0eb247aee81f"
 usage = "Documentation screenshot of the minimum supported window"
 
 [[asset]]
@@ -459,6 +459,56 @@ license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
 sha256 = "a9eba0fdd69a04dfa6d21109bcaa1d5b2dfe0f4737942e5c7980bf16a812b329"
 usage = "Documentation screenshot of the folder step at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p6c-reading-attachments.png"
+title = "Postino P6c reading pane with attachments"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "e4b54d9abaec8a23e551b86d82837fb453db998551238144ae58a1ecfde0714f"
+usage = "Documentation screenshot of the text reading pane, safe link and attachment Save chip"
+
+[[asset]]
+path = "docs/images/postino-p6c-link-confirm.png"
+title = "Postino P6c link confirmation"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "823b267effffeaa4e2e354d37963acc2468160cc3d71f0b71d7714335269c852"
+usage = "Documentation screenshot of the full-destination link confirmation sheet"
+
+[[asset]]
+path = "docs/images/postino-p6c-settings.png"
+title = "Postino P6c settings"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "0de616ab3dd15ad3eb5c24c1ccd4f8b1a91d94a1c6696d2c989a7cb0985602c2"
+usage = "Documentation screenshot of accounts, appearance, data and information settings"
+
+[[asset]]
+path = "docs/images/postino-p6c-settings-dark.png"
+title = "Postino P6c settings in the dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "858fb6d5f3105d271107dd9333dcca002bc8a5828db1a1c4e8772ac34153e60a"
+usage = "Documentation screenshot of the settings dialog in the dark theme"
+
+[[asset]]
+path = "docs/images/postino-p6c-settings-980.png"
+title = "Postino P6c settings at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "e2286dbb374e898dce54b991f6add67436128c0ea52e67efab5b6dd31e2ad2b4"
+usage = "Documentation screenshot of the settings dialog at the minimum window"
 
 # Cargo dependencies that carry licensed assets (an icon font, not a vendored file).
 [[dependency]]

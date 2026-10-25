@@ -1,5 +1,5 @@
-//! Postino desktop app. M0 is a walking skeleton: a real egui shell over the same operation
-//! registry the CLI and MCP use, with synthetic demo mail until IMAP lands in M1.
+//! Postino desktop app: an egui shell over the same operation registry the CLI and MCP use. The
+//! normal launch opens the encrypted local store; `--demo` is the synthetic fallback.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -7,6 +7,8 @@
 mod app;
 mod boot;
 mod onboarding;
+mod reading;
+mod seams;
 mod settings;
 mod sync_worker;
 #[cfg(test)]
