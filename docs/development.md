@@ -52,7 +52,7 @@ cargo xtask assets --write                    # regenerate ATTRIBUTION.md
 crates/core/        domain, engine (demo or store-backed), operation registry, store_map
 crates/mime/        MIME parse/serialize, HTML sanitization, HTML-to-text, header guards
 crates/platform/    OS seams: the store key in the Windows Credential Manager
-crates/store/       encrypted SQLCipher store, schema v2, repository
+crates/store/       encrypted SQLCipher store, schema v3, repository
 apps/postino-app/   egui shell (demo data until P6)
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks

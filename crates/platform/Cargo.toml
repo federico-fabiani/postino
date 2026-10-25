@@ -7,6 +7,8 @@ rust-version.workspace = true
 description = "Platform seams: the OS keyring, and the store key Postino keeps in it"
 
 [dependencies]
+directories.workspace = true
+fs4.workspace = true
 getrandom.workspace = true
 keyring-core.workspace = true
 thiserror.workspace = true
@@ -14,6 +16,9 @@ zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

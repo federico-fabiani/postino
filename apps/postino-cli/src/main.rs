@@ -44,28 +44,37 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum DraftCommand {
-    /// Create or update a draft in the Drafts folder.
+    /// Create a draft or patch one in place. Omitted content flags keep their current value on
+    /// update; pass an empty flag value to clear a field.
     Save {
         /// Existing draft id; omit to create a new draft.
         #[arg(long)]
         id: Option<String>,
-        /// Recipient. Repeat for multiple addresses; `Name <mail>` or bare mail.
-        #[arg(long = "to", value_name = "ADDRESS", required = true)]
-        to: Vec<String>,
+        /// Account id for a new draft. Required when several accounts exist.
+        #[arg(long)]
+        account: Option<String>,
+        /// Recipient. Repeat for multiple addresses; `Name <mail>` or bare mail. Omit to keep the
+        /// current recipients on update; pass --to= to clear them.
+        #[arg(long = "to", value_name = "ADDRESS")]
+        to: Option<Vec<String>>,
+        /// Cc recipient. Repeat for multiple addresses. Omit to keep; pass --cc= to clear.
         #[arg(long = "cc", value_name = "ADDRESS")]
-        cc: Vec<String>,
+        cc: Option<Vec<String>>,
+        /// Bcc recipient. Repeat for multiple addresses. Omit to keep; pass --bcc= to clear.
         #[arg(long = "bcc", value_name = "ADDRESS")]
-        bcc: Vec<String>,
-        #[arg(long, default_value = "")]
-        subject: String,
-        #[arg(long, default_value = "")]
-        body: String,
-        /// Send the draft immediately after saving it (demo).
+        bcc: Option<Vec<String>>,
+        /// Subject. Omit to keep it on update; pass --subject "" to clear it.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Body text. Omit to keep it on update; pass --body "" to clear it.
+        #[arg(long)]
+        body: Option<String>,
+        /// Save the draft and move it to Sent in the same command (no SMTP is opened).
         #[arg(long)]
         send: bool,
     },
-    /// Demo only: move an existing draft to Sent. Nothing is sent over the network; use
-    /// `draft save --send` to create and send a draft in one CLI command.
+    /// Move an existing draft to Sent locally. No SMTP connection is opened in this build; real
+    /// submission arrives with M2. Use `draft save --send` to create and move a draft in one step.
     Send { id: String },
 }
 
@@ -368,15 +377,8 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
             }
         }
         Command::Draft { command } => match command {
-            DraftCommand::Save { id, to, cc, bcc, subject, body, send } => {
-                let args = json!({
-                    "id": id,
-                    "to": parse_cli_addresses(to, "--to")?,
-                    "cc": parse_cli_addresses(cc, "--cc")?,
-                    "bcc": parse_cli_addresses(bcc, "--bcc")?,
-                    "subject": subject,
-                    "body_text": body,
-                });
+            DraftCommand::Save { id, account, to, cc, bcc, subject, body, send } => {
+                let args = draft_save_args(id, account, to, cc, bcc, subject, body)?;
                 let saved: DraftSave = decode(call(engine, "draft_save", args)?)?;
                 let draft_id = saved.draft.summary.id.clone();
                 if send {
@@ -384,7 +386,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                     if json_output {
                         print_json(&sent)?;
                     } else {
-                        say(format!("Messaggio spostato in Inviati (demo).\n{}", format_summary(&sent.message)))?;
+                        say(format!("{}\n{}", send_note(engine), format_summary(&sent.message)))?;
                     }
                 } else if json_output {
                     print_json(&saved)?;
@@ -397,7 +399,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 if json_output {
                     print_json(&sent)?;
                 } else {
-                    say(format!("Messaggio spostato in Inviati (demo).\n{}", format_summary(&sent.message)))?;
+                    say(format!("{}\n{}", send_note(engine), format_summary(&sent.message)))?;
                 }
             }
         },
@@ -514,8 +516,53 @@ fn draft_note(engine: &Engine) -> &'static str {
     if engine.is_persistent() {
         "Bozza salvata nel database cifrato: riapri con lo stesso --store per ritrovarla."
     } else {
-        "Il motore demo è in memoria: usa --send per inviarla subito."
+        "Il motore demo è in memoria: la bozza sparisce alla chiusura."
     }
+}
+
+fn send_note(engine: &Engine) -> &'static str {
+    if engine.is_persistent() {
+        "Bozza spostata in Inviati (in locale, nessun SMTP): lo spostamento è salvato nel database cifrato. L'invio reale arriva con M2."
+    } else {
+        "Bozza spostata in Inviati (in locale, nessun SMTP): il motore demo è in memoria. L'invio reale arriva con M2."
+    }
+}
+
+/// Build `draft_save` arguments from the flags the user actually passed. Omitted flags stay absent,
+/// which makes an update a patch; an explicitly empty flag (`--to ""`, `--subject ""`) is sent so it
+/// clears the field.
+fn draft_save_args(
+    id: Option<String>,
+    account: Option<String>,
+    to: Option<Vec<String>>,
+    cc: Option<Vec<String>>,
+    bcc: Option<Vec<String>>,
+    subject: Option<String>,
+    body: Option<String>,
+) -> Result<Value> {
+    let mut args = serde_json::Map::new();
+    if let Some(id) = id {
+        args.insert("id".to_owned(), json!(id));
+    }
+    if let Some(account) = account {
+        args.insert("account".to_owned(), json!(account));
+    }
+    if let Some(to) = to {
+        args.insert("to".to_owned(), json!(parse_cli_addresses(to, "--to")?));
+    }
+    if let Some(cc) = cc {
+        args.insert("cc".to_owned(), json!(parse_cli_addresses(cc, "--cc")?));
+    }
+    if let Some(bcc) = bcc {
+        args.insert("bcc".to_owned(), json!(parse_cli_addresses(bcc, "--bcc")?));
+    }
+    if let Some(subject) = subject {
+        args.insert("subject".to_owned(), json!(subject));
+    }
+    if let Some(body) = body {
+        args.insert("body_text".to_owned(), json!(body));
+    }
+    Ok(Value::Object(args))
 }
 
 fn format_label_delete(result: &LabelDelete, note: &str) -> String {
@@ -687,6 +734,100 @@ mod tests {
     }
 
     #[test]
+    fn cli_draft_save_patches_only_the_flags_the_user_passed() {
+        let mut engine = Engine::demo();
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: None,
+                    account: None,
+                    to: Some(vec!["Giulia <giulia.ferri@example.com>".to_owned()]),
+                    cc: Some(vec!["marco.bianchi@example.com".to_owned()]),
+                    bcc: None,
+                    subject: Some("Progetto".to_owned()),
+                    body: Some("Prima versione".to_owned()),
+                    send: false,
+                },
+            }),
+            &mut engine,
+        )
+        .expect("create a draft from the CLI");
+        let id = engine.messages().iter().find(|message| message.summary.subject == "Progetto").expect("draft").summary.id.clone();
+
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: Some(id.clone()),
+                    account: None,
+                    to: None,
+                    cc: None,
+                    bcc: None,
+                    subject: None,
+                    body: Some("Solo il corpo".to_owned()),
+                    send: false,
+                },
+            }),
+            &mut engine,
+        )
+        .expect("patch the body only");
+        let patched = engine.message(&id).expect("draft");
+        assert_eq!(patched.body_text, "Solo il corpo");
+        assert_eq!(patched.summary.subject, "Progetto", "the CLI wiped an omitted subject");
+        assert_eq!(patched.summary.to, vec![Address::new("Giulia", "giulia.ferri@example.com")], "the CLI wiped omitted recipients");
+        assert_eq!(patched.cc, vec![Address::new("", "marco.bianchi@example.com")], "the CLI wiped omitted cc");
+
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: Some(id.clone()),
+                    account: Some("ignored-in-demo".to_owned()),
+                    to: Some(Vec::new()),
+                    cc: None,
+                    bcc: None,
+                    subject: Some(String::new()),
+                    body: None,
+                    send: false,
+                },
+            }),
+            &mut engine,
+        )
+        .expect_err("the demo has one account, so an explicit unknown account is refused");
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: Some(id.clone()),
+                    account: None,
+                    to: Some(Vec::new()),
+                    cc: None,
+                    bcc: None,
+                    subject: Some(String::new()),
+                    body: None,
+                    send: false,
+                },
+            }),
+            &mut engine,
+        )
+        .expect("clear recipients and subject");
+        let cleared = engine.message(&id).expect("draft");
+        assert!(cleared.summary.to.is_empty(), "an explicitly empty --to did not clear the recipients");
+        assert_eq!(cleared.summary.subject, "");
+        assert_eq!(cleared.body_text, "Solo il corpo", "an omitted body was cleared");
+    }
+
+    #[test]
+    fn draft_save_args_omit_unset_flags_and_keep_an_explicit_account() {
+        let args = draft_save_args(None, Some("acc_b".to_owned()), None, None, None, None, Some("Corpo".to_owned())).expect("args");
+        assert_eq!(args["account"], "acc_b");
+        assert_eq!(args["body_text"], "Corpo");
+        assert!(args.get("to").is_none(), "an omitted --to must stay absent for patch semantics");
+        assert!(args.get("subject").is_none(), "an omitted --subject must stay absent for patch semantics");
+
+        let empty = draft_save_args(None, None, Some(Vec::new()), None, None, Some(String::new()), None).expect("empty args");
+        assert_eq!(empty["to"], json!([]));
+        assert_eq!(empty["subject"], "");
+    }
+
+    #[test]
     fn run_args_merge_key_value_overrides() {
         let args = parse_run_args(Some(json!({ "id": "one" }).to_string()), vec!["subject=Ciao".to_owned()]).expect("arguments");
         assert_eq!(args["id"], "one");
@@ -844,27 +985,36 @@ mod tests {
 
         /// Onboarding is P6, so the test seeds the account and the folders the draft flow needs.
         fn seed(&self) {
+            self.seed_account("acc_cli", "Test", "test@example.com", "");
+        }
+
+        fn seed_two_accounts(&self) {
+            self.seed_account("acc_a", "Account A", "a@example.com", "acc_a_");
+            self.seed_account("acc_b", "Account B", "b@example.com", "acc_b_");
+        }
+
+        fn seed_account(&self, id: &str, name: &str, email: &str, prefix: &str) {
             let store = self.open();
             store
                 .upsert_account(&postino_store::Account {
-                    id: "acc_cli".to_owned(),
-                    name: "Test".to_owned(),
-                    email: "test@example.com".to_owned(),
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    email: email.to_owned(),
                     provider: "manual".to_owned(),
                     signature: String::new(),
                     created_at: 1_700_000_000_000,
                 })
                 .expect("account");
-            for (id, name, kind) in [
+            for (suffix, folder_name, kind) in [
                 ("inbox", "Posta in arrivo", postino_store::FolderKind::Inbox),
                 ("sent", "Inviati", postino_store::FolderKind::Sent),
                 ("drafts", "Bozze", postino_store::FolderKind::Drafts),
             ] {
                 store
                     .upsert_folder(&postino_store::Folder {
-                        id: id.to_owned(),
-                        account_id: "acc_cli".to_owned(),
-                        name: name.to_owned(),
+                        id: format!("{prefix}{suffix}"),
+                        account_id: id.to_owned(),
+                        name: folder_name.to_owned(),
                         kind,
                         unread: 0,
                         total: 0,
@@ -919,6 +1069,100 @@ mod tests {
         assert_eq!(listed.messages[0].subject, "Bozza persistente");
         let message: MessageGet = decode(call(&mut engine, "message_get", json!({ "id": draft_id })).expect("message_get")).expect("message");
         assert_eq!(message.message.body_text, "Scritta da CLI, revisione due");
+    }
+
+    #[test]
+    fn cli_store_draft_patch_keeps_recipients_across_a_reopen() {
+        let fixture = TempStore::new();
+        fixture.seed();
+
+        let draft_id = {
+            let mut engine = Engine::open(fixture.open()).expect("engine");
+            run(
+                cli(Command::Draft {
+                    command: DraftCommand::Save {
+                        id: None,
+                        account: Some("acc_cli".to_owned()),
+                        to: Some(vec!["Giulia <giulia.ferri@example.com>".to_owned(), "marco@example.com".to_owned()]),
+                        cc: Some(vec!["info@example.it".to_owned()]),
+                        bcc: None,
+                        subject: Some("Bozza patch".to_owned()),
+                        body: Some("Prima versione".to_owned()),
+                        send: false,
+                    },
+                }),
+                &mut engine,
+            )
+            .expect("create a draft in the store");
+            let id = engine.messages().iter().find(|message| message.summary.subject == "Bozza patch").expect("draft").summary.id.clone();
+
+            run(
+                cli(Command::Draft {
+                    command: DraftCommand::Save {
+                        id: Some(id.clone()),
+                        account: None,
+                        to: None,
+                        cc: None,
+                        bcc: None,
+                        subject: None,
+                        body: Some("Solo il corpo".to_owned()),
+                        send: false,
+                    },
+                }),
+                &mut engine,
+            )
+            .expect("patch only the body");
+            id
+        };
+
+        let store = fixture.open();
+        let draft = store.get_draft(&draft_id).expect("draft row").expect("the draft survived");
+        assert_eq!(draft.body_text, "Solo il corpo");
+        assert_eq!(draft.subject, "Bozza patch", "the CLI patch wiped the subject in the store");
+        assert_eq!(
+            draft.to,
+            vec![postino_store::Address::new("Giulia", "giulia.ferri@example.com"), postino_store::Address::new("", "marco@example.com")]
+        );
+        assert_eq!(draft.cc, vec![postino_store::Address::new("", "info@example.it")]);
+        assert_eq!(draft.revision, 2);
+
+        let engine = Engine::open(fixture.open()).expect("reopen");
+        let message = engine.message(&draft_id).expect("the draft survived the restart");
+        assert_eq!(message.body_text, "Solo il corpo");
+        assert_eq!(message.summary.to.len(), 2);
+        assert_eq!(message.cc.len(), 1);
+    }
+
+    #[test]
+    fn cli_draft_save_routes_an_explicit_account_and_sends_from_it() {
+        let fixture = TempStore::new();
+        fixture.seed_two_accounts();
+        {
+            let mut engine = Engine::open(fixture.open()).expect("engine");
+            run(
+                cli(Command::Draft {
+                    command: DraftCommand::Save {
+                        id: None,
+                        account: Some("acc_b".to_owned()),
+                        to: Some(vec!["giulia.ferri@example.com".to_owned()]),
+                        cc: None,
+                        bcc: None,
+                        subject: Some("Per B".to_owned()),
+                        body: Some("Corpo".to_owned()),
+                        send: true,
+                    },
+                }),
+                &mut engine,
+            )
+            .expect("save and move from B");
+        }
+
+        let store = fixture.open();
+        let sent = store.get_message("draft_1").expect("row").expect("sent message");
+        assert_eq!(sent.summary.account_id, "acc_b");
+        assert_eq!(sent.summary.folder_id, "acc_b_sent");
+        assert_eq!(store.get_folder("acc_a_sent").expect("A sent").expect("A sent").total, 0, "the CLI moved B's draft into A's Sent");
+        assert_eq!(store.get_folder("acc_b_sent").expect("B sent").expect("B sent").total, 1);
     }
 
     /// The `--store` path end to end: the key comes from the platform seam (a mock vault here,

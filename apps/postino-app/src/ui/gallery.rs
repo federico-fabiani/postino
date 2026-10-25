@@ -313,7 +313,7 @@ impl GalleryApp {
             .inner_margin(Margin::symmetric(inset::XL, inset::LG))
             .show(ui, |ui| {
                 ui.set_width(ui_size::COMPOSER_WIDTH);
-                let _ = Composer::new(&mut self.composer, &self.account, true).show(ui);
+                let _ = Composer::new(&mut self.composer, &self.account).show(ui);
             });
     }
 

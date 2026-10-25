@@ -174,6 +174,45 @@ fn draft(subject: &str, body: &str) -> DraftContent {
     }
 }
 
+fn attachment(id: &str) -> Attachment {
+    Attachment { id: id.to_owned(), filename: format!("{id}.pdf"), mime: "application/pdf".to_owned(), size: 128 }
+}
+
+fn seed_two_accounts(fixture: &Fixture) {
+    let store = fixture.open();
+    for (id, name, email) in [("acc_a", "Account A", "a@example.com"), ("acc_b", "Account B", "b@example.com")] {
+        store
+            .upsert_account(&postino_store::Account {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                email: email.to_owned(),
+                provider: "manual".to_owned(),
+                signature: String::new(),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("account");
+        for (suffix, folder_name, kind) in [
+            ("inbox", "Posta in arrivo", postino_store::FolderKind::Inbox),
+            ("sent", "Inviati", postino_store::FolderKind::Sent),
+            ("drafts", "Bozze", postino_store::FolderKind::Drafts),
+        ] {
+            store
+                .upsert_folder(&postino_store::Folder {
+                    id: format!("{id}_{suffix}"),
+                    account_id: id.to_owned(),
+                    name: folder_name.to_owned(),
+                    kind,
+                    unread: 0,
+                    total: 0,
+                    uid_validity: None,
+                    uid_next: None,
+                    last_sync_at: None,
+                })
+                .expect("folder");
+        }
+    }
+}
+
 #[test]
 fn demo_shaped_mailbox_survives_a_round_trip() {
     let fixture = Fixture::new();
@@ -227,11 +266,11 @@ fn draft_save_revision_and_send_survive_a_reopen() {
 
     let draft_id = {
         let mut engine = Engine::open(fixture.open()).expect("engine");
-        let created = engine.save_draft(None, draft("Bozza persistente", "Prima versione")).expect("new draft");
+        let created = engine.save_draft(None, None, draft("Bozza persistente", "Prima versione")).expect("new draft");
         let id = created.summary.id.clone();
         assert!(engine.folders().iter().any(|folder| folder.kind == FolderKind::Drafts && folder.total == 2));
 
-        let updated = engine.save_draft(Some(&id), draft("Bozza persistente", "Seconda versione")).expect("update");
+        let updated = engine.save_draft(None, Some(&id), draft("Bozza persistente", "Seconda versione")).expect("update");
         assert_eq!(updated.summary.id, id, "an update must not create a second draft");
         assert_eq!(updated.body_text, "Seconda versione");
         id
@@ -329,13 +368,24 @@ fn a_draft_row_without_a_display_row_is_still_loaded() {
             .expect("draft row");
     }
 
-    let engine = Engine::open(fixture.open()).expect("open");
+    let mut engine = Engine::open(fixture.open()).expect("open");
     let message = engine.message("drf_1").expect("the draft row is visible as mail");
     assert_eq!(message.summary.folder_id, "drafts");
     assert_eq!(message.summary.subject, "Bozza orfana");
     assert_eq!(message.summary.to, vec![Address::new("Giulia", "giulia.ferri@example.com")]);
     assert_eq!(message.body_text, "Solo la riga drafts");
     assert_eq!(engine.folders().iter().find(|folder| folder.id == "drafts").map(|folder| folder.total), Some(1));
+
+    // The orphan is now a real message row in the store, not a memory-only ghost: store counts,
+    // flags and label writes work against it.
+    let store = fixture.open();
+    let repaired = store.get_message("drf_1").expect("message row").expect("the repair wrote a display row");
+    assert_eq!(repaired.summary.folder_id, "drafts");
+    assert_eq!(store.counts(Some("drafts")).expect("counts"), postino_store::MessageCounts { total: 1, unread: 0 });
+    assert_eq!(store.get_folder("drafts").expect("folder").expect("drafts").total, 1);
+    drop(store);
+    engine.set_flags("drf_1", Some(true), None).expect("the repaired draft accepts a flag write");
+    assert!(fixture.open().get_message("drf_1").expect("row").expect("message").summary.unread);
 }
 
 #[test]
@@ -345,22 +395,178 @@ fn a_repo_failure_surfaces_and_leaves_memory_unchanged() {
     let mut engine = Engine::open(fixture.open()).expect("engine");
 
     // A second connection removes the row behind the engine's back: the engine still has it, the
-    // store no longer does. This is the shape of any write that the store refuses.
+    // store no longer does. This is a caller-visible unknown id, not a disk problem.
     let intruder = fixture.open();
     assert!(intruder.delete_message("msg_002").expect("delete the row behind the engine"));
 
     let folders_before = engine.folders().to_vec();
     let messages_before = engine.message("msg_002").cloned().expect("in memory");
     let error = engine.set_flags("msg_002", Some(true), None).expect_err("the store must refuse the flag");
-    assert!(matches!(&error, OpError::Failed(detail) if detail.contains("local store refused")), "{error}");
+    assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("unknown message")), "{error}");
+    assert!(!error.to_string().contains("free disk space"), "a caller mistake must not be reported as a disk problem");
     assert_eq!(engine.message("msg_002"), Some(&messages_before), "the message was mutated in memory anyway");
     assert_eq!(engine.folders(), folders_before.as_slice(), "counts were mutated after a failed write");
 
     let labels_before = engine.label_summaries();
     let error = engine.set_label("lbl_1", &["msg_002".to_owned()], false).expect_err("the store must refuse the label batch");
-    assert!(matches!(&error, OpError::Failed(detail) if detail.contains("local store refused")), "{error}");
+    assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("unknown message")), "{error}");
     assert_eq!(engine.label_summaries(), labels_before);
     assert_eq!(engine.message("msg_002").map(|message| message.summary.labels.clone()), Some(vec!["lbl_1".to_owned()]));
+}
+
+#[test]
+fn storage_failures_are_failed_with_the_storage_advice() {
+    let fixture = Fixture::new();
+    fixture.seed(&Engine::demo_at(now()));
+    let mut engine = Engine::open(fixture.open()).expect("engine");
+    let before = engine.message("msg_001").cloned().expect("msg_001");
+
+    // A real storage failure: the table disappears under the engine. This is not a caller mistake,
+    // so it must say the store refused the change and that memory is untouched.
+    let connection = raw_connection(&fixture);
+    connection.execute_batch("DROP TABLE messages").expect("drop the messages table");
+    drop(connection);
+    let error = engine.set_flags("msg_001", Some(true), None).expect_err("a missing table must fail");
+    assert!(
+        matches!(&error, OpError::Failed(detail)
+            if detail.contains("local store refused") && detail.contains("rolled back") && detail.contains("free disk space")),
+        "{error}"
+    );
+    assert_eq!(engine.message("msg_001"), Some(&before), "memory changed after a storage failure");
+}
+
+fn raw_connection(fixture: &Fixture) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(fixture.path()).expect("raw open");
+    let hex = fixture.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";")).expect("apply the key");
+    connection
+}
+
+#[test]
+fn a_failed_draft_save_leaves_store_rows_and_revision_unchanged() {
+    let fixture = Fixture::new();
+    fixture.seed(&Engine::demo_at(now()));
+    let mut engine = Engine::open(fixture.open()).expect("engine");
+
+    let mut first_content = draft("Bozza A", "Prima versione");
+    first_content.attachments.push(attachment("att_a"));
+    let first = engine.save_draft(None, None, first_content).expect("first draft");
+    let mut second_content = draft("Bozza B", "Seconda versione");
+    second_content.attachments.push(attachment("att_b"));
+    let second = engine.save_draft(None, None, second_content).expect("second draft");
+
+    let before_message = engine.message(&first.summary.id).cloned().expect("in-memory draft");
+    let store_before = fixture.open();
+    let before_row = store_before.get_message(&first.summary.id).expect("row").expect("first row");
+    let before_revision = store_before.get_draft(&first.summary.id).expect("draft").expect("first draft row").revision;
+    let before_attachments = store_before.attachments(&first.summary.id).expect("attachments");
+    drop(store_before);
+
+    // The update tries to re-use an attachment id owned by the second draft. The store must refuse
+    // it before writing anything, and memory must stay exactly as it was.
+    let mut conflicting = draft("Bozza A", "Non deve essere salvata");
+    conflicting.attachments.push(attachment("att_b"));
+    let error = engine.save_draft(None, Some(&first.summary.id), conflicting).expect_err("cross-message attachment id");
+    assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("belongs to message") && detail.contains("omit")), "{error}");
+    assert!(!error.to_string().contains("free disk space"), "a caller mistake must not carry disk advice");
+    assert_eq!(engine.message(&first.summary.id), Some(&before_message), "memory changed after a failed draft save");
+
+    let mut duplicated = draft("Bozza A", "Duplicato");
+    duplicated.attachments.push(attachment("att_dup"));
+    duplicated.attachments.push(attachment("att_dup"));
+    let error = engine.save_draft(None, Some(&first.summary.id), duplicated).expect_err("duplicate attachment id");
+    assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("repeated")), "{error}");
+
+    let store_after = fixture.open();
+    assert_eq!(store_after.get_message(&first.summary.id).expect("row").expect("first row"), before_row);
+    assert_eq!(store_after.get_draft(&first.summary.id).expect("draft").expect("first draft row").revision, before_revision);
+    assert_eq!(store_after.attachments(&first.summary.id).expect("attachments"), before_attachments);
+    assert_eq!(store_after.get_draft(&second.summary.id).expect("draft").expect("second draft row").revision, 1);
+}
+
+#[test]
+fn two_accounts_route_drafts_and_sent_to_the_owning_account() {
+    let fixture = Fixture::new();
+    seed_two_accounts(&fixture);
+    let mut engine = Engine::open(fixture.open()).expect("engine");
+
+    let created = engine.save_draft(Some("acc_b"), None, draft("Per B", "Corpo")).expect("draft for B");
+    assert_eq!(created.summary.folder_id, "acc_b_drafts", "the draft must live in B's Drafts");
+    let error = engine.save_draft(Some("acc_a"), Some(&created.summary.id), draft("Spostata", "Corpo")).expect_err("account mismatch on update");
+    assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("belongs to account")), "{error}");
+    let sent = engine.send_draft(&created.summary.id).expect("send from B");
+    assert_eq!(sent.folder_id, "acc_b_sent", "B's draft must not move into A's Sent");
+
+    let store = fixture.open();
+    let row = store.get_message(&created.summary.id).expect("row").expect("sent row");
+    assert_eq!(row.summary.account_id, "acc_b");
+    assert_eq!(row.summary.folder_id, "acc_b_sent");
+    assert_eq!(store.get_folder("acc_a_sent").expect("A sent").expect("A sent").total, 0, "A's Sent was touched");
+    assert_eq!(store.get_folder("acc_a_drafts").expect("A drafts").expect("A drafts").total, 0, "A's Drafts was touched");
+    assert_eq!(store.get_folder("acc_b_sent").expect("B sent").expect("B sent").total, 1);
+    drop(store);
+
+    let error = engine.save_draft(None, None, draft("Senza account", "Corpo")).expect_err("two accounts need an explicit one");
+    assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("accounts") && detail.contains("account")), "{error}");
+    let error = engine.save_draft(Some("acc_missing"), None, draft("Sconosciuto", "Corpo")).expect_err("unknown account");
+    assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("unknown account")), "{error}");
+}
+
+#[test]
+fn draft_revisions_never_go_backwards_across_send_and_move_back() {
+    let fixture = Fixture::new();
+    fixture.seed(&Engine::demo_at(now()));
+    let mut engine = Engine::open(fixture.open()).expect("engine");
+
+    let created = engine.save_draft(None, None, draft("Revisioni", "Prima")).expect("draft");
+    let id = created.summary.id.clone();
+    assert_eq!(fixture.open().get_draft(&id).expect("draft").expect("row").revision, 1);
+    engine.save_draft(None, Some(&id), draft("Revisioni", "Seconda")).expect("second save");
+    assert_eq!(fixture.open().get_draft(&id).expect("draft").expect("row").revision, 2);
+
+    engine.send_draft(&id).expect("send");
+    assert!(fixture.open().get_draft(&id).expect("draft").is_none());
+    engine.move_message(&id, "drafts").expect("move back to Drafts");
+    engine.save_draft(None, Some(&id), draft("Revisioni", "Terza")).expect("save after move back");
+    assert_eq!(fixture.open().get_draft(&id).expect("draft").expect("row").revision, 3, "the revision restarted after send");
+}
+
+#[test]
+fn deleting_a_message_removes_its_draft_across_a_reopen() {
+    let fixture = Fixture::new();
+    fixture.seed(&Engine::demo_at(now()));
+    let id = {
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        engine.save_draft(None, None, draft("Da cancellare", "Corpo")).expect("draft").summary.id
+    };
+    assert!(fixture.open().delete_message(&id).expect("delete"));
+    assert!(fixture.open().get_draft(&id).expect("draft").is_none());
+
+    let reopened = Engine::open(fixture.open()).expect("reopen");
+    assert!(reopened.message(&id).is_none(), "the deleted draft came back after reopen");
+    assert_eq!(reopened.folders().iter().find(|folder| folder.id == "drafts").map(|folder| folder.total), Some(1), "only the demo draft remains");
+}
+
+#[test]
+fn label_ids_do_not_go_backwards_across_a_reopen() {
+    let fixture = Fixture::new();
+    fixture.seed(&Engine::demo_at(now()));
+    {
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        engine.delete_label("lbl_3").expect("delete the highest label");
+    }
+    let created = {
+        let mut engine = Engine::open(fixture.open()).expect("reopen");
+        engine.create_label("Nuova", postino_core::LabelColor::Forest).expect("create after reopen")
+    };
+    assert_eq!(created.id, "lbl_4", "a deleted label id came back after reopen");
+
+    // An older store without the meta row is repaired from the surviving ids on open.
+    fixture.open().set_meta(postino_store::LABEL_SEQ_KEY, "0").expect("forge an old meta value");
+    let mut engine = Engine::open(fixture.open()).expect("second reopen");
+    let next = engine.create_label("Altra", postino_core::LabelColor::Muted).expect("create after repair");
+    assert_eq!(next.id, "lbl_5");
+    assert_eq!(fixture.open().get_meta(postino_store::LABEL_SEQ_KEY).expect("meta").as_deref(), Some("5"));
 }
 
 #[test]
@@ -374,7 +580,7 @@ fn engine_writes_never_land_in_plaintext() {
     let mut engine = Engine::open(fixture.open()).expect("engine");
     let mut content = draft(SUBJECT, BODY);
     content.to = vec![Address::new("Canary", RECIPIENT)];
-    engine.save_draft(None, content).expect("draft");
+    engine.save_draft(None, None, content).expect("draft");
     drop(engine);
 
     let files = std::fs::read_dir(fixture.dir.path())

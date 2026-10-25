@@ -68,7 +68,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P1 | U0.5 labels | label create/rename/delete/apply/filter in engine, GUI, CLI, MCP; counts; keyboard | done |
 | P2a | Layout and modals | composer fits 980x600, modal palette, pinned sidebar editor, list proportions | todo |
 | P2b | States and a11y | empty/error/loading states, contrast floors, accessible rows, persistence, copy | todo |
-| P3d | Persistence correctness | atomic draft save, patch updates, account routing, revision and label sequences, keyring lock | todo |
+| P3d | Persistence correctness | atomic draft save, patch updates, account routing, revision and label sequences, keyring lock | done |
 | P3a | Store spike | SQLCipher go/no-go with measured build time, size and encrypted-file proof | done |
 | P3b | Store schema + keyring | platform keyring seam, schema v2, repository API, no-plaintext tests | done |
 | P3c | Engine wiring | engine reads/writes the encrypted store; demo path unchanged; reopen test | done |

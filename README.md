@@ -3,14 +3,14 @@
 **Local-first, agent-first mail.** A fast, native email client written in Rust, with one operation
 registry shared by the desktop app, the CLI and an MCP server.
 
-> **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c) + the
-> MIME crate (P4a).** The shell, the operation registry, the CLI and the MCP server work against a
-> synthetic demo mailbox, and `postino --store <path>` can now run the same operations on the
+> **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
+> the MIME crate (P4a).** The shell, the operation registry, the CLI and the MCP server work against
+> a synthetic demo mailbox, and `postino --store <path>` can now run the same operations on the
 > encrypted SQLCipher database: accounts, folders, messages, labels, drafts and flags survive a
 > restart. The desktop app still boots on the demo until onboarding (P6). MIME parsing,
 > sanitization and serialization exist as `postino-mime` but are not wired into the engine yet;
 > IMAP, SMTP and the background daemon land in M1-M4. No real account is configured, no mail leaves
-> the machine, and the composer's send is explicitly a local demo.
+> the machine, and the composer's send is a local move to Sent, never an SMTP submission.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -27,8 +27,10 @@ MCP      ─┘
 - Folder rail, message table, reading pane, filters, read/starred toggles, command palette
   (`Ctrl+K`), dark theme and a demo inbox with realistic threads and attachments.
 - Compose window with To/Cc/Bcc, subject, signature, Markdown formatting, drag-and-drop attachment
-  metadata, autosaved drafts and reply/reply-all/forward prefill. Send is demo-only until M2 and is
-  undoable.
+  metadata, autosaved drafts and reply/reply-all/forward prefill. Send is a local move to Sent until
+  M2 (no SMTP) and is undoable. `draft_save` is a patch on update: an omitted content field keeps the
+  draft's current value, while an explicitly empty value clears it. The CLI sends only the flags the
+  user passed and accepts `--account`; the app keeps sending the full content.
 - Local labels with a semantic colour palette: create, rename and delete from the sidebar; apply and
   remove from the message menu (`L`), the command palette, the CLI and MCP; filter the list by label
   and see label chips in the reading pane. A label view spans every folder by default and a folder
@@ -41,9 +43,10 @@ MCP      ─┘
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
 - The M1 persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema
-  v2, additive migrations and a typed repository (`postino-store`), plus the Windows Credential
-  Manager key seam (`postino-platform`). `Engine::open` loads the mailbox once and writes every
-  mutation through; `Engine::demo()` is unchanged and the desktop app still uses it.
+  v3 (draft revision sequence and label high-water mark), additive migrations and a typed repository
+  (`postino-store`), plus the Windows Credential Manager key seam (`postino-platform`). `Engine::open`
+  loads the mailbox once, repairs orphan drafts, writes every mutation through in one transaction
+  and keeps store errors categorised; `Engine::demo()` is unchanged and the desktop app still uses it.
 - The M1 MIME foundation as a crate (`postino-mime`, P4a): bounded RFC 5322/2045 parsing with
   recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
@@ -89,10 +92,11 @@ cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" info
 The app is `postino-app`; the command is `postino`. The product name stays Postino.
 
 `--store` opens or creates the SQLCipher database at that path and takes the key from the OS keyring
-(service `postino`, scope `default`); `--demo` and `--store` are mutually exclusive. A fresh store has
-no accounts until onboarding (P6), so mail commands report that nothing is configured; the store is
-exercised end to end by the test suite today. One process owns the database: do not point two
-`postino --store` commands at the same file.
+(service `postino`, scope `default`); `--demo` and `--store` are mutually exclusive. First-run key
+creation is serialised with `<app local data>/Postino/keyring.lock` and verified by reading the key
+back. A fresh store has no accounts until onboarding (P6), so mail commands report that nothing is
+configured; the store is exercised end to end by the test suite today. One process owns the database:
+do not point two `postino --store` commands at the same file.
 
 ### MCP
 

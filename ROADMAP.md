@@ -41,8 +41,8 @@ interaction model before real mail makes them expensive to change. Full spec:
       table, palette with arrows/Enter/shortcuts, `?` sheet, context menus, batch bar, undo/toast,
       read-state policy, reading pane open/expand/Esc.
 - [x] **U0.4 Compose** — composer component, draft operations, autosave, reply/forward prefill,
-      demo send, Drafts folder and counts. `draft_save` and `draft_send` are in the CLI/MCP registry;
-      attachments are metadata-only until M2. Screenshots: `docs/images/postino-u04.png`,
+      local move to Sent, Drafts folder and counts. `draft_save` and `draft_send` are in the
+      CLI/MCP registry; attachments are metadata-only until M2. Screenshots: `docs/images/postino-u04.png`,
       `postino-u04-compose.png`, `postino-u04-compose-dark.png`.
 - [x] **U0.5 Labels** — label registry with counts, create/rename/delete/apply/remove and filter in
       the engine, GUI, CLI and MCP; inline creation under the ETICHETTE header with a semantic colour

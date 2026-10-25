@@ -17,6 +17,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 getrandom.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [lints]

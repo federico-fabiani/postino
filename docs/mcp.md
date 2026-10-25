@@ -56,8 +56,8 @@ agent can read the message and recover.
 | `message_get` | yes | One message with body and attachments |
 | `message_flag` | no | Set read/unread and/or starred |
 | `message_move` | no | Move a message to a regular folder |
-| `draft_save` | no | Create or update one draft in place |
-| `draft_send` | no | Demo only: move a draft to Sent, with no SMTP connection |
+| `draft_save` | no | Create a draft or patch one in place |
+| `draft_send` | no | Move a draft to Sent locally; no SMTP connection in this build |
 | `search` | yes | Case-insensitive search over subjects, people and bodies, with optional folder and label filters |
 | `labels_list` | yes | Labels with mailbox-wide total and unread counts |
 | `label_create` | no | Create a local label with a semantic colour |
@@ -88,17 +88,22 @@ validates every message id before changing anything, caps a call at 500 ids and 
 messages actually changed, so an agent can retry safely.
 
 `draft_save` refuses CR/LF in addresses or the subject, validates every recipient, caps recipients
-and attachments, and returns the draft with a stable id. `draft_send` requires at least one
-recipient and is explicitly labelled demo: it moves the draft to Sent locally, without opening a
-connection. Real submission, dry-run, rate limits and an audit log arrive with M2.
+and attachments, and returns the draft with a stable id. **It is a patch on update:** every content
+field (`to`, `cc`, `bcc`, `subject`, `body_text`, `attachments`) is optional; omitting a field keeps
+its current value and sending it — even as an empty list or empty string — replaces it. On create,
+omitted fields are empty, and `account` chooses the account; it is required when more than one
+account exists. The app sends the full content on every autosave, which is equivalent to replacing
+every field. `draft_send` requires at least one recipient, moves the draft to the Sent folder of its
+own account, and opens no connection: the move is local and durable on a `--store` database, and
+real submission arrives with M2.
 
 ## Safety
 
 - The server is opt-in and stdio-only; there is no network listener.
 - The daemon pipe (M4) will be same-user and token-authenticated.
-- `draft_send` is demo-only and never opens a connection. The real M2 send tool will add `dry_run`,
-  idempotency keys, a rate limit and an audit log; recipient caps and header-injection checks are
-  already in place. See `docs/threat-model.md`.
+- `draft_send` never opens a connection and is honestly labelled "Move a draft to Sent (local)".
+  The real M2 send tool will add `dry_run`, idempotency keys, a rate limit and an audit log;
+  recipient caps and header-injection checks are already in place. See `docs/threat-model.md`.
 - Tool arguments are validated against `deny_unknown_fields`; typos are rejected rather than
   ignored.
 - Never put credentials, tokens or message bodies in logs.

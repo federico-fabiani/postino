@@ -175,12 +175,17 @@ mod tests {
     }
 
     #[test]
-    fn draft_tools_are_exposed_and_the_demo_send_works() {
+    fn draft_tools_are_exposed_and_the_local_send_works() {
         let mut engine = Engine::demo();
         let tools = request(&mut engine, "tools/list");
         let definitions = tools["result"]["tools"].as_array().expect("tools");
         let draft_send = definitions.iter().find(|tool| tool["name"] == "draft_send").expect("draft_send");
-        assert!(draft_send["description"].as_str().is_some_and(|description| description.contains("Demo only")));
+        assert_eq!(draft_send["title"], "Move a draft to Sent (local)");
+        assert!(
+            draft_send["description"]
+                .as_str()
+                .is_some_and(|description| { description.contains("No SMTP") && description.contains("local and durable on a store") })
+        );
 
         let saved = handle(
             &mut engine,

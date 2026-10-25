@@ -84,15 +84,15 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "draft_save",
             "Save a draft",
-            "Create or update a draft in Drafts. Omit `id` for a new draft, pass the returned id to update it in place. Recipients are structured addresses; header injection is refused.",
+            "Create or patch a draft in Drafts. Omit `id` to create one: absent content fields are empty. With `id`, an absent field keeps its current value and a present field replaces it, including an empty list or empty string. `account` chooses the account on create; it is required when several accounts exist.",
             DraftSaveArgs,
             false,
             false
         ),
         def!(
             "draft_send",
-            "Send a draft (demo)",
-            "Demo only: move a draft to Sent and record the current timestamp. No SMTP server is contacted; real submission arrives in M2. At least one To, Cc or Bcc recipient is required.",
+            "Move a draft to Sent (local)",
+            "Move a draft to the Sent folder of its own account and record the current timestamp. No SMTP connection is opened in this build: the move is local and durable on a store, and real submission arrives with M2. At least one To, Cc or Bcc recipient is required.",
             DraftSendArgs,
             false,
             false
@@ -220,20 +220,22 @@ pub struct MessageMoveArgs {
 pub struct DraftSaveArgs {
     /// Existing draft id returned by a previous draft_save. Omit to create a draft.
     pub id: Option<String>,
-    /// Primary recipients. An empty list is allowed while drafting.
-    #[serde(default)]
-    pub to: Vec<Address>,
-    #[serde(default)]
-    pub cc: Vec<Address>,
-    #[serde(default)]
-    pub bcc: Vec<Address>,
-    #[serde(default)]
-    pub subject: String,
-    #[serde(default)]
-    pub body_text: String,
-    /// Attachment metadata. M0 stores the name, MIME type and size; the bytes arrive in M2.
-    #[serde(default)]
-    pub attachments: Vec<DraftAttachment>,
+    /// Account id for a new draft. Required when the mailbox has more than one account; an update
+    /// keeps the draft's own account.
+    pub account: Option<String>,
+    /// Primary recipients. Omit to keep the current list on update; an empty list clears it.
+    pub to: Option<Vec<Address>>,
+    /// Cc recipients. Omit to keep the current list on update; an empty list clears it.
+    pub cc: Option<Vec<Address>>,
+    /// Bcc recipients. Omit to keep the current list on update; an empty list clears it.
+    pub bcc: Option<Vec<Address>>,
+    /// Subject. Omit to keep the current subject on update; an empty string clears it.
+    pub subject: Option<String>,
+    /// Body text. Omit to keep the current body on update; an empty string clears it.
+    pub body_text: Option<String>,
+    /// Attachment metadata. Omit to keep the current attachments on update; an empty list clears
+    /// them. M0 stores the name, MIME type and size; the bytes arrive in M2.
+    pub attachments: Option<Vec<DraftAttachment>>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -439,24 +441,8 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "draft_save" => {
             let args: DraftSaveArgs = parse(args)?;
-            let content = DraftContent {
-                to: args.to,
-                cc: args.cc,
-                bcc: args.bcc,
-                subject: args.subject,
-                body_text: args.body_text,
-                attachments: args
-                    .attachments
-                    .into_iter()
-                    .map(|attachment| Attachment {
-                        id: attachment.id.unwrap_or_default(),
-                        filename: attachment.filename,
-                        mime: attachment.mime,
-                        size: attachment.size,
-                    })
-                    .collect(),
-            };
-            value(DraftSave { draft: engine.save_draft(args.id.as_deref(), content)? })
+            let content = draft_content(engine, args)?;
+            value(DraftSave { draft: content })
         }
         "draft_send" => {
             let args: DraftSendArgs = parse(args)?;
@@ -490,6 +476,49 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         other => Err(OpError::UnknownOp(other.to_owned())),
     }
+}
+
+/// Merge a `draft_save` request into full draft content. On create absent fields are empty; on
+/// update absent fields keep the current value and present fields (including empty ones) replace it.
+fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, OpError> {
+    let DraftSaveArgs { id, account, to, cc, bcc, subject, body_text, attachments } = args;
+    let content = match &id {
+        Some(id) => {
+            let current = engine.message(id).ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}; omit id to create a draft")))?;
+            DraftContent {
+                to: to.unwrap_or_else(|| current.summary.to.clone()),
+                cc: cc.unwrap_or_else(|| current.cc.clone()),
+                bcc: bcc.unwrap_or_else(|| current.bcc.clone()),
+                subject: subject.unwrap_or_else(|| current.summary.subject.clone()),
+                body_text: body_text.unwrap_or_else(|| current.body_text.clone()),
+                attachments: match attachments {
+                    Some(attachments) => draft_attachments(attachments),
+                    None => current.attachments.clone(),
+                },
+            }
+        }
+        None => DraftContent {
+            to: to.unwrap_or_default(),
+            cc: cc.unwrap_or_default(),
+            bcc: bcc.unwrap_or_default(),
+            subject: subject.unwrap_or_default(),
+            body_text: body_text.unwrap_or_default(),
+            attachments: attachments.map(draft_attachments).unwrap_or_default(),
+        },
+    };
+    engine.save_draft(account.as_deref(), id.as_deref(), content)
+}
+
+fn draft_attachments(attachments: Vec<DraftAttachment>) -> Vec<Attachment> {
+    attachments
+        .into_iter()
+        .map(|attachment| Attachment {
+            id: attachment.id.unwrap_or_default(),
+            filename: attachment.filename,
+            mime: attachment.mime,
+            size: attachment.size,
+        })
+        .collect()
 }
 
 fn parse<T: DeserializeOwned>(args: Value) -> Result<T, OpError> {
@@ -833,6 +862,46 @@ mod tests {
         assert_eq!(sent["message"]["folder_id"], "sent");
         let drafts = call(&mut engine, "messages_list", json!({ "folder": "drafts" }));
         assert!(!drafts["messages"].as_array().expect("rows").iter().any(|row| row["id"] == json!(id)));
+    }
+
+    #[test]
+    fn draft_save_update_is_a_patch_and_create_defaults_to_empty() {
+        let mut engine = Engine::demo();
+        let saved = call(
+            &mut engine,
+            "draft_save",
+            json!({
+                "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
+                "cc": [{ "email": "marco.bianchi@example.com" }],
+                "subject": "Proposta",
+                "body_text": "Prima versione",
+                "attachments": [{ "filename": "preventivo.pdf", "mime": "application/pdf", "size": 1200 }]
+            }),
+        );
+        let id = saved["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
+
+        let updated = call(&mut engine, "draft_save", json!({ "id": id, "body_text": "Solo il corpo cambia" }));
+        assert_eq!(updated["draft"]["body_text"], "Solo il corpo cambia");
+        assert_eq!(updated["draft"]["summary"]["subject"], "Proposta", "an omitted subject was wiped");
+        assert_eq!(updated["draft"]["summary"]["to"], json!([{ "name": "Giulia", "email": "giulia.ferri@example.com" }]));
+        assert_eq!(updated["draft"]["cc"], json!([{ "name": "", "email": "marco.bianchi@example.com" }]));
+        assert_eq!(updated["draft"]["attachments"].as_array().map(Vec::len), Some(1), "omitted attachments were wiped");
+        assert_eq!(updated["draft"]["summary"]["id"], json!(id), "the patch created a second draft");
+
+        let cleared =
+            call(&mut engine, "draft_save", json!({ "id": id, "to": [], "cc": [], "bcc": [], "subject": "", "body_text": "", "attachments": [] }));
+        assert_eq!(cleared["draft"]["summary"]["to"], json!([]));
+        assert_eq!(cleared["draft"]["cc"], json!([]));
+        assert_eq!(cleared["draft"]["summary"]["subject"], "");
+        assert_eq!(cleared["draft"]["body_text"], "");
+        assert_eq!(cleared["draft"]["attachments"], json!([]));
+
+        let created = call(&mut engine, "draft_save", json!({ "subject": "Solo oggetto" }));
+        assert_eq!(created["draft"]["summary"]["to"], json!([]));
+        assert_eq!(created["draft"]["cc"], json!([]));
+        assert_eq!(created["draft"]["bcc"], json!([]));
+        assert_eq!(created["draft"]["body_text"], "");
+        assert_eq!(created["draft"]["attachments"], json!([]));
     }
 
     #[test]

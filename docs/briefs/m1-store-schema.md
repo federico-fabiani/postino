@@ -1,5 +1,10 @@
 # Brief — M1 store schema and keyring (P3b)
 
+> **Superseded by P3d where it differs.** Schema v3 adds `draft_seq`, `meta.label_seq` is the label
+> high-water mark, `delete_message` also removes the draft row and sequence, and first-run key
+> creation takes the `Postino/keyring.lock` file lock with a read-back check. See
+> `docs/briefs/p3d-persistence-fixes.md`.
+
 > **Depends on:** P3a (SQLCipher proof) · **Next:** P3c engine wiring · **No UI work**
 
 ## Outcome

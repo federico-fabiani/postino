@@ -220,13 +220,12 @@ pub struct ComposerResponse {
 pub struct Composer<'a> {
     state: &'a mut ComposerState,
     account: &'a Account,
-    demo: bool,
 }
 
 impl<'a> Composer<'a> {
     #[must_use]
-    pub fn new(state: &'a mut ComposerState, account: &'a Account, demo: bool) -> Self {
-        Self { state, account, demo }
+    pub fn new(state: &'a mut ComposerState, account: &'a Account) -> Self {
+        Self { state, account }
     }
 
     pub fn show(self, ui: &mut Ui) -> ComposerResponse {
@@ -536,7 +535,7 @@ impl<'a> Composer<'a> {
                 } else {
                     ""
                 };
-                let send_label = if self.demo { "Invia (demo)" } else { "Invia" };
+                let send_label = "Invia (locale)";
                 if Button::primary(send_label)
                     .icon(icons::SEND)
                     .shortcut("Ctrl+Invio")

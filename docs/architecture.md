@@ -13,7 +13,7 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/core` | Domain types, the engine (demo or store-backed), the operation registry and its JSON Schemas |
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/platform` | OS seams; today the store key in the Windows Credential Manager |
-| `crates/store` | SQLCipher schema v2, migrations and the repository; the engine's persistence layer since P3c |
+| `crates/store` | SQLCipher schema v3, migrations and the repository; the engine's persistence layer since P3c |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
 | `apps/postino-cli` | `postino` command line and the opt-in MCP server |
 | `xtask` | `ci`, `layers`, `assets` |
@@ -124,6 +124,7 @@ message(id, account, folder, uid, message_id, thread_id, from, to, cc, bcc,
 thread(id, account, subject_norm, last_date, unread, message_count)
 attachment(id, message, filename, mime, size, blob_hash)
 draft(id, account, revision, updated_at, blob_hash, in_reply_to)
+draft_seq(message_id, revision)
 outbox(id, account, idempotency_key, created_at, send_at, attempts, last_error)
 rule(id, account, priority, enabled, match_json, action_json)
 signature(id, account, identity, name, html)
@@ -140,7 +141,7 @@ sync_state(account, folder, uidvalidity, last_uid, modseq)
 - Nothing is deleted from the server unless the user asks. "Trash" is a local view and an IMAP
   move; expunge is explicit.
 
-### 4.1 Implemented in P3b: schema v2, keyring and repository
+### 4.1 Implemented in P3b, revised in P3d: schema v3, keyring and repository
 
 The first real persistence layer exists as two crates; P3c wires them into the engine.
 
@@ -160,11 +161,18 @@ postino --store <path> ── load_or_create_key("default") ──▶ postino-pl
 ```
 
 `load_or_create_key` fails closed: no vault, a failed read, a secret that is not 32 bytes or a
-failed RNG is an error, never a derived key or a plaintext file. `StoreKey` is redacted in `Debug`,
-has no `Clone` and zeroises its bytes on drop; the SQLCipher pragma is built in a zeroising string.
-SQLCipher's internal copy of the key is the remaining gap, recorded in `docs/store-spike.md`. The
-store crate never reads the keyring, which is what lets its tests run with a random in-memory key.
-Tests for the platform crate install `keyring_core::mock` and never touch the real vault.
+failed RNG is an error, never a derived key or a plaintext file. First-run creation is serialised
+with an OS file lock at `<app local data>/Postino/keyring.lock`, held across re-read → generate →
+write → read-back; a mismatch is retried once inside the lock and then fails closed. `StoreKey` is
+redacted in `Debug`, has no `Clone` and zeroises its bytes on drop; the SQLCipher pragma is built in
+a zeroising string sized for the exact final length, so it never reallocates. SQLCipher's internal
+copy of the key is the remaining gap, recorded in `docs/store-spike.md`. The store crate never reads
+the keyring, which is what lets its tests run with a random in-memory key. Tests for the platform
+crate install `keyring_core::mock` and never touch the real vault.
+
+**Schema v3** (`crates/store/src/lib.rs`): v2 plus `draft_seq(message_id PRIMARY KEY, revision)`,
+which holds the draft revision high-water mark independently from the draft row. Migration v3 seeds
+it from `drafts.revision`, so an existing store keeps its revision numbers.
 
 **Schema v2** (`crates/store/src/lib.rs`, migration index 1, additive from the P3a `meta` table):
 
@@ -193,11 +201,19 @@ Every multi-row mutation is one transaction, and a bad id rolls the batch back. 
 leave labels and attachments alone unless the caller replaces them, and a message cannot be placed
 in another account's folder (`AccountMismatch`).
 
+`save_draft_message` is the one whole-draft transaction: it validates attachment ids, upserts the
+message row, replaces attachments, writes the `drafts` revision and `draft_seq`, and refreshes the
+Drafts folder counts before commit. `send_draft_message` moves the message to Sent and deletes only
+the `drafts` row, keeping `draft_seq` for a later move back. `delete_message` removes the message,
+its attachments/assignments by cascade, the `drafts` row and the sequence together. Label creation
+raises `meta.label_seq` in the same transaction as the label row; deleting the highest label never
+lowers it.
+
 Folder `unread`/`total` are a cache refreshed from `messages` by mutations and repairable with
 `recount_folder`. The list query returns `total`/`unread` for the filtered scope before pagination
 and clamps pages to 1..=500 rows.
 
-### 4.2 Implemented in P3c: the engine on the store
+### 4.2 Implemented in P3c, hardened in P3d: the engine on the store
 
 `Engine` holds `store: Option<postino_store::Store>`. `demo()` and `demo_at()` leave it `None` and
 behave exactly as before; `open(store)` hydrates the mailbox and keeps the connection for
@@ -205,31 +221,44 @@ write-through. The store crate does not depend on core: `crates/core/src/store_m
 translation between domain types and store rows.
 
 **Load once.** `Engine::open` issues one query per table: accounts, folders, messages (with labels
-in a second grouped query), attachments grouped by message, labels and drafts. There is no
-per-message read. A draft that exists only as a `drafts` row is materialised into its Drafts folder,
-so the revision log can never hide mail.
+in a second grouped query), attachments grouped by message and labels. There is no per-message read.
+Before hydrating, it repairs every `drafts` row that has no message row into a real message row in
+the Drafts folder of its account, in one transaction, using the body and recipients from the
+revision row. If an account, folder or date cannot be repaired, the open fails with an actionable
+error instead of serving a ghost draft. The label sequence is read from `meta.label_seq`, seeded
+from `max(meta, existing label ids)` and written back when an older store lacks it; the next label
+id is therefore never one that was already used.
 
 **Write through.** Every mutating operation writes the repository first and only then updates
-memory; a failed write is an `OpError::Failed` with the store's reason and an instruction, and
-memory is untouched. Wired in P3c: `save_draft` (message row, attachment rows, revision row),
-`send_draft` (move to Sent plus delete the draft row), `set_flags`, `move_message`, label
-create/update/delete and label apply/remove. Reads (`message_get`, `messages_list`, `search`,
+memory; a failed write leaves memory untouched. `save_draft` is one `save_draft_message`
+transaction (message row, attachments, revision row and Drafts folder counts); a cross-message
+attachment id or a repeated one is refused before the first write. `send_draft` is one
+`send_draft_message` transaction that moves the message to the Sent folder of the draft's own
+account and deletes only the draft row, keeping its revision sequence. `delete_message` removes the
+draft row and sequence in the same transaction. Also wired in P3c: `set_flags`, `move_message`,
+label create/update/delete and label apply/remove. Reads (`message_get`, `messages_list`, `search`,
 `labels_list`) never mutate. Account and folder writes remain a P6 seam: onboarding will call
 `upsert_account`/`upsert_folder` before the first engine load.
+
+Store errors are categorised at the `store_map` boundary: caller mistakes (unknown ids, duplicate
+names, account mismatches, repeated or cross-message attachment ids) are `OpError::InvalidArgs` with
+a specific sentence; I/O, wrong key, corruption and schema-too-new are `OpError::Failed` with the
+storage advice and a "rolled back, memory untouched" statement, which every engine write can honour
+because each is one transaction.
 
 **Counts.** The store keeps `folders.total`/`unread` current inside its own transactions; the engine
 recomputes its in-memory counts after each mutation instead of re-reading the store. The virtual
 `starred` folder is derived from message flags and is not a meaningful row in the store's folder
 cache; the engine is authoritative for it.
 
-**Residual windows.** Each repository call is individually transactional, but `save_draft` composes
-three and `send_draft` two. A crash or disk failure between them can leave the store one step ahead
-of memory; the next save repairs the draft, and the message row is always written before the
-revision row. Attachment bytes, IMAP `uid`/`Message-ID` and `size` are not written by the engine yet
-(P4/P5). There is no cross-process locking story beyond SQLite's WAL and busy timeout: one process
-owns the store until the daemon (M4), and the desktop app does not open it yet. The repository
-returns folders and labels ordered by name, so a store engine sees alphabetical order where the demo
-saw creation order; P6 decides the real folder-tree order when onboarding writes it.
+**Residual windows.** Each engine mutation is one repository transaction, so a crash or disk
+failure cannot leave the store one step ahead of memory within an operation. Activations and the
+app are still demo-only, attachment bytes, IMAP `uid`/`Message-ID` and `size` are not written by the
+engine yet (P4/P5), and the keyring lock protects first-run key creation, not the store file itself.
+There is no cross-process locking story beyond SQLite's WAL, busy timeout and the keyring lock: one
+process owns the store until the daemon (M4), and the desktop app does not open it yet. The
+repository returns folders and labels ordered by name, so a store engine sees alphabetical order
+where the demo saw creation order; P6 decides the real folder-tree order when onboarding writes it.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
 a store. **Still missing:** onboarding and the default store path (P6), IMAP writers for
@@ -349,4 +378,5 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P3a: encrypted SQLCipher store proof and the build decision |
 | 2026-10-25 | major | P3b: platform keyring seam, schema v2, repository and tests |
 | 2026-10-25 | major | P3c: engine loads the store once and writes through; CLI `--store`; demo unchanged |
+| 2026-10-25 | major | P3d: schema v3 (`draft_seq`, `label_seq`), atomic draft save/send, draft patch semantics, per-account Sent, orphan repair, keyring first-run lock, categorised store errors |
 | 2026-10-25 | major | P4a: `postino-mime` parses, sanitizes and serializes MIME with bounds, warnings and injection guards |

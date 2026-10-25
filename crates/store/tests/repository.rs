@@ -474,6 +474,109 @@ fn drafts_revision_increments_and_survives_reopen() {
 }
 
 #[test]
+fn save_draft_message_is_one_transaction_and_validates_attachment_ids() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    store.upsert_folder(&folder("drafts", "Bozze", FolderKind::Drafts)).expect("drafts");
+    store.upsert_folder(&folder("sent", "Inviati", FolderKind::Sent)).expect("sent");
+
+    let mut first = sample_message("drf_1", "drafts", "Bozza A", "Prima versione", 1_700_000_200_000);
+    first.summary.unread = false;
+    let first_attachment =
+        Attachment { id: "att_a".to_owned(), filename: "a.pdf".to_owned(), mime: "application/pdf".to_owned(), size: 10, blob_hash: None };
+    store.save_draft_message(&first, std::slice::from_ref(&first_attachment)).expect("first draft");
+
+    let mut second = sample_message("drf_2", "drafts", "Bozza B", "Seconda", 1_700_000_200_100);
+    second.summary.unread = false;
+    let second_attachment = Attachment { id: "att_b".to_owned(), filename: "b.pdf".to_owned(), ..first_attachment.clone() };
+    store.save_draft_message(&second, std::slice::from_ref(&second_attachment)).expect("second draft");
+
+    let before = store.get_draft("drf_1").expect("draft row").expect("drf_1");
+    assert_eq!(before.revision, 1);
+    assert_eq!(store.attachments("drf_1").expect("attachments"), vec![first_attachment.clone()]);
+
+    let mut conflict = first.clone();
+    conflict.body_text = "Non deve essere scritto".to_owned();
+    let error = store
+        .save_draft_message(&conflict, std::slice::from_ref(&second_attachment))
+        .expect_err("an attachment owned by another message must be refused");
+    assert!(matches!(error, StoreError::AttachmentOwnedByOther { ref id, ref owner } if id == "att_b" && owner == "drf_2"), "{error}");
+
+    let after = store.get_draft("drf_1").expect("draft row").expect("drf_1");
+    assert_eq!(after.revision, before.revision, "the failed save bumped the revision");
+    assert_eq!(after.body_text, "Prima versione", "the failed save changed the draft row");
+    assert_eq!(store.get_message("drf_1").expect("message").expect("drf_1").body_text, "Prima versione", "the failed save changed the display row");
+    assert_eq!(store.attachments("drf_1").expect("attachments"), vec![first_attachment.clone()], "the failed save changed attachments");
+
+    let error = store
+        .save_draft_message(&first, &[first_attachment.clone(), first_attachment.clone()])
+        .expect_err("a repeated attachment id must be refused");
+    assert!(matches!(error, StoreError::DuplicateAttachment { ref id } if id == "att_a"), "{error}");
+    assert_eq!(store.get_draft("drf_1").expect("draft row").expect("drf_1").revision, before.revision);
+}
+
+#[test]
+fn send_keeps_the_draft_revision_sequence() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    store.upsert_folder(&folder("drafts", "Bozze", FolderKind::Drafts)).expect("drafts");
+    store.upsert_folder(&folder("sent", "Inviati", FolderKind::Sent)).expect("sent");
+
+    let mut message = sample_message("drf_1", "drafts", "Bozza", "Prima", 1_700_000_200_000);
+    message.summary.unread = false;
+    assert_eq!(store.save_draft_message(&message, &[]).expect("save v1").revision, 1);
+    assert_eq!(store.save_draft_message(&message, &[]).expect("save v2").revision, 2);
+
+    let mut sent = message.clone();
+    sent.summary.folder_id = "sent".to_owned();
+    sent.summary.date = 1_700_000_300_000;
+    store.send_draft_message(&sent).expect("send");
+    assert!(store.get_draft("drf_1").expect("draft row").is_none());
+    assert_eq!(store.get_message("drf_1").expect("message").expect("sent message").summary.folder_id, "sent");
+
+    store.move_messages(&["drf_1".to_owned()], "drafts").expect("move back");
+    assert_eq!(store.save_draft_message(&message, &[]).expect("save v3").revision, 3, "the sequence restarted after a send");
+}
+
+#[test]
+fn delete_message_removes_the_draft_row_and_sequence() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    store.upsert_folder(&folder("drafts", "Bozze", FolderKind::Drafts)).expect("drafts");
+
+    let mut message = sample_message("drf_1", "drafts", "Bozza", "Corpo", 1_700_000_200_000);
+    message.summary.unread = false;
+    assert_eq!(store.save_draft_message(&message, &[]).expect("save").revision, 1);
+    assert!(store.delete_message("drf_1").expect("delete"));
+    assert!(store.get_draft("drf_1").expect("draft").is_none());
+    assert!(store.get_message("drf_1").expect("message").is_none());
+    assert!(store.list_orphan_drafts().expect("orphans").is_empty());
+
+    // Reusing the id after a permanent delete starts a fresh sequence, not revision 2.
+    store.upsert_message(&message).expect("reinsert display row");
+    assert_eq!(store.save_draft_message(&message, &[]).expect("save after delete").revision, 1);
+}
+
+#[test]
+fn label_sequence_is_a_high_water_mark() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+
+    let label = |id: &str, name: &str| Label { id: id.to_owned(), account_id: None, name: name.to_owned(), color: "gold".to_owned() };
+    store.create_label(&label("lbl_1", "Uno")).expect("lbl_1");
+    assert_eq!(store.get_meta(postino_store::LABEL_SEQ_KEY).expect("meta").as_deref(), Some("1"));
+    store.create_label(&label("lbl_5", "Cinque")).expect("lbl_5");
+    assert_eq!(store.get_meta(postino_store::LABEL_SEQ_KEY).expect("meta").as_deref(), Some("5"));
+    assert!(store.delete_label("lbl_5").expect("delete the highest"));
+    assert_eq!(store.get_meta(postino_store::LABEL_SEQ_KEY).expect("meta").as_deref(), Some("5"), "delete lowered the high-water mark");
+    store.create_label(&label("lbl_6", "Sei")).expect("lbl_6");
+    assert_eq!(store.get_meta(postino_store::LABEL_SEQ_KEY).expect("meta").as_deref(), Some("6"));
+}
+
+#[test]
 fn reopen_keeps_every_row() {
     let fixture = Fixture::new();
     let store = fixture.open();

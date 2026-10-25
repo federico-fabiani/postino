@@ -1,5 +1,11 @@
 # Brief — M1 engine wiring (P3c)
 
+> **Superseded by P3d where it differs.** `save_draft` is one store transaction with full-replace
+> semantics, `draft_save` patches omitted fields at the operation boundary, `draft_send` resolves
+> the draft account's Sent folder and keeps its revision sequence, and store errors are categorised
+> into caller mistakes (`InvalidArgs`) versus storage failures (`Failed`). See
+> `docs/briefs/p3d-persistence-fixes.md`.
+
 > **Depends on:** P3b (store schema + repository + keyring) · **Next:** P4 MIME
 > **No UI redesign; the demo path must stay byte-for-byte behaviour-compatible**
 

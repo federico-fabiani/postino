@@ -142,87 +142,8 @@ impl Store {
     /// untouched: a sync refresh must not lose local labels. Attachment presence is refreshed by
     /// [`Store::replace_attachments`].
     pub fn upsert_message(&self, message: &Message) -> Result<(), StoreError> {
-        let to_json = serde_json::to_string(&message.summary.to)?;
-        let cc_json = serde_json::to_string(&message.cc)?;
-        let bcc_json = serde_json::to_string(&message.bcc)?;
-        let size = message.size.map(|value| to_i64(value, "message size")).transpose()?;
         let tx = self.conn.unchecked_transaction()?;
-        let folder_account: Option<String> =
-            tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [&message.summary.folder_id], |row| row.get(0)).optional()?;
-        let Some(folder_account) = folder_account else {
-            return Err(StoreError::NotFound { entity: "folder", id: message.summary.folder_id.clone() });
-        };
-        if folder_account != message.summary.account_id {
-            return Err(StoreError::AccountMismatch {
-                folder_id: message.summary.folder_id.clone(),
-                message_account: message.summary.account_id.clone(),
-                folder_account,
-            });
-        }
-        let previous: Option<(String, bool)> = tx
-            .query_row("SELECT folder_id, unread FROM messages WHERE id = ?1", [&message.summary.id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?;
-        tx.execute(
-            "INSERT INTO messages(
-                 id, account_id, folder_id, uid, message_id, thread_id, from_name, from_email,
-                 to_json, cc_json, bcc_json, subject, snippet, date, unread, starred,
-                 has_attachments, body_text, body_html, size
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
-             ON CONFLICT(id) DO UPDATE SET
-                 account_id = excluded.account_id,
-                 folder_id = excluded.folder_id,
-                 uid = excluded.uid,
-                 message_id = excluded.message_id,
-                 thread_id = excluded.thread_id,
-                 from_name = excluded.from_name,
-                 from_email = excluded.from_email,
-                 to_json = excluded.to_json,
-                 cc_json = excluded.cc_json,
-                 bcc_json = excluded.bcc_json,
-                 subject = excluded.subject,
-                 snippet = excluded.snippet,
-                 date = excluded.date,
-                 unread = excluded.unread,
-                 starred = excluded.starred,
-                 has_attachments = excluded.has_attachments,
-                 body_text = excluded.body_text,
-                 body_html = excluded.body_html,
-                 size = excluded.size",
-            params![
-                message.summary.id,
-                message.summary.account_id,
-                message.summary.folder_id,
-                message.uid.map(i64::from),
-                message.message_id,
-                message.summary.thread_id,
-                message.summary.from.name,
-                message.summary.from.email,
-                to_json,
-                cc_json,
-                bcc_json,
-                message.summary.subject,
-                message.summary.snippet,
-                message.summary.date,
-                message.summary.unread,
-                message.summary.starred,
-                message.summary.has_attachments,
-                message.body_text,
-                message.body_html,
-                size
-            ],
-        )?;
-        // Counts only move when the folder or the read flag changes; a body/subject refresh during a
-        // sync must not rescan the folder for every message.
-        let folder_changed = previous.as_ref().is_none_or(|(folder, _)| folder != &message.summary.folder_id);
-        let unread_changed = previous.as_ref().is_none_or(|(_, unread)| *unread != message.summary.unread);
-        if folder_changed || unread_changed {
-            refresh_folder_counts(&tx, &message.summary.folder_id)?;
-        }
-        if let Some((previous, _)) = previous
-            && previous != message.summary.folder_id
-        {
-            refresh_folder_counts(&tx, &previous)?;
-        }
+        upsert_message_row(&tx, message)?;
         tx.commit()?;
         Ok(())
     }
@@ -362,16 +283,21 @@ impl Store {
         changed_count(moved)
     }
 
-    /// Delete one message. Attachments and label assignments go with it via `ON DELETE CASCADE`.
-    /// Returns `false` when the id was already gone.
+    /// Delete one message permanently. Attachments and label assignments go with it via
+    /// `ON DELETE CASCADE`; the draft row and its revision counter are removed explicitly in the
+    /// same transaction, so a later open cannot resurrect the draft. Returns `false` when the
+    /// message row was already gone (stale draft rows are still cleaned up).
     pub fn delete_message(&self, id: &str) -> Result<bool, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let folder: Option<String> = tx.query_row("SELECT folder_id FROM messages WHERE id = ?1", [id], |row| row.get(0)).optional()?;
-        let Some(folder) = folder else { return Ok(false) };
+        tx.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
         tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
-        refresh_folder_counts(&tx, &folder)?;
+        if let Some(folder) = &folder {
+            refresh_folder_counts(&tx, folder)?;
+        }
         tx.commit()?;
-        Ok(true)
+        Ok(folder.is_some())
     }
 }
 
@@ -381,7 +307,9 @@ impl Store {
 
 impl Store {
     /// Create a label. `id` is caller-owned and stable; a duplicate name (case-sensitive, in the
-    /// same account scope) is [`StoreError::Duplicate`].
+    /// same account scope) is [`StoreError::Duplicate`]. The `label_seq` high-water mark is raised
+    /// to this id's number in the same transaction, so deleting the highest label and reopening
+    /// cannot hand the id out again.
     pub fn create_label(&self, label: &Label) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         if let Some(account) = &label.account_id {
@@ -392,6 +320,15 @@ impl Store {
             params![label.id, label.account_id, label.name, label.color],
         )
         .map_err(|error| duplicate("label", &label.name, error))?;
+        let label_number = label.id.strip_prefix("lbl_").and_then(|suffix| suffix.parse::<u32>().ok()).unwrap_or(0);
+        let stored: Option<String> = tx.query_row("SELECT value FROM meta WHERE key = ?1", [crate::LABEL_SEQ_KEY], |row| row.get(0)).optional()?;
+        let current = stored.and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+        let high = current.max(label_number);
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![crate::LABEL_SEQ_KEY, high.to_string()],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -554,15 +491,7 @@ impl Store {
     pub fn replace_attachments(&self, message_id: &str, attachments: &[Attachment]) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         require_message(&tx, message_id)?;
-        tx.execute("DELETE FROM attachments WHERE message_id = ?1", [message_id])?;
-        for attachment in attachments {
-            let size = to_i64(attachment.size, "attachment size")?;
-            tx.execute(
-                "INSERT INTO attachments(id, message_id, filename, mime, size, blob_hash) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                params![attachment.id, message_id, attachment.filename, attachment.mime, size, attachment.blob_hash],
-            )?;
-        }
-        tx.execute("UPDATE messages SET has_attachments = ?1 WHERE id = ?2", params![!attachments.is_empty(), message_id])?;
+        replace_attachments_in_tx(&tx, message_id, attachments)?;
         tx.commit()?;
         Ok(())
     }
@@ -595,32 +524,47 @@ impl Store {
 // ---------------------------------------------------------------------------------------------
 
 impl Store {
-    /// Save a draft. A new id starts at revision 1; an existing id increments `revision` by one and
-    /// takes every editable field. The stored row is returned so the caller sees the new revision.
+    /// Save a draft revision row. A new id starts at revision 1; an existing id increments the
+    /// store-owned sequence by one and takes every editable field. The sequence is written in the
+    /// same transaction, so it survives a send and a later move back to Drafts.
     pub fn save_draft(&self, draft: &DraftUpdate) -> Result<Draft, StoreError> {
-        let to_json = serde_json::to_string(&draft.to)?;
-        let cc_json = serde_json::to_string(&draft.cc)?;
-        let bcc_json = serde_json::to_string(&draft.bcc)?;
         let tx = self.conn.unchecked_transaction()?;
         require_account(&tx, &draft.account_id)?;
-        tx.execute(
-            "INSERT INTO drafts(id, account_id, revision, updated_at, body_text, to_json, cc_json, bcc_json, subject, in_reply_to)
-             VALUES(?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(id) DO UPDATE SET
-                 account_id = excluded.account_id,
-                 revision = drafts.revision + 1,
-                 updated_at = excluded.updated_at,
-                 body_text = excluded.body_text,
-                 to_json = excluded.to_json,
-                 cc_json = excluded.cc_json,
-                 bcc_json = excluded.bcc_json,
-                 subject = excluded.subject,
-                 in_reply_to = excluded.in_reply_to",
-            params![draft.id, draft.account_id, draft.updated_at, draft.body_text, to_json, cc_json, bcc_json, draft.subject, draft.in_reply_to],
-        )?;
-        let saved = get_draft(&tx, &draft.id)?.ok_or_else(|| StoreError::NotFound { entity: "draft", id: draft.id.clone() })?;
+        let saved = save_draft_row(&tx, draft)?;
         tx.commit()?;
         Ok(saved)
+    }
+
+    /// Save a whole draft: message row, attachments, revision row and Drafts folder counts in one
+    /// `BEGIN IMMEDIATE` transaction. `message.summary.id` is the draft id and
+    /// `message.summary.account_id`/`folder_id` must agree with a real folder.
+    ///
+    /// Every attachment id is validated before the first write: ids repeated in the request and ids
+    /// owned by another message are [`StoreError::DuplicateAttachment`] and
+    /// [`StoreError::AttachmentOwnedByOther`], never a raw UNIQUE constraint. On any error the
+    /// transaction rolls back and the previous rows are exactly as they were.
+    pub fn save_draft_message(&self, message: &Message, attachments: &[Attachment]) -> Result<Draft, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        validate_attachment_ids(&tx, &message.summary.id, attachments)?;
+        upsert_message_row(&tx, message)?;
+        replace_attachments_in_tx(&tx, &message.summary.id, attachments)?;
+        let draft = draft_update_from_message(message);
+        let saved = save_draft_row(&tx, &draft)?;
+        refresh_folder_counts(&tx, &message.summary.folder_id)?;
+        tx.commit()?;
+        Ok(saved)
+    }
+
+    /// Move a draft to Sent in one transaction. The draft row is deleted because the message is no
+    /// longer a draft, but `draft_seq` is kept so a move back to Drafts and a new save continue the
+    /// revision sequence instead of restarting at 1.
+    pub fn send_draft_message(&self, message: &Message) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        upsert_message_row(&tx, message)?;
+        tx.execute("DELETE FROM drafts WHERE id = ?1", [&message.summary.id])?;
+        refresh_folder_counts(&tx, &message.summary.folder_id)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_draft(&self, id: &str) -> Result<Option<Draft>, StoreError> {
@@ -645,15 +589,238 @@ impl Store {
         Ok(rows)
     }
 
-    /// Delete a draft. Returns `false` when it was already gone.
+    /// Draft rows that have no message row yet. [`Store::repair_orphan_drafts`] turns them into
+    /// display rows during engine open, so a crash between the two writes of an old build cannot
+    /// leave a draft that is visible but cannot be flagged, labelled or moved.
+    pub fn list_orphan_drafts(&self) -> Result<Vec<Draft>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {DRAFT_COLUMNS} FROM drafts d
+             WHERE NOT EXISTS(SELECT 1 FROM messages m WHERE m.id = d.id)
+             ORDER BY d.updated_at DESC, d.id ASC"
+        ))?;
+        let rows = stmt.query_map([], row_to_draft)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("drafts", error))
+    }
+
+    /// Materialise orphan drafts as message rows in one transaction. Messages that already exist are
+    /// left untouched. Returns the number of rows written.
+    pub fn repair_orphan_drafts(&self, messages: &[Message]) -> Result<u32, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut repaired = 0usize;
+        for message in messages {
+            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)", [&message.summary.id], |row| row.get(0))?;
+            if !exists {
+                upsert_message_row(&tx, message)?;
+                repaired += 1;
+            }
+        }
+        tx.commit()?;
+        changed_count(repaired)
+    }
+
+    /// Delete a draft permanently: the revision row and its sequence go in one transaction. Sending
+    /// a draft uses [`Store::send_draft_message`] instead because the sequence must survive.
+    /// Returns `false` when the draft was already gone.
     pub fn delete_draft(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.conn.execute("DELETE FROM drafts WHERE id = ?1", [id])? == 1)
+        let tx = self.conn.unchecked_transaction()?;
+        let removed = tx.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
+        tx.commit()?;
+        Ok(removed == 1)
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------------------------
+
+/// Upsert a message row inside an open transaction and keep the folder `total`/`unread` cache in
+/// step. The caller owns the transaction boundary.
+fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message) -> Result<(), StoreError> {
+    let to_json = serde_json::to_string(&message.summary.to)?;
+    let cc_json = serde_json::to_string(&message.cc)?;
+    let bcc_json = serde_json::to_string(&message.bcc)?;
+    let size = message.size.map(|value| to_i64(value, "message size")).transpose()?;
+    let folder_account: Option<String> =
+        tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [&message.summary.folder_id], |row| row.get(0)).optional()?;
+    let Some(folder_account) = folder_account else {
+        return Err(StoreError::NotFound { entity: "folder", id: message.summary.folder_id.clone() });
+    };
+    if folder_account != message.summary.account_id {
+        return Err(StoreError::AccountMismatch {
+            folder_id: message.summary.folder_id.clone(),
+            message_account: message.summary.account_id.clone(),
+            folder_account,
+        });
+    }
+    let previous: Option<(String, bool)> = tx
+        .query_row("SELECT folder_id, unread FROM messages WHERE id = ?1", [&message.summary.id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    tx.execute(
+        "INSERT INTO messages(
+             id, account_id, folder_id, uid, message_id, thread_id, from_name, from_email,
+             to_json, cc_json, bcc_json, subject, snippet, date, unread, starred,
+             has_attachments, body_text, body_html, size
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+         ON CONFLICT(id) DO UPDATE SET
+             account_id = excluded.account_id,
+             folder_id = excluded.folder_id,
+             uid = excluded.uid,
+             message_id = excluded.message_id,
+             thread_id = excluded.thread_id,
+             from_name = excluded.from_name,
+             from_email = excluded.from_email,
+             to_json = excluded.to_json,
+             cc_json = excluded.cc_json,
+             bcc_json = excluded.bcc_json,
+             subject = excluded.subject,
+             snippet = excluded.snippet,
+             date = excluded.date,
+             unread = excluded.unread,
+             starred = excluded.starred,
+             has_attachments = excluded.has_attachments,
+             body_text = excluded.body_text,
+             body_html = excluded.body_html,
+             size = excluded.size",
+        params![
+            message.summary.id,
+            message.summary.account_id,
+            message.summary.folder_id,
+            message.uid.map(i64::from),
+            message.message_id,
+            message.summary.thread_id,
+            message.summary.from.name,
+            message.summary.from.email,
+            to_json,
+            cc_json,
+            bcc_json,
+            message.summary.subject,
+            message.summary.snippet,
+            message.summary.date,
+            message.summary.unread,
+            message.summary.starred,
+            message.summary.has_attachments,
+            message.body_text,
+            message.body_html,
+            size
+        ],
+    )?;
+    // Counts only move when the folder or the read flag changes; a body/subject refresh during a
+    // sync must not rescan the folder for every message.
+    let folder_changed = previous.as_ref().is_none_or(|(folder, _)| folder != &message.summary.folder_id);
+    let unread_changed = previous.as_ref().is_none_or(|(_, unread)| *unread != message.summary.unread);
+    if folder_changed || unread_changed {
+        refresh_folder_counts(tx, &message.summary.folder_id)?;
+    }
+    if let Some((previous, _)) = previous
+        && previous != message.summary.folder_id
+    {
+        refresh_folder_counts(tx, &previous)?;
+    }
+    Ok(())
+}
+
+/// Replace attachment rows and `has_attachments` inside an open transaction.
+fn replace_attachments_in_tx(tx: &rusqlite::Transaction<'_>, message_id: &str, attachments: &[Attachment]) -> Result<(), StoreError> {
+    tx.execute("DELETE FROM attachments WHERE message_id = ?1", [message_id])?;
+    for attachment in attachments {
+        let size = to_i64(attachment.size, "attachment size")?;
+        tx.execute(
+            "INSERT INTO attachments(id, message_id, filename, mime, size, blob_hash) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![attachment.id, message_id, attachment.filename, attachment.mime, size, attachment.blob_hash],
+        )?;
+    }
+    tx.execute("UPDATE messages SET has_attachments = ?1 WHERE id = ?2", params![!attachments.is_empty(), message_id])?;
+    Ok(())
+}
+
+/// Validate attachment ids before a draft write: duplicates inside the request and ids owned by a
+/// different message are caller errors with a specific reason, not a UNIQUE constraint.
+fn validate_attachment_ids(tx: &rusqlite::Transaction<'_>, message_id: &str, attachments: &[Attachment]) -> Result<(), StoreError> {
+    let mut seen = BTreeSet::new();
+    for attachment in attachments {
+        if !seen.insert(attachment.id.as_str()) {
+            return Err(StoreError::DuplicateAttachment { id: attachment.id.clone() });
+        }
+        let owner: Option<String> =
+            tx.query_row("SELECT message_id FROM attachments WHERE id = ?1", [&attachment.id], |row| row.get(0)).optional()?;
+        if let Some(owner) = owner
+            && owner != message_id
+        {
+            return Err(StoreError::AttachmentOwnedByOther { id: attachment.id.clone(), owner });
+        }
+    }
+    Ok(())
+}
+
+fn draft_update_from_message(message: &Message) -> DraftUpdate {
+    DraftUpdate {
+        id: message.summary.id.clone(),
+        account_id: message.summary.account_id.clone(),
+        updated_at: message.summary.date,
+        body_text: message.body_text.clone(),
+        to: message.summary.to.clone(),
+        cc: message.cc.clone(),
+        bcc: message.bcc.clone(),
+        subject: message.summary.subject.clone(),
+        // Core has no reply linkage yet; M2 adds it with the compose work.
+        in_reply_to: None,
+    }
+}
+
+/// Write the revision row and its sequence inside an open transaction.
+fn save_draft_row(tx: &rusqlite::Transaction<'_>, draft: &DraftUpdate) -> Result<Draft, StoreError> {
+    let to_json = serde_json::to_string(&draft.to)?;
+    let cc_json = serde_json::to_string(&draft.cc)?;
+    let bcc_json = serde_json::to_string(&draft.bcc)?;
+    let revision = next_draft_revision(tx, &draft.id)?;
+    tx.execute(
+        "INSERT INTO drafts(id, account_id, revision, updated_at, body_text, to_json, cc_json, bcc_json, subject, in_reply_to)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             account_id = excluded.account_id,
+             revision = excluded.revision,
+             updated_at = excluded.updated_at,
+             body_text = excluded.body_text,
+             to_json = excluded.to_json,
+             cc_json = excluded.cc_json,
+             bcc_json = excluded.bcc_json,
+             subject = excluded.subject,
+             in_reply_to = excluded.in_reply_to",
+        params![
+            draft.id,
+            draft.account_id,
+            revision,
+            draft.updated_at,
+            draft.body_text,
+            to_json,
+            cc_json,
+            bcc_json,
+            draft.subject,
+            draft.in_reply_to
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO draft_seq(message_id, revision) VALUES(?1, ?2)
+         ON CONFLICT(message_id) DO UPDATE SET revision = excluded.revision",
+        params![draft.id, revision],
+    )?;
+    get_draft(tx, &draft.id)?.ok_or_else(|| StoreError::NotFound { entity: "draft", id: draft.id.clone() })
+}
+
+/// The next revision is one more than the high-water mark in `draft_seq`, or the old `drafts` row
+/// for a store that predates v3 and still has to be repaired.
+fn next_draft_revision(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<u32, StoreError> {
+    let sequenced: Option<u32> = tx.query_row("SELECT revision FROM draft_seq WHERE message_id = ?1", [id], |row| get_u32(row, 0)).optional()?;
+    let stored: Option<u32> = tx.query_row("SELECT revision FROM drafts WHERE id = ?1", [id], |row| get_u32(row, 0)).optional()?;
+    let previous = match (sequenced, stored) {
+        (Some(sequenced), Some(stored)) => sequenced.max(stored),
+        (Some(sequenced), None) => sequenced,
+        (None, Some(stored)) => stored,
+        (None, None) => 0,
+    };
+    previous.checked_add(1).ok_or(StoreError::OutOfRange { field: "draft revision" })
+}
 
 fn message_where(filter: &MessageFilter) -> (String, Vec<Value>) {
     let mut sql = String::from(" WHERE 1 = 1");

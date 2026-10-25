@@ -207,9 +207,10 @@ What changed since the spike:
   default suite covers idempotent creation, reload, a fresh handle, scope isolation, a missing
   vault, a read failure and a wrong-length secret; the native path remains a manual smoke test.
 - **Key lifetime, risk 3.** `StoreKey` in both crates has no `Clone`, redacts `Debug`, and zeroises
-  its bytes on drop (`zeroize` 1.9). The raw-key pragma is built inside a zeroising `String`. The
-  SQLCipher connection keeps its own copy of the key internally; that copy is outside our reach and
-  is still a documented gap, not a solved one.
+  its bytes on drop (`zeroize` 1.9). The raw-key pragma is built inside a zeroising `String` sized
+  for its exact final length, so formatting never reallocates and leaves an unzeroised copy behind.
+  The SQLCipher connection keeps its own copy of the key internally; that copy is outside our reach
+  and is still a documented gap, not a solved one.
 - **Schema v2** in `postino-store`: accounts, folders, messages, attachments, labels,
   message_labels, drafts and sync_state, additive from the v1 `meta` table. Foreign keys on, WAL,
   `synchronous = FULL`, 5 s busy timeout, Unix-millisecond dates (rationale in the crate docs).

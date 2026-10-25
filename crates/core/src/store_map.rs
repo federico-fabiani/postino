@@ -22,17 +22,43 @@ pub(crate) fn date(value: i64) -> Result<DateTime<Utc>, OpError> {
         .ok_or_else(|| OpError::Failed(format!("the local store holds a date this build cannot read ({value} ms since the epoch)")))
 }
 
-/// A failed write. The store says what was wrong; this wrapper says what the caller can do next.
+/// A failed write from the store.
+///
+/// Caller mistakes get a specific sentence and no disk advice; storage, I/O and corruption failures
+/// get the storage advice. Only the latter may mention a rollback, and every repository write the
+/// engine performs is one transaction, so nothing is half-applied.
 pub(crate) fn write_error(error: StoreError) -> OpError {
-    OpError::Failed(format!(
-        "the local store refused the change: {error}. Nothing was changed in memory; check that the store is writable and has free space, then retry."
-    ))
+    match &error {
+        StoreError::NotFound { entity, id } => OpError::InvalidArgs(format!("unknown {entity} {id:?}; use an id returned by the list operation")),
+        StoreError::AccountMismatch { folder_id, message_account, folder_account } => OpError::InvalidArgs(format!(
+            "folder {folder_id:?} belongs to account {folder_account:?}, not {message_account:?}; use a folder from the message's own account"
+        )),
+        StoreError::Duplicate { entity, name } => OpError::InvalidArgs(format!("{entity} {name:?} already exists; choose another one")),
+        StoreError::DuplicateAttachment { id } => {
+            OpError::InvalidArgs(format!("attachment id {id:?} is repeated in the draft; give every attachment a unique id"))
+        }
+        StoreError::AttachmentOwnedByOther { id, owner } => {
+            OpError::InvalidArgs(format!("attachment id {id:?} belongs to message {owner:?}; omit the id so the engine assigns a new one"))
+        }
+        StoreError::OutOfRange { field } => OpError::InvalidArgs(format!("{field} is outside the range the local store accepts")),
+        StoreError::Encode(_) => OpError::Failed(format!("the local store could not encode the change: {error}. Memory is untouched.")),
+        _ => OpError::Failed(format!(
+            "the local store refused the change: {error}. The change was rolled back and memory is untouched; check that the store file is writable, that the key matches and that there is free disk space, then retry."
+        )),
+    }
 }
 
 /// A failed read while the engine loads its mailbox.
 pub(crate) fn read_error(error: StoreError) -> OpError {
     OpError::Failed(format!(
         "the local store could not be read: {error}. The engine was not started; check the store file and the key in the OS keyring, then retry."
+    ))
+}
+
+/// A failed repair of draft rows that had no display row.
+pub(crate) fn repair_error(error: StoreError) -> OpError {
+    OpError::Failed(format!(
+        "the local store has draft rows that could not be repaired into messages: {error}. The engine was not started; check the store file and the key in the OS keyring, then retry."
     ))
 }
 
@@ -133,23 +159,6 @@ pub(crate) fn attachment_rows(attachments: &[Attachment]) -> Vec<store::Attachme
             blob_hash: None,
         })
         .collect()
-}
-
-/// The draft row that carries the monotonic revision. The message row holds the display copy, so
-/// both are written by `Engine::save_draft`.
-pub(crate) fn draft_update(message: &Message, account_id: &str) -> store::DraftUpdate {
-    store::DraftUpdate {
-        id: message.summary.id.clone(),
-        account_id: account_id.to_owned(),
-        updated_at: millis(message.summary.date),
-        body_text: message.body_text.clone(),
-        to: message.summary.to.iter().map(store_address).collect(),
-        cc: message.cc.iter().map(store_address).collect(),
-        bcc: message.bcc.iter().map(store_address).collect(),
-        subject: message.summary.subject.clone(),
-        // Core has no reply linkage yet; M2 adds it with the compose work.
-        in_reply_to: None,
-    }
 }
 
 /// Rebuild a draft that only exists as a `drafts` row, so a store cannot silently lose a draft

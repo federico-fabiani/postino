@@ -9,7 +9,8 @@
 //!
 //! `PRAGMA user_version` names the schema version; `MIGRATIONS` holds the ordered, additive
 //! migrations. Version 2 is the M1 mailbox schema: accounts, folders, messages, attachments, labels,
-//! message_labels, drafts, sync_state and the P3a `meta` table.
+//! message_labels, drafts, sync_state and the P3a `meta` table. Version 3 adds `draft_seq`, the
+//! monotonic draft revision counter that survives a send and a move back to Drafts.
 //!
 //! Every date is a **Unix timestamp in milliseconds** (`i64`). The choice is deliberate:
 //!
@@ -28,8 +29,8 @@
 //!
 //! Every repository mutation that touches more than one row runs in one transaction: label batch
 //! apply/remove, label delete plus detach, attachment replacement, message move, draft save and the
-//! flag batch. Upserts of a message never touch `message_labels` or `attachments`, so a sync refresh
-//! preserves local labels and attachment metadata unless the caller explicitly replaces them.
+//! flag batch. A draft save writes the display message, its attachments, the revision row and the
+//! folder counts together, so a failure leaves no half-saved draft.
 
 mod model;
 mod repo;
@@ -46,7 +47,11 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
+
+/// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
+/// label id is never handed out again.
+pub const LABEL_SEQ_KEY: &str = "label_seq";
 
 /// Migrations applied in order: index `n - 1` moves `PRAGMA user_version` from `n - 1` to `n`.
 ///
@@ -155,6 +160,16 @@ CREATE TABLE sync_state(
     last_error     TEXT NULL
 ) WITHOUT ROWID;
 "#,
+    // v3 (P3d): the revision counter is independent from the draft row, so sending a draft and
+    // moving it back to Drafts cannot restart the sequence at 1. Existing revisions seed the table.
+    r#"
+CREATE TABLE draft_seq(
+    message_id TEXT PRIMARY KEY,
+    revision   INTEGER NOT NULL CHECK(revision >= 1)
+);
+
+INSERT INTO draft_seq(message_id, revision) SELECT id, revision FROM drafts;
+"#,
 ];
 
 /// A 256-bit store key.
@@ -178,16 +193,19 @@ impl StoreKey {
     ///
     /// SQLCipher reads the pragma when the statement is prepared, before bound parameters are
     /// available, so a bound `PRAGMA key = ?` is silently ignored on an existing file. The hex-only
-    /// literal cannot need escaping. The returned string is zeroised when dropped.
+    /// literal cannot need escaping. The buffer is sized for the exact final length, so the key is
+    /// never copied into a larger, unzeroised allocation; the string is zeroised when dropped.
     fn pragma(&self) -> Zeroizing<String> {
         use fmt::Write as _;
-        let mut sql = Zeroizing::new(String::with_capacity(80));
-        sql.push_str("PRAGMA key = \"x'");
-        for byte in self.0 {
-            // Writing into a String is infallible.
+        const PREFIX: &str = "PRAGMA key = \"x'";
+        const SUFFIX: &str = "'\";";
+        let mut sql = Zeroizing::new(String::with_capacity(PREFIX.len() + self.0.len() * 2 + SUFFIX.len()));
+        sql.push_str(PREFIX);
+        for byte in &self.0 {
+            // Writing into a String is infallible, and the buffer has room for every byte.
             let _ = write!(sql, "{byte:02x}");
         }
-        sql.push_str("'\";");
+        sql.push_str(SUFFIX);
         sql
     }
 }
@@ -220,6 +238,10 @@ pub enum StoreError {
     AccountMismatch { folder_id: String, message_account: String, folder_account: String },
     #[error("{entity} {name:?} already exists")]
     Duplicate { entity: &'static str, name: String },
+    #[error("attachment id {id:?} is repeated in the same draft; every attachment needs a unique id")]
+    DuplicateAttachment { id: String },
+    #[error("attachment id {id:?} belongs to message {owner:?}; omit the id so the engine assigns a new one")]
+    AttachmentOwnedByOther { id: String, owner: String },
     #[error("store row in {table} is not readable: {detail}")]
     Corrupt { table: &'static str, detail: String },
     #[error("store value cannot be encoded: {0}")]
@@ -243,7 +265,7 @@ pub struct Store {
 impl Store {
     /// Open or create the database at `path` and apply pending migrations.
     pub fn open(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.execute_batch(&key.pragma()).map_err(translate)?;
         // Fail closed if the codec is missing: without SQLCipher the pragma is a no-op and the file
         // would be written in plaintext.
@@ -252,6 +274,10 @@ impl Store {
             return Err(StoreError::NotEncrypted);
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // One process owns the store, so every transaction takes the write lock up front. That makes
+        // `unchecked_transaction` (which reads this setting) `BEGIN IMMEDIATE` for the whole draft
+        // save instead of a deferred transaction that can fail halfway through.
+        conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         // `journal_mode = WAL` reads page 1, so on an existing file this is where a wrong key
         // surfaces as NotADatabase.
         conn.execute_batch(
@@ -315,6 +341,14 @@ mod tests {
     fn pragma_uses_the_raw_key_form() {
         let key = StoreKey::from_bytes([0x0f; 32]);
         assert_eq!(key.pragma().as_str(), "PRAGMA key = \"x'0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f'\";");
+    }
+
+    #[test]
+    fn pragma_fits_its_allocation_exactly() {
+        let key = StoreKey::from_bytes([0xab; 32]);
+        let sql = key.pragma();
+        assert_eq!(sql.capacity(), sql.len(), "the pragma buffer reallocated and left an unzeroised copy behind");
+        assert_eq!(sql.len(), 83);
     }
 
     #[test]

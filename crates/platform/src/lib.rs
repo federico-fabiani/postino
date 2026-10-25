@@ -9,9 +9,21 @@
 //! The key is never formatted, logged or compared by its `Debug` output. [`StoreKey`] zeroises its
 //! bytes when dropped; SQLCipher's internal copy of the key is outside this crate's reach and is
 //! documented as a remaining risk in `docs/store-spike.md`.
+//!
+//! # First-run serialisation
+//!
+//! Two processes can both observe `NoEntry` and generate different keys. The loser would keep a key
+//! that is not in the vault, making its store unreadable later. First-run creation therefore takes
+//! an OS file lock at `<app local data>/Postino/keyring.lock` and, while holding it, re-reads the
+//! vault, generates a key, writes it and reads it back. A read-back mismatch is retried once inside
+//! the lock and then fails closed. The lock is advisory but shared by every Postino process on the
+//! machine because the path is derived from the app data directory, not the database path.
 
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 
+use fs4::fs_std::FileExt;
 use keyring_core::{Entry, Error as KeyringError};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -24,6 +36,9 @@ const STORE_KEY_BYTES: usize = 32;
 /// Longest accepted scope. Scopes become the keyring `user` (and part of the Windows target name),
 /// so they are bounded and printable.
 const MAX_SCOPE_CHARS: usize = 128;
+
+/// How many generate → write → read-back attempts happen inside the first-run lock.
+const CREATE_ATTEMPTS: usize = 2;
 
 /// A 256-bit store key.
 ///
@@ -87,6 +102,12 @@ pub enum PlatformError {
     Random(#[from] getrandom::Error),
     #[error("the keyring entry for scope {scope:?} does not hold a 256-bit store key")]
     Malformed { scope: String },
+    #[error("the app data directory is unavailable, so the keyring lock cannot be placed")]
+    DataDir,
+    #[error("the keyring lock at {path:?} could not be taken: {detail}")]
+    Lock { path: String, detail: String },
+    #[error("the OS keyring did not return the key just written for scope {scope:?}; refusing to use a key that is not in the vault")]
+    ReadBackMismatch { scope: String },
     #[error("this platform has no supported OS keyring; Postino refuses to keep the store key on disk")]
     Unsupported,
 }
@@ -98,21 +119,60 @@ pub enum PlatformError {
 /// store. The function fails closed: when the vault cannot be read or written there is no
 /// plaintext fallback and no derived key.
 ///
-/// The first run races if two processes start before either has stored a key; the device is
-/// expected to have one owner of the store (the daemon in M4), and a lost race surfaces as
-/// [`crate::PlatformError`] or a store that refuses to open, never as silent plaintext.
+/// A normal load takes no lock. First-run creation is serialised across processes with the OS file
+/// lock described in the crate docs, and the key is read back before it is returned.
 pub fn load_or_create_key(scope: &str) -> Result<StoreKey, PlatformError> {
     validate_scope(scope)?;
+    let lock_path = default_lock_path()?;
+    load_or_create_key_at(scope, &lock_path)
+}
+
+fn load_or_create_key_at(scope: &str, lock_path: &Path) -> Result<StoreKey, PlatformError> {
     let entry = keyring_entry(scope)?;
     match entry.get_secret() {
-        Ok(secret) => store_key_from(scope, Zeroizing::new(secret)),
-        Err(KeyringError::NoEntry) => {
-            let key = StoreKey::generate()?;
-            entry.set_secret(key.as_bytes()).map_err(|error| vault_error(scope, &error))?;
-            Ok(key)
-        }
-        Err(error) => Err(vault_error(scope, &error)),
+        Ok(secret) => return store_key_from(scope, Zeroizing::new(secret)),
+        Err(KeyringError::NoEntry) => {}
+        Err(error) => return Err(vault_error(scope, &error)),
     }
+
+    // First run. Hold the lock across re-read → generate → write → read-back so a second process
+    // either sees our key or makes us see its key, never two unverified keys.
+    let _lock = lock_first_run(lock_path)?;
+    match entry.get_secret() {
+        Ok(secret) => return store_key_from(scope, Zeroizing::new(secret)),
+        Err(KeyringError::NoEntry) => {}
+        Err(error) => return Err(vault_error(scope, &error)),
+    }
+    for _ in 0..CREATE_ATTEMPTS {
+        let key = StoreKey::generate()?;
+        entry.set_secret(key.as_bytes()).map_err(|error| vault_error(scope, &error))?;
+        let stored = entry.get_secret().map_err(|error| vault_error(scope, &error))?;
+        let read_back = store_key_from(scope, Zeroizing::new(stored))?;
+        if read_back == key {
+            return Ok(key);
+        }
+    }
+    Err(PlatformError::ReadBackMismatch { scope: scope.to_owned() })
+}
+
+fn default_lock_path() -> Result<PathBuf, PlatformError> {
+    let dirs = directories::BaseDirs::new().ok_or(PlatformError::DataDir)?;
+    Ok(dirs.data_local_dir().join("Postino").join("keyring.lock"))
+}
+
+fn lock_first_run(path: &Path) -> Result<File, PlatformError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| PlatformError::Lock { path: path.display().to_string(), detail: error.to_string() })?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| PlatformError::Lock { path: path.display().to_string(), detail: error.to_string() })?;
+    file.lock_exclusive().map_err(|error| PlatformError::Lock { path: path.display().to_string(), detail: error.to_string() })?;
+    Ok(file)
 }
 
 fn vault_error(scope: &str, error: &KeyringError) -> PlatformError {
@@ -155,7 +215,81 @@ fn install_native_store() -> Result<(), PlatformError> {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use keyring_core::api::{CredentialApi, CredentialStoreApi};
+    use keyring_core::{Credential, CredentialPersistence, Entry};
+
     use super::*;
+
+    /// The default store is process-wide, so tests that replace it must not overlap.
+    static VAULT: Mutex<()> = Mutex::new(());
+
+    fn vault() -> MutexGuard<'static, ()> {
+        VAULT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A credential that accepts writes but always reads back a different 32-byte secret.
+    struct MismatchCred {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl CredentialApi for MismatchCred {
+        fn set_secret(&self, _secret: &[u8]) -> keyring_core::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn get_secret(&self) -> keyring_core::Result<Vec<u8>> {
+            if self.writes.load(Ordering::SeqCst) == 0 { Err(keyring_core::Error::NoEntry) } else { Ok(vec![0x55; STORE_KEY_BYTES]) }
+        }
+
+        fn delete_credential(&self) -> keyring_core::Result<()> {
+            Ok(())
+        }
+
+        fn get_credential(&self) -> keyring_core::Result<Option<Arc<Credential>>> {
+            Ok(None)
+        }
+
+        fn get_specifiers(&self) -> Option<(String, String)> {
+            Some((KEYRING_SERVICE.to_owned(), "mismatch".to_owned()))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct MismatchStore {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl CredentialStoreApi for MismatchStore {
+        fn vendor(&self) -> String {
+            "postino-test".to_owned()
+        }
+
+        fn id(&self) -> String {
+            "postino-test.mismatch".to_owned()
+        }
+
+        fn build(&self, _service: &str, _user: &str, _modifiers: Option<&HashMap<&str, &str>>) -> keyring_core::Result<Entry> {
+            let credential: Arc<Credential> = Arc::new(MismatchCred { writes: self.writes.clone() });
+            Ok(Entry::new_with_credential(credential))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn persistence(&self) -> CredentialPersistence {
+            CredentialPersistence::ProcessOnly
+        }
+    }
 
     #[test]
     fn debug_never_prints_the_key() {
@@ -182,5 +316,21 @@ mod tests {
         }
         let long = "a".repeat(MAX_SCOPE_CHARS + 1);
         assert!(matches!(load_or_create_key(&long), Err(PlatformError::InvalidScope)));
+    }
+
+    #[test]
+    fn a_read_back_mismatch_retries_once_and_fails_closed() {
+        let _guard = vault();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let store: Arc<keyring_core::CredentialStore> = Arc::new(MismatchStore { writes: writes.clone() });
+        keyring_core::set_default_store(store);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let lock_path = dir.path().join("Postino").join("keyring.lock");
+
+        let error = load_or_create_key_at("mismatch", &lock_path).expect_err("a key that is not in the vault must never be returned");
+        assert!(matches!(error, PlatformError::ReadBackMismatch { .. }), "{error}");
+        assert!(!error.to_string().contains("55"), "the error leaked key bytes: {error}");
+        assert_eq!(writes.load(Ordering::SeqCst), 2, "the mismatch path must retry exactly once");
+        assert!(lock_path.exists(), "the first-run lock file was not created");
     }
 }

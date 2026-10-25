@@ -284,13 +284,13 @@ searchable shortcut sheet. Reply/forward arrived in U0.4; labels arrived in U0.5
 
 ### U0.4 Compose and drafts — done
 
-- Composer component, draft ops in the engine, autosave, demo send.
+- Composer component, draft ops in the engine, autosave, local move to Sent.
 - Reply/reply-all/forward prefill.
 - Drafts folder and counts.
 
 Shipped in `apps/postino-app/src/ui/widgets/composer.rs` and `apps/postino-app/src/app.rs`.
-`draft_save` creates or updates one draft in place; `draft_send` is demo-only, moves the draft to
-Sent and is undoable. Attachments are metadata-only in M0, as is the send itself.
+`draft_save` creates a draft or patches one in place; `draft_send` moves the draft to Sent locally
+(no SMTP in this build) and is undoable. Attachments are metadata-only in M0, as is the send itself.
 
 ### U0.5 Labels — done
 

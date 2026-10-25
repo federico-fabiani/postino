@@ -52,17 +52,52 @@ fn upgrades_a_v1_database_additively() {
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v1 to v2");
-        assert_eq!(store.schema_version().expect("version"), 2);
+        let store = Store::open(&path, &key).expect("upgrade v1 to v3");
+        assert_eq!(store.schema_version().expect("version"), 3);
         assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v1"), "the upgrade lost meta data");
         store.upsert_account(&account("acc_1")).expect("the v2 tables exist");
-        store.set_meta("schema", "v2").expect("write");
+        store.set_meta("schema", "v3").expect("write");
     }
 
     let store = Store::open(&path, &key).expect("reopen");
-    assert_eq!(store.schema_version().expect("version"), 2);
+    assert_eq!(store.schema_version().expect("version"), 3);
     assert!(store.get_account("acc_1").expect("account").is_some());
-    assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v2"));
+    assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v3"));
+}
+
+#[test]
+fn upgrades_a_v2_database_and_seeds_the_draft_sequence() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("store.db");
+    let key = random_key();
+    let draft = |body: &str| postino_store::DraftUpdate {
+        id: "drf_1".to_owned(),
+        account_id: "acc_1".to_owned(),
+        updated_at: 1_700_000_000_000,
+        body_text: body.to_owned(),
+        to: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: "Bozza v2".to_owned(),
+        in_reply_to: None,
+    };
+
+    {
+        let store = Store::open(&path, &key).expect("open v3");
+        store.upsert_account(&account("acc_1")).expect("account");
+        store.save_draft(&draft("prima")).expect("draft");
+        store.save_draft(&draft("seconda")).expect("second revision");
+        // Make the file look like the shipped v2 schema: the migration had not created draft_seq.
+        let connection = raw_open(&path, &key);
+        connection.execute_batch("DROP TABLE draft_seq; PRAGMA user_version = 2;").expect("forge v2");
+    }
+
+    {
+        let store = Store::open(&path, &key).expect("upgrade v2 to v3");
+        assert_eq!(store.schema_version().expect("version"), 3);
+        let saved = store.save_draft(&draft("terza")).expect("the seeded sequence must continue");
+        assert_eq!(saved.revision, 3, "the v2 draft revision did not seed draft_seq");
+    }
 }
 
 #[test]
@@ -73,7 +108,7 @@ fn reopening_does_not_run_a_migration_twice() {
 
     for round in 0..3 {
         let store = Store::open(&path, &key).unwrap_or_else(|error| panic!("open round {round}: {error}"));
-        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.schema_version().expect("version"), 3);
         store.set_meta("rounds", &round.to_string()).expect("write");
         // Dropping the store closes the connection and checkpoints the WAL.
     }
@@ -89,7 +124,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     let key = random_key();
 
     {
-        let store = Store::open(&path, &key).expect("open v2");
+        let store = Store::open(&path, &key).expect("open v3");
         store.set_meta("canary", "still here").expect("write");
     }
     {
@@ -98,7 +133,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     }
 
     let error = Store::open(&path, &key).err().expect("a newer schema must not be opened");
-    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 2 }), "{error}");
+    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 3 }), "{error}");
 }
 
 #[test]

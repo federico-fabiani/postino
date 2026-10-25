@@ -3,8 +3,9 @@
 //!
 //! With a store the engine is **load once, write through**: [`Engine::open`] hydrates the mailbox
 //! with one query per table, every mutating operation writes the repository first and only then
-//! updates memory, and folder counts are recomputed locally instead of re-read. A failed write is
-//! an [`OpError::Failed`] and leaves memory untouched.
+//! updates memory, and folder counts are recomputed locally instead of re-read. A failed write
+//! leaves memory untouched: caller mistakes are [`OpError::InvalidArgs`] and storage failures are
+//! [`OpError::Failed`], and each engine mutation is one store transaction.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -68,13 +69,15 @@ impl Engine {
 
     /// Load the mailbox from `store` and keep it for write-through.
     ///
-    /// The load is bounded by the table count, not by the mailbox: accounts, folders, message rows
-    /// with their labels, attachments grouped by message and drafts. A draft that exists only as a
-    /// `drafts` row is materialised into its Drafts folder, so the revision log can never hide mail
-    /// from the client.
+    /// The load is bounded by the table count, not by the mailbox: accounts, folders, orphan
+    /// drafts, message rows with their labels and attachments grouped by message. A draft row
+    /// without a message row is repaired into a real message row in one transaction *before* the
+    /// mailbox is hydrated; if that repair fails the open fails with an actionable error instead of
+    /// serving a draft that cannot be flagged, labelled or moved.
     pub fn open(store: Store) -> Result<Self, OpError> {
         let accounts = store.list_accounts().map_err(store_map::read_error)?.into_iter().map(store_map::account).collect::<Vec<_>>();
         let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
+        repair_orphan_drafts(&store, &accounts, &folders)?;
         let mut attachments = store.list_all_attachments().map_err(store_map::read_error)?;
         let messages = store
             .list_all_messages()
@@ -86,10 +89,10 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let labels = store.list_labels(None).map_err(store_map::read_error)?.into_iter().map(store_map::label).collect::<Result<Vec<_>, _>>()?;
-        let drafts = store.list_drafts(None).map_err(store_map::read_error)?;
+        let label_seq = repair_label_seq(&store, &labels)?;
 
         let mut engine = Self::from_parts(accounts, folders, messages, labels, false, Some(store));
-        engine.absorb_drafts(drafts)?;
+        engine.next_label_seq = label_seq.saturating_add(1);
         Ok(engine)
     }
 
@@ -101,12 +104,7 @@ impl Engine {
         demo: bool,
         store: Option<Store>,
     ) -> Self {
-        let next_label_seq = labels
-            .iter()
-            .filter_map(|label| label.id.strip_prefix("lbl_").and_then(|suffix| suffix.parse::<u32>().ok()))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let next_label_seq = labels.iter().filter_map(label_number).max().unwrap_or(0).saturating_add(1);
         let mut engine = Self { accounts, folders, messages, labels, next_label_seq, demo, store };
         engine.recount();
         engine
@@ -353,19 +351,18 @@ impl Engine {
         Ok(summary)
     }
 
-    /// Create or update a draft in the Drafts folder. An empty recipient list is allowed while
-    /// composing; sending validates it separately. Header injection is refused here, before any
-    /// state changes.
-    pub fn save_draft(&mut self, id: Option<&str>, draft: DraftContent) -> Result<Message, OpError> {
+    /// Create or update a draft in the Drafts folder, replacing every content field.
+    ///
+    /// `account` chooses the account on create: it may be omitted when the mailbox has exactly one
+    /// account and is required when several exist. An update keeps the draft's own account and
+    /// folder and rejects an explicit `account` that disagrees. An empty recipient list is allowed
+    /// while composing; sending validates it separately. Header injection is refused here, before
+    /// any state changes.
+    ///
+    /// With a store the message, attachments, revision and folder counts are one transaction. A
+    /// failure returns before memory changes and leaves the previous rows exactly as they were.
+    pub fn save_draft(&mut self, account: Option<&str>, id: Option<&str>, draft: DraftContent) -> Result<Message, OpError> {
         validate_draft(&draft)?;
-        let account = self.accounts.first().cloned().ok_or_else(|| OpError::Failed("no account is configured".to_owned()))?;
-        let draft_folder = self
-            .folders
-            .iter()
-            .find(|folder| folder.kind == FolderKind::Drafts)
-            .map(|folder| folder.id.clone())
-            .ok_or_else(|| OpError::Failed("the mailbox has no Drafts folder".to_owned()))?;
-
         let index = match id {
             Some(id) => {
                 if id.trim().is_empty() {
@@ -375,7 +372,7 @@ impl Engine {
                     .messages
                     .iter()
                     .position(|message| message.summary.id == id)
-                    .ok_or_else(|| OpError::Failed(format!("unknown draft {id:?}")))?;
+                    .ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}; omit id to create a draft")))?;
                 let kind = self.folders.iter().find(|folder| folder.id == self.messages[index].summary.folder_id).map(|folder| folder.kind);
                 if kind != Some(FolderKind::Drafts) {
                     return Err(OpError::InvalidArgs(format!("message {id:?} is not a draft")));
@@ -383,6 +380,38 @@ impl Engine {
                 Some(index)
             }
             None => None,
+        };
+        let current_folder = index.and_then(|index| self.messages.get(index)).map(|message| message.summary.folder_id.as_str());
+        let current_account =
+            current_folder.and_then(|folder_id| self.folders.iter().find(|folder| folder.id == folder_id)).map(|folder| folder.account_id.clone());
+        let account = match (index, current_account) {
+            (Some(_), Some(account_id)) => {
+                if let Some(requested) = account
+                    && requested != account_id
+                {
+                    return Err(OpError::InvalidArgs(format!(
+                        "draft {id:?} belongs to account {account_id:?}; omit account or pass {account_id:?} to update it"
+                    )));
+                }
+                self.accounts
+                    .iter()
+                    .find(|candidate| candidate.id == account_id)
+                    .cloned()
+                    .ok_or_else(|| OpError::Failed(format!("the local store has draft {id:?} in a folder for unknown account {account_id:?}")))?
+            }
+            (Some(_), None) => {
+                return Err(OpError::Failed(format!("the local store has draft {id:?} in an unknown folder")));
+            }
+            _ => self.draft_account(account)?,
+        };
+        let draft_folder = match index.and_then(|index| self.messages.get(index)) {
+            Some(current) => current.summary.folder_id.clone(),
+            None => self
+                .folders
+                .iter()
+                .find(|folder| folder.account_id == account.id && folder.kind == FolderKind::Drafts)
+                .map(|folder| folder.id.clone())
+                .ok_or_else(|| OpError::Failed(format!("account {:?} has no Drafts folder", account.id)))?,
         };
 
         let message_id = match (index, id) {
@@ -400,6 +429,7 @@ impl Engine {
                 attachment
             })
             .collect::<Vec<_>>();
+        validate_unique_attachment_ids(&attachments)?;
         let has_attachments = !attachments.is_empty();
         let summary_snippet = snippet(&draft.body_text);
         // An update keeps what the draft form does not own: its thread, starred flag and labels.
@@ -430,11 +460,8 @@ impl Engine {
         };
 
         if let Some(store) = &self.store {
-            // Three repository calls, each transactional. Order matters: the message row must exist
-            // before its attachment rows and before the revision log can point at it.
-            store.upsert_message(&store_map::message_row(&saved, &account.id)).map_err(store_map::write_error)?;
-            store.replace_attachments(&message_id, &store_map::attachment_rows(&saved.attachments)).map_err(store_map::write_error)?;
-            store.save_draft(&store_map::draft_update(&saved, &account.id)).map_err(store_map::write_error)?;
+            let row = store_map::message_row(&saved, &account.id);
+            store.save_draft_message(&row, &store_map::attachment_rows(&saved.attachments)).map_err(store_map::write_error)?;
         }
 
         match index {
@@ -450,17 +477,43 @@ impl Engine {
         Ok(saved)
     }
 
-    /// Local submission: move a draft to Sent and record the current timestamp. No SMTP connection
-    /// is opened; the operation description and the UI label this as demo until M2, and a
-    /// store-backed engine persists the move locally like any other mutation.
+    /// Pick the account for a new draft. One account is implied; several require an explicit id.
+    fn draft_account(&self, requested: Option<&str>) -> Result<Account, OpError> {
+        if let Some(requested) = requested {
+            return self
+                .accounts
+                .iter()
+                .find(|account| account.id == requested)
+                .cloned()
+                .ok_or_else(|| OpError::InvalidArgs(format!("unknown account {requested:?}; run accounts_list to see the configured ids")));
+        }
+        match self.accounts.as_slice() {
+            [] => Err(OpError::Failed("no account is configured".to_owned())),
+            [account] => Ok(account.clone()),
+            accounts => Err(OpError::InvalidArgs(format!(
+                "the mailbox has {} accounts; pass `account` to draft_save to choose where the draft lives (for example {:?})",
+                accounts.len(),
+                accounts.first().map(|account| account.id.as_str()).unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// Local submission: move a draft to the Sent folder of its own account and record the current
+    /// timestamp. No SMTP connection is opened in this build; the operation description and the UI
+    /// say the move is local and that real submission arrives with M2. A store-backed engine
+    /// persists the move, and keeps the draft revision sequence for a later move back.
     pub fn send_draft(&mut self, id: &str) -> Result<MessageSummary, OpError> {
         let index =
-            self.messages.iter().position(|message| message.summary.id == id).ok_or_else(|| OpError::Failed(format!("unknown draft {id:?}")))?;
+            self.messages.iter().position(|message| message.summary.id == id).ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}")))?;
         let Some(current) = self.messages.get(index) else {
-            return Err(OpError::Failed(format!("unknown draft {id:?}")));
+            return Err(OpError::InvalidArgs(format!("unknown draft {id:?}")));
         };
-        let kind = self.folders.iter().find(|folder| folder.id == current.summary.folder_id).map(|folder| folder.kind);
-        if kind != Some(FolderKind::Drafts) {
+        let folder = self
+            .folders
+            .iter()
+            .find(|folder| folder.id == current.summary.folder_id)
+            .ok_or_else(|| OpError::Failed(format!("the draft {id:?} lives in unknown folder {:?}", current.summary.folder_id)))?;
+        if folder.kind != FolderKind::Drafts {
             return Err(OpError::InvalidArgs(format!("message {id:?} is not a draft")));
         }
         if current.summary.to.is_empty() && current.cc.is_empty() && current.bcc.is_empty() {
@@ -470,15 +523,16 @@ impl Engine {
         validate_addresses("cc", &current.cc)?;
         validate_addresses("bcc", &current.bcc)?;
         validate_header("subject", &current.summary.subject, MAX_SUBJECT_BYTES)?;
+        let account_id = folder.account_id.clone();
         let sent = self
             .folders
             .iter()
-            .find(|folder| folder.kind == FolderKind::Sent)
-            .map(|folder| (folder.id.clone(), folder.account_id.clone()))
-            .ok_or_else(|| OpError::Failed("the mailbox has no Sent folder".to_owned()))?;
+            .find(|folder| folder.account_id == account_id && folder.kind == FolderKind::Sent)
+            .map(|folder| folder.id.clone())
+            .ok_or_else(|| OpError::Failed(format!("account {account_id:?} has no Sent folder")))?;
 
         let mut message = current.clone();
-        message.summary.folder_id = sent.0;
+        message.summary.folder_id = sent;
         message.summary.date = Utc::now();
         message.summary.unread = false;
         message.summary.starred = false;
@@ -486,10 +540,10 @@ impl Engine {
         message.summary.has_attachments = !message.attachments.is_empty();
 
         if let Some(store) = &self.store {
-            // The heading row moves to Sent in the same upsert that records the new date; the
-            // revision row goes away because the draft is done.
-            store.upsert_message(&store_map::message_row(&message, &sent.1)).map_err(store_map::write_error)?;
-            store.delete_draft(id).map_err(store_map::write_error)?;
+            // One transaction: move the display row to Sent and drop the draft row. `draft_seq` is
+            // deliberately kept, so a move back to Drafts continues the revision sequence.
+            let row = store_map::message_row(&message, &account_id);
+            store.send_draft_message(&row).map_err(store_map::write_error)?;
         }
 
         let Some(slot) = self.messages.get_mut(index) else {
@@ -518,33 +572,6 @@ impl Engine {
         directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().join("Postino"))
     }
 
-    /// Materialise drafts that exist only in the `drafts` table. A normal save writes the message
-    /// row too, so this keeps a store whose display row went missing from hiding the draft.
-    fn absorb_drafts(&mut self, drafts: Vec<postino_store::Draft>) -> Result<(), OpError> {
-        for draft in drafts {
-            if self.messages.iter().any(|message| message.summary.id == draft.id) {
-                continue;
-            }
-            let account = self
-                .accounts
-                .iter()
-                .find(|account| account.id == draft.account_id)
-                .ok_or_else(|| OpError::Failed(format!("the local store has draft {:?} for unknown account {:?}", draft.id, draft.account_id)))?;
-            let folder_id = self
-                .folders
-                .iter()
-                .find(|folder| folder.account_id == draft.account_id && folder.kind == FolderKind::Drafts)
-                .map(|folder| folder.id.clone())
-                .ok_or_else(|| {
-                    OpError::Failed(format!("the local store has draft {:?} but no Drafts folder for account {:?}", draft.id, draft.account_id))
-                })?;
-            let message = store_map::draft_message(&draft, account, &folder_id)?;
-            self.messages.push(message);
-        }
-        self.recount();
-        Ok(())
-    }
-
     fn next_id(&self, prefix: &str) -> Result<String, OpError> {
         let base = self.messages.len().saturating_add(1);
         for offset in 0..10_000 {
@@ -571,6 +598,50 @@ impl Engine {
             folder.unread = unread;
         }
     }
+}
+
+/// Materialise every `drafts` row that has no display row, in one store transaction, before the
+/// mailbox is hydrated. Unknown accounts/folders and unreadable dates fail the open with the reason.
+fn repair_orphan_drafts(store: &Store, accounts: &[Account], folders: &[Folder]) -> Result<(), OpError> {
+    let drafts = store.list_orphan_drafts().map_err(store_map::read_error)?;
+    if drafts.is_empty() {
+        return Ok(());
+    }
+    let mut messages = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let account = accounts
+            .iter()
+            .find(|account| account.id == draft.account_id)
+            .ok_or_else(|| OpError::Failed(format!("the local store has draft {:?} for unknown account {:?}", draft.id, draft.account_id)))?;
+        let folder_id = folders
+            .iter()
+            .find(|folder| folder.account_id == draft.account_id && folder.kind == FolderKind::Drafts)
+            .map(|folder| folder.id.clone())
+            .ok_or_else(|| {
+                OpError::Failed(format!("the local store has draft {:?} but no Drafts folder for account {:?}", draft.id, draft.account_id))
+            })?;
+        let message = store_map::draft_message(&draft, account, &folder_id)?;
+        messages.push(store_map::message_row(&message, &account.id));
+    }
+    store.repair_orphan_drafts(&messages).map_err(store_map::repair_error)?;
+    Ok(())
+}
+
+/// Read the persisted label high-water mark, raise it to whatever labels already exist and repair an
+/// older store that has no `label_seq` row. The returned number is the highest id ever allocated.
+fn repair_label_seq(store: &Store, labels: &[Label]) -> Result<u32, OpError> {
+    let raw = store.get_meta(postino_store::LABEL_SEQ_KEY).map_err(store_map::read_error)?;
+    let stored = raw.as_deref().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+    let existing = labels.iter().filter_map(label_number).max().unwrap_or(0);
+    let high = stored.max(existing);
+    if raw.as_deref().and_then(|value| value.parse::<u32>().ok()) != Some(high) {
+        store.set_meta(postino_store::LABEL_SEQ_KEY, &high.to_string()).map_err(store_map::read_error)?;
+    }
+    Ok(high)
+}
+
+fn label_number(label: &Label) -> Option<u32> {
+    label.id.strip_prefix("lbl_").and_then(|suffix| suffix.parse::<u32>().ok())
 }
 
 fn validate_label_name(name: &str) -> Result<String, OpError> {
@@ -632,6 +703,19 @@ fn validate_header(field: &str, value: &str, max_bytes: usize) -> Result<(), OpE
     }
     if value.len() > max_bytes {
         return Err(OpError::InvalidArgs(format!("{field} is longer than {max_bytes} bytes")));
+    }
+    Ok(())
+}
+
+fn validate_unique_attachment_ids(attachments: &[Attachment]) -> Result<(), OpError> {
+    let mut seen = BTreeSet::new();
+    for attachment in attachments {
+        if !seen.insert(attachment.id.as_str()) {
+            return Err(OpError::InvalidArgs(format!(
+                "attachment id {:?} is repeated in the draft; give every attachment a unique id",
+                attachment.id
+            )));
+        }
     }
     Ok(())
 }
@@ -718,14 +802,14 @@ mod tests {
     fn saving_twice_updates_the_same_draft_and_the_folder_count() {
         let mut engine = Engine::demo();
         let before = engine.folders().iter().find(|folder| folder.kind == FolderKind::Drafts).map_or(0, |folder| folder.total);
-        let first = engine.save_draft(None, draft("Ciao", "Prima versione")).expect("new draft");
+        let first = engine.save_draft(None, None, draft("Ciao", "Prima versione")).expect("new draft");
         assert_eq!(first.summary.folder_id, "drafts");
         let after_first = engine.folders().iter().find(|folder| folder.kind == FolderKind::Drafts).map_or(0, |folder| folder.total);
         assert_eq!(after_first, before.saturating_add(1));
 
         let mut changed = draft("Ciao", "Seconda versione");
         changed.cc.push(Address::new("Marco Bianchi", "marco.bianchi@example.com"));
-        let second = engine.save_draft(Some(&first.summary.id), changed).expect("update");
+        let second = engine.save_draft(None, Some(&first.summary.id), changed).expect("update");
         assert_eq!(second.summary.id, first.summary.id);
         assert_eq!(second.body_text, "Seconda versione");
         assert_eq!(second.cc.len(), 1);
@@ -736,7 +820,7 @@ mod tests {
     #[test]
     fn sending_a_draft_moves_it_to_sent_and_undo_can_move_it_back() {
         let mut engine = Engine::demo();
-        let draft = engine.save_draft(None, draft("Ciao", "Corpo")).expect("draft");
+        let draft = engine.save_draft(None, None, draft("Ciao", "Corpo")).expect("draft");
         let id = draft.summary.id;
         let sent = engine.send_draft(&id).expect("send");
         assert_eq!(sent.folder_id, "sent");
@@ -751,11 +835,11 @@ mod tests {
         let mut engine = Engine::demo();
         let mut injected = draft("Ciao", "Corpo");
         injected.subject = "Ciao\nBcc: attacker@example.com".to_owned();
-        assert!(matches!(engine.save_draft(None, injected), Err(OpError::InvalidArgs(_))));
+        assert!(matches!(engine.save_draft(None, None, injected), Err(OpError::InvalidArgs(_))));
 
         let mut bad_address = draft("Ciao", "Corpo");
         bad_address.to = vec![Address::new("Giulia", "not-an-address")];
-        assert!(matches!(engine.save_draft(None, bad_address), Err(OpError::InvalidArgs(_))));
+        assert!(matches!(engine.save_draft(None, None, bad_address), Err(OpError::InvalidArgs(_))));
     }
 
     #[test]
@@ -763,14 +847,14 @@ mod tests {
         let mut engine = Engine::demo();
         let mut empty = draft("", "");
         empty.to.clear();
-        let draft = engine.save_draft(None, empty).expect("draft");
+        let draft = engine.save_draft(None, None, empty).expect("draft");
         assert!(matches!(engine.send_draft(&draft.summary.id), Err(OpError::InvalidArgs(_))));
     }
 
     #[test]
     fn a_sent_message_is_not_a_draft_any_more() {
         let mut engine = Engine::demo();
-        let draft = engine.save_draft(None, draft("Ciao", "Corpo")).expect("draft");
+        let draft = engine.save_draft(None, None, draft("Ciao", "Corpo")).expect("draft");
         let id = draft.summary.id;
         engine.send_draft(&id).expect("send");
         assert!(matches!(engine.send_draft(&id), Err(OpError::InvalidArgs(_))));

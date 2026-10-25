@@ -1539,14 +1539,14 @@ impl PostinoApp {
                 Ok(sent) => {
                     self.composer = ComposerState::closed();
                     self.status = format!(
-                        "Messaggio spostato in {} (demo)",
+                        "Messaggio spostato in {} (in locale, nessun SMTP)",
                         self.engine
                             .folders()
                             .iter()
                             .find(|folder| folder.id == sent.message.folder_id)
                             .map_or("Inviati", |folder| folder.name.as_str())
                     );
-                    self.push_toast("Messaggio inviato in modalità demo", UndoAction::Send(id));
+                    self.push_toast("Bozza spostata in Inviati: nessun messaggio è stato inviato", UndoAction::Send(id));
                 }
                 Err(error) => self.composer.mark_failed(format!("risposta non valida: {error}"), self.now),
             },
@@ -2621,7 +2621,7 @@ impl PostinoApp {
                     .corner_radius(radius::WINDOW)
                     .inner_margin(Margin::symmetric(inset::XL, inset::LG)),
             )
-            .show(ui.ctx(), |ui| Composer::new(&mut self.composer, &account, self.engine.is_demo()).show(ui));
+            .show(ui.ctx(), |ui| Composer::new(&mut self.composer, &account).show(ui));
         let Some(inner) = response else {
             return;
         };
@@ -3367,7 +3367,7 @@ const COMMANDS: &[Command] = &[
     Command { id: "reply_all", label: "Rispondi a tutti", icon: icons::REPLY_ALL, shortcut: "A", rule: CommandRule::Message, in_palette: true },
     Command { id: "forward", label: "Inoltra", icon: icons::FORWARD, shortcut: "F", rule: CommandRule::Message, in_palette: true },
     Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", rule: CommandRule::Message, in_palette: false },
-    Command { id: "send", label: "Invia (demo)", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
+    Command { id: "send", label: "Invia (locale)", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
     Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", rule: CommandRule::Message, in_palette: true },
     Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", rule: CommandRule::Message, in_palette: true },
     Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", rule: CommandRule::Message, in_palette: true },
