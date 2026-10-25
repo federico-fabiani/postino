@@ -1,7 +1,7 @@
 //! Text and search fields. The field owns its frame, label, hint, error and focus ring so a
 //! screen never hand-paints an input.
 
-use eframe::egui::{Align, FontFamily, FontId, Frame, Margin, Response, Stroke, TextEdit, Ui};
+use eframe::egui::{Align, FontFamily, FontId, Frame, Id, Margin, Response, Stroke, TextEdit, Ui};
 
 use crate::ui::icons;
 use crate::ui::tokens::{self, inset, radius, space, type_size};
@@ -17,12 +17,22 @@ pub struct TextField<'a> {
     multiline: bool,
     rows: usize,
     focus: bool,
+    id_salt: Option<Id>,
 }
 
 impl<'a> TextField<'a> {
     #[must_use]
     pub fn new(text: &'a mut String, hint: &'a str) -> Self {
-        Self { text, hint, label: None, leading_icon: None, error: None, width: None, multiline: false, rows: 3, focus: false }
+        Self { text, hint, label: None, leading_icon: None, error: None, width: None, multiline: false, rows: 3, focus: false, id_salt: None }
+    }
+
+    /// A stable id for a field whose layout may shift between passes, such as the palette search.
+    /// Compose it from a scope and a session number so a reopened composer cannot inherit the
+    /// previous draft's cursor or undo history.
+    #[must_use]
+    pub fn id_salt(mut self, id: impl std::hash::Hash + std::fmt::Debug) -> Self {
+        self.id_salt = Some(Id::new(id));
+        self
     }
 
     #[must_use]
@@ -82,14 +92,17 @@ impl<'a> TextField<'a> {
                     ui.label(icons::icon(icon, 14.0, t.text_faint));
                 }
                 let edit = if self.multiline { TextEdit::multiline(self.text).desired_rows(self.rows) } else { TextEdit::singleline(self.text) };
-                let response = ui.add(
-                    edit.hint_text(self.hint)
-                        .font(FontId::new(type_size::BODY_SMALL, FontFamily::Proportional))
-                        .text_color(t.text)
-                        .frame(Frame::NONE)
-                        .desired_width(f32::INFINITY)
-                        .margin(Margin::ZERO),
-                );
+                let mut edit = edit
+                    .hint_text(self.hint)
+                    .font(FontId::new(type_size::BODY_SMALL, FontFamily::Proportional))
+                    .text_color(t.text)
+                    .frame(Frame::NONE)
+                    .desired_width(f32::INFINITY)
+                    .margin(Margin::ZERO);
+                if let Some(id_salt) = self.id_salt {
+                    edit = edit.id_salt(id_salt);
+                }
+                let response = ui.add(edit);
                 if self.focus {
                     response.request_focus();
                 }

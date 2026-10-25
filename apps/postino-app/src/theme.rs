@@ -32,6 +32,13 @@ pub const DARK_TEXT: Color32 = Color32::from_rgb(0xF5, 0xEB, 0xD6);
 pub const DARK_MUTED: Color32 = Color32::from_rgb(0xB4, 0xC3, 0xB9);
 pub const DARK_FAINT: Color32 = Color32::from_rgb(0x8D, 0xA2, 0x96);
 
+/// The scrim under a modal layer. Warm-neutral black, never blue: the forest/ivory surfaces keep
+/// their temperature when they are dimmed, and the card keeps its own contrast because the scrim
+/// is painted under it, not over it.
+pub fn scrim(dark: bool) -> Color32 {
+    Color32::from_black_alpha(if dark { 150 } else { 96 })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Tokens {
     pub bg: Color32,

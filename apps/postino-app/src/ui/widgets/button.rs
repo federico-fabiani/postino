@@ -188,6 +188,9 @@ impl<'a> Button<'a> {
         if self.enabled && response.has_focus() {
             tokens::paint_focus_ring(ui, rect, radius::CONTROL, &t);
         }
+        if self.enabled && response.clicked() {
+            response.request_focus();
+        }
 
         let mut cursor = rect.left() + padding;
         if let Some(dot) = self.dot {
@@ -344,6 +347,9 @@ impl<'a> IconButton<'a> {
         }
         if self.enabled && response.has_focus() {
             tokens::paint_focus_ring(ui, rect, radius::CONTROL, &t);
+        }
+        if self.enabled && response.clicked() {
+            response.request_focus();
         }
         let font = if self.filled { icons::font_filled(icon_size) } else { icons::font(icon_size) };
         let galley = layout(ui, self.icon, &font, foreground);

@@ -147,7 +147,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "de8b31f3daea36f374e7adcc6e4fee84f972c08fa7c92c4d48f961b20de5278a"
+sha256 = "86c6aa3bdf606d94fa17dfc932ccfbf99339680380a285bfb618598090683755"
 usage = "Documentation screenshot of the U0.4 reading pane with reply and forward actions"
 
 [[asset]]
@@ -157,7 +157,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a062d3f4b1cbfcf419e28dba7b23a69eaef8c36ce5a8482dd719e74e9251c4e3"
+sha256 = "80875c17ef081bbdcd02e53b328dc8aa011a63179e0923ecf6c42e961605d4ca"
 usage = "Documentation screenshot of the U0.4 composer with recipients, attachment and draft state"
 
 [[asset]]
@@ -167,7 +167,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a8441b9873a5401bbf96f9ab2b7bef0b52e5f822f6d31bc66aa25ebfc7cad80b"
+sha256 = "c1474bd32f59a930c71fbb3f9dd4f94f100fc373cfc7ae8f631ad5c335c9b485"
 usage = "Documentation screenshot of the U0.4 composer in the dark theme"
 
 [[asset]]
@@ -187,8 +187,28 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "56f6c1bcede527ea3d5ae974d84c022a2a92b28718cc116e95ee4cd806b72e6a"
+sha256 = "80abe26d82b51c18d8960190b064e0ef59fa377f61640fa11e5e933c574cc07f"
 usage = "Documentation screenshot of the modal label menu over the message list, with the applied label chip visible in the reading pane"
+
+[[asset]]
+path = "docs/images/postino-p2a-palette.png"
+title = "Postino P2a command palette"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "2d901c67eb8f6196814f41c843d5dc87b11ed1c3d83339f066c02784c4ea79f7"
+usage = "Documentation screenshot of the modal command palette with the scrim, filtered results, shortcut hints and a disabled reason"
+
+[[asset]]
+path = "docs/images/postino-p2a-compose-980.png"
+title = "Postino P2a composer at 980×600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "25388fb23723cee2909e5f33a01dfb7269919ff6064971408596adc093562784"
+usage = "Documentation screenshot of the composer sheet at the 980×600 minimum window, with pinned header/footer and a scrolling body"
 
 [[asset]]
 path = "assets/app-icon/postino-256.png"

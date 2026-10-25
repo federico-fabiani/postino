@@ -1,7 +1,7 @@
 //! Numeric and colour tokens. Screens and components read these values; they do not invent their
 //! own spacing, radii, type sizes or control heights.
 
-use eframe::egui::{Color32, CornerRadius, Rect, Stroke, StrokeKind, Ui};
+use eframe::egui::{Color32, CornerRadius, Rect, Stroke, StrokeKind, Ui, style::ScrollStyle};
 
 pub use crate::theme::{BORDER, DANGER, FAINT, FOREST, FOREST_SOFT, GOLD, GOLD_INK, IVORY, IVORY_2, MUTED, Tokens, tokens};
 
@@ -54,13 +54,40 @@ pub mod size {
     pub const TOOLBAR: f32 = 56.0;
     pub const STATUS: f32 = 28.0;
     pub const SIDEBAR: f32 = 240.0;
-    pub const COMPOSER_WIDTH: f32 = 720.0;
+    /// Composer modal card. Wider cards would leave the list and the reading pane too narrow to
+    /// keep the composer a layer over the mail instead of a second window.
+    pub const COMPOSER_CARD_WIDTH: f32 = 640.0;
     pub const COMPOSER_HEIGHT: f32 = 600.0;
-    pub const COMPOSER_MIN_HEIGHT: f32 = 480.0;
     pub const COMPOSER_HEADER: f32 = 40.0;
+    /// The pinned title/rule/account block above the scrolling body. The body is what moves; the
+    /// header and the footer keep their position at every window size.
+    pub const COMPOSER_HEADER_BLOCK: f32 = 78.0;
+    pub const COMPOSER_ACCOUNT_ROW: f32 = 20.0;
+    pub const COMPOSER_FOOTER_BLOCK: f32 = 50.0;
     pub const COMPOSER_BODY_MIN: f32 = 96.0;
-    pub const COMPOSER_BODY_MAX: f32 = 310.0;
     pub const ATTACHMENT_LIST_MAX: f32 = 36.0;
+    /// The inline label editor is a drawer above the sidebar footer, tall enough for the field, its
+    /// error line, the colour row, the hint and Save/Cancel at 980×600.
+    pub const LABEL_EDITOR_DRAWER: f32 = 208.0;
+    /// Command palette: a modal layer, not a window. Ten rows are enough to scan a filtered list;
+    /// the rest scrolls inside the palette.
+    pub const PALETTE_WIDTH: f32 = 560.0;
+    pub const PALETTE_TOP_RATIO: f32 = 0.12;
+    pub const PALETTE_RESULTS_MAX: f32 = 380.0;
+    pub const PALETTE_ROW: f32 = 38.0;
+    /// Chrome above and below the results: frame margins, search field, separators, hint and the
+    /// item spacing between them. The results are capped by the window height minus this block, so
+    /// ten rows never push the palette under the status bar at 980×600.
+    pub const PALETTE_CHROME: f32 = 128.0;
+    /// Room reserved for the disabled reason line under the results.
+    pub const PALETTE_REASON: f32 = 24.0;
+    /// Below this list width the date column is dropped before the subject is truncated.
+    pub const LIST_DATE_MIN: f32 = 560.0;
+    /// The reading pane may never squeeze the list below this while the side pane is in use.
+    pub const LIST_MIN: f32 = 460.0;
+    pub const LIST_SENDER: f32 = 140.0;
+    pub const LIST_SENDER_NARROW: f32 = 96.0;
+    pub const LIST_DATE: f32 = 52.0;
 }
 
 /// Type scale in points. No other sizes should appear in component code.
@@ -98,6 +125,17 @@ pub fn paint_focus_ring(ui: &Ui, rect: Rect, radius: u8, tokens: &Tokens) {
     let painter = ui.painter();
     painter.rect_stroke(rect.expand(2.0), CornerRadius::same(radius.saturating_add(2)), Stroke::new(2.0, tokens.gold), StrokeKind::Outside);
     painter.rect_stroke(rect, CornerRadius::same(radius), Stroke::new(1.0, tokens.text), StrokeKind::Inside);
+}
+
+/// A thin but always-visible scroll bar for surfaces where overflow must be an affordance: the
+/// sidebar drawer, the composer body and the palette results. egui's default is a 2 pt sliver with
+/// zero dormant opacity, so an overflowing list looked broken until the pointer hovered it.
+#[must_use]
+pub fn scroll_style() -> ScrollStyle {
+    let mut style = ScrollStyle::thin();
+    style.foreground_color = true;
+    style.floating_width = 4.0;
+    style
 }
 
 #[cfg(test)]

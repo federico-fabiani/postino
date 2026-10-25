@@ -1,7 +1,7 @@
 //! The egui shell. Panels are deliberately plain: folder rail, message table, reading pane.
 //! Every action goes through `Engine::call`, the same operation registry the CLI and MCP expose.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
-    RichText, Sense, Stroke, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType,
+    RichText, Sense, Stroke, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
     Account, Address, Attachment, DraftSave, DraftSend, Engine, FolderKind, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary,
@@ -20,11 +20,13 @@ use serde_json::json;
 
 use crate::theme::{self, GOLD, IVORY, Tokens};
 use crate::ui::icons;
-use crate::ui::tokens::{inset, radius, size as ui_size, space};
+use crate::ui::tokens::{inset, radius, size as ui_size, space, type_size};
 use crate::ui::typography::{self, Role};
+#[cfg(test)]
+use crate::ui::widgets::ComposerFocus;
 use crate::ui::widgets::{
-    AUTOSAVE_DELAY, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerFocus, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize,
-    ListRow, Menu, MenuItem, SearchField, SectionHeader, TextField, Toast, compose_body, quote_body, signature_body,
+    AUTOSAVE_DELAY, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize, ListRow, Menu,
+    MenuItem, SearchField, SectionHeader, TextField, Toast, compose_body, quote_body, signature_body,
 };
 
 /// The shell scenes `--screenshot` can render. Add a label here and a branch in
@@ -86,12 +88,17 @@ pub fn screenshot_clock() -> Result<DateTime<Utc>, String> {
 /// Below this available width a side reading pane leaves no usable list, so reading becomes a
 /// full-width overlay with a back button.
 const READING_PANE_MIN_WIDTH: f32 = 1000.0;
-/// The pane opens at 52% of the window and resizes between 420 px and 62%.
+/// The pane opens at 52% of the content width *after* the 240 pt sidebar, resizes between 420 px
+/// and 62%, and stops shrinking the list below 460 px whenever the geometry allows it.
 const READING_PANE_DEFAULT_RATIO: f32 = 0.52;
 const READING_PANE_MAX_RATIO: f32 = 0.62;
 const READING_PANE_MIN_SIZE: f32 = 420.0;
 /// The message list shows avatars only when its column is at least this wide (`docs/ui/plan.md`).
 const AVATAR_MIN_LIST_WIDTH: f32 = 720.0;
+/// The composer switches from a sheet to a centred card only when there is room for both the
+/// declared minimum window and a card that does not touch the status bar.
+const COMPOSER_CARD_MIN_WIDTH: f32 = 1000.0;
+const COMPOSER_CARD_MIN_HEIGHT: f32 = 700.0;
 /// `label_apply` accepts at most 500 ids per call; undoing a delete restores in these batches.
 const LABEL_APPLY_CHUNK: usize = 500;
 
@@ -139,6 +146,14 @@ pub struct PostinoApp {
     reading_open: bool,
     reading_full: bool,
     composer: ComposerState,
+    /// The widget that owned the keyboard when the composer opened. Closing the modal returns
+    /// focus there instead of dropping the user on the shell with no focus at all.
+    composer_return_focus: Option<Id>,
+    composer_focus_pending: bool,
+    /// The egui id of each visible message row, so `J`/`K` can move real keyboard focus and the
+    /// truncation tooltips also work without a mouse.
+    row_ids: BTreeMap<String, Id>,
+    focus_selected_row: bool,
     /// Deterministic PNG capture, set only by `--screenshot`.
     screenshot: Option<ScreenshotMode>,
 }
@@ -207,13 +222,14 @@ impl PostinoApp {
                     size: 248_320,
                 }];
                 composer.saved_at = Some(format_time(self.now_utc));
-                composer.focus = Some(ComposerFocus::Body);
                 self.start_composer(composer);
             }
             ScreenshotState::Palette => {
                 self.show_palette = true;
                 self.palette_focus = true;
-                self.palette_query = "scr".to_owned();
+                // A filtered palette is more useful than an empty query in a docs shot: it shows
+                // the search, a handful of rows and the disabled reason line together.
+                self.palette_query = "etichetta".to_owned();
                 self.palette_selected = 0;
             }
             ScreenshotState::Labels => {
@@ -289,6 +305,10 @@ impl PostinoApp {
             reading_open: false,
             reading_full: false,
             composer: ComposerState::closed(),
+            composer_return_focus: None,
+            composer_focus_pending: false,
+            row_ids: BTreeMap::new(),
+            focus_selected_row: false,
             screenshot: None,
         }
     }
@@ -886,6 +906,7 @@ impl PostinoApp {
             self.focus_message(message.id.clone());
         }
         self.scroll_to_selected = true;
+        self.focus_selected_row = true;
     }
 
     fn set_flag_for(&mut self, id: &str, unread: Option<bool>, starred: Option<bool>) -> bool {
@@ -1375,7 +1396,11 @@ impl PostinoApp {
             return;
         }
         state.open = true;
+        // Over the modal, the first empty field owns the keyboard. A reply with every field filled
+        // falls back to the body.
+        state.focus = Some(state.first_empty_focus());
         self.composer = state;
+        self.composer_focus_pending = true;
         self.show_palette = false;
         self.show_shortcuts = false;
         self.show_about = false;
@@ -1389,7 +1414,6 @@ impl PostinoApp {
         };
         let mut state = ComposerState::new(ComposeMode::New);
         state.body = signature_body(&account.signature);
-        state.focus = Some(ComposerFocus::To);
         self.start_composer(state);
     }
 
@@ -1422,7 +1446,6 @@ impl PostinoApp {
         state.subject = subject;
         state.body = compose_body(&account.signature, quoted);
         state.attachments = if mode == ComposeMode::Forward { message.attachments.clone() } else { Vec::new() };
-        state.focus = Some(ComposerFocus::Body);
         self.start_composer(state);
     }
 
@@ -1452,7 +1475,6 @@ impl PostinoApp {
         state.body = message.body_text.clone();
         state.attachments = message.attachments.clone();
         state.saved_at = Some(format_time(message.summary.date));
-        state.focus = Some(ComposerFocus::Body);
         self.start_composer(state);
     }
 
@@ -1746,7 +1768,10 @@ impl PostinoApp {
                     }
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
-                    if Button::primary("Scrivi").icon(icons::COMPOSE).shortcut("C").show(ui).clicked() {
+                    let compose = Button::primary("Scrivi").icon(icons::COMPOSE).shortcut("C").show(ui);
+                    #[cfg(test)]
+                    probe::compose_button(ui, compose.rect);
+                    if compose.clicked() {
                         self.compose_new();
                     }
                     ui.add_space(space::SM);
@@ -1767,23 +1792,49 @@ impl PostinoApp {
             .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::LG, inset::XL)))
             .show_separator_line(false)
             .show(ui, |ui| {
-                let footer_height = 42.0;
+                #[cfg(test)]
+                probe::sidebar_panel(ui, ui.max_rect());
                 let labels = self.labels_cache.clone();
                 let editor_open = self.label_editor.is_some();
                 let mut folder_action = None;
                 let mut label_action = None;
                 let mut editor_action = LabelEditorAction::None;
 
-                // Footer first so it stays pinned; everything above it is one scroll area. At
-                // 980×600 with the inline editor open the content overflows, and the scroll bar is
-                // the affordance that keeps Cestino and the label rows reachable. Two fixed
-                // sub-panels used to clip the folder list instead of scrolling it.
-                egui::Panel::bottom("sidebar-footer").exact_size(footer_height).frame(Frame::NONE).show_separator_line(false).show(ui, |ui| {
+                // Panels nest in the order they are added. The footer is the outermost bottom
+                // panel, the label drawer sits directly above it, and the folder/label list scrolls
+                // in what remains. Opening the editor therefore never moves the list: it shrinks
+                // the viewport, it does not scroll it.
+                let footer = egui::Panel::bottom("sidebar-footer").exact_size(42.0).frame(Frame::NONE).show_separator_line(false).show(ui, |ui| {
                     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                         ui.label(typography::text(Role::Caption, format!("Postino {} · M0 + U0.5", env!("CARGO_PKG_VERSION")), t.text_faint));
                         ui.label(typography::text(Role::Caption, "Locale · offline", t.text_faint));
                     });
                 });
+                #[cfg(test)]
+                probe::sidebar_footer(ui, footer.response.rect);
+                #[cfg(not(test))]
+                let _ = footer;
+
+                if self.label_editor.is_some() {
+                    let drawer = egui::Panel::bottom("sidebar-editor")
+                        .exact_size(ui_size::LABEL_EDITOR_DRAWER)
+                        .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(0, inset::MD)))
+                        .show_separator_line(false)
+                        .show(ui, |ui| {
+                            let Some(editor) = self.label_editor.as_mut() else {
+                                return;
+                            };
+                            let editor_scope = ui.scope(|ui| label_editor_widget(ui, editor, &t));
+                            #[cfg(test)]
+                            probe::editor(ui, editor_scope.response.rect);
+                            // The drawer is a pinned surface: the editor's own focus request is
+                            // enough, no scroll-to-rect is allowed to move the navigation.
+                            editor_action = editor_scope.inner;
+                        });
+                    ui.painter().hline(drawer.response.rect.x_range(), drawer.response.rect.top(), Stroke::new(1.0, t.border));
+                    #[cfg(test)]
+                    probe::editor_drawer(ui, drawer.response.rect);
+                }
 
                 #[cfg(test)]
                 probe::clear_rows(ui);
@@ -1798,10 +1849,14 @@ impl PostinoApp {
                     .show(ui, |ui| {
                         // Rows sit flush instead of carrying a two-pixel gap each.
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.scope(|ui| {
+                        let header = ui.scope(|ui| {
                             ui.spacing_mut().interact_size.y = 20.0;
                             SectionHeader::new("CARTELLE").show(ui);
                         });
+                        #[cfg(test)]
+                        probe::sidebar_header(ui, "CARTELLE", header.response.rect);
+                        #[cfg(not(test))]
+                        let _ = header;
                         ui.add_space(space::XS);
                         let folders = self.engine.folders().to_vec();
                         for folder in folders {
@@ -1860,20 +1915,6 @@ impl PostinoApp {
                             label_action = Some(LabelAction::New);
                         }
                         ui.add_space(space::XS);
-                        // The editor lives directly under the ETICHETTE header, before the rows,
-                        // so the field, its error, the palette and the pointer controls stay
-                        // together however long the list grows.
-                        if let Some(editor) = self.label_editor.as_mut() {
-                            let focus = editor.focus;
-                            let editor_scope = ui.scope(|ui| label_editor_widget(ui, editor, &t));
-                            let rect = editor_scope.response.rect;
-                            if focus {
-                                // Opening the editor must reveal it, not leave its controls under
-                                // the footer at the minimum window size.
-                                ui.scroll_to_rect(rect.expand2(Vec2::new(0.0, space::MD)), Some(Align::BOTTOM));
-                            }
-                            editor_action = editor_scope.inner;
-                        }
                         for label in &labels {
                             let meta = if label.unread_count > 0 { label.unread_count.to_string() } else { String::new() };
                             let detail = format!(
@@ -1914,7 +1955,7 @@ impl PostinoApp {
                         }
                     });
                 #[cfg(test)]
-                probe::scroll(ui, scroll.inner_rect, scroll.content_size);
+                probe::scroll(ui, scroll.inner_rect, scroll.content_size, scroll.state.offset);
                 #[cfg(not(test))]
                 let _ = scroll;
 
@@ -1938,6 +1979,10 @@ impl PostinoApp {
 
     fn list_panel(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
+        // The panel width left after the sidebar and the reading pane. It includes the list's own
+        // margin; the columns are laid out against the content width inside the panel.
+        let list_panel_width = ui.available_width();
+        let _ = list_panel_width;
         let now_utc = self.now_utc;
         let current_folder_name =
             self.engine.folders().iter().find(|folder| folder.id == self.folder).map_or_else(|| "Posta".to_owned(), |folder| folder.name.clone());
@@ -2098,15 +2143,25 @@ impl PostinoApp {
             }
 
             let mut clicked = None;
+            let mut double_clicked = None;
             let mut star_clicked = None;
             let mut context_clicked = None;
             let mut context_action = None;
             let modifiers = ui.input(|input| input.modifiers);
-            let list_width = ui.available_width();
-            let show_avatars = show_list_avatars(list_width);
-            // A list squeezed by the 52% reading pane trades sender/date space for the subject.
-            let sender_width = if list_width < 560.0 { 96.0 } else { 140.0 };
-            let date_width = if list_width < 560.0 { 44.0 } else { 52.0 };
+            let content_width = ui.available_width();
+            let columns = list_columns(content_width);
+            let show_avatars = show_list_avatars(content_width);
+            #[cfg(test)]
+            probe::list_width(ui, content_width, list_panel_width);
+            #[cfg(test)]
+            probe::date_column(ui, columns.date.is_some());
+            #[cfg(test)]
+            probe::clear_tooltips(ui);
+            #[cfg(test)]
+            probe::clear_message_rows(ui);
+            self.row_ids.clear();
+            let ctx = ui.ctx().clone();
+            let _ = &ctx;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let mut focus_rect = None;
                 let mut table = egui_extras::TableBuilder::new(ui)
@@ -2120,9 +2175,11 @@ impl PostinoApp {
                 if show_avatars {
                     table = table.column(egui_extras::Column::exact(30.0));
                 }
+                table = table.column(egui_extras::Column::exact(columns.sender));
+                if let Some(date) = columns.date {
+                    table = table.column(egui_extras::Column::exact(date));
+                }
                 table
-                    .column(egui_extras::Column::exact(sender_width))
-                    .column(egui_extras::Column::exact(date_width))
                     .column(egui_extras::Column::remainder())
                     .column(egui_extras::Column::exact(24.0))
                     .header(24.0, |mut header| {
@@ -2133,9 +2190,13 @@ impl PostinoApp {
                         header.col(|ui| {
                             ui.add(egui::Label::new(typography::text(Role::Caption, "MITTENTE", t.text_faint)).selectable(false));
                         });
-                        header.col(|ui| {
-                            ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
-                        });
+                        // The date is dropped before the subject is truncated, so the header must
+                        // drop the column with it instead of leaving a hole.
+                        if columns.date.is_some() {
+                            header.col(|ui| {
+                                ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
+                            });
+                        }
                         header.col(|ui| {
                             ui.add(egui::Label::new(typography::text(Role::Caption, "OGGETTO", t.text_faint)).selectable(false));
                         });
@@ -2146,6 +2207,10 @@ impl PostinoApp {
                             let focused = self.selected.as_deref() == Some(message.id.as_str());
                             let selected = self.selection.contains(&message.id);
                             let foreground = if selected { t.selected_text } else { t.text };
+                            let row_font =
+                                FontId::new(type_size::BODY_SMALL, if message.unread { theme::medium() } else { FontFamily::Proportional });
+                            let mut sender_truncated = false;
+                            let mut subject_truncated = false;
                             body.row(ui_size::ROW, |mut row| {
                                 row.set_selected(selected);
                                 row.col(|ui| {
@@ -2168,23 +2233,24 @@ impl PostinoApp {
                                 row.col(|ui| {
                                     let name =
                                         if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
-                                    let text = RichText::new(name)
-                                        .font(FontId::new(13.0, if message.unread { theme::medium() } else { FontFamily::Proportional }))
-                                        .color(foreground);
+                                    sender_truncated = !text_fits(ui, name, &row_font, ui.available_width());
+                                    let text = RichText::new(name).font(row_font.clone()).color(foreground);
                                     ui.add(egui::Label::new(text).truncate().selectable(false));
                                 });
-                                row.col(|ui| {
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.add(
-                                            egui::Label::new(typography::mono(
-                                                format_when(message.date, now_utc),
-                                                10.5,
-                                                if selected { t.selected_muted } else { t.text_faint },
-                                            ))
-                                            .selectable(false),
-                                        );
+                                if columns.date.is_some() {
+                                    row.col(|ui| {
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add(
+                                                egui::Label::new(typography::mono(
+                                                    format_when(message.date, now_utc),
+                                                    type_size::CAPTION,
+                                                    if selected { t.selected_muted } else { t.text_faint },
+                                                ))
+                                                .selectable(false),
+                                            );
+                                        });
                                     });
-                                });
+                                }
                                 row.col(|ui| {
                                     // The cell layout starts content at the top. Centre the two lines
                                     // explicitly so the subject never touches the selected row edge.
@@ -2194,11 +2260,10 @@ impl PostinoApp {
                                         ui.spacing_mut().item_spacing.y = 1.0;
                                         let subject_text =
                                             if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() };
-                                        let subject = RichText::new(subject_text)
-                                            .font(FontId::new(13.0, if message.unread { theme::medium() } else { FontFamily::Proportional }))
-                                            .color(foreground);
+                                        subject_truncated = !text_fits(ui, subject_text, &row_font, ui.available_width());
+                                        let subject = RichText::new(subject_text).font(row_font.clone()).color(foreground);
                                         ui.add(egui::Label::new(subject).truncate().selectable(false));
-                                        let snippet = RichText::new(message.snippet.as_str()).size(11.0).color(if selected {
+                                        let snippet = RichText::new(message.snippet.as_str()).size(type_size::META).color(if selected {
                                             t.selected_muted
                                         } else {
                                             t.text_muted
@@ -2228,17 +2293,55 @@ impl PostinoApp {
                                     }
                                 });
                                 let response = row.response();
+                                self.row_ids.insert(message.id.clone(), response.id);
+                                // The table reports its row rect from the measuring pass, which can be
+                                // wider than the list. Clamp it to the visible content for the focus
+                                // ring and for the pointer tests.
+                                let row_rect = Rect::from_min_max(
+                                    response.rect.min,
+                                    pos2(response.rect.max.x.min(response.rect.min.x + content_width), response.rect.max.y),
+                                );
+                                #[cfg(test)]
+                                probe::message_row(&ctx, &message.id, row_rect);
                                 if focused && self.scroll_to_selected {
                                     response.scroll_to_me(None);
                                 }
                                 if focused && !selected {
-                                    focus_rect = Some(response.rect.shrink(1.0));
+                                    focus_rect = Some(row_rect.shrink(1.0));
                                 }
                                 if response.secondary_clicked() {
                                     context_clicked = Some(message.id.clone());
                                 }
                                 if response.clicked() {
                                     clicked = Some((message.id.clone(), modifiers));
+                                }
+                                if double_activated(&response) {
+                                    double_clicked = Some(message.id.clone());
+                                }
+                                let mut tooltip = String::new();
+                                if sender_truncated {
+                                    let name =
+                                        if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
+                                    tooltip.push_str(name);
+                                }
+                                if subject_truncated {
+                                    if !tooltip.is_empty() {
+                                        tooltip.push('\n');
+                                    }
+                                    tooltip.push_str(if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() });
+                                }
+                                if !tooltip.is_empty() {
+                                    // A tooltip on hover has the usual delay; a keyboard-focused row
+                                    // shows it at once, so truncation is never information loss
+                                    // without a mouse.
+                                    if response.has_focus() && !response.hovered() {
+                                        #[cfg(test)]
+                                        probe::tooltip(&ctx, &tooltip);
+                                        let _ = egui::Tooltip::for_widget(&response).show(|ui| {
+                                            ui.label(typography::text(Role::BodySmall, tooltip.as_str(), t.text));
+                                        });
+                                    }
+                                    response.clone().on_hover_text(tooltip);
                                 }
                                 let is_draft = self
                                     .engine
@@ -2262,6 +2365,14 @@ impl PostinoApp {
                     crate::ui::tokens::paint_focus_ring(ui, rect, radius::CONTROL, &t);
                 }
             });
+            if self.focus_selected_row {
+                if let Some(id) = self.selected.as_ref().and_then(|selected| self.row_ids.get(selected)) {
+                    ui.ctx().memory_mut(|memory| memory.request_focus(*id));
+                    self.focus_selected_row = false;
+                } else if self.selected.is_none() {
+                    self.focus_selected_row = false;
+                }
+            }
             self.scroll_to_selected = false;
             if let Some(id) = star_clicked {
                 self.toggle_star_for(&id);
@@ -2271,7 +2382,13 @@ impl PostinoApp {
                 {
                     self.focus_message(id);
                 }
-                if let Some((id, modifiers)) = clicked {
+                let overlay = reading_overlay(ui.ctx().content_rect().width());
+                if let Some(id) = double_clicked {
+                    // A double-click is the physical "open and expand": on a wide window the pane
+                    // grows to the full content area; on a narrow one the overlay is already full.
+                    self.open_message(id);
+                    self.reading_full = !overlay;
+                } else if let Some((id, modifiers)) = clicked {
                     if modifiers.command {
                         self.toggle_selection(id);
                     } else if modifiers.shift {
@@ -2305,7 +2422,7 @@ impl PostinoApp {
         } else {
             let available = ui.ctx().content_rect().width();
             let default_width = reading_pane_width(available);
-            let max_width = (available * READING_PANE_MAX_RATIO).max(READING_PANE_MIN_SIZE);
+            let max_width = reading_pane_max_width(available);
             egui::Panel::right("reading")
                 .resizable(true)
                 .default_size(default_width)
@@ -2332,11 +2449,21 @@ impl PostinoApp {
             .find(|folder| folder.id == message.summary.folder_id)
             .is_some_and(|folder| folder.kind == FolderKind::Drafts);
 
+        // The header is also the restore target: a double-click on a row expands reading, a
+        // double-click here goes back. It is registered before the buttons so a button wins the
+        // hit test; only the empty part of the header restores.
+        let header_rect = Rect::from_min_size(ui.available_rect_before_wrap().min, Vec2::new(ui.available_width(), 36.0));
+        let header_response = ui.interact(header_rect, ui.id().with("reading-header"), Sense::click());
+        #[cfg(test)]
+        probe::reading_header(ui, header_rect);
+
         let (left_action, right_action) = Sides::new().height(36.0).shrink_left().show(
             ui,
             |ui| {
                 let mut action = None;
-                let compact = ui.available_width() < 560.0;
+                // The labels still fit the default 541 pt pane; the icon-only path is for the pane
+                // at its 420 pt minimum and for the overlay header, not for the default layout.
+                let compact = ui.available_width() < 400.0;
                 // Below the pane breakpoint the reading view is an overlay with no list behind it,
                 // so it must keep Back and the two triage actions a user reaches for most.
                 let overlay = reading_overlay(ui.ctx().content_rect().width());
@@ -2444,6 +2571,15 @@ impl PostinoApp {
                 action
             },
         );
+
+        if double_activated(&header_response) {
+            if reading_overlay(ui.ctx().content_rect().width()) {
+                self.close_reading();
+            } else {
+                self.reading_full = false;
+            }
+            return;
+        }
 
         ui.add_space(space::LG);
         let subject_text = if message.summary.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.summary.subject.as_str() };
@@ -2606,28 +2742,27 @@ impl PostinoApp {
             return;
         };
         let t = theme::tokens(self.dark);
-        let height = (ui.ctx().content_rect().height() - 48.0).clamp(ui_size::COMPOSER_MIN_HEIGHT, ui_size::COMPOSER_HEIGHT);
-        let response = egui::Window::new("Postino composer")
-            .id(egui::Id::new("postino-composer"))
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([ui_size::COMPOSER_WIDTH, height])
-            .frame(
-                Frame::new()
-                    .fill(t.panel)
-                    .stroke(Stroke::new(1.0, t.border))
-                    .corner_radius(radius::WINDOW)
-                    .inner_margin(Margin::symmetric(inset::XL, inset::LG)),
-            )
-            .show(ui.ctx(), |ui| Composer::new(&mut self.composer, &account).show(ui));
-        let Some(inner) = response else {
-            return;
-        };
-        let Some(action) = inner.inner else {
-            return;
-        };
+        let window = ui.ctx().content_rect();
+        let body_area = Rect::from_min_max(window.min, pos2(window.max.x, (window.max.y - ui_size::STATUS).max(window.min.y)));
+        let (card, _sheet) = composer_card_rect(window, body_area);
+        let margin = Vec2::new(f32::from(inset::XL), f32::from(inset::LG));
+        let inner = Rect::from_min_size(card.min + margin, (card.size() - margin * 2.0).max(Vec2::ZERO));
+        #[cfg(test)]
+        probe::composer_card(ui, card);
+        let frame = Frame::new()
+            .fill(t.panel)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(radius::WINDOW)
+            .inner_margin(Margin::symmetric(inset::XL, inset::LG));
+        // A modal layer, not a window: the scrim dims the shell for the whole content area, the
+        // backdrop swallows every click and no title bar can be dragged over the toolbar.
+        let id = Id::new("postino-composer");
+        let area = egui::Modal::default_area(id).anchor(Align2::LEFT_TOP, card.min - window.min).constrain(false);
+        let response = egui::Modal::new(id).area(area).backdrop_color(theme::scrim(self.dark)).frame(frame).show(ui.ctx(), |ui| {
+            ui.set_min_size(inner.size());
+            ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| Composer::new(&mut self.composer, &account).show(ui)).inner
+        });
+        let action = response.inner;
         if action.discard {
             self.discard_composer();
         } else if action.close {
@@ -2681,35 +2816,54 @@ impl PostinoApp {
         self.show_about = open;
     }
 
+    /// The command palette. It is a modal layer, not a window: no title band, no close button, a
+    /// scrim that blocks the shell, the search field on top, ten rows with an internal scroll and
+    /// the keyboard hint at the bottom. The command table remains the only source of rows.
     fn command_palette(&mut self, ui: &mut Ui) {
         if !self.show_palette {
             return;
         }
         let t = theme::tokens(self.dark);
         let ctx = ui.ctx().clone();
-        let mut open = self.show_palette;
         let mut chosen = None;
         // Consume the navigation keys before the text field sees them. Otherwise the caret
         // swallows the arrows and only the first command can ever run.
         let down = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown));
         let up = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp));
-        let enter = ctx.input(|input| input.key_pressed(Key::Enter));
+        let enter = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
         let navigated = down || up;
-        egui::Window::new("Comandi")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_TOP, [0.0, 110.0])
-            .default_width(480.0)
+        if navigated {
+            // egui records the arrow as a focus-navigation intent at the start of the pass, before
+            // this handler consumes it; without this reset the field loses focus to the first row.
+            ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        }
+        let window = ui.ctx().content_rect();
+        let outer_width = ui_size::PALETTE_WIDTH.min((window.width() - 2.0 * space::XL).max(240.0));
+        let content_width = (outer_width - 2.0 * f32::from(inset::XL)).max(120.0);
+        let top = window.height() * ui_size::PALETTE_TOP_RATIO;
+        let id = Id::new("postino-palette");
+        let frame = Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL));
+        let response = egui::Modal::new(id)
+            .area(egui::Modal::default_area(id).anchor(Align2::CENTER_TOP, Vec2::new(0.0, top)).constrain(false))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(frame)
             .show(&ctx, |ui| {
-                let response =
-                    ui.add_sized([ui.available_width(), 32.0], egui::TextEdit::singleline(&mut self.palette_query).hint_text("Cerca un comando…"));
-                if self.palette_focus {
-                    response.request_focus();
-                    self.palette_focus = false;
-                }
-                if response.changed() {
+                ui.set_width(content_width);
+                ui.spacing_mut().scroll = crate::ui::tokens::scroll_style();
+                let search = TextField::new(&mut self.palette_query, "Cerca un comando…")
+                    .id_salt("postino-palette-search")
+                    .icon(icons::SEARCH)
+                    .width(content_width)
+                    .focus(self.palette_focus)
+                    .show(ui);
+                self.palette_focus = false;
+                if search.changed() {
                     self.palette_selected = 0;
+                }
+                // A palette keeps the keyboard in its field. Clicking a row may move focus to the
+                // button for one frame; the next frame is already typing again.
+                if !search.has_focus() {
+                    search.request_focus();
                 }
                 let filtered = filtered_commands(&self.palette_query);
                 if filtered.is_empty() {
@@ -2732,7 +2886,17 @@ impl PostinoApp {
                         }
                     }
                     ui.add_space(space::SM);
-                    egui::ScrollArea::vertical().max_height(330.0).auto_shrink([false, true]).show(ui, |ui| {
+                    let rows = filtered.len().min(10) as f32;
+                    // Reserve the reason line before sizing the list: at 980×600 ten rows plus the
+                    // reason must still end above the status bar.
+                    let disabled_reason = filtered
+                        .get(self.palette_selected)
+                        .filter(|command| !self.command_enabled(command))
+                        .and_then(|command| command.rule.reason());
+                    let reason_height = if disabled_reason.is_some() { ui_size::PALETTE_REASON } else { 0.0 };
+                    let available = (window.height() - ui_size::STATUS - top - ui_size::PALETTE_CHROME - reason_height).max(ui_size::PALETTE_ROW);
+                    let height = (rows * ui_size::PALETTE_ROW).min(ui_size::PALETTE_RESULTS_MAX).min(available);
+                    egui::ScrollArea::vertical().id_salt("palette-results").max_height(height).auto_shrink([false, true]).show(ui, |ui| {
                         for (index, command) in filtered.iter().enumerate() {
                             let enabled = self.command_enabled(command);
                             let selected = index == self.palette_selected;
@@ -2754,19 +2918,22 @@ impl PostinoApp {
                     });
                     // Hover is not a visible affordance on the keyboard path: spell the refusal out
                     // under the list whenever the selected command is unavailable.
-                    if let Some(command) = filtered.get(self.palette_selected)
-                        && !self.command_enabled(command)
-                        && let Some(reason) = command.rule.reason()
-                    {
+                    if let Some(reason) = disabled_reason {
                         ui.add_space(space::XS);
                         ui.label(typography::text(Role::Meta, reason, t.text_muted));
                     }
                 }
                 ui.add_space(space::XS);
+                ui.add(egui::Separator::default().spacing(1.0));
+                ui.add_space(space::XS);
                 ui.label(typography::text(Role::Caption, "↑↓ scegli · Invio esegue · Esc chiude", t.text_faint));
             });
-        self.show_palette = open;
-        if !open {
+        #[cfg(test)]
+        probe::palette(ui, response.response.rect);
+        if response.should_close() {
+            self.show_palette = false;
+        }
+        if !self.show_palette {
             ctx.memory_mut(|memory| memory.stop_text_input());
         }
         if let Some(id) = chosen {
@@ -2861,6 +3028,7 @@ impl PostinoApp {
             // Over the list, not the reading pane: the chips behind stay visible and the menu sits
             // next to the rows it labels.
             .area(egui::Modal::default_area(Id::new("postino-label-menu")).anchor(Align2::LEFT_TOP, Vec2::new(ui_size::SIDEBAR + 24.0, 120.0)))
+            .backdrop_color(theme::scrim(self.dark))
             .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
             .show(ui.ctx(), |ui| {
                 ui.set_width(304.0);
@@ -2950,12 +3118,13 @@ impl PostinoApp {
         if let Some(state) = self.label_delete.as_mut() {
             state.focus_primary = false;
         }
-        let response = egui::Modal::new(egui::Id::new("postino-label-delete")).frame(Frame::NONE).show(ui.ctx(), |ui| {
-            let response =
-                Dialog::new("Eliminare l'etichetta?", &body, "Elimina").secondary("Annulla").danger(true).focus_primary(focus_primary).show(ui);
-            confirm = response.primary;
-            cancel = response.secondary;
-        });
+        let response =
+            egui::Modal::new(egui::Id::new("postino-label-delete")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
+                let response =
+                    Dialog::new("Eliminare l'etichetta?", &body, "Elimina").secondary("Annulla").danger(true).focus_primary(focus_primary).show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            });
         if confirm {
             self.label_delete = None;
             self.delete_label(&state);
@@ -3140,6 +3309,7 @@ impl PostinoApp {
     }
 
     fn show_inner(&mut self, ui: &mut egui::Ui) {
+        let composer_was_open = self.composer.open;
         self.capture_screenshot(ui.ctx());
         self.tick(ui.ctx());
         self.resize_handles(ui.ctx());
@@ -3154,7 +3324,8 @@ impl PostinoApp {
         self.toolbar(ui);
         self.sidebar(ui);
         // Below 1000 px the side pane cannot keep a usable list, so reading reuses the full path
-        // as an overlay. At or above it the pane opens at 52% and resizes between 420 and 62%.
+        // as an overlay. At or above it the pane opens at 52% of the width left by the sidebar,
+        // resizes between 420 and 62%, and is capped so the list keeps its 460 pt floor.
         let overlay = reading_overlay(ui.ctx().content_rect().width());
         let full = self.reading_open && (self.reading_full || overlay);
         if full {
@@ -3168,7 +3339,19 @@ impl PostinoApp {
         self.shortcuts_sheet(ui);
         self.label_menu_window(ui);
         self.label_delete_dialog(ui);
+        // The composer owns the keyboard while it is open. Capture the widget that had it before
+        // the composer requests focus, so closing returns the user exactly where they were.
+        if self.composer.open && self.composer_focus_pending {
+            self.composer_return_focus = ui.ctx().memory(|memory| memory.focused());
+            self.composer_focus_pending = false;
+        }
         self.composer_window(ui);
+        if composer_was_open
+            && !self.composer.open
+            && let Some(id) = self.composer_return_focus.take()
+        {
+            ui.ctx().memory_mut(|memory| memory.request_focus(id));
+        }
         self.toast_overlay(ui.ctx());
     }
 }
@@ -3791,19 +3974,77 @@ fn label_color_swatches(ui: &mut Ui, selected: &mut LabelColor, t: &Tokens) -> b
     focused
 }
 
-/// A thin but always-visible scroll bar for the sidebar, where the overflow must be an affordance.
-/// egui's default is a 2 pt sliver with zero dormant opacity: only a hover reveals it, so at
-/// 980×600 the clipped list looked broken. The text colour gives 10:1 on ivory and 12:1 on forest.
+/// The sidebar uses the shared always-visible scroll bar: at 980×600 an overflowing list with
+/// only a hover-revealed sliver looked broken.
 fn sidebar_scroll_style() -> egui::style::ScrollStyle {
-    let mut style = egui::style::ScrollStyle::thin();
-    style.foreground_color = true;
-    style.floating_width = 4.0;
-    style
+    crate::ui::tokens::scroll_style()
 }
 
+/// The reading pane takes 52% of the content width left by the sidebar, clamped to 420 pt and 62%,
+/// and it yields space back to the list whenever the list would fall below its 460 pt floor. At
+/// 1280×720 this is a ~541 pt pane and a ~499 pt list instead of the old 666/374 split.
 fn reading_pane_width(available: f32) -> f32 {
-    let max = (available * READING_PANE_MAX_RATIO).max(READING_PANE_MIN_SIZE);
-    (available * READING_PANE_DEFAULT_RATIO).clamp(READING_PANE_MIN_SIZE, max)
+    let remaining = (available - ui_size::SIDEBAR).max(0.0);
+    if remaining <= 0.0 {
+        return READING_PANE_MIN_SIZE;
+    }
+    let max = reading_pane_max_width(available);
+    let preferred = (remaining * READING_PANE_DEFAULT_RATIO).clamp(READING_PANE_MIN_SIZE, max);
+    let list_cap = (remaining - ui_size::LIST_MIN).max(READING_PANE_MIN_SIZE);
+    preferred.min(list_cap)
+}
+
+/// The widest the resizable pane may become: 62% of the content left by the sidebar, capped so a
+/// user drag cannot squeeze the list below its 460 pt floor (where the 420 pt pane minimum allows).
+fn reading_pane_max_width(available: f32) -> f32 {
+    let remaining = (available - ui_size::SIDEBAR).max(0.0);
+    let ratio = (remaining * READING_PANE_MAX_RATIO).max(READING_PANE_MIN_SIZE);
+    ratio.min((remaining - ui_size::LIST_MIN).max(READING_PANE_MIN_SIZE))
+}
+
+/// The columns of the message table at a given content width. Below 560 pt the date is dropped
+/// first: the subject is what the list is for, and a squeezed date column only truncates it sooner.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ListColumns {
+    sender: f32,
+    date: Option<f32>,
+}
+
+fn list_columns(list_width: f32) -> ListColumns {
+    if list_width < ui_size::LIST_DATE_MIN {
+        ListColumns { sender: ui_size::LIST_SENDER_NARROW, date: None }
+    } else {
+        ListColumns { sender: ui_size::LIST_SENDER, date: Some(ui_size::LIST_DATE) }
+    }
+}
+
+/// Would `text` have to be truncated to fit `width` at this font? Used to attach a tooltip only
+/// when something is actually cut off.
+fn text_fits(ui: &Ui, text: &str, font: &FontId, width: f32) -> bool {
+    ui.painter().layout_no_wrap(text.to_owned(), font.clone(), Color32::PLACEHOLDER).size().x <= width
+}
+
+/// egui counts a third quick click as a triple, even when the previous double-click was on another
+/// widget. A row double-click followed by a header double-click must still restore, so both the
+/// double and the triple activation mean "the same gesture happened again".
+fn double_activated(response: &egui::Response) -> bool {
+    response.double_clicked() || response.triple_clicked()
+}
+
+/// The composer surface rectangle. A window of at least 1000×700 gets a centred card capped to the
+/// content height and never touching the status bar; anything smaller gets a sheet with LG margins
+/// over the body area so its controls stay reachable at 980×600.
+fn composer_card_rect(window: Rect, body: Rect) -> (Rect, bool) {
+    let card = window.width() >= COMPOSER_CARD_MIN_WIDTH && window.height() >= COMPOSER_CARD_MIN_HEIGHT;
+    if !card {
+        return (body.shrink(space::LG), true);
+    }
+    let margin = Vec2::new(space::XXL, space::XL);
+    let size = Vec2::new(
+        ui_size::COMPOSER_CARD_WIDTH.min((body.width() - 2.0 * margin.x).max(0.0)),
+        ui_size::COMPOSER_HEIGHT.min((body.height() - 2.0 * margin.y).max(0.0)),
+    );
+    (Rect::from_center_size(body.center(), size), false)
 }
 
 fn show_list_avatars(list_width: f32) -> bool {
@@ -3913,7 +4154,7 @@ fn encode_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod probe {
+pub(crate) mod probe {
     //! Deterministic per-frame facts a headless test can assert on: which rows were drawn, where
     //! they were and which actions the reading toolbar offered. Nothing is recorded in a shipped
     //! build; the call sites are `#[cfg(test)]` statements.
@@ -3940,10 +4181,11 @@ mod probe {
         ctx.data(|data| data.get_temp(id("rows"))).unwrap_or_default()
     }
 
-    pub fn scroll(ui: &Ui, viewport: Rect, content: Vec2) {
+    pub fn scroll(ui: &Ui, viewport: Rect, content: Vec2, offset: Vec2) {
         ui.ctx().data_mut(|data| {
             data.insert_temp(id("scroll-view"), viewport);
             data.insert_temp(id("scroll-content"), content);
+            data.insert_temp(id("scroll-offset"), offset.y);
         });
     }
 
@@ -3953,6 +4195,166 @@ mod probe {
 
     pub fn scroll_content(ctx: &Context) -> Option<Vec2> {
         ctx.data(|data| data.get_temp(id("scroll-content")))
+    }
+
+    pub fn scroll_offset(ctx: &Context) -> Option<f32> {
+        ctx.data(|data| data.get_temp(id("scroll-offset")))
+    }
+
+    pub fn sidebar_panel(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("sidebar-panel"), rect));
+    }
+
+    pub fn sidebar_panel_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("sidebar-panel")))
+    }
+
+    pub fn sidebar_footer(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("sidebar-footer"), rect));
+    }
+
+    pub fn sidebar_footer_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("sidebar-footer")))
+    }
+
+    pub fn sidebar_header(ui: &Ui, name: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("sidebar-headers")).insert(name.to_owned(), rect);
+        });
+    }
+
+    pub fn sidebar_header_rect(ctx: &Context, name: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("sidebar-headers"))).and_then(|rows| rows.get(name).copied())
+    }
+
+    pub fn editor(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("editor"), rect));
+    }
+
+    pub fn editor_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("editor")))
+    }
+
+    pub fn editor_drawer(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("editor-drawer"), rect));
+    }
+
+    pub fn editor_drawer_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("editor-drawer")))
+    }
+
+    pub fn composer_card(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-card"), rect));
+    }
+
+    pub fn composer_card_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-card")))
+    }
+
+    pub fn composer_send(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-send"), rect));
+    }
+
+    pub fn composer_send_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-send")))
+    }
+
+    pub fn composer_cancel(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-cancel"), rect));
+    }
+
+    pub fn composer_cancel_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-cancel")))
+    }
+
+    pub fn composer_scroll(ui: &Ui, offset: f32, viewport: Rect, content: Vec2) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("composer-scroll-offset"), offset);
+            data.insert_temp(id("composer-scroll-view"), viewport);
+            data.insert_temp(id("composer-scroll-content"), content);
+        });
+    }
+
+    pub fn composer_scroll_state(ctx: &Context) -> Option<(f32, Rect, Vec2)> {
+        ctx.data(|data| {
+            let offset = data.get_temp(id("composer-scroll-offset"))?;
+            let viewport = data.get_temp(id("composer-scroll-view"))?;
+            let content = data.get_temp(id("composer-scroll-content"))?;
+            Some((offset, viewport, content))
+        })
+    }
+
+    pub fn list_width(ui: &Ui, content: f32, panel: f32) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("list-content-width"), content);
+            data.insert_temp(id("list-panel-width"), panel);
+        });
+    }
+
+    pub fn list_widths(ctx: &Context) -> Option<(f32, f32)> {
+        ctx.data(|data| {
+            let content = data.get_temp(id("list-content-width"))?;
+            let panel = data.get_temp(id("list-panel-width"))?;
+            Some((content, panel))
+        })
+    }
+
+    pub fn date_column(ui: &Ui, visible: bool) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("date-column"), visible));
+    }
+
+    pub fn date_column_visible(ctx: &Context) -> Option<bool> {
+        ctx.data(|data| data.get_temp(id("date-column")))
+    }
+
+    pub fn clear_tooltips(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("tooltips"), Vec::<String>::new()));
+    }
+
+    pub fn tooltip(ctx: &Context, text: &str) {
+        ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<String>>(id("tooltips")).push(text.to_owned()));
+    }
+
+    pub fn tooltips(ctx: &Context) -> Vec<String> {
+        ctx.data(|data| data.get_temp(id("tooltips"))).unwrap_or_default()
+    }
+
+    pub fn reading_header(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("reading-header"), rect));
+    }
+
+    pub fn reading_header_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("reading-header")))
+    }
+
+    pub fn compose_button(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("compose-button"), rect));
+    }
+
+    pub fn compose_button_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("compose-button")))
+    }
+
+    pub fn palette(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("palette"), rect));
+    }
+
+    pub fn palette_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("palette")))
+    }
+
+    pub fn message_row(ctx: &Context, message_id: &str, rect: Rect) {
+        ctx.data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("message-rows")).insert(message_id.to_owned(), rect);
+        });
+    }
+
+    pub fn message_rows(ctx: &Context) -> BTreeMap<String, Rect> {
+        ctx.data(|data| data.get_temp(id("message-rows"))).unwrap_or_default()
+    }
+
+    pub fn clear_message_rows(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("message-rows"), BTreeMap::<String, Rect>::new()));
     }
 
     pub fn clear_menu_rows(ui: &Ui) {
@@ -4039,14 +4441,20 @@ mod tests {
         click_at(ctx, app, pos, Vec2::new(1200.0, 800.0));
     }
 
+    /// Two press/release pairs inside the double-click window, like a physical mouse. The second
+    /// press resolves against the layout of the frame after the first click, as it does for a user.
+    fn double_click_at(ctx: &egui::Context, app: &mut PostinoApp, pos: egui::Pos2, size: Vec2) {
+        frame_at(ctx, app, size, vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+        frame_at(ctx, app, size, vec![pointer(pos, false)]);
+        // Let a pane opened by the first click settle before the second press resolves its hit.
+        frame_at(ctx, app, size, vec![]);
+        frame_at(ctx, app, size, vec![pointer(pos, true)]);
+        frame_at(ctx, app, size, vec![pointer(pos, false)]);
+    }
+
     /// Small wheel steps are applied without easing, so one frame scrolls deterministically.
     fn wheel(pos: egui::Pos2, steps: usize) -> Vec<egui::Event> {
         wheel_by(pos, steps, -6.0)
-    }
-
-    /// Scroll towards the top of the scroll area.
-    fn wheel_up(pos: egui::Pos2, steps: usize) -> Vec<egui::Event> {
-        wheel_by(pos, steps, 6.0)
     }
 
     fn wheel_by(pos: egui::Pos2, steps: usize, step: f32) -> Vec<egui::Event> {
@@ -4555,13 +4963,24 @@ mod tests {
 
     #[test]
     fn responsive_breakpoints_keep_the_list_usable() {
-        assert_eq!(reading_pane_width(1280.0), 1280.0 * 0.52, "the pane opens at 52%");
+        let pane = reading_pane_width(1280.0);
+        assert!((pane - (1280.0 - ui_size::SIDEBAR) * 0.52).abs() < 0.01, "the pane opens at 52% of the width left by the sidebar");
+        assert!(1280.0 - ui_size::SIDEBAR - pane >= ui_size::LIST_MIN, "the list keeps its 460 pt floor");
+        assert!(
+            1280.0 - ui_size::SIDEBAR - reading_pane_max_width(1280.0) >= ui_size::LIST_MIN,
+            "even a full drag of the pane cannot squeeze the list below 460"
+        );
+        assert!(pane < 1280.0 * 0.52, "the old window-relative 52% left a 374 pt list");
         assert_eq!(reading_pane_width(800.0), READING_PANE_MIN_SIZE, "it never goes below 420");
-        assert!(reading_pane_width(1280.0) <= 1280.0 * READING_PANE_MAX_RATIO);
+        assert!(reading_pane_width(1280.0) <= (1280.0 - ui_size::SIDEBAR) * READING_PANE_MAX_RATIO);
         assert!(reading_overlay(980.0), "980x600 must use the overlay");
         assert!(!reading_overlay(1000.0), "1000 px switches to the side pane");
         assert!(!show_list_avatars(719.0));
         assert!(show_list_avatars(720.0));
+        assert_eq!(list_columns(559.0).date, None, "below 560 the date column is dropped before the subject");
+        assert_eq!(list_columns(559.0).sender, ui_size::LIST_SENDER_NARROW);
+        assert_eq!(list_columns(560.0).date, Some(ui_size::LIST_DATE));
+        assert_eq!(list_columns(560.0).sender, ui_size::LIST_SENDER);
     }
 
     #[test]
@@ -5085,21 +5504,50 @@ mod tests {
     }
 
     #[test]
-    fn narrow_sidebar_keeps_cestino_reachable_with_the_editor_open() {
+    fn narrow_sidebar_keeps_the_editor_in_a_pinned_drawer() {
         let (ctx, mut app) = ready_app();
         let narrow = Vec2::new(980.0, 600.0);
         frame_at(&ctx, &mut app, narrow, vec![]);
+        let offset_before = probe::scroll_offset(&ctx).expect("the sidebar scroll offset");
+        assert_eq!(offset_before, 0.0, "the sidebar starts at the top");
+
         app.start_label_create();
         for _ in 0..20 {
             frame_at(&ctx, &mut app, narrow, vec![]);
         }
 
         let view = probe::scroll_view(&ctx).expect("the sidebar scroll area");
+        let panel = probe::sidebar_panel_rect(&ctx).expect("the sidebar panel");
+        let drawer = probe::editor_drawer_rect(&ctx).expect("the editor drawer");
+        let editor = probe::editor_rect(&ctx).expect("the editor content");
+        let footer = probe::sidebar_footer_rect(&ctx).expect("the sidebar footer");
+        let header = probe::sidebar_header_rect(&ctx, "CARTELLE").expect("the CARTELLE header");
         let save = probe::saved_at(&ctx).expect("the editor save button");
+        let cancel = probe::cancel_at(&ctx).expect("the editor cancel button");
+
         assert!(
-            save.top() >= view.top() && save.bottom() <= view.bottom(),
-            "opening the editor must reveal its controls, not clip them under the footer: {save:?} vs {view:?}"
+            panel.min.x <= drawer.min.x && panel.max.x + 2.0 >= drawer.max.x && panel.min.y <= drawer.min.y && panel.max.y >= drawer.max.y,
+            "the drawer stays inside the sidebar: {drawer:?} vs {panel:?}"
         );
+        assert!(drawer.min.y <= editor.min.y && drawer.max.y >= editor.max.y, "the editor is fully inside its drawer");
+        assert!(drawer.max.y <= footer.min.y + 0.5, "the drawer sits above the pinned footer: {drawer:?} vs {footer:?}");
+        assert!(drawer.contains_rect(save) && drawer.contains_rect(cancel), "Save and Cancel are inside the drawer");
+        assert!(header.min.y >= view.min.y - 1.0 && header.max.y <= view.max.y, "the folder header stays visible at the top");
+        assert!(header.min.y <= view.min.y + 4.0, "opening the editor must not push CARTELLE down");
+        assert_eq!(probe::scroll_offset(&ctx), Some(offset_before), "opening the editor must not change the list offset");
+
+        // The error line is the tallest editor state; it must still fit without clipping the controls.
+        if let Some(editor) = app.label_editor.as_mut() {
+            editor.text = "Lavoro".to_owned();
+            editor.error = Some("Esiste già un'etichetta con questo nome.".to_owned());
+        }
+        for _ in 0..4 {
+            frame_at(&ctx, &mut app, narrow, vec![]);
+        }
+        let drawer = probe::editor_drawer_rect(&ctx).expect("the editor drawer with an error");
+        let save = probe::saved_at(&ctx).expect("the editor save button with an error");
+        assert!(drawer.contains_rect(save), "an error line must not clip Save: {save:?} vs {drawer:?}");
+
         let content = probe::scroll_content(&ctx).expect("the scroll content size");
         assert!(content.y > view.height(), "with the editor open the sidebar overflows and shows a scroll bar");
         let style = sidebar_scroll_style();
@@ -5107,15 +5555,18 @@ mod tests {
         assert!(style.foreground_color, "its handle must use the text colour, not the panel fill");
         assert!(style.floating_width >= 4.0, "it must be more than a hairline");
 
-        frame_at(&ctx, &mut app, narrow, wheel_up(view.center(), 40));
-        // The scroll offset applies to the next frame's layout, like any egui input.
+        // A single wheel gesture brings Cestino into the list viewport; the drawer does not move.
+        frame_at(&ctx, &mut app, narrow, wheel(view.center(), 16));
+        frame_at(&ctx, &mut app, narrow, vec![]);
         frame_at(&ctx, &mut app, narrow, vec![]);
         let rows = probe::rows(&ctx);
         let trash = rows.get("Cestino").copied().expect("Cestino is in the sidebar");
         assert!(
             trash.top() >= view.top() - 1.0 && trash.bottom() <= view.bottom() + 1.0,
-            "a wheel scroll reaches Cestino while the editor stays open: {trash:?} vs {view:?}"
+            "one wheel gesture reaches Cestino while the editor stays open: {trash:?} vs {view:?}"
         );
+        let drawer_after = probe::editor_drawer_rect(&ctx).expect("the drawer does not move");
+        assert_eq!(drawer, drawer_after, "scrolling the list must not move the drawer");
         let last = rows.get("Fatture").copied().expect("the last label row");
         assert!(last.bottom() > view.bottom(), "the label rows sit below the fold, so only the scroll bar reaches them");
 
@@ -5124,6 +5575,223 @@ mod tests {
         let scrolled = probe::rows(&ctx);
         let fatture = scrolled.get("Fatture").copied().expect("the last label row is still drawn");
         assert!(fatture.bottom() <= view.bottom() + 1.0, "a wheel scroll brings the last label row into view: {fatture:?} vs {view:?}");
+    }
+
+    #[test]
+    fn composer_sheet_fits_the_minimum_window_and_scrolls_its_body() {
+        let (ctx, mut app) = ready_app();
+        let narrow = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        app.compose_new();
+        app.composer.subject = "Preventivo".to_owned();
+        app.composer.body = (0..80).map(|line| format!("Riga {line} di una bozza lunga")).collect::<Vec<_>>().join("\n");
+        app.composer.touch(0.0);
+        for _ in 0..3 {
+            frame_at(&ctx, &mut app, narrow, vec![]);
+        }
+
+        let content = ctx.content_rect();
+        let body_area = Rect::from_min_max(content.min, pos2(content.max.x, content.max.y - ui_size::STATUS));
+        let card = probe::composer_card_rect(&ctx).expect("the composer surface");
+        assert!(card.width() > 900.0, "below 1000×700 the composer is a sheet: {card:?}");
+        assert!(
+            card.min.x >= body_area.min.x && card.max.x <= body_area.max.x,
+            "the sheet stays inside the content rect horizontally: {card:?} vs {body_area:?}"
+        );
+        assert!(
+            card.min.y >= body_area.min.y && card.max.y <= body_area.max.y,
+            "the sheet never goes under the status bar: {card:?} vs {body_area:?}"
+        );
+
+        let send = probe::composer_send_rect(&ctx).expect("the Send button");
+        let cancel = probe::composer_cancel_rect(&ctx).expect("the Scarta button");
+        for (name, rect) in [("Send", send), ("Cancel", cancel)] {
+            assert!(
+                rect.min.x >= card.min.x && rect.max.x <= card.max.x && rect.min.y >= card.min.y && rect.max.y <= card.max.y,
+                "{name} must be inside the sheet: {rect:?} vs {card:?}"
+            );
+        }
+
+        let (offset, viewport, body) = probe::composer_scroll_state(&ctx).expect("the composer body scroll");
+        assert!(body.y > viewport.height() + 1.0, "a long draft makes the body scroll inside the sheet: {body:?} vs {viewport:?}");
+        frame_at(&ctx, &mut app, narrow, wheel(viewport.center(), 6));
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let (scrolled, _, _) = probe::composer_scroll_state(&ctx).expect("the composer body scroll");
+        assert!(scrolled > offset, "the wheel moves the body, not the header or the footer: {scrolled} vs {offset}");
+    }
+
+    #[test]
+    fn composer_modal_blocks_the_background_and_escape_saves_or_stops() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1280.0, 720.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let row = probe::message_rows(&ctx).values().next().copied().expect("a message row");
+        app.compose_new();
+        app.composer.subject = "Bozza aperta".to_owned();
+        app.composer.touch(0.0);
+        for _ in 0..3 {
+            frame_at(&ctx, &mut app, wide, vec![]);
+        }
+
+        // Left of the centred card is the scrim. The row behind must not open.
+        click_at(&ctx, &mut app, pos2(row.left() + 8.0, row.center().y), wide);
+        assert!(app.composer.open, "clicking the scrim never closes the composer");
+        assert!(app.selected.is_none(), "the scrim swallows the background click");
+        assert_eq!(app.composer.subject, "Bozza aperta", "the background Scrivi button cannot replace the open composer");
+
+        // An invalid recipient makes the unsaved guard refuse to close on Esc.
+        app.composer.to = "non-una-mail".to_owned();
+        app.composer.touch(0.0);
+        frame_at(&ctx, &mut app, wide, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.composer.open, "Esc keeps an unsaved, invalid draft open");
+        assert!(app.composer.save_error.is_some(), "the composer says why it did not save");
+        assert!(!app.engine.messages().iter().any(|message| message.summary.subject == "Bozza aperta"), "a refused save must not create the draft");
+
+        app.composer = ComposerState::closed();
+        app.compose_new();
+        frame_at(&ctx, &mut app, wide, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.composer.open, "Esc closes an empty, unchanged composer");
+    }
+
+    #[test]
+    fn composer_focus_enters_the_first_empty_field_and_returns_on_close() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1200.0, 800.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let button = probe::compose_button_rect(&ctx).expect("the toolbar Scrivi button");
+        click_at(&ctx, &mut app, button.center(), wide);
+        assert!(app.composer.open, "the toolbar button opens the composer");
+        let previous = app.composer_return_focus.expect("the widget that opened the composer");
+        assert!(ctx.text_edit_focused(), "focus enters the first empty field (A)");
+
+        frame_at(&ctx, &mut app, wide, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.composer.open);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(previous), "focus returns to the Scrivi button");
+    }
+
+    #[test]
+    fn palette_is_modal_and_closes_on_an_outside_click_without_touching_the_list() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1200.0, 800.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let row = probe::message_rows(&ctx).values().next().copied().expect("a message row");
+        app.show_palette = true;
+        app.palette_focus = true;
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        assert!(app.show_palette);
+        assert!(ctx.text_edit_focused(), "the palette keeps the keyboard in its search field");
+
+        // The palette is centred at 560 pt: the row's left edge is outside it.
+        click_at(&ctx, &mut app, pos2(row.left() + 4.0, row.center().y), wide);
+        assert!(!app.show_palette, "an outside click closes the modal palette");
+        assert!(app.selected.is_none(), "the background row never receives the click");
+    }
+
+    #[test]
+    fn palette_arrows_keep_focus_in_the_search_field() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.show_palette = true;
+        app.palette_focus = true;
+        frame(&ctx, &mut app, vec![]);
+        assert!(ctx.text_edit_focused());
+        frame(&ctx, &mut app, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(app.palette_selected, 1, "arrows still move the selected command");
+        assert!(ctx.text_edit_focused(), "the field keeps the keyboard after arrow navigation");
+    }
+
+    #[test]
+    fn palette_fits_the_minimum_window_with_ten_rows() {
+        let (ctx, mut app) = ready_app();
+        let narrow = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        app.show_palette = true;
+        app.palette_focus = true;
+        app.palette_query.clear();
+        for _ in 0..3 {
+            frame_at(&ctx, &mut app, narrow, vec![]);
+        }
+        assert!(filtered_commands("").len() > 10, "the empty query needs the ten-row cap");
+        let rect = probe::palette_rect(&ctx).expect("the palette surface");
+        assert!(rect.width() <= narrow.x - 2.0 * space::XL + 0.5, "the palette is min(560, available - 2*XL): {rect:?}");
+        assert!(rect.min.y >= 0.0 && rect.max.y <= narrow.y - ui_size::STATUS, "the palette stays above the status bar: {rect:?}");
+        assert!(rect.height() <= 502.0, "ten rows are capped with an internal scroll: {rect:?}");
+    }
+
+    #[test]
+    fn reading_pane_keeps_the_list_wide_and_tooltips_the_truncated_subject() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1280.0, 720.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let first = app.visible_messages().0[0].id.clone();
+        app.open_message(first);
+        frame_at(&ctx, &mut app, wide, vec![]);
+
+        let (content, panel) = probe::list_widths(&ctx).expect("the list width");
+        assert!(content >= ui_size::LIST_MIN, "the list content is {content} pt, below the 460 pt floor");
+        assert!(panel >= content, "the panel includes the list margin: {panel} vs {content}");
+        assert_eq!(probe::date_column_visible(&ctx), Some(false), "below 560 pt of list width the date column is dropped");
+        assert!(content < ui_size::LIST_DATE_MIN, "the 52%-after-sidebar pane puts the list below the date threshold at 1280");
+
+        // A long subject is the case the tooltip exists for. Drafts have a real subject and are a
+        // folder the demo can add to deterministically.
+        let long = "Un oggetto davvero lungo che non entra nella colonna del soggetto e deve essere troncato";
+        let value = app.engine.call("draft_save", json!({ "subject": long, "body_text": "x" })).expect("a long draft");
+        let draft = serde_json::from_value::<DraftSave>(value).expect("draft response").draft.summary.id;
+        app.select_folder("drafts");
+        frame_at(&ctx, &mut app, wide, vec![]);
+        app.open_message(draft);
+        app.focus_selected_row = true;
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let tips = probe::tooltips(&ctx);
+        assert!(tips.iter().any(|tip| tip == long), "a keyboard-focused truncated subject carries its full text as a tooltip: {tips:?}");
+
+        app.close_reading();
+        frame_at(&ctx, &mut app, Vec2::new(1600.0, 900.0), vec![]);
+        assert_eq!(probe::date_column_visible(&ctx), Some(true), "the date returns once the list has room");
+    }
+
+    #[test]
+    fn double_click_opens_and_expands_and_the_reading_header_restores() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1200.0, 800.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let id = app.visible_messages().0[0].id.clone();
+        let row = probe::message_rows(&ctx).get(&id).copied().expect("the first message row");
+        double_click_at(&ctx, &mut app, pos2(row.left() + 30.0, row.center().y), wide);
+        assert!(app.reading_open, "a row double-click opens the message");
+        assert!(app.reading_full, "a row double-click expands the reading pane on a wide window");
+
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let header = probe::reading_header_rect(&ctx).expect("the reading header");
+        double_click_at(&ctx, &mut app, header.center(), wide);
+        assert!(app.reading_open && !app.reading_full, "a header double-click restores the split view");
+
+        // On a narrow window the same gesture uses the full-width overlay and the header closes it.
+        app.close_reading();
+        let narrow = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let row = probe::message_rows(&ctx).get(&id).copied().expect("the first message row");
+        // On a narrow window the first click already replaces the list with the full-width overlay;
+        // keep the gesture away from the label chips the overlay shows at its left edge.
+        let pos = pos2(row.left() + row.width() * 0.6, row.center().y);
+        double_click_at(&ctx, &mut app, pos, narrow);
+        assert!(app.reading_open, "a narrow row double-click opens the overlay");
+        frame_at(&ctx, &mut app, narrow, vec![]);
+        let header = probe::reading_header_rect(&ctx).expect("the overlay header");
+        double_click_at(&ctx, &mut app, header.center(), narrow);
+        assert!(!app.reading_open, "a header double-click on the overlay returns to the list");
     }
 
     fn label_unread(app: &PostinoApp, id: &str) -> Option<u32> {

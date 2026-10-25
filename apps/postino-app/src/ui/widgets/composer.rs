@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui::containers::Sides;
 use eframe::egui::text::{CCursor, CCursorRange};
-use eframe::egui::{self, Align, FontFamily, FontId, Frame, Layout, Margin, ScrollArea, Stroke, TextEdit, Ui, Vec2};
+use eframe::egui::{self, Align, FontFamily, FontId, Frame, Layout, Margin, Rect, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2, pos2};
 use postino_core::{Account, Address, Attachment};
 
 use crate::theme::Tokens;
@@ -144,6 +144,23 @@ impl ComposerState {
         Ok((Address::parse_list(&self.to)?, Address::parse_list(&self.cc)?, Address::parse_list(&self.bcc)?))
     }
 
+    /// The field a freshly opened composer should focus: the first empty one, in reading order.
+    /// A reply or a reopened draft usually has every field filled, so the body is the fallback.
+    #[must_use]
+    pub fn first_empty_focus(&self) -> ComposerFocus {
+        if self.to.trim().is_empty() {
+            ComposerFocus::To
+        } else if self.show_cc && self.cc.trim().is_empty() {
+            ComposerFocus::Cc
+        } else if self.show_bcc && self.bcc.trim().is_empty() {
+            ComposerFocus::Bcc
+        } else if self.subject.trim().is_empty() {
+            ComposerFocus::Subject
+        } else {
+            ComposerFocus::Body
+        }
+    }
+
     fn apply_format(&mut self, action: FormatAction, now: f64) {
         let chars = self.body.chars().collect::<Vec<_>>();
         let (start, end) = self.body_selection.unwrap_or((chars.len(), chars.len()));
@@ -236,36 +253,63 @@ impl<'a> Composer<'a> {
     fn show_session(mut self, ui: &mut Ui) -> ComposerResponse {
         let t = tokens::tokens(ui.visuals().dark_mode);
         let now = ui.input(|input| input.time);
+        let session = self.state.session;
         let mut response = ComposerResponse::default();
 
-        self.header(ui, &t, &mut response);
-        ui.add_space(space::MD);
+        // The caller sizes the surface: a centred card at >= 1000×700, a sheet with LG margins
+        // below it. The header and the footer are pinned here; only the body scrolls.
+        let area = ui.max_rect();
+        let header_rect = Rect::from_min_size(area.min, Vec2::new(area.width(), ui_size::COMPOSER_HEADER_BLOCK));
+        let footer_rect = Rect::from_min_max(pos2(area.min.x, area.max.y - ui_size::COMPOSER_FOOTER_BLOCK), area.max);
+        let body_rect = Rect::from_min_max(pos2(area.min.x, header_rect.max.y + space::XS), pos2(area.max.x, footer_rect.min.y - space::XS));
+
+        self.header(ui, &t, header_rect, &mut response);
 
         let parsed = self.state.recipients();
         let addresses_ok = parsed.is_ok();
         let send_ready = parsed.as_ref().is_ok_and(|(to, cc, bcc)| !to.is_empty() || !cc.is_empty() || !bcc.is_empty());
+        let recipient_error = parsed.err();
         let mut changed = false;
-        changed |= self.recipient_field(ui, &t, "A", ComposerFocus::To, icons::USER);
-        if self.state.show_cc {
-            changed |= self.recipient_field(ui, &t, "Cc", ComposerFocus::Cc, icons::USER);
-        }
-        if self.state.show_bcc {
-            changed |= self.recipient_field(ui, &t, "Bcc", ComposerFocus::Bcc, icons::USER);
-        }
-        if let Err(error) = &parsed {
-            ui.label(typography::text(Role::Caption, error.as_str(), t.danger));
-        }
-        ui.add_space(space::XS);
+        ui.scope_builder(UiBuilder::new().max_rect(body_rect), |ui| {
+            ui.spacing_mut().scroll = tokens::scroll_style();
+            let scroll = egui::ScrollArea::vertical()
+                .id_salt(("composer-body-scroll", session))
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .show(ui, |ui| {
+                    changed |= self.recipient_field(ui, &t, "A", ComposerFocus::To, icons::USER);
+                    if self.state.show_cc {
+                        changed |= self.recipient_field(ui, &t, "Cc", ComposerFocus::Cc, icons::USER);
+                    }
+                    if self.state.show_bcc {
+                        changed |= self.recipient_field(ui, &t, "Bcc", ComposerFocus::Bcc, icons::USER);
+                    }
+                    if let Some(error) = &recipient_error {
+                        ui.label(typography::text(Role::Caption, error.as_str(), t.danger));
+                    }
+                    ui.add_space(space::XS);
 
-        let subject =
-            TextField::new(&mut self.state.subject, "Oggetto").icon(icons::MAIL).focus(self.state.focus == Some(ComposerFocus::Subject)).show(ui);
-        changed |= subject.changed();
-        ui.add_space(space::SM);
+                    let subject = TextField::new(&mut self.state.subject, "Oggetto")
+                        .id_salt(("composer-subject", self.state.session))
+                        .icon(icons::MAIL)
+                        .focus(self.state.focus == Some(ComposerFocus::Subject))
+                        .show(ui);
+                    changed |= subject.changed();
+                    ui.add_space(space::SM);
 
-        self.formatting_bar(ui, &t, now);
-        changed |= self.body_field(ui, &t);
-        changed |= self.attachment_section(ui, &t, now);
-        self.footer(ui, &t, addresses_ok, send_ready, &mut response);
+                    self.formatting_bar(ui, &t, now);
+                    changed |= self.body_field(ui, &t);
+                    changed |= self.attachment_section(ui, &t, now);
+                    // A little tail so the last attachment breathes instead of touching the footer.
+                    ui.add_space(space::SM);
+                });
+            #[cfg(test)]
+            crate::app::probe::composer_scroll(ui, scroll.state.offset.y, scroll.inner_rect, scroll.content_size);
+            #[cfg(not(test))]
+            let _ = scroll;
+        });
+
+        self.footer(ui, &t, footer_rect, addresses_ok, send_ready, &mut response);
 
         if changed {
             self.state.touch(now);
@@ -274,45 +318,52 @@ impl<'a> Composer<'a> {
         response
     }
 
-    fn header(&mut self, ui: &mut Ui, t: &Tokens, response: &mut ComposerResponse) {
-        Sides::new().height(ui_size::COMPOSER_HEADER).show(
-            ui,
-            |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(icons::icon(self.state.mode.icon(), ui_size::ICON_LG, t.gold_ink));
-                    ui.add_space(space::SM);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(typography::strong(Role::Emphasis, self.state.mode.title(), t.text));
-                        let (subtitle, color) = if let Some(error) = &self.state.save_error {
-                            (format!("Non salvata · {error}"), t.danger)
-                        } else if let Some(notice) = &self.state.notice {
-                            (notice.clone(), t.danger)
-                        } else if self.state.dirty {
-                            ("Modifiche non salvate".to_owned(), t.text_faint)
-                        } else if let Some(at) = &self.state.saved_at {
-                            (format!("Bozza salvata alle {at}"), t.text_faint)
-                        } else {
-                            ("Bozza · salvataggio automatico".to_owned(), t.text_faint)
-                        };
-                        ui.add(egui::Label::new(typography::text(Role::Caption, subtitle, color)).truncate());
+    fn header(&mut self, ui: &mut Ui, t: &Tokens, rect: Rect, response: &mut ComposerResponse) {
+        let title_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), ui_size::COMPOSER_HEADER));
+        ui.scope_builder(UiBuilder::new().max_rect(title_rect), |ui| {
+            Sides::new().height(ui_size::COMPOSER_HEADER).show(
+                ui,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(icons::icon(self.state.mode.icon(), ui_size::ICON_LG, t.gold_ink));
+                        ui.add_space(space::SM);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(typography::strong(Role::Emphasis, self.state.mode.title(), t.text));
+                            let (subtitle, color) = if let Some(error) = &self.state.save_error {
+                                (format!("Non salvata · {error}"), t.danger)
+                            } else if let Some(notice) = &self.state.notice {
+                                (notice.clone(), t.danger)
+                            } else if self.state.dirty {
+                                ("Modifiche non salvate".to_owned(), t.text_faint)
+                            } else if let Some(at) = &self.state.saved_at {
+                                (format!("Bozza salvata alle {at}"), t.text_faint)
+                            } else {
+                                ("Bozza · salvataggio automatico".to_owned(), t.text_faint)
+                            };
+                            ui.add(egui::Label::new(typography::text(Role::Caption, subtitle, color)).truncate());
+                        });
                     });
-                });
-            },
-            |ui| {
-                if IconButton::new(icons::CLOSE, "Chiudi e conserva la bozza").show(ui).clicked() {
-                    response.close = true;
-                }
-            },
-        );
-        ui.add_space(space::XS);
-        ui.separator();
-        ui.add_space(space::XS);
-        ui.horizontal(|ui| {
-            ui.add_sized([24.0, ui_size::CONTROL_SM], egui::Label::new(typography::text(Role::Meta, "Da", t.text_faint)));
-            ui.add(
-                egui::Label::new(typography::text(Role::Meta, format!("{} <{}>", self.account.name, self.account.email), t.text_muted)).truncate(),
+                },
+                |ui| {
+                    if IconButton::new(icons::CLOSE, "Chiudi e conserva la bozza").show(ui).clicked() {
+                        response.close = true;
+                    }
+                },
             );
+        });
+
+        let rule_y = title_rect.bottom() + space::XS;
+        ui.painter().hline(rect.x_range(), rule_y, Stroke::new(1.0, t.border));
+        let account_rect = Rect::from_min_size(pos2(rect.min.x, rule_y + 1.0 + space::SM), Vec2::new(rect.width(), ui_size::COMPOSER_ACCOUNT_ROW));
+        ui.scope_builder(UiBuilder::new().max_rect(account_rect), |ui| {
+            ui.horizontal(|ui| {
+                ui.add_sized([24.0, ui_size::COMPOSER_ACCOUNT_ROW], egui::Label::new(typography::text(Role::Meta, "Da", t.text_faint)));
+                ui.add(
+                    egui::Label::new(typography::text(Role::Meta, format!("{} <{}>", self.account.name, self.account.email), t.text_muted))
+                        .truncate(),
+                );
+            });
         });
     }
 
@@ -323,11 +374,18 @@ impl<'a> Composer<'a> {
             ComposerFocus::Bcc => (&mut self.state.bcc, "Bcc"),
             ComposerFocus::Subject | ComposerFocus::Body => return false,
         };
+        let salt = match field {
+            ComposerFocus::To => ("composer-to", self.state.session),
+            ComposerFocus::Cc => ("composer-cc", self.state.session),
+            ComposerFocus::Bcc => ("composer-bcc", self.state.session),
+            ComposerFocus::Subject | ComposerFocus::Body => ("composer-field", self.state.session),
+        };
         ui.horizontal(|ui| {
             ui.add_sized([24.0, ui_size::CONTROL], egui::Label::new(typography::text(Role::Meta, label, t.text_faint)));
             let hide = matches!(field, ComposerFocus::Cc | ComposerFocus::Bcc);
             let reserved = 76.0;
             let field_response = TextField::new(text, hint)
+                .id_salt(salt)
                 .icon(icon)
                 .width((ui.available_width() - reserved).max(120.0))
                 .focus(self.state.focus == Some(field))
@@ -400,40 +458,35 @@ impl<'a> Composer<'a> {
             .inner_margin(Margin::symmetric(inset::LG, inset::SM))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ScrollArea::vertical()
-                    .id_salt("composer-body-scroll")
-                    .max_height(ui_size::COMPOSER_BODY_MAX)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        let body_salt = ("composer-body", self.state.session);
-                        let body_id = ui.make_persistent_id(body_salt);
-                        let edit = TextEdit::multiline(&mut self.state.body)
-                            .id_salt(body_salt)
-                            .hint_text("Scrivi il messaggio…")
-                            .font(FontId::new(type_size::BODY_SMALL, FontFamily::Proportional))
-                            .text_color(t.text)
-                            .frame(Frame::NONE)
-                            .desired_width(f32::INFINITY)
-                            .min_size(Vec2::new(0.0, ui_size::COMPOSER_BODY_MIN))
-                            .margin(Margin::ZERO);
-                        let mut output = edit.show(ui);
-                        self.state.body_selection = output.cursor_range.map(|range| {
-                            let range = range.as_sorted_char_range();
-                            (range.start.0, range.end.0)
-                        });
-                        if let Some((start, end)) = self.state.pending_selection.take() {
-                            let range = CCursorRange::two(CCursor::new(start), CCursor::new(end));
-                            output.state.cursor.set_char_range(Some(range));
-                            output.state.store(ui.ctx(), body_id);
-                            output.response.request_focus();
-                            self.state.body_selection = Some((start, end));
-                        }
-                        if self.state.focus == Some(ComposerFocus::Body) {
-                            output.response.request_focus();
-                        }
-                        (output.response.changed(), output.response.has_focus())
-                    })
-                    .inner
+                // The body grows with the text and the modal body scrolls; a second scroll area
+                // inside the editor would trap the wheel at 980×600.
+                let body_salt = ("composer-body", self.state.session);
+                let body_id = ui.make_persistent_id(body_salt);
+                let edit = TextEdit::multiline(&mut self.state.body)
+                    .id_salt(body_salt)
+                    .hint_text("Scrivi il messaggio…")
+                    .font(FontId::new(type_size::BODY_SMALL, FontFamily::Proportional))
+                    .text_color(t.text)
+                    .frame(Frame::NONE)
+                    .desired_width(f32::INFINITY)
+                    .min_size(Vec2::new(0.0, ui_size::COMPOSER_BODY_MIN))
+                    .margin(Margin::ZERO);
+                let mut output = edit.show(ui);
+                self.state.body_selection = output.cursor_range.map(|range| {
+                    let range = range.as_sorted_char_range();
+                    (range.start.0, range.end.0)
+                });
+                if let Some((start, end)) = self.state.pending_selection.take() {
+                    let range = CCursorRange::two(CCursor::new(start), CCursor::new(end));
+                    output.state.cursor.set_char_range(Some(range));
+                    output.state.store(ui.ctx(), body_id);
+                    output.response.request_focus();
+                    self.state.body_selection = Some((start, end));
+                }
+                if self.state.focus == Some(ComposerFocus::Body) {
+                    output.response.request_focus();
+                }
+                (output.response.changed(), output.response.has_focus())
             });
         let (changed, has_focus) = frame.inner;
         if has_focus {
@@ -509,60 +562,65 @@ impl<'a> Composer<'a> {
         changed
     }
 
-    fn footer(&mut self, ui: &mut Ui, t: &Tokens, addresses_ok: bool, send_ready: bool, response: &mut ComposerResponse) {
-        ui.add_space(space::XS);
-        ui.separator();
-        ui.add_space(space::XS);
-        Sides::new().height(ui_size::CONTROL_LG).show(
-            ui,
-            |ui| {
-                let (text, color) = if let Some(error) = &self.state.save_error {
-                    (format!("Bozza non salvata · {error}"), t.danger)
-                } else if self.state.dirty {
-                    ("Salvataggio automatico in corso…".to_owned(), t.text_faint)
-                } else if let Some(at) = &self.state.saved_at {
-                    (format!("Bozza salvata alle {at}"), t.success)
-                } else {
-                    ("La bozza si salva da sola".to_owned(), t.text_faint)
-                };
-                ui.add(egui::Label::new(typography::text(Role::Caption, text, color)).truncate());
-            },
-            |ui| {
-                let send_reason = if !addresses_ok {
-                    "Controlla gli indirizzi: c'è un destinatario non valido"
-                } else if !send_ready {
-                    "Aggiungi almeno un destinatario"
-                } else {
-                    ""
-                };
-                let send_label = "Invia (locale)";
-                if Button::primary(send_label)
-                    .icon(icons::SEND)
-                    .shortcut("Ctrl+Invio")
-                    .enabled(send_ready)
-                    .disabled_reason(send_reason)
-                    .show(ui)
-                    .clicked()
-                {
-                    response.send = true;
-                }
-                ui.add_space(space::XS);
-                if Button::new("Salva bozza")
-                    .icon(icons::SAVE)
-                    .size(ButtonSize::Sm)
-                    .enabled(addresses_ok)
-                    .disabled_reason("Controlla gli indirizzi: c'è un destinatario non valido")
-                    .show(ui)
-                    .clicked()
-                {
-                    response.save = true;
-                }
-                ui.add_space(space::XS);
-                if Button::ghost("Scarta").size(ButtonSize::Sm).show(ui).clicked() {
-                    response.discard = true;
-                }
-            },
-        );
+    fn footer(&mut self, ui: &mut Ui, t: &Tokens, rect: Rect, addresses_ok: bool, send_ready: bool, response: &mut ComposerResponse) {
+        ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, t.border));
+        let row_rect = Rect::from_min_size(pos2(rect.min.x, rect.top() + space::MD), Vec2::new(rect.width(), ui_size::CONTROL_LG));
+        ui.scope_builder(UiBuilder::new().max_rect(row_rect), |ui| {
+            Sides::new().height(ui_size::CONTROL_LG).show(
+                ui,
+                |ui| {
+                    let (text, color) = if let Some(error) = &self.state.save_error {
+                        (format!("Bozza non salvata · {error}"), t.danger)
+                    } else if self.state.dirty {
+                        ("Salvataggio automatico in corso…".to_owned(), t.text_faint)
+                    } else if let Some(at) = &self.state.saved_at {
+                        (format!("Bozza salvata alle {at}"), t.success)
+                    } else {
+                        ("La bozza si salva da sola".to_owned(), t.text_faint)
+                    };
+                    ui.add(egui::Label::new(typography::text(Role::Caption, text, color)).truncate());
+                },
+                |ui| {
+                    let send_reason = if !addresses_ok {
+                        "Controlla gli indirizzi: c'è un destinatario non valido"
+                    } else if !send_ready {
+                        "Aggiungi almeno un destinatario"
+                    } else {
+                        ""
+                    };
+                    let send_label = "Invia (locale)";
+                    let send = Button::primary(send_label)
+                        .icon(icons::SEND)
+                        .shortcut("Ctrl+Invio")
+                        .enabled(send_ready)
+                        .disabled_reason(send_reason)
+                        .show(ui);
+                    #[cfg(test)]
+                    crate::app::probe::composer_send(ui, send.rect);
+                    if send.clicked() {
+                        response.send = true;
+                    }
+                    ui.add_space(space::XS);
+                    if Button::new("Salva bozza")
+                        .icon(icons::SAVE)
+                        .size(ButtonSize::Sm)
+                        .enabled(addresses_ok)
+                        .disabled_reason("Controlla gli indirizzi: c'è un destinatario non valido")
+                        .show(ui)
+                        .clicked()
+                    {
+                        response.save = true;
+                    }
+                    ui.add_space(space::XS);
+                    let discard = Button::ghost("Scarta").size(ButtonSize::Sm).show(ui);
+                    #[cfg(test)]
+                    crate::app::probe::composer_cancel(ui, discard.rect);
+                    if discard.clicked() {
+                        response.discard = true;
+                    }
+                },
+            );
+        });
     }
 }
 

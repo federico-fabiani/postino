@@ -1,7 +1,7 @@
 //! The live component gallery. `postino-app --gallery` is the review surface for every primitive
 //! in every state, in light and dark.
 
-use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, ScrollArea, Stroke, StrokeKind, Ui, Vec2};
+use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, Rect, ScrollArea, Stroke, StrokeKind, Ui, UiBuilder, Vec2};
 use postino_core::{Account, Attachment};
 
 use crate::theme;
@@ -306,15 +306,24 @@ impl GalleryApp {
 
     fn composer(&mut self, ui: &mut Ui, t: &Tokens) {
         section(ui, "Composer", t);
-        egui::Frame::new()
-            .fill(t.panel)
-            .stroke(Stroke::new(1.0, t.border))
-            .corner_radius(radius::WINDOW)
-            .inner_margin(Margin::symmetric(inset::XL, inset::LG))
-            .show(ui, |ui| {
-                ui.set_width(ui_size::COMPOSER_WIDTH);
-                let _ = Composer::new(&mut self.composer, &self.account).show(ui);
-            });
+        // The composer is a modal surface shaped by its caller: give it a card-sized content rect
+        // instead of the whole remaining gallery height.
+        let inner_size = Vec2::new(ui_size::COMPOSER_CARD_WIDTH - 2.0 * f32::from(inset::XL), 520.0);
+        let outer_size = inner_size + Vec2::new(2.0 * f32::from(inset::XL), 2.0 * f32::from(inset::LG));
+        ui.allocate_ui(outer_size, |ui| {
+            egui::Frame::new()
+                .fill(t.panel)
+                .stroke(Stroke::new(1.0, t.border))
+                .corner_radius(radius::WINDOW)
+                .inner_margin(Margin::symmetric(inset::XL, inset::LG))
+                .show(ui, |ui| {
+                    let inner = Rect::from_min_size(ui.cursor().min, inner_size);
+                    ui.set_min_size(inner_size);
+                    ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
+                        let _ = Composer::new(&mut self.composer, &self.account).show(ui);
+                    });
+                });
+        });
     }
 
     fn dialogs(&self, ui: &mut Ui, t: &Tokens) {
