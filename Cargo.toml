@@ -25,6 +25,9 @@ env_logger = "0.11"
 directories = "6"
 anyhow = "1"
 
+# store
+rusqlite = { version = "0.41", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+
 # cli
 clap = { version = "4.6", features = ["derive"] }
 
@@ -38,6 +41,10 @@ png = "0.18"
 cargo_metadata = "0.23"
 toml = "0.9"
 sha2 = "0.10"
+
+# test-only
+getrandom = "0.3"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

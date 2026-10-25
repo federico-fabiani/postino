@@ -45,6 +45,18 @@ fn ci() -> Result<()> {
                  $env:PATH = \"C:\\msys64\\mingw64\\bin;$env:PATH\"; see docs/development.md"
             );
         }
+        // postino-store builds SQLCipher and OpenSSL from source; both tools must be resolvable
+        // before cargo starts a long C build.
+        for tool in ["make", "perl"] {
+            if Command::new(tool).arg("--version").output().is_err() {
+                bail!(
+                    "{tool} was not found. postino-store builds SQLCipher and OpenSSL from source \
+                     and needs MSYS2 make and perl on PATH, e.g. \
+                     $env:PATH = \"C:\\msys64\\mingw64\\bin;C:\\msys64\\usr\\bin;$env:PATH\"; \
+                     see docs/development.md"
+                );
+            }
+        }
     }
     run("cargo", &["fmt", "--all", "--", "--check"])?;
     run("cargo", &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
@@ -68,6 +80,7 @@ fn layers() -> Result<()> {
     let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec().context("cargo metadata")?;
     let allowed: HashMap<&str, &[&str]> = HashMap::from([
         ("postino-core", &[][..]),
+        ("postino-store", &[][..]),
         ("postino-app", &["postino-core"][..]),
         ("postino-cli", &["postino-core"][..]),
         ("xtask", &[][..]),

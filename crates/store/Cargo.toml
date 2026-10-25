@@ -1,0 +1,18 @@
+[package]
+name = "postino-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Encrypted local store: SQLCipher connection, migrations and the key seam"
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+getrandom.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

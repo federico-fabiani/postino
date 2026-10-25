@@ -15,6 +15,17 @@
 
   The MSVC toolchain may be installed, but it needs Visual Studio's `link.exe`, which is not on the
   PATH. Use GNU + MSYS2 for now.
+- `postino-store` builds SQLCipher and OpenSSL from source. That needs MSYS2 `make` and `perl`, plus a
+  parallel cold build:
+
+  ```powershell
+  C:\msys64\usr\bin\pacman.exe -S make       # once; perl is already installed
+  $env:PATH = "C:\msys64\mingw64\bin;C:\msys64\usr\bin;$env:PATH"
+  $env:MAKEFLAGS = "-j$env:NUMBER_OF_PROCESSORS"
+  ```
+
+  Without `MAKEFLAGS`, `openssl-src` builds serially on Windows: ~14 min cold instead of ~4.5 min.
+  Warm builds are seconds. See `docs/store-spike.md`.
 - No Node, no npm, no browser build in M0.
 
 ## 2. Commands
@@ -36,6 +47,7 @@ cargo xtask assets --write               # regenerate ATTRIBUTION.md
 
 ```
 crates/core/        domain, demo engine, operation registry
+crates/store/       encrypted SQLCipher store (P3a proof; not wired into the engine)
 apps/postino-app/   egui shell
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks

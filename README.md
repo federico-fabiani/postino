@@ -111,13 +111,19 @@ verifies every font and logo against `ATTRIBUTION.toml`; `cargo xtask assets --w
 ### Windows note
 
 The repository currently builds with the GNU Rust toolchain, which needs `dlltool.exe` for the
-Windows import libraries. If `cargo test` says `error calling dlltool`, add MSYS2's MinGW bin
-folder to `PATH` for that shell:
+Windows import libraries. `postino-store` also builds SQLCipher and OpenSSL from source, so it needs
+MSYS2 `make` and `perl`. Add both MSYS2 folders to `PATH` and let `make` use every core:
 
 ```powershell
-$env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+C:\msys64\usr\bin\pacman.exe -S make   # once
+$env:PATH = "C:\msys64\mingw64\bin;C:\msys64\usr\bin;$env:PATH"
+$env:MAKEFLAGS = "-j$env:NUMBER_OF_PROCESSORS"
 cargo test --workspace
 ```
+
+If `cargo test` says `error calling dlltool`, the MinGW folder is missing from `PATH`. A cold
+SQLCipher/OpenSSL build takes ~4.5 min with `MAKEFLAGS` and ~14 min without; warm builds are seconds.
+See `docs/store-spike.md`.
 
 The MSVC toolchain is also installed on some machines, but it needs Visual Studio's `link.exe`.
 The GNU toolchain plus MSYS2 is the path documented here.
@@ -144,6 +150,7 @@ The GNU toolchain plus MSYS2 is the path documented here.
 - [Security policy](SECURITY.md): how to report a vulnerability.
 - [Design](docs/design.md): palette, contrast, type, logo.
 - [Development](docs/development.md): toolchain, layout, testing.
+- [Store spike](docs/store-spike.md): P3a encrypted-SQLite evaluation, numbers and decision.
 - [Roadmap](ROADMAP.md): M0 to M6.
 - [Decisions](docs/decisions/): UI, runtime and sync ADRs.
 

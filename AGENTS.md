@@ -118,16 +118,20 @@ contract that keeps the app from becoming a pile of one-off patches.
 
 ## 7. Windows development note
 
-The active Rust host is `x86_64-pc-windows-gnu`. `cargo test` needs `dlltool.exe`; add MSYS2's
-MinGW bin folder to `PATH` in the shell:
+The active Rust host is `x86_64-pc-windows-gnu`. `cargo test` needs `dlltool.exe`; the store builds
+SQLCipher and OpenSSL from source and needs `make` and `perl`. Add MSYS2's MinGW and MSYS2 bin
+folders to `PATH` in the shell:
 
 ```powershell
-$env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+C:\msys64\usr\bin\pacman.exe -S make       # once
+$env:PATH = "C:\msys64\mingw64\bin;C:\msys64\usr\bin;$env:PATH"
+$env:MAKEFLAGS = "-j$env:NUMBER_OF_PROCESSORS"
 cargo test --workspace
 ```
 
+Without `MAKEFLAGS`, `openssl-src` builds serially on Windows (~14 min cold instead of ~4.5 min).
 The MSVC toolchain is installed but lacks `link.exe`; do not switch to it without installing Visual
-Studio Build Tools. `cargo xtask ci` prints a clear error when `dlltool` is missing.
+Studio Build Tools. `cargo xtask ci` prints a clear error when `dlltool`, `make` or `perl` is missing.
 
 ## 8. Commits
 
@@ -184,3 +188,9 @@ Append one line when significant time is lost to an issue likely to recur. Forma
 - [egui/screenshots] formatting with `Local::now()`/`Utc::now()` makes PNG captures change every
   minute and breaks attribution hashes. fix/avoid: own the clock in the app, freeze it in screenshot
   mode, and seed demo dates from the same instant.
+- [Windows/OpenSSL] `openssl-src` needs MSYS2 `make` + `perl` and, on Windows, ignores
+  `CARGO_MAKEFLAGS` so a cold build runs serially (~14 min). fix/avoid: `pacman -S make`, put
+  `C:\msys64\usr\bin` on `PATH`, set `MAKEFLAGS=-j$env:NUMBER_OF_PROCESSORS` (~4.5 min).
+- [SQLCipher/rusqlite] a bound `PRAGMA key = ?` is read at prepare time and silently ignored on an
+  existing file ("file is not a database"). fix/avoid: literal raw key `PRAGMA key = "x'<hex>'"`,
+  never `conn.pragma_update(..., "key", ...)`.
