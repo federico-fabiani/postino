@@ -3,7 +3,10 @@
 //! Contrast, measured on sRGB:
 //! - forest `#173D32` on ivory `#F5EBD6`: 10.1:1, body text.
 //! - gold `#E4B96A` on forest: 6.5:1, accent text and icons on dark surfaces.
-//! - gold on ivory: 1.55:1, decorative only. Never use gold as body text on ivory.
+//! - gold on ivory: 1.55:1, decorative only. Every gold mark on a light surface — the unread dot,
+//!   label dots, chips and stars — uses `GOLD_INK` (`#8A5A12`, 4.99:1) instead.
+//! - faint metadata `#536055`: 5.59:1 on ivory, 5.20:1 on the alt panel, 4.74:1 on hover.
+//! - placeholders use the same measured `PLACEHOLDER` token, never egui's faded body colour.
 
 use std::sync::Arc;
 
@@ -18,8 +21,12 @@ pub const GOLD: Color32 = Color32::from_rgb(0xE4, 0xB9, 0x6A);
 /// A darker gold for text on ivory, where the light gold would fail contrast.
 pub const GOLD_INK: Color32 = Color32::from_rgb(0x8A, 0x5A, 0x12);
 pub const MUTED: Color32 = Color32::from_rgb(0x4F, 0x61, 0x57);
-/// Metadata on ivory. Previously `#6E7D73` (3.66:1); this is 4.75:1.
-pub const FAINT: Color32 = Color32::from_rgb(0x5C, 0x6B, 0x61);
+/// Metadata on ivory. Previously `#6E7D73` (3.66:1); `#5C6B61` measured 4.42:1 on the alt panel,
+/// so this is the darker `#536055`: 5.59:1 on ivory, 5.20:1 on the panel and 4.74:1 on hover.
+pub const FAINT: Color32 = Color32::from_rgb(0x53, 0x60, 0x55);
+/// Placeholder text in a field. The old egui default faded the body colour to 60%, which measured
+/// 3.24:1 on ivory; this passes 4.5:1 on the field, the panel and the alt panel.
+pub const PLACEHOLDER: Color32 = Color32::from_rgb(0x53, 0x60, 0x55);
 pub const BORDER: Color32 = Color32::from_rgb(0xD9, 0xC9, 0xA8);
 pub const DANGER: Color32 = Color32::from_rgb(0x9A, 0x3B, 0x2A);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x36, 0x6B, 0x4A);
@@ -59,6 +66,8 @@ pub struct Tokens {
     pub field: Color32,
     pub gold: Color32,
     pub gold_ink: Color32,
+    /// Placeholder text for a field, measured at >= 4.5:1 on the field and the panel.
+    pub placeholder: Color32,
     pub danger: Color32,
     pub success: Color32,
 }
@@ -83,6 +92,7 @@ pub fn tokens(dark: bool) -> Tokens {
             field: Color32::from_rgb(0x0F, 0x22, 0x1B),
             gold: GOLD,
             gold_ink: GOLD,
+            placeholder: DARK_FAINT,
             danger: Color32::from_rgb(0xE0, 0x7A, 0x64),
             success: Color32::from_rgb(0x7F, 0xC0, 0x96),
         }
@@ -107,6 +117,7 @@ pub fn tokens(dark: bool) -> Tokens {
             field: Color32::from_rgb(0xFB, 0xF6, 0xEA),
             gold: GOLD,
             gold_ink: GOLD_INK,
+            placeholder: PLACEHOLDER,
             danger: DANGER,
             success: SUCCESS,
         }
@@ -170,6 +181,9 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     visuals.extreme_bg_color = t.field;
     visuals.faint_bg_color = t.panel_alt;
     visuals.override_text_color = Some(t.text);
+    // egui fades hint text to 60% of the body colour (3.24:1 on ivory). Point the weak slot at
+    // the measured placeholder token, so every field in the app inherits a 4.5:1 hint.
+    visuals.weak_text_color = Some(t.placeholder);
     visuals.hyperlink_color = if dark { t.gold } else { t.gold_ink };
     visuals.window_stroke = Stroke::new(1.0, t.border);
     visuals.selection.bg_fill = t.selected;
@@ -203,4 +217,23 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     style.text_styles.insert(TextStyle::Heading, FontId::new(20.0, display()));
     style.text_styles.insert(TextStyle::Monospace, FontId::new(11.5, FontFamily::Monospace));
     ctx.set_style_of(theme, style);
+}
+
+/// The one animation length the shell uses. egui keeps a single global time, so pane, menu and
+/// hover motion all share it; 140 ms sits inside the 120–160 ms the plan allows.
+pub const ANIMATION_TIME: f32 = 0.14;
+
+/// Apply the reduced-motion preference to every egui style. `animation_time = 0` is egui's
+/// equivalent of `reduce_motion`: every `animate_bool`, menu fade and hover transition resolves to
+/// its final value on the first frame. Nothing in the shell animates outside this switch.
+pub fn apply_motion(ctx: &egui::Context, reduced: bool) {
+    let time = if reduced { 0.0 } else { ANIMATION_TIME };
+    ctx.all_styles_mut(|style| style.animation_time = time);
+}
+
+/// The length of a named animation under the current style. A zero result means "jump to the end";
+/// any new motion must go through this instead of a literal so the reduced path cannot be missed.
+#[must_use]
+pub fn motion_seconds(ctx: &egui::Context, nominal: f32) -> f32 {
+    if ctx.global_style().animation_time <= f32::EPSILON { 0.0 } else { nominal }
 }

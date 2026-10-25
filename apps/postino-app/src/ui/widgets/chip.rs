@@ -146,6 +146,7 @@ impl<'a> Badge<'a> {
         ui.painter().rect_filled(rect, CornerRadius::same(radius::SM), fill);
         let galley = layout(ui, self.label, &font, foreground);
         paint_left(ui, rect, rect.left() + space::MD, &galley);
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, self.label));
         response
     }
 }

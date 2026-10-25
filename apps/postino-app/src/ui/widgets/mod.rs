@@ -17,7 +17,9 @@ pub use chip::{Badge, BadgeKind, Chip};
 pub use composer::ComposerFocus;
 pub use composer::{AUTOSAVE_DELAY, ComposeMode, Composer, ComposerState, compose_body, quote_body, signature_body};
 pub use dialog::Dialog;
-pub use feedback::{EmptyState, Toast, ToastKind};
+#[cfg(test)]
+pub(crate) use feedback::probe as toast_probe;
+pub use feedback::{EmptyState, Toast, ToastKind, ToastResult};
 pub use input::{SearchField, TextField};
 pub use list_row::ListRow;
 pub use menu::{Menu, MenuItem};

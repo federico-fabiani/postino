@@ -107,7 +107,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "46c3b6669fc826f59f3a97f3e7549a08fdd78890ef78cd97f8011381b02fcf4e"
+sha256 = "dcd2f4af5d096176c930bb8a7d3be10bfee1416759bce024b40a26d12ffc29d4"
 usage = "Documentation screenshot of the U0.2 shell with the custom title bar"
 
 [[asset]]
@@ -117,7 +117,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "ea29554a337cc7ce3a2d38b5a7f2019192ee2f82270ef05580a828e7ebc24746"
+sha256 = "c7813b386385e576b796f445c56e8c6a4cfb86ce7e1b6dfeef6cc48f907e19a8"
 usage = "Documentation screenshot of the U0.2 split reading view"
 
 [[asset]]
@@ -127,7 +127,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "8b9766e909c0fb24c11bdec5a7ba0d8459573abc94f58ae4bb6eaf68c7e05fb3"
+sha256 = "3838bf0632e2d976ebb8c99af8654a61b44bc02ac61436f1c40ffd0266edb6ef"
 usage = "Documentation screenshot of the U0.2 full-screen message view"
 
 [[asset]]
@@ -137,7 +137,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "1054e0b07d3b797aa0bd1f1d0379f11b763d8d5a2da2114e50ce2652875da1c9"
+sha256 = "4232b50c22875ea5f4b42a4a5e5565f28f2d369bfa463a6c312c0ba12e31d4d4"
 usage = "Documentation screenshot of the U0.2 shell in the dark theme"
 
 [[asset]]
@@ -147,7 +147,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "86c6aa3bdf606d94fa17dfc932ccfbf99339680380a285bfb618598090683755"
+sha256 = "c7813b386385e576b796f445c56e8c6a4cfb86ce7e1b6dfeef6cc48f907e19a8"
 usage = "Documentation screenshot of the U0.4 reading pane with reply and forward actions"
 
 [[asset]]
@@ -157,7 +157,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "80875c17ef081bbdcd02e53b328dc8aa011a63179e0923ecf6c42e961605d4ca"
+sha256 = "831c0ca9e1acdce6f7fbe727db4d06bb2ab4ef988b196dd3b67aed44bdb7c86e"
 usage = "Documentation screenshot of the U0.4 composer with recipients, attachment and draft state"
 
 [[asset]]
@@ -167,7 +167,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "c1474bd32f59a930c71fbb3f9dd4f94f100fc373cfc7ae8f631ad5c335c9b485"
+sha256 = "5b46f333f57bae462204a46285456ace3774f9a8ddf335557bcb188db032ee37"
 usage = "Documentation screenshot of the U0.4 composer in the dark theme"
 
 [[asset]]
@@ -177,7 +177,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "bcd9257bb0b4cfb550782dcc1835f385107972cc9ce0022c81ee686b39d10536"
+sha256 = "c7a870d2385baba3cf05115070fc9350aa031cf55f79e10d8e7bfc366284b69a"
 usage = "Documentation screenshot of the U0.5 label view, its mailbox-wide scope header and the coloured label rows"
 
 [[asset]]
@@ -187,7 +187,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "80abe26d82b51c18d8960190b064e0ef59fa377f61640fa11e5e933c574cc07f"
+sha256 = "4518433a6a0829b7d794e8f0ba67bcaa541f0099268c3e49910b77dc93a3e642"
 usage = "Documentation screenshot of the modal label menu over the message list, with the applied label chip visible in the reading pane"
 
 [[asset]]
@@ -197,7 +197,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "2d901c67eb8f6196814f41c843d5dc87b11ed1c3d83339f066c02784c4ea79f7"
+sha256 = "b9a390d6dd05c35ce29a4dfaa6208645eb76b0cef9da4fd15b5dff4794351334"
 usage = "Documentation screenshot of the modal command palette with the scrim, filtered results, shortcut hints and a disabled reason"
 
 [[asset]]
@@ -207,8 +207,98 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "25388fb23723cee2909e5f33a01dfb7269919ff6064971408596adc093562784"
+sha256 = "e638d66fb7789d50a5d4a74a90eb8c4af7c19d16c65378541fc324e35659ee29"
 usage = "Documentation screenshot of the composer sheet at the 980×600 minimum window, with pinned header/footer and a scrolling body"
+
+[[asset]]
+path = "docs/images/postino-p2b-shell-980.png"
+title = "Postino P2b shell at 980×600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "e737561fe80e009e88600d116d3cbc756bd50a09e96caacd49546541d99bb476"
+usage = "Documentation screenshot of the shell at the minimum window, with the compact date column and the single demo notice"
+
+[[asset]]
+path = "docs/images/postino-p2b-shell-980-dark.png"
+title = "Postino P2b shell at 980×600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "a40a5e49283be439e820a5f81d9d55647cadd4358d96ab8710dae8f10de45f02"
+usage = "Documentation screenshot of the dark shell at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p2b-reading-dark.png"
+title = "Postino P2b reading pane, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "5d9d3b306dc9e1fd4243adee538f38b623b84f7e7e679c455f891a789c7bc730"
+usage = "Documentation screenshot of the split reading pane in the dark theme"
+
+[[asset]]
+path = "docs/images/postino-p2b-reading-980.png"
+title = "Postino P2b reading overlay at 980×600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "2c7fa9dc638219f688b2c5fd3602e2ab143287d6a80a6261aee7de5019e43072"
+usage = "Documentation screenshot of the full-width reading overlay at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p2b-reading-980-dark.png"
+title = "Postino P2b reading overlay at 980×600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "3bad4c8fcddfa4a9a6a5da4c1b1480217892dd36a8077a8c8cc42a39b23758db"
+usage = "Documentation screenshot of the dark reading overlay at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p2b-palette-dark.png"
+title = "Postino P2b command palette, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "1687bf91702dd106703c6a19e69d782537acc9b0cef509a2edea611a65532513"
+usage = "Documentation screenshot of the modal command palette in the dark theme, with the disabled cursor and its reason"
+
+[[asset]]
+path = "docs/images/postino-p2b-empty-unread.png"
+title = "Postino P2b empty unread state"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "9071e40f13a01b75effadb200d534354947678d325962faae7b98ef02742beba"
+usage = "Documentation screenshot of the unread filter empty state with its 'Mostra tutti' way out"
+
+[[asset]]
+path = "docs/images/postino-p2b-empty-attachments.png"
+title = "Postino P2b empty attachments state"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "5141a21a4e2e5a7e4ce1b786fd3e7d3827fd29ba9890ebf8b0dacda228a7fc1c"
+usage = "Documentation screenshot of the attachments filter empty state with its 'Mostra tutti' way out"
+
+[[asset]]
+path = "docs/images/postino-p2b-empty-label-unread.png"
+title = "Postino P2b empty label and unread state"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "38d442c456019c88bcdff748f5aa86b5b3bc41099654c91eb859df97f20790f7"
+usage = "Documentation screenshot of the Lavoro and unread empty state, naming both filters and offering 'Togli filtro non letti'"
 
 [[asset]]
 path = "assets/app-icon/postino-256.png"

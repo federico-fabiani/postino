@@ -3258,6 +3258,7 @@ dependencies = [
  "log",
  "png",
  "postino-core",
+ "serde",
  "serde_json",
 ]
 

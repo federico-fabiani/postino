@@ -19,6 +19,7 @@ egui-phosphor.workspace = true
 env_logger.workspace = true
 log.workspace = true
 png.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]

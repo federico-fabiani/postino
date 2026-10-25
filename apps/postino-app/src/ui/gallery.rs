@@ -84,11 +84,7 @@ impl GalleryApp {
                 self.composer(ui, &t);
                 self.dialogs(ui, &t);
                 ui.add_space(space::HUGE);
-                ui.label(typography::text(
-                    Role::Caption,
-                    "Phosphor Regular (MIT) · Inter e JetBrains Mono (OFL) · Postino UI kit, U0.5",
-                    t.text_faint,
-                ));
+                ui.label(typography::text(Role::Caption, "Phosphor Regular (MIT) · Inter e JetBrains Mono (OFL) · Postino UI kit", t.text_faint));
                 ui.add_space(space::XXXL);
             });
         });
@@ -101,7 +97,7 @@ impl GalleryApp {
                 ui.add_space(space::SM);
                 ui.vertical(|ui| {
                     ui.label(typography::text(Role::Page, "Postino UI kit", t.text));
-                    ui.label(typography::text(Role::Meta, "Componenti, stati e token · U0.5", t.text_muted));
+                    ui.label(typography::text(Role::Meta, "Componenti, stati e token", t.text_muted));
                 });
             });
             ui.add_space(space::XL);
@@ -205,7 +201,7 @@ impl GalleryApp {
             Button::new("Piccolo").size(ButtonSize::Sm).show(ui);
             Button::new("Normale").size(ButtonSize::Md).show(ui);
             Button::new("Grande").size(ButtonSize::Lg).show(ui);
-            Button::new("Disabilitato").enabled(false).disabled_reason("Questa azione arriva in M2").show(ui);
+            Button::new("Disabilitato").enabled(false).disabled_reason("Questa azione non è disponibile").show(ui);
         });
         ui.add_space(space::MD);
         ui.horizontal_wrapped(|ui| {
@@ -242,14 +238,14 @@ impl GalleryApp {
             Chip::new("Tutti").selected(true).show(ui);
             Chip::new("Non letti").count(3).show(ui);
             Chip::new("Allegati").icon(icons::PAPERCLIP).show(ui);
-            Chip::new("Lavoro").dot(tokens::GOLD).show(ui);
+            Chip::new("Lavoro").dot(tokens::GOLD_INK).show(ui);
             Chip::new("Personale").dot(t.success).show(ui);
             Chip::new("Archiviati").enabled(false).show(ui);
         });
         ui.add_space(space::SM);
         ui.horizontal_wrapped(|ui| {
-            Badge::new("M0").show(ui);
-            Badge::new("DEMO").kind(BadgeKind::Accent).show(ui);
+            Badge::new("Locale").show(ui);
+            Badge::new("Nuovo").kind(BadgeKind::Accent).show(ui);
             Badge::new("Errore").kind(BadgeKind::Danger).show(ui);
         });
     }
@@ -276,7 +272,7 @@ impl GalleryApp {
         ui.add_space(space::SM);
         SectionHeader::new("CARTELLE").count(6).show(ui);
         ui.add_space(space::LG);
-        EmptyState::new(icons::INBOX, "Nessun messaggio", "Questa cartella è vuota.").action("Aggiorna").show(ui);
+        EmptyState::new(icons::INBOX, "Nessun messaggio", "Questa cartella è vuota.").action("Mostra tutti").show(ui);
     }
 
     fn feedback(&self, ui: &mut Ui) {

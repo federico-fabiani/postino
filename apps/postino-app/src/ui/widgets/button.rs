@@ -173,10 +173,15 @@ impl<'a> Button<'a> {
         let hovered = self.enabled && response.hovered();
         let pressed = self.enabled && response.is_pointer_button_down_on();
         let (mut fill, mut stroke, mut foreground) = paint_colors(self.kind, &t, self.enabled, hovered, pressed);
-        if self.selected && !pressed {
+        if self.enabled && self.selected && !pressed {
             fill = t.selected;
             stroke = Color32::TRANSPARENT;
-            foreground = if self.enabled { t.selected_text } else { t.selected_muted };
+            foreground = t.selected_text;
+        } else if self.selected && !self.enabled {
+            // The palette cursor can sit on a command that is unavailable. Keep the disabled
+            // colours (the row must not look usable) but draw the frame that says "this is the
+            // current row", so the user can see what Enter will refuse.
+            stroke = t.text_muted;
         }
 
         if fill != Color32::TRANSPARENT {
@@ -211,7 +216,9 @@ impl<'a> Button<'a> {
             right -= galley.size().x + space::SM;
         }
         if let Some(shortcut) = self.shortcut {
-            let shortcut_color = if self.selected { t.selected_muted } else { t.text_faint };
+            // The hint is text on the button's own fill: derive it from the foreground and keep a
+            // measured 4.5:1 floor instead of reusing a faint token that only works on the panel.
+            let shortcut_color = tokens::supporting_text(foreground, effective_fill(fill, &t));
             let galley = layout(ui, shortcut, &shortcut_font, shortcut_color);
             paint_right(ui, rect, right, &galley);
         }
@@ -404,12 +411,75 @@ fn paint_colors(kind: ButtonKind, t: &Tokens, enabled: bool, hovered: bool, pres
             let fill = if pressed {
                 t.danger
             } else if hovered {
-                t.danger.gamma_multiply(0.12)
+                tokens::mix(t.panel, t.danger, 0.1)
             } else {
                 Color32::TRANSPARENT
             };
-            let foreground = if pressed { t.selected_text } else { t.danger };
+            // The dark theme's danger fill is light, so ivory on it measures 2.49:1. The panel
+            // colour is the readable foreground in both themes: ivory on #9A3B2A (5.85:1) and the
+            // dark panel on #E07A64 (5.27:1).
+            let foreground = if pressed { t.panel } else { t.danger };
             (fill, Color32::TRANSPARENT, foreground)
         }
+    }
+}
+
+/// The surface a shortcut hint is actually painted on. A transparent button shows the panel behind
+/// it, so contrast must be measured against that instead of against `TRANSPARENT`.
+fn effective_fill(fill: Color32, t: &Tokens) -> Color32 {
+    if fill == Color32::TRANSPARENT { t.panel } else { fill }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::tokens::contrast_ratio;
+
+    fn hint_for(kind: ButtonKind, dark: bool, hovered: bool, pressed: bool) -> (Color32, Color32) {
+        let t = tokens::tokens(dark);
+        let (fill, _, foreground) = paint_colors(kind, &t, true, hovered, pressed);
+        let fill = effective_fill(fill, &t);
+        (tokens::supporting_text(foreground, fill), fill)
+    }
+
+    #[test]
+    fn every_enabled_button_hint_clears_4_5_to_1() {
+        for dark in [false, true] {
+            for kind in [ButtonKind::Primary, ButtonKind::Secondary, ButtonKind::Ghost, ButtonKind::Danger] {
+                for (hovered, pressed) in [(false, false), (true, false), (false, true)] {
+                    let (hint, fill) = hint_for(kind, dark, hovered, pressed);
+                    let ratio = contrast_ratio(hint, fill);
+                    assert!(
+                        ratio >= 4.5,
+                        "{kind:?} hint in {} hovered={hovered} pressed={pressed} is {ratio:.2}:1 on {fill:?}",
+                        if dark { "dark" } else { "light" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_primary_hint_is_not_the_old_faint_token() {
+        let light = tokens::tokens(false);
+        let dark = tokens::tokens(true);
+        for (t, dark_mode) in [(&light, false), (&dark, true)] {
+            let (fill, _, foreground) = paint_colors(ButtonKind::Primary, t, true, false, false);
+            let hint = tokens::supporting_text(foreground, fill);
+            assert_ne!(hint, t.text_faint, "the hint must derive from the button foreground");
+            assert!(
+                contrast_ratio(hint, fill) > contrast_ratio(t.text_faint, fill),
+                "the derived hint must beat the old faint token in {}",
+                if dark_mode { "dark" } else { "light" }
+            );
+        }
+    }
+
+    #[test]
+    fn a_selected_button_hint_stays_legible_on_forest() {
+        let light = tokens::tokens(false);
+        let hint = tokens::supporting_text(light.selected_text, light.selected);
+        assert!(contrast_ratio(hint, light.selected) >= 4.5);
+        assert_ne!(hint, light.selected_muted, "the hint is measured, not a fixed muted token");
     }
 }

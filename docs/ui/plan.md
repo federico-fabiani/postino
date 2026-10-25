@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1–U0.5 foundations implemented; P2a layout/modals done, P2b states/a11y next · **Last updated:** 2026-10-25
+> **Status:** U0.1–U0.5 foundations implemented; P2a layout/modals done, P2b states/accessibility done · **Last updated:** 2026-10-25
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
@@ -61,10 +61,21 @@ identity and the minimal surface. Build the system underneath, then let the scre
 - **Type scale (px):** 10.5 caption, 11 metadata, 12 secondary, 13 body-small, 14 body, 16
   emphasis, 20 section title, 24 page title. Line heights 1.2 / 1.45. No ad-hoc sizes.
 - **Weights:** Inter Regular, Medium, SemiBold only.
-- **Colours:** current tokens, plus a darker faint (`#5C6B61`, ≥ 4.5:1) and `GOLD_INK` for stars and
-  links on ivory. `GOLD` is for dots, rules and text on forest/dark.
+- **Colours:** current tokens, plus a darker faint (`#536055`, 5.59:1 on ivory and 5.20:1 on the
+  alt panel for metadata) and `GOLD_INK` (4.99:1) for every gold mark on ivory: the unread dot,
+  label dots, chips and stars. `GOLD` is for dots, rules and text on forest/dark. A third token,
+  `PLACEHOLDER` (`#536055`), is the only colour for field placeholders: 4.5:1 on the field and the
+  panel, unlike egui's 60%-faded body colour (3.24:1).
+- **Button hints:** a shortcut hint is text on the button's own fill. It is derived from the
+  button foreground (`supporting_text`: the foreground walked toward the fill in 5% steps) and kept
+  at a measured 4.5:1 against that fill; it is never a fixed faint token. `Ctrl+Invio` on the gold
+  or forest primary button passes the same floor.
 - **Borders:** 1 px `#D9C9A8` light / `#2B4A3E` dark.
-- **Focus:** 2 px gold ring outside the control, with a 1 px forest inner ring for contrast.
+- **Focus:** 2 px gold ring outside the control, with a 1 px inner edge for contrast: forest on
+  ivory, the selected-row ivory on forest.
+- **Motion:** one 140 ms ease, applied through `style.animation_time`, which is set to 0 when
+  reduced motion is on. Every animation resolves on the first frame in that mode; no component may
+  hard-code a duration.
 
 ### 4.2 Components
 
@@ -79,16 +90,16 @@ Every component has `default`, `hover`, `active`, `focus`, `disabled` and, where
 | `SearchField` | centred placeholder, leading magnifier, `/` focus, `Esc` clear |
 | `Chip` | filter, label, count; selected/unselected; removable |
 | `Badge` | neutral, accent, danger; used for unread counts and roadmap states |
-| `ListRow` | message, folder, contact; selected, focused, unread, starred; no text selection |
+| `ListRow` | message, folder, contact; selected, focused, unread, starred; no text selection; accessible name with sender/subject/state/date/Enter |
 | `TableHeader` | sortable, right-aligned numeric/date |
 | `SectionHeader` | title, count, action (`+`) |
-| `EmptyState` | icon, title, body, one or two actions; filter-aware copy |
-| `Toast` | info, success, error; optional undo; 8 s; bottom-centre |
+| `EmptyState` | icon, title, body, one or two actions; filter-aware copy; actions stack under the copy |
+| `Toast` | info, success, error; optional undo/action and dismiss; 8 s; bottom-centre |
 | `Menu` / `ContextMenu` | items with icon, label, shortcut, danger; separators; submenu |
 | `Dialog` | title, body, footer; scrim; focus trap; Esc |
 | `Composer` | fields, formatting bar, attachments, save/send, draft state |
 | `Pane` | resizable, collapsible, animated; min/max; remembers size |
-| `StatusBar` | sync state dot, message, shortcut hint; severity |
+| `StatusBar` | three honest states (Demo, Pronto, Errore), one demo badge, one line, shortcut hint |
 
 ### 4.3 Gallery
 
@@ -120,13 +131,18 @@ guard against drift. A headless test renders it.
 - **Toolbar:** centred search, `Sincronizza` as a quiet icon+label, `Scrivi` as the only primary
   button on the right, theme and account after it. No 550 px hole.
 - **Sidebar:** 240 px, scrollable, collapsible below 1100 px. Account block, folders, labels with a
-  `+`, storage/demo footer. Right-click on a label offers rename/delete.
-- **List:** flexible. Row 44 px default, 36 px compact. Sender 140 px (96 px when the list content is
-  below 560 px), date 52 px, star 24 px, avatar 24 px only when the list is at least 720 px wide;
-  otherwise no avatar. The date column is dropped below 560 px of list content **before** the subject
-  is truncated; the subject takes the rest. Subject and snippet are single-line with ellipsis. When a
-  sender or subject is actually truncated, hover and keyboard focus show its full text in a tooltip.
-  No text selection in rows.
+  `+`. Right-click on a label offers rename/delete. The demo/version notice lives once, in the
+  status bar; the sidebar has no second footer line.
+- **List:** flexible. Row 44 px default, 36 px compact. Sender 140 px (100 px when the list panel is
+  below 560 px), date 52 px at 480 px and wider, star 28 px, unread dot 12 px, avatar 24 px only
+  when the list is at least 720 px wide; otherwise no avatar. The date is compact and monospace —
+  `HH:MM` today, `dd/MM` this year, `dd/MM/yy` otherwise — and is dropped only below 480 px of list
+  panel, before the subject is truncated. The 52 px column, not 44, is what `dd/MM/yy` measures at
+  the caption monospace size; at the 499 px list the 1280×720 reading split leaves, the subject
+  still gets at least 260 px. Subject and snippet are single-line with ellipsis. When a sender or
+  subject is actually truncated, hover and keyboard focus show its full text in a tooltip. No text
+  selection in rows. The star is its own 28×28 keyboard-focusable control with its own accessible
+  name; a star click never opens the message.
 - **Reading pane:** closed when nothing is selected. It opens at 52% of the content width left by the
   240 px sidebar, clamped to `420 ..= 62%`, and capped so the list keeps its 460 px floor whenever
   the pane can honour its own 420 px minimum (from 1120 px up). At 1280×720 that is a ~541 px pane
@@ -137,8 +153,12 @@ guard against drift. A headless test renders it.
   Per-message scroll state.
 - **Bulk bar:** replaces the folder header when multi-select is active: count, mark read/unread,
   star, archive, delete, clear. Same shortcuts.
-- **Status bar:** real severity dot (local, syncing, offline, error), one line, shortcut hint.
-  One demo notice in the whole app, not four.
+- **Status bar:** three honest states. `Demo` is a gold `Modalità demo` badge whose tooltip explains
+  in one sentence that the mail is synthetic and nothing leaves the computer; `Pronto` is the store;
+  `Errore` is a real failure with one dismissable toast (retry only where meaningful). The version
+  sits next to the state. The bar carries one transient confirmation line, never a raw engine error.
+- **Loading:** a 2 px line under the toolbar, shown only after 200 ms of work, so local calls that
+  return within a frame never flicker.
 
 ## 6. Interaction model
 
@@ -148,7 +168,9 @@ guard against drift. A headless test renders it.
 
 - Click: select one, focus it, open the reading pane; do **not** mark read immediately.
 - `Ctrl/Cmd+Click`: toggle one; `Shift+Click`: range from anchor.
-- `↑`/`↓` or `J`/`K`: move focus without opening; scroll it into view. `Shift+↑/↓`: extend.
+- `↑`/`↓` or `J`/`K`: move focus without opening; scroll it into view. Plain `J`/`K` collapse the
+  selection to the focused row. `Shift+↑/↓` or `Shift+J/K` extend from the anchor; the bulk bar
+  stays visible while that anchor is alive.
 - `Space` or `X`: toggle focused row; `Ctrl/Cmd+A`: select all; `Esc`: clear selection and close
   the reading pane.
 - `Enter`: open focused row in reading pane / expand to full content; mark read after 600 ms with
@@ -159,12 +181,12 @@ guard against drift. A headless test renders it.
 
 | Key | Action |
 |---|---|
-| `J` / `↓` | next message |
-| `K` / `↑` | previous message |
+| `J` / `↓` | move focus to the next message and collapse to it |
+| `K` / `↑` | move focus to the previous message and collapse to it |
+| `Shift+J` / `Shift+K` | extend the selection from the anchor |
 | `Enter` / `O` | open / expand reading |
 | `Esc` | back from full reading, then clear selection, then close overlays |
 | `X` / `Space` | toggle selection |
-| `Shift+J/K` | extend selection |
 | `R` / `A` / `F` | reply / reply all / forward |
 | `E` | archive |
 | `#` / `Delete` | delete (move to trash) |
@@ -258,25 +280,35 @@ until M1. Screenshots: `docs/images/postino-u05-labels.png`,
 
 Reading adapts to the window: at 1000 px and wider it is a side pane at 52% of the width left by the
 sidebar, clamped to 420 px and 62% and capped so the list keeps its 460 px floor from 1120 px up;
-below 1000 px it is a full-width overlay with "Torna alla posta" and Esc returns to the list. Below
-560 px of list content the date column is dropped before the subject truncates, and truncated
-sender/subject rows carry a tooltip on hover and keyboard focus. Message-list avatars appear only
+below 1000 px it is a full-width overlay with "Torna alla posta" and Esc returns to the list. The
+compact date is kept down to 480 px of list panel (52 px wide: `HH:MM`, `dd/MM`, `dd/MM/yy`),
+truncated sender/subject rows carry a tooltip on hover and keyboard focus, and the sender narrows to
+100 px below 560 px so the subject keeps its floor. Message-list avatars appear only
 when the list column is at least 720 px. A row double-click opens and expands; a reading-header
 double-click restores. The 980 × 600 minimum window is part of the screenshot pass:
 `--size 980x600` renders the same scenes at that size.
 
 ## 9. States, motion, accessibility
 
-- **Loading:** a quiet 2 px progress line under the toolbar after 200 ms; never a full-screen
-  spinner for local data.
-- **Empty:** filter-aware copy and an action. "Nessun messaggio non letto" + "Mostra tutti".
-- **Error:** toast near the action + status dot red + a retry where possible. No raw engine strings.
-- **Sync:** dot + short label; never a fake perpetual spinner.
-- **Motion:** 140 ms pane, 120 ms menu/toast, 80 ms hover; ease-out. `reduce_motion` disables
-  width/position animations, keeps opacity.
+- **Loading:** a quiet 2 px line under the toolbar after 200 ms; never a full-screen spinner for
+  local data and never for work that returns inside one frame.
+- **Empty:** one resolver in the order search → label → unread → attachments → drafts → folder. It
+  never calls a folder empty when a filter produced the result, and offers up to two actions from
+  the active filter: "Nessun messaggio non letto" + "Mostra tutti", "Nessun messaggio con allegati"
+  + "Mostra tutti", "Nessun messaggio con l'etichetta …" + "Togli filtro etichetta" and "Mostra
+  tutti", label + unread + "Togli filtro “non letti”", search with its active scope in words.
+- **Error:** one Italian sentence, one toast with a dismiss control and a retry only for a list
+  reload; the status dot turns red and says `Errore`. No raw engine string reaches the UI, and a
+  failure never also becomes a status line.
+- **Sync:** the only refresh command is visibly disabled with "La sincronizzazione arriva con
+  IMAP"; there is no enabled action that only writes a status note.
+- **Motion:** 140 ms pane, 120 ms menu/toast, 80 ms hover; ease-out, through `style.animation_time`.
+  Reduced motion sets the style time to 0 and every animation resolves on the first frame. The
+  preference is persisted and is also reachable as "Riduci le animazioni" in the palette.
 - **Accessibility:** every icon button has a name and a tooltip with its shortcut; rows are
-  focusable and announce sender/subject/unread; focus ring always visible; targets ≥ 28 px;
-  metadata contrast ≥ 4.5:1; no colour-only state.
+  focusable, are announced as buttons with sender, subject, unread, attachment, date, selection and
+  the Enter hint; the star is its own 28×28 control; focus is always visible and follows real
+  keyboard focus, distinct from selection; metadata contrast ≥ 4.5:1; no colour-only state.
 
 ## 10. Work packages (no dates)
 
@@ -340,9 +372,10 @@ su questo computer.` before the click. Attachments are metadata-only in M0, as i
   independently and keeps its offset when the editor opens; CARTELLE stays at the top and Cestino is
   one wheel away at 980×600.
 - The reading pane is 52% of the width after the sidebar, clamped 420..=62% and capped so the list
-  keeps its 460 px floor from 1120 px up. Below 560 px of list content the date column is dropped,
-  the sender narrows to 96 px and the subject gets the rest; truncation carries a tooltip on hover
-  and keyboard focus.
+  keeps its 460 px floor from 1120 px up. The compact date column is kept down to 480 px of list
+  panel (52 px wide: `HH:MM`, `dd/MM`, `dd/MM/yy`), the sender narrows to 100 px below 560 px and
+  the subject gets at least 260 px at the 499 px list the 1280 split leaves; truncation carries a
+  tooltip on hover and keyboard focus.
 - Double-click a row to open and expand, double-click the reading header to restore. The 1000 px
   overlay keeps Archivia, Elimina and Back.
 - Screenshots: compose and palette at 1280×720 and 980×600, light and dark. The committed evidence is
@@ -350,10 +383,45 @@ su questo computer.` before the click. Attachments are metadata-only in M0, as i
   `postino-p2a-compose-980.png` (sheet at the minimum window) and `postino-p2a-palette.png` (modal
   palette); the reading shots are regenerated at the new proportions.
 
-### U0.5 Polish — next
+### P2b States, contrast, accessibility — done
 
-- Empty/loading/error states, reduced motion, accessibility pass.
-- Final screenshots, gallery review, docs update (`design.md`, `AGENTS.md` if rules changed).
+- **Filter-aware empty states.** One resolver (search → label → unread → attachments → drafts →
+  folder) returns title, body and up to two actions. "Mostra tutti" and "Togli filtro …" clear a
+  real filter and always change the view; a folder is never called empty when a filter caused the
+  result. Screenshots: `docs/images/postino-p2b-empty-unread.png`,
+  `postino-p2b-empty-attachments.png`, `postino-p2b-empty-label-unread.png`.
+- **Contrast.** `GOLD_INK` replaces the 1.55:1 gold unread dot on ivory (and every gold mark on a
+  light surface); `GOLD` stays on forest. `FAINT` moves to `#536055` (5.59:1 on ivory, 5.20:1 on
+  the alt panel) and a `PLACEHOLDER` token replaces egui's 3.24:1 hint. Button shortcut hints are
+  derived from the button foreground and measured at 4.5:1 against the fill. Tests cover all five
+  label colours on ivory and forest at 3:1 and every text token at 4.5:1.
+- **Accessible rows.** Every message row is a named button (sender, subject, unread, attachment,
+  date, selection, "Premi Invio per aprire"); the star is its own 28×28 focusable control with a
+  "Segna con stella"/"Togli la stella" name and never opens the row. The focus ring follows real
+  keyboard focus (Tab reaches the list), not the selection, and uses an ivory inner edge on a
+  selected forest row.
+- **Read state.** Any explicit flag action (read/unread/star) cancels the 600 ms auto-read, even
+  when the flag is already in the requested state.
+- **Honest operational states.** `Aggiorna` is gone as an enabled no-op; a disabled `sync` item
+  says "La sincronizzazione arriva con IMAP". The status bar is `Demo` (a `Modalità demo` badge with
+  one sentence and the version), `Pronto` or `Errore`; errors are one dismissable toast with a retry
+  only for a list reload, and never a raw engine line. A loading line appears after 200 ms.
+- **One demo notice.** All milestone codes are gone from the product; the composer says
+  "Markdown", the drop zone "Gli allegati reali arrivano con l'invio", the label menu "Le etichette
+  sono locali", and `Invia (locale)` keeps its no-SMTP notice.
+- **Preferences.** Theme, reading-pane fraction, last folder and reduced motion persist in
+  `%APPDATA%\Postino\settings.json` (or the platform config directory); a missing or corrupt file
+  falls back to the defaults, and no draft text or message content is ever written.
+- **Keyboard.** Plain `J`/`K` move focus and collapse to that row (standard); `Shift+J`/`Shift+K`
+  extend from the anchor and keep the bulk bar while it is alive. The shortcut sheet lists both.
+- **Reduced motion.** `theme::apply_motion` sets `style.animation_time` to 0 for reduced motion;
+  every animation resolves on the first frame. The preference is persisted and exposed as "Riduci
+  le animazioni" in the palette.
+- Tests: empty resolver branches and rendered empty states, contrast tokens and computed button
+  hints, accessible row labels/star targets/focus ring, U/pending-read, settings round trip,
+  plain vs Shift J/K, loading delay, error toast, date column width and subject floor.
+  Screenshots: shell/reading at 1280×720 and 980×600, light and dark, compose, palette, empty
+  states and the refreshed attribution hashes.
 
 Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 
@@ -364,13 +432,22 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   compose, send, undo.
 - Clicking a row never selects text; the subject has consistent padding; no dead button.
 - The reading pane opens on click, expands on `Enter` or a row double-click, restores on a header
-  double-click, returns on `Esc`, and remembers per-message scroll. At 1280×720 with the pane open the
-  list is at least 460 px wide and the date column is dropped before the subject truncates.
+  double-click, returns on `Esc`, and remembers per-message scroll. At 1280×720 with the pane open
+  the list is about 499 px wide, keeps the compact date column and leaves the subject at least
+  260 px; the date is dropped only below 480 px of list panel.
 - The palette lists every command with its shortcut, is a modal with a scrim and no title bar, and
   works with arrows/Enter/Esc and an outside click.
+- A filter that empties the list is named in the empty state, with a way out; no folder is ever
+  called empty because of a filter.
 - The composer fits 980×600, from the header to Send/Cancel, with a body that scrolls and a scrim that
   blocks the shell; Esc keeps the unsaved guard.
-- Contrast and focus pass the checks in `docs/design.md`.
+- Contrast and focus pass the checks in `docs/design.md`; every gold mark on ivory uses `GOLD_INK`,
+  shortcut hints and placeholders clear 4.5:1.
+- Message rows are named buttons; the star has a 28×28 target and its own name; the focus ring is
+  reachable with Tab and distinct from selection.
+- `U` immediately after opening leaves the message unread after the auto-read delay; plain `J`/`K`
+  collapse to the focused row while `Shift+J`/`Shift+K` extend the batch from its anchor.
+- Theme, reading width, last folder and reduced motion survive a restart; no draft text does.
 - No ad-hoc literals in screens: spacing/type/radii/control sizes come from tokens.
 - `cargo xtask ci` stays green; headless tests cover the shell, gallery, palette, composer, sidebar
   drawer, pane proportions and double-click.

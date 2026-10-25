@@ -1,7 +1,7 @@
 # Development
 
 > **Status:** M0 + U0.5 labels + P3c engine on the encrypted store + P4a MIME crate + P4b encrypted
-> attachment blobs · **Last updated:** 2026-10-25
+> attachment blobs + P2b states/accessibility · **Last updated:** 2026-10-25
 
 ## 1. Toolchain
 
@@ -78,15 +78,18 @@ failed write returns `OpError::Failed` without changing memory. Moving, flagging
 renaming labels and saving/sending drafts all survive a restart.
 
 Attachment bytes live next to the database, not in it: `Store::open` also creates and opens
-`<db parent>/blobs`, one encrypted file per distinct content
-(`blobs/<xx>/<BLAKE3>.blob`, see `docs/architecture.md` §4.5). The blob key is derived from the same
-store key with HKDF-SHA256 (label `blob`), so a store without its keyring entry loses its attachments
-too. Back up the folder (database plus `blobs/`), not just the `.db` file. A damaged blob is
+`<db file>.blobs` (`mail.db` → `mail.db.blobs`), one encrypted file per distinct content
+(`mail.db.blobs/<xx>/<BLAKE3>.blob`, see `docs/architecture.md` §4.5). The blob key is derived from
+the same store key with HKDF-SHA256 (label `blob`), so a store without its keyring entry loses its
+attachments too. Back up or move the database file and its `.blobs` directory together; renaming one
+without the other leaves the attachment rows pointing at `BlobMissing`. A damaged blob is
 `CorruptBlob`; the engine reports it as `OpError::Failed` and leaves the message intact. `put`
-deduplicates on the file's existence, so a corrupt file has to be removed before the same content can
-be written again. There is no garbage collector yet: deleting a message leaves its blob, because the
-same content may belong to another message. Nothing in the CLI, the app or the operations calls the
-seam yet; sync (P5b) and the reading pane (P6) will.
+authenticates an existing file before it deduplicates, so storing the same bytes again repairs a
+damaged or foreign file; there is no separate repair command. A draft re-save keeps the stored hash
+and size of an attachment that survives, so a stale metadata size cannot shrink the read cap. There
+is no garbage collector yet: deleting a message leaves its blob, because the same content may belong
+to another message. Nothing in the CLI, the app or the operations calls the seam yet; sync (P5b) and
+the reading pane (P6) will.
 
 What is still demo or missing:
 
@@ -196,8 +199,11 @@ they have a reason to exist.
 - **Platform:** keyring load-or-create against `keyring_core::mock` only; the native vault is a
   manual, tagged smoke test and never part of the default suite.
 - **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery,
-  composer, sidebar label registry, label filter, inline create/rename and the multi-select label
-  undo path. The test asserts the shell paints at least one shape.
+  composer, sidebar label registry, label filter, inline create/rename, the multi-select label
+  undo path, the empty-state resolver and its three rendered filter states, contrast tokens and
+  computed button hints, accessible row names and star targets, keyboard focus, the auto-read
+  cancellation, the settings round trip and the plain/Shift J/K anchor. The test asserts the shell
+  paints at least one shape.
 - **Future:** a fake IMAP/SMTP server, property tests for the network parsers, fuzzing for MIME and
   HTML.
 
@@ -226,14 +232,22 @@ cargo run -p postino-app -- --screenshot compose --dark --out docs/images/postin
 cargo run -p postino-app -- --screenshot labels --out docs/images/postino-u05-labels.png
 cargo run -p postino-app -- --screenshot label_menu --out docs/images/postino-u05-label-menu.png
 cargo run -p postino-app -- --screenshot labels --size 980x600 --out tmp-labels-980.png
+cargo run -p postino-app -- --screenshot empty_unread --out docs/images/postino-p2b-empty-unread.png
+cargo run -p postino-app -- --screenshot empty_attachments --out docs/images/postino-p2b-empty-attachments.png
+cargo run -p postino-app -- --screenshot empty_label_unread --out docs/images/postino-p2b-empty-label-unread.png
+cargo run -p postino-app -- --screenshot shell --size 980x600 --out tmp-shell-980.png
 ```
 
-The states are `shell` (demo inbox, no selection), `reading` (first inbox message open), `compose`
-(the composer prefilled with the docs fixture), `palette` (command palette open), `labels` (Lavoro
-filter active, list visible), `label_menu` (a labelled message open with the modal label menu above
-its captured target) and `label_editor` (the inline create editor open under the ETICHETTE header
-with a name typed). `--dark` applies the dark theme. `--gallery` is a separate component review
-window, not a screenshot state, and cannot be combined with `--screenshot`.
+The states are `shell` (demo inbox, no selection), `reading` (first inbox message open),
+`reading_full` (the same message with the pane expanded), `compose` (the composer prefilled with
+the docs fixture), `palette` (command palette open), `labels` (Lavoro filter active, list visible),
+`label_menu` (a labelled message open with the modal label menu above its captured target),
+`label_editor` (the inline create editor open under the ETICHETTE header with a name typed),
+`empty_unread` (the inbox with every message read and the unread filter on), `empty_attachments`
+(inbox mail with attachments moved out and the attachments filter on) and `empty_label_unread`
+(Lavoro selected, its unread mail read, the unread filter on). `--dark` applies the dark theme.
+`--gallery` is a separate component review window, not a screenshot state, and cannot be combined
+with `--screenshot`.
 
 `--size WxH` sets the **logical** viewport. The default is 1280 × 720 and the minimum is 980 × 600.
 The PNG has the physical pixel size of that viewport: 1280 × 720 at 100% display scaling and
@@ -258,9 +272,26 @@ a value that is another flag are all refused. `--native-chrome` keeps the operat
 bar; on macOS the native title bar is always used. Screenshots otherwise use the same chrome rule
 as a normal startup.
 
-Only the images regenerated by the commands above come from the harness. The older `postino-m0`,
-`postino-u02*` and UI-kit images predate it and are not reproduced by it. Regenerating a committed
-image invalidates its SHA-256 in `ATTRIBUTION.toml`: update the affected `sha256` entries, run
+## 9.1 Preferences
+
+The app owns one small settings file, not eframe storage:
+`%APPDATA%\Postino\settings.json` on Windows, `$XDG_CONFIG_HOME/Postino/settings.json` (or
+`~/.config/Postino/settings.json`) elsewhere. It holds exactly five fields: theme (`dark`), the
+reading-pane fraction of the width left by the sidebar (`reading_pane_ratio`), the last folder id
+(`folder`) and `reduced_motion`, plus the schema `version`. Missing, truncated, unknown-version or
+out-of-range values fall back to the defaults (light, 0.52, `inbox`, motion on) without a dialog.
+The file is written atomically (`.tmp` then rename) at most once a second while a pane is dragged
+and once on exit; renaming, deleting or corrupting it is safe. It never carries draft text, message
+bodies, addresses or credentials, and a test asserts that.
+
+`POSTINO_REDUCE_MOTION=1` forces reduced motion for one session (the persisted preference works
+too, and "Riduci le animazioni" in the palette toggles it). Reduced motion sets
+`style.animation_time` to 0: every animation resolves on its first frame. Screenshot mode
+deliberately disables animations and never reads or writes this file.
+
+Only the images regenerated by the commands above come from the harness. The older `postino-m0` and
+UI-kit images predate it and are not reproduced by it. Regenerating a committed image invalidates
+its SHA-256 in `ATTRIBUTION.toml`: update the affected `sha256` entries, run
 `cargo xtask assets --write` to regenerate `ATTRIBUTION.md`, then run `cargo xtask assets` (or
 `cargo xtask ci`) to verify the hashes.
 

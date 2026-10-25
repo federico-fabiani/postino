@@ -3,7 +3,7 @@
 
 use eframe::egui::{Color32, CornerRadius, FontFamily, FontId, Response, Sense, TextWrapMode, Ui, Vec2, WidgetInfo, WidgetType, pos2};
 
-use crate::theme::{self, GOLD_INK};
+use crate::theme;
 use crate::ui::icons;
 use crate::ui::tokens::{self, radius, size, space, type_size};
 use crate::ui::widgets::{layout, paint_left, paint_right};
@@ -145,7 +145,7 @@ impl<'a> ListRow<'a> {
             ui.painter().rect_filled(rect, CornerRadius::same(radius::CONTROL), t.hover);
         }
         if self.focused || response.has_focus() {
-            tokens::paint_focus_ring(ui, rect, radius::CONTROL, &t);
+            tokens::paint_focus_ring_on(ui, rect, radius::CONTROL, &t, selected);
         }
 
         let foreground = if selected { t.selected_text } else { t.text };
@@ -167,7 +167,9 @@ impl<'a> ListRow<'a> {
         }
         if self.kind == ListRowKind::Message {
             if self.unread {
-                ui.painter().circle_filled(pos2(cursor + 3.0, rect.center().y), 3.0, t.gold);
+                // The 3 pt dot is the only unread cue on a light row: gold ink, not the decorative
+                // gold, because 1.55:1 is invisible. On the forest selection the light gold returns.
+                ui.painter().circle_filled(pos2(cursor + 3.0, rect.center().y), 3.0, if selected { t.gold } else { t.gold_ink });
             }
             cursor += 12.0;
             if self.show_avatar {
@@ -217,7 +219,7 @@ impl<'a> ListRow<'a> {
         }
         if self.kind == ListRowKind::Message {
             let star_color = if self.starred {
-                if selected { t.gold } else { GOLD_INK }
+                if selected { t.gold } else { t.gold_ink }
             } else if selected {
                 t.selected_muted
             } else {

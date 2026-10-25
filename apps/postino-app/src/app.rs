@@ -18,15 +18,17 @@ use postino_core::{
 };
 use serde_json::json;
 
+use crate::settings::Settings;
 use crate::theme::{self, GOLD, IVORY, Tokens};
 use crate::ui::icons;
+use crate::ui::tokens;
 use crate::ui::tokens::{inset, radius, size as ui_size, space, type_size};
 use crate::ui::typography::{self, Role};
 #[cfg(test)]
 use crate::ui::widgets::ComposerFocus;
 use crate::ui::widgets::{
-    AUTOSAVE_DELAY, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize, ListRow, Menu,
-    MenuItem, SearchField, SectionHeader, TextField, Toast, compose_body, quote_body, signature_body,
+    AUTOSAVE_DELAY, Badge, BadgeKind, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize,
+    ListRow, Menu, MenuItem, SearchField, SectionHeader, TextField, Toast, ToastKind, ToastResult, compose_body, quote_body, signature_body,
 };
 
 /// The shell scenes `--screenshot` can render. Add a label here and a branch in
@@ -35,11 +37,15 @@ use crate::ui::widgets::{
 pub enum ScreenshotState {
     Shell,
     Reading,
+    ReadingFull,
     Compose,
     Palette,
     Labels,
     LabelMenu,
     LabelEditor,
+    EmptyUnread,
+    EmptyAttachments,
+    EmptyLabelUnread,
 }
 
 impl ScreenshotState {
@@ -47,13 +53,18 @@ impl ScreenshotState {
         match name {
             "shell" => Ok(Self::Shell),
             "reading" => Ok(Self::Reading),
+            "reading_full" => Ok(Self::ReadingFull),
             "compose" => Ok(Self::Compose),
             "palette" => Ok(Self::Palette),
             "labels" => Ok(Self::Labels),
             "label_menu" => Ok(Self::LabelMenu),
             "label_editor" => Ok(Self::LabelEditor),
+            "empty_unread" => Ok(Self::EmptyUnread),
+            "empty_attachments" => Ok(Self::EmptyAttachments),
+            "empty_label_unread" => Ok(Self::EmptyLabelUnread),
             other => Err(format!(
-                "unknown screenshot state {other:?}; expected one of: shell, reading, compose, palette, labels, label_menu, label_editor"
+                "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
+                 empty_unread, empty_attachments, empty_label_unread"
             )),
         }
     }
@@ -128,6 +139,17 @@ pub struct PostinoApp {
     attachments_only: bool,
     dark: bool,
     status: String,
+    /// One Italian sentence for the current operation failure. While it is set the status bar says
+    /// `Errore` and a toast carries the sentence; the raw engine error never reaches the UI.
+    failure: Option<Failure>,
+    /// A list read that already reported its failure must not re-open the same toast every frame
+    /// after the user dismisses it.
+    list_error_ack: bool,
+    /// The folder/filters the acknowledgement belongs to. A new view retries the read and may
+    /// report a new failure.
+    list_signature: String,
+    /// When a long operation started, for the delayed loading line.
+    loading: Option<f64>,
     show_about: bool,
     show_palette: bool,
     palette_query: String,
@@ -145,6 +167,15 @@ pub struct PostinoApp {
     custom_chrome: bool,
     reading_open: bool,
     reading_full: bool,
+    /// The saved fraction of the width left by the sidebar. The pane is resizable; the last width
+    /// that fits the clamps is written back to settings.
+    reading_ratio: f32,
+    reduced_motion: bool,
+    /// `None` in screenshot mode and in tests, so a docs capture never reads or writes the
+    /// user's preferences.
+    settings_path: Option<PathBuf>,
+    settings_dirty: bool,
+    settings_saved_at: f64,
     composer: ComposerState,
     /// The widget that owned the keyboard when the composer opened. Closing the modal returns
     /// focus there instead of dropping the user on the shell with no focus at all.
@@ -161,8 +192,17 @@ pub struct PostinoApp {
 impl PostinoApp {
     pub fn new(cc: &eframe::CreationContext<'_>, custom_chrome: bool) -> Self {
         theme::install_fonts(&cc.egui_ctx);
-        theme::apply(&cc.egui_ctx, false);
-        Self::demo(custom_chrome)
+        let settings_path = Settings::path();
+        let settings = settings_path.as_deref().map_or_else(Settings::default, Settings::load_from);
+        theme::apply(&cc.egui_ctx, settings.dark);
+        let reduced = settings.reduced_motion || crate::settings::reduced_motion_from_env();
+        theme::apply_motion(&cc.egui_ctx, reduced);
+        let mut app = Self::demo(custom_chrome);
+        app.reading_ratio = settings.reading_pane_ratio;
+        app.apply_settings(settings);
+        app.reduced_motion = reduced;
+        app.settings_path = settings_path;
+        app
     }
 
     /// Build the shell in the exact state a docs screenshot shows. Used only by `--screenshot`;
@@ -205,7 +245,66 @@ impl PostinoApp {
                     self.now = 1.0;
                     self.maybe_complete_read();
                     self.toast = None;
+                    self.status.clear();
                 }
+            }
+            ScreenshotState::ReadingFull => {
+                let first = self.visible_messages().0.first().map(|message| message.id.clone());
+                if let Some(id) = first {
+                    self.open_message(id);
+                    self.now = 1.0;
+                    self.maybe_complete_read();
+                    self.toast = None;
+                    self.status.clear();
+                    self.reading_full = true;
+                }
+            }
+            ScreenshotState::EmptyUnread => {
+                let ids = self
+                    .engine
+                    .messages()
+                    .iter()
+                    .filter(|message| message.summary.folder_id == "inbox" && message.summary.unread)
+                    .map(|message| message.summary.id.clone())
+                    .collect::<Vec<_>>();
+                for id in ids {
+                    let _ = self.engine.call("message_flag", json!({ "id": id, "unread": false, "starred": null }));
+                }
+                self.refresh_labels();
+                self.unread_only = true;
+                self.clear_selection();
+            }
+            ScreenshotState::EmptyAttachments => {
+                // Inbox mail with an attachment is moved out, so the attachments filter is the only
+                // reason the list is empty. The copy names the filter, not an empty folder.
+                let ids = self
+                    .engine
+                    .messages()
+                    .iter()
+                    .filter(|message| message.summary.folder_id == "inbox" && message.summary.has_attachments)
+                    .map(|message| message.summary.id.clone())
+                    .collect::<Vec<_>>();
+                for id in ids {
+                    let _ = self.engine.call("message_move", json!({ "id": id, "folder": "archive" }));
+                }
+                self.refresh_labels();
+                self.attachments_only = true;
+                self.clear_selection();
+            }
+            ScreenshotState::EmptyLabelUnread => {
+                self.select_label("lbl_1".to_owned());
+                let ids = self
+                    .engine
+                    .messages()
+                    .iter()
+                    .filter(|message| message.summary.unread && message.summary.labels.iter().any(|id| id == "lbl_1"))
+                    .map(|message| message.summary.id.clone())
+                    .collect::<Vec<_>>();
+                for id in ids {
+                    let _ = self.engine.call("message_flag", json!({ "id": id, "unread": false, "starred": null }));
+                }
+                self.refresh_labels();
+                self.unread_only = true;
             }
             ScreenshotState::Compose => {
                 let mut composer = ComposerState::new(ComposeMode::New);
@@ -255,6 +354,7 @@ impl PostinoApp {
                     self.now = 1.0;
                     self.maybe_complete_read();
                     self.toast = None;
+                    self.status.clear();
                     // The captured targets are the visible message; the Lavoro chip stays visible in
                     // the reading pane behind the modal scrim.
                     self.open_label_menu(vec![id]);
@@ -288,7 +388,11 @@ impl PostinoApp {
             unread_only: false,
             attachments_only: false,
             dark: false,
-            status: "Demo · dati sintetici, nessun server collegato".to_owned(),
+            status: String::new(),
+            failure: None,
+            list_error_ack: false,
+            list_signature: String::new(),
+            loading: None,
             show_about: false,
             show_palette: false,
             palette_query: String::new(),
@@ -304,6 +408,11 @@ impl PostinoApp {
             custom_chrome,
             reading_open: false,
             reading_full: false,
+            reading_ratio: READING_PANE_DEFAULT_RATIO,
+            reduced_motion: false,
+            settings_path: None,
+            settings_dirty: false,
+            settings_saved_at: 0.0,
             composer: ComposerState::closed(),
             composer_return_focus: None,
             composer_focus_pending: false,
@@ -311,6 +420,234 @@ impl PostinoApp {
             focus_selected_row: false,
             screenshot: None,
         }
+    }
+
+    /// Adopt a loaded settings file. The folder is only accepted when the engine knows it; a
+    /// settings file from another mailbox falls back to the inbox instead of opening a blank view.
+    fn apply_settings(&mut self, settings: Settings) {
+        self.dark = settings.dark;
+        self.folder = if self.engine.folders().iter().any(|folder| folder.id == settings.folder) { settings.folder } else { "inbox".to_owned() };
+        self.reading_ratio = settings.reading_pane_ratio;
+        self.reduced_motion = settings.reduced_motion;
+    }
+
+    fn settings_snapshot(&self) -> Settings {
+        Settings {
+            version: crate::settings::SETTINGS_VERSION,
+            dark: self.dark,
+            reading_pane_ratio: self.reading_ratio,
+            folder: self.folder.clone(),
+            reduced_motion: self.reduced_motion,
+        }
+    }
+
+    fn mark_settings_dirty(&mut self) {
+        self.settings_dirty = true;
+        self.settings_saved_at = self.now;
+    }
+
+    fn persist_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        if let Err(error) = self.settings_snapshot().save_to(&path) {
+            // The path is not mail data, but keep the message generic: a settings failure must not
+            // become a product error dialog on the next launch.
+            log::warn!("settings could not be saved: {error}");
+        }
+        self.settings_dirty = false;
+        self.settings_saved_at = self.now;
+    }
+
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        theme::apply(ctx, self.dark);
+        theme::apply_motion(ctx, self.reduced_motion);
+    }
+
+    fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
+        self.dark = dark;
+        self.apply_theme(ctx);
+        self.mark_settings_dirty();
+        self.persist_settings();
+    }
+
+    fn set_reduced_motion(&mut self, ctx: &egui::Context, reduced: bool) {
+        self.reduced_motion = reduced;
+        self.apply_theme(ctx);
+        self.mark_settings_dirty();
+        self.persist_settings();
+    }
+
+    /// The honest tri-state shown by the status bar. `Errore` is a real failure that has not been
+    /// dismissed; `Pronto` is a store-backed engine; `Demo` is synthetic mail in memory.
+    fn status_kind(&self) -> StatusKind {
+        status_kind(self.engine.is_demo(), self.failure.is_some())
+    }
+
+    /// One place for every operation failure: an Italian sentence, a red status dot and a single
+    /// toast with a dismiss control. The raw engine error stays out of the UI.
+    fn report_failure(&mut self, message: impl Into<String>, retry_list: bool) {
+        self.failure = Some(Failure { message: message.into(), retry_list });
+        self.toast = None;
+        // The failure owns the message surface; a stale confirmation in the status bar would read
+        // like a second, contradictory account of the same operation.
+        self.status.clear();
+    }
+
+    fn dismiss_failure(&mut self) {
+        if self.failure.as_ref().is_some_and(|failure| failure.retry_list) {
+            self.list_error_ack = true;
+        }
+        self.failure = None;
+    }
+
+    fn retry_failure(&mut self) {
+        self.failure = None;
+        self.list_error_ack = false;
+        let (rows, _, _) = self.visible_messages();
+        if self.failure.is_none() {
+            self.status = "Elenco aggiornato".to_owned();
+            if rows.is_empty() {
+                self.status = "Elenco aggiornato · nessun messaggio".to_owned();
+            }
+        }
+    }
+
+    /// Mark a long operation as running. The line only appears after [`LOADING_DELAY`], so a
+    /// synchronous local call that returns within one frame never flickers.
+    fn begin_loading(&mut self) {
+        if self.loading.is_none() {
+            self.loading = Some(self.now);
+        }
+    }
+
+    fn end_loading(&mut self) {
+        self.loading = None;
+    }
+
+    fn loading_visible(&self) -> bool {
+        self.loading.is_some_and(|started| self.now - started >= LOADING_DELAY)
+    }
+
+    /// The filter-aware empty state. The order is search → label → unread → attachments → drafts →
+    /// folder, so a filter is always named as the cause and a folder is never called empty when a
+    /// filter produced the result. Each branch offers at most two ways out, and every action changes
+    /// something visible.
+    fn empty_view(&self, label_name: Option<&str>, label_scope: Option<&str>) -> EmptyView {
+        let query = self.query.trim();
+        let scope = label_scope.unwrap_or("in questa cartella");
+        if !query.is_empty() {
+            let search_scope = match (label_name, label_scope) {
+                (Some(name), Some(folder)) if folder != "in tutte le cartelle" => format!("nell'etichetta “{name}” {folder}"),
+                (Some(name), _) => format!("nell'etichetta “{name}”"),
+                _ => "in tutte le cartelle".to_owned(),
+            };
+            let primary = ("Cancella ricerca", EmptyAction::ClearSearch);
+            let secondary = label_name.map(|_| ("Togli filtro etichetta", EmptyAction::ClearLabel));
+            return EmptyView {
+                icon: icons::SEARCH,
+                title: "Nessun risultato".to_owned(),
+                body: format!("Nessun messaggio corrisponde a “{query}” {search_scope}."),
+                primary: Some(primary),
+                secondary,
+            };
+        }
+        if let Some(name) = label_name {
+            if self.unread_only {
+                return EmptyView {
+                    icon: icons::MARK_UNREAD,
+                    title: format!("Nessun messaggio non letto con l'etichetta “{name}”"),
+                    body: format!("Nessun messaggio non letto con l'etichetta “{name}” {scope}."),
+                    primary: Some(("Togli filtro “non letti”", EmptyAction::ClearUnread)),
+                    secondary: None,
+                };
+            }
+            if self.attachments_only {
+                return EmptyView {
+                    icon: icons::PAPERCLIP,
+                    title: "Nessun messaggio con allegati".to_owned(),
+                    body: format!("Nessun messaggio con allegati ha l'etichetta “{name}” {scope}."),
+                    primary: Some(("Togli filtro “allegati”", EmptyAction::ClearAttachments)),
+                    secondary: Some(("Togli filtro etichetta", EmptyAction::ClearLabel)),
+                };
+            }
+            return EmptyView {
+                icon: icons::TAG,
+                title: "Nessun messaggio".to_owned(),
+                body: format!("Nessun messaggio con l'etichetta “{name}” {scope}."),
+                primary: Some(("Togli filtro etichetta", EmptyAction::ClearLabel)),
+                secondary: Some(("Mostra tutti", EmptyAction::ShowAll)),
+            };
+        }
+        if self.unread_only {
+            return EmptyView {
+                icon: icons::MARK_UNREAD,
+                title: "Nessun messaggio non letto".to_owned(),
+                body: "In questa cartella non ci sono messaggi non letti.".to_owned(),
+                primary: Some(("Mostra tutti", EmptyAction::ShowAll)),
+                secondary: None,
+            };
+        }
+        if self.attachments_only {
+            return EmptyView {
+                icon: icons::PAPERCLIP,
+                title: "Nessun messaggio con allegati".to_owned(),
+                body: "In questa cartella non ci sono messaggi con allegati.".to_owned(),
+                primary: Some(("Mostra tutti", EmptyAction::ShowAll)),
+                secondary: None,
+            };
+        }
+        if self.folder == "drafts" {
+            return EmptyView {
+                icon: icons::DRAFTS,
+                title: "Nessuna bozza".to_owned(),
+                body: "Le bozze si salvano da sole mentre scrivi.".to_owned(),
+                primary: Some(("Scrivi", EmptyAction::Compose)),
+                secondary: None,
+            };
+        }
+        if self.folder == "inbox" {
+            return EmptyView {
+                icon: icons::INBOX,
+                title: "Nessun messaggio".to_owned(),
+                body: "La posta in arrivo è vuota.".to_owned(),
+                primary: None,
+                secondary: None,
+            };
+        }
+        EmptyView {
+            icon: icons::INBOX,
+            title: "Nessun messaggio".to_owned(),
+            body: "Questa cartella è vuota.".to_owned(),
+            primary: Some(("Vai a Posta in arrivo", EmptyAction::Inbox)),
+            secondary: None,
+        }
+    }
+
+    fn apply_empty_action(&mut self, action: EmptyAction) {
+        match action {
+            EmptyAction::ShowAll => {
+                self.query.clear();
+                self.unread_only = false;
+                self.attachments_only = false;
+                self.label_filter = None;
+                self.label_folder = None;
+                self.clear_selection();
+                self.reading_open = false;
+            }
+            EmptyAction::ClearLabel => {
+                // The label filter goes; an explicit folder narrowing stays, so the header visibly
+                // changes instead of looking untouched.
+                self.label_filter = None;
+                self.label_folder = None;
+            }
+            EmptyAction::ClearUnread => self.unread_only = false,
+            EmptyAction::ClearAttachments => self.attachments_only = false,
+            EmptyAction::ClearSearch => self.query.clear(),
+            EmptyAction::Compose => self.compose_new(),
+            EmptyAction::Inbox => self.select_folder("inbox"),
+        }
+        self.list_error_ack = false;
     }
 
     fn select_folder(&mut self, folder: impl Into<String>) {
@@ -326,10 +663,15 @@ impl PostinoApp {
         self.clear_selection();
         self.reading_open = false;
         self.reading_full = false;
+        self.list_error_ack = false;
+        self.mark_settings_dirty();
+        self.persist_settings();
     }
 
     fn refresh_labels(&mut self) {
+        self.begin_loading();
         self.labels_cache = self.engine.label_summaries();
+        self.end_loading();
     }
 
     fn label_summary(&self, id: &str) -> Option<&LabelSummary> {
@@ -396,7 +738,7 @@ impl PostinoApp {
 
     fn start_label_rename(&mut self, id: &str) {
         let Some(label) = self.engine.label(id) else {
-            self.status = format!("Etichetta {id:?} non trovata");
+            self.report_failure("Etichetta non trovata.", false);
             return;
         };
         self.label_menu = None;
@@ -484,7 +826,7 @@ impl PostinoApp {
 
     fn request_label_delete(&mut self, id: &str) {
         let Some(label) = self.engine.label(id) else {
-            self.status = format!("Etichetta {id:?} non trovata");
+            self.report_failure("Etichetta non trovata.", false);
             return;
         };
         let message_ids = self
@@ -521,9 +863,9 @@ impl PostinoApp {
                         UndoAction::LabelDelete { name: deleted.label.name, color: deleted.label.color, message_ids: state.message_ids.clone() },
                     );
                 }
-                Err(error) => self.status = format!("Errore: {error}"),
+                Err(_) => self.report_failure("Non è stato possibile eliminare l'etichetta.", false),
             },
-            Err(error) => self.status = format!("Errore: {error}"),
+            Err(_) => self.report_failure("Non è stato possibile eliminare l'etichetta.", false),
         }
     }
 
@@ -588,7 +930,7 @@ impl PostinoApp {
             return;
         }
         let Some(label) = self.engine.label(id).cloned() else {
-            self.status = format!("Etichetta {id:?} non trovata");
+            self.report_failure("Etichetta non trovata.", false);
             return;
         };
         let before = ids
@@ -612,9 +954,9 @@ impl PostinoApp {
                     self.status = message.clone();
                     self.push_toast(message, UndoAction::Labels(before));
                 }
-                Err(error) => self.status = format!("Errore: {error}"),
+                Err(_) => self.report_failure("Non è stato possibile applicare l'etichetta.", false),
             },
-            Err(error) => self.status = format!("Errore: {error}"),
+            Err(_) => self.report_failure("Non è stato possibile applicare l'etichetta.", false),
         }
     }
 
@@ -737,6 +1079,9 @@ impl PostinoApp {
             self.pending_read = None;
             return;
         }
+        // The focus row is always inside the batch: a plain J/K collapses to it, Shift+J/K keeps
+        // the whole range selected. A row that left the list moves the focus to the last visible
+        // selection.
         if let Some(selected) = self.selected.as_deref()
             && !self.selection.contains(selected)
         {
@@ -776,6 +1121,8 @@ impl PostinoApp {
         if ids.len() < 2 {
             return;
         }
+        #[cfg(test)]
+        probe::bulk_bar(ui, ui.available_rect_before_wrap());
         let all_starred = ids.iter().all(|id| self.engine.message(id).is_some_and(|message| message.summary.starred));
         let mut action = None;
         ui.horizontal(|ui| {
@@ -865,8 +1212,8 @@ impl PostinoApp {
             };
             match self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
                 Ok(_) => moved.push((id.clone(), previous)),
-                Err(error) => {
-                    self.status = format!("Errore: {error}");
+                Err(_) => {
+                    self.report_failure("Non è stato possibile spostare il messaggio.", false);
                     return;
                 }
             }
@@ -903,6 +1250,8 @@ impl PostinoApp {
         } else if self.reading_open {
             self.open_message(message.id.clone());
         } else {
+            // Plain J/K move the focus and collapse to that row, as in a standard list. Shift+J/K
+            // is the way to keep a batch and its anchor alive.
             self.focus_message(message.id.clone());
         }
         self.scroll_to_selected = true;
@@ -911,9 +1260,16 @@ impl PostinoApp {
 
     fn set_flag_for(&mut self, id: &str, unread: Option<bool>, starred: Option<bool>) -> bool {
         match self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
-            Ok(_) => true,
-            Err(error) => {
-                self.status = format!("Errore: {error}");
+            Ok(_) => {
+                // Any explicit flag action wins over the 600 ms auto-read. Otherwise pressing U
+                // right after opening would be overwritten by the timer.
+                if self.pending_read.as_ref().is_some_and(|pending| pending.id == id) {
+                    self.pending_read = None;
+                }
+                true
+            }
+            Err(_) => {
+                self.report_failure("Non è stato possibile aggiornare il messaggio.", false);
                 false
             }
         }
@@ -945,6 +1301,13 @@ impl PostinoApp {
     }
 
     fn set_starred_many(&mut self, ids: &[String], starred: bool) {
+        // An explicit flag action always wins over the pending auto-read, even when the flag is
+        // already in the requested state and no engine call is needed.
+        for id in ids {
+            if self.pending_read.as_ref().is_some_and(|pending| &pending.id == id) {
+                self.pending_read = None;
+            }
+        }
         let mut changes = Vec::new();
         for id in ids {
             let Some(previous) = self.engine.message(id).map(|message| message.summary.starred) else {
@@ -987,6 +1350,12 @@ impl PostinoApp {
     }
 
     fn set_unread_many(&mut self, ids: &[String], unread: bool) {
+        // U on an already-unread message is still an explicit action: it must cancel the timer.
+        for id in ids {
+            if self.pending_read.as_ref().is_some_and(|pending| &pending.id == id) {
+                self.pending_read = None;
+            }
+        }
         let mut changes = Vec::new();
         for id in ids {
             let Some(previous) = self.engine.message(id).map(|message| message.summary.unread) else {
@@ -1031,6 +1400,7 @@ impl PostinoApp {
     }
 
     fn push_toast(&mut self, message: impl Into<String>, undo: UndoAction) {
+        self.failure = None;
         self.toast = Some(ToastState { message: message.into(), undo, until: self.now + 8.0 });
     }
 
@@ -1038,42 +1408,41 @@ impl PostinoApp {
         let Some(toast) = self.toast.take() else {
             return;
         };
-        let mut error = None;
+        let mut failed = false;
         match toast.undo {
             UndoAction::Unread(changes) => {
                 for (id, unread) in changes {
-                    if let Err(cause) = self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": null })) {
-                        error = Some(cause);
+                    if self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": null })).is_err() {
+                        failed = true;
                         break;
                     }
                 }
             }
             UndoAction::Starred(changes) => {
                 for (id, starred) in changes {
-                    if let Err(cause) = self.engine.call("message_flag", json!({ "id": id, "unread": null, "starred": starred })) {
-                        error = Some(cause);
+                    if self.engine.call("message_flag", json!({ "id": id, "unread": null, "starred": starred })).is_err() {
+                        failed = true;
                         break;
                     }
                 }
             }
             UndoAction::Move(changes) => {
                 for (id, folder) in changes {
-                    if let Err(cause) = self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
-                        error = Some(cause);
+                    if self.engine.call("message_move", json!({ "id": id, "folder": folder })).is_err() {
+                        failed = true;
                         break;
                     }
                 }
             }
             UndoAction::Send(id) => {
-                if let Err(cause) = self.engine.call("message_move", json!({ "id": id, "folder": "drafts" })) {
-                    error = Some(cause);
+                if self.engine.call("message_move", json!({ "id": id, "folder": "drafts" })).is_err() {
+                    failed = true;
                 }
             }
             UndoAction::Labels(changes) => {
                 for (message_id, label_id, was_applied) in changes {
-                    if let Err(cause) = self.engine.call("label_apply", json!({ "id": label_id, "message_ids": [message_id], "apply": was_applied }))
-                    {
-                        error = Some(cause);
+                    if self.engine.call("label_apply", json!({ "id": label_id, "message_ids": [message_id], "apply": was_applied })).is_err() {
+                        failed = true;
                         break;
                     }
                 }
@@ -1085,34 +1454,49 @@ impl PostinoApp {
                         // A deleted label can carry more assignments than one `label_apply` call
                         // accepts (500), so restore in chunks instead of failing halfway.
                         for chunk in ids.chunks(LABEL_APPLY_CHUNK) {
-                            if let Err(cause) =
-                                self.engine.call("label_apply", json!({ "id": created.label.id, "message_ids": chunk, "apply": true }))
-                            {
-                                error = Some(cause);
+                            if self.engine.call("label_apply", json!({ "id": created.label.id, "message_ids": chunk, "apply": true })).is_err() {
+                                failed = true;
                                 break;
                             }
                         }
                     }
-                    Err(cause) => error = Some(postino_core::OpError::Failed(cause.to_string())),
+                    Err(_) => failed = true,
                 },
-                Err(cause) => error = Some(cause),
+                Err(_) => failed = true,
             },
             UndoAction::LabelRename { id, name, color } => {
-                if let Err(cause) = self.engine.call("label_update", json!({ "id": id, "name": name, "color": color })) {
-                    error = Some(cause);
+                if self.engine.call("label_update", json!({ "id": id, "name": name, "color": color })).is_err() {
+                    failed = true;
                 }
             }
         }
-        if error.is_none() {
+        if failed {
+            self.report_failure("Non è stato possibile annullare l'azione.", false);
+        } else {
             self.refresh_labels();
-        }
-        match error {
-            Some(error) => self.status = format!("Errore: {error}"),
-            None => self.status = "Annullato".to_owned(),
+            self.status = "Annullato".to_owned();
         }
     }
 
+    /// Report a list failure once. `visible_messages` runs on every frame, so re-reporting after
+    /// the user dismisses the toast would trap them in a loop; a retry or a view change clears the
+    /// acknowledgement.
+    fn report_list_failure(&mut self) {
+        if self.list_error_ack || self.failure.is_some() {
+            return;
+        }
+        self.report_failure("Non è stato possibile leggere i messaggi. Riprova.", true);
+    }
+
     fn visible_messages(&mut self) -> (Vec<MessageSummary>, usize, usize) {
+        // A changed folder or filter is a fresh read: let it report a failure even if the previous
+        // view's toast was dismissed.
+        let signature =
+            format!("{}|{}|{}|{}|{:?}|{:?}", self.folder, self.query, self.unread_only, self.attachments_only, self.label_filter, self.label_folder);
+        if signature != self.list_signature {
+            self.list_signature = signature;
+            self.list_error_ack = false;
+        }
         let searching = !self.query.trim().is_empty();
         // A label view spans every folder until the user narrows it. A plain view is one folder.
         let label_scoped = self.label_filter.is_some();
@@ -1146,20 +1530,20 @@ impl PostinoApp {
                     let total = rows.len();
                     (rows, total, unread)
                 }
-                Err(error) => {
-                    self.status = format!("Errore: {error}");
+                Err(_) => {
+                    self.report_list_failure();
                     (Vec::new(), 0, 0)
                 }
             },
             Ok(value) => match serde_json::from_value::<MessagesList>(value) {
                 Ok(result) => (result.messages, result.total, result.unread),
-                Err(error) => {
-                    self.status = format!("Errore: {error}");
+                Err(_) => {
+                    self.report_list_failure();
                     (Vec::new(), 0, 0)
                 }
             },
-            Err(error) => {
-                self.status = format!("Errore: {error}");
+            Err(_) => {
+                self.report_list_failure();
                 (Vec::new(), 0, 0)
             }
         }
@@ -1239,11 +1623,15 @@ impl PostinoApp {
         // is also true for a focused row or button, and clicking a label left the app deaf to
         // F2/L/J/K/? until Esc.
         let typing = ctx.text_edit_focused();
+        // Enter opens a message only from the list (or from nowhere); a focused star or toolbar
+        // control keeps Enter for its own activation.
+        let focused_widget = ctx.memory(|memory| memory.focused());
+        let row_focused = focused_widget.is_none() || focused_widget.is_some_and(|id| self.row_ids.values().any(|row| *row == id));
         ctx.input(|input| {
             palette = input.modifiers.command && input.key_pressed(Key::K);
             escape = input.key_pressed(Key::Escape);
             shortcuts = !typing && !input.modifiers.command && input.key_pressed(Key::Questionmark);
-            enter = !typing && !input.modifiers.command && input.key_pressed(Key::Enter);
+            enter = !typing && !input.modifiers.command && input.key_pressed(Key::Enter) && row_focused;
             open = !typing && !input.modifiers.command && input.key_pressed(Key::O);
             next = !typing && !input.modifiers.command && (input.key_pressed(Key::J) || input.key_pressed(Key::ArrowDown));
             previous = !typing && !input.modifiers.command && (input.key_pressed(Key::K) || input.key_pressed(Key::ArrowUp));
@@ -1253,7 +1641,7 @@ impl PostinoApp {
             archive = !typing && !input.modifiers.command && input.key_pressed(Key::E);
             delete = !typing && !input.modifiers.command && input.key_pressed(Key::Delete);
             undo = !typing && !input.modifiers.command && input.key_pressed(Key::Z);
-            toggle = !typing && !input.modifiers.command && (input.key_pressed(Key::Space) || input.key_pressed(Key::X));
+            toggle = !typing && !input.modifiers.command && row_focused && (input.key_pressed(Key::Space) || input.key_pressed(Key::X));
             select_all = !typing && input.modifiers.command && input.key_pressed(Key::A);
             focus_search = !typing && !input.modifiers.command && input.key_pressed(Key::Slash);
             compose = !typing && !input.modifiers.command && input.key_pressed(Key::C);
@@ -1530,15 +1918,15 @@ impl PostinoApp {
                     }
                     true
                 }
-                Err(error) => {
-                    self.composer.mark_failed(format!("risposta non valida: {error}"), self.now);
+                Err(_) => {
+                    self.composer.mark_failed("Non è stato possibile salvare la bozza.", self.now);
                     false
                 }
             },
-            Err(error) => {
-                self.composer.mark_failed(error.to_string(), self.now);
+            Err(_) => {
+                self.composer.mark_failed("Non è stato possibile salvare la bozza.", self.now);
                 if notify {
-                    self.status = format!("Errore: {error}");
+                    self.status = "La bozza non è stata salvata".to_owned();
                 }
                 false
             }
@@ -1570,9 +1958,9 @@ impl PostinoApp {
                     );
                     self.push_toast("Bozza spostata in Inviati: nessun messaggio è stato inviato", UndoAction::Send(id));
                 }
-                Err(error) => self.composer.mark_failed(format!("risposta non valida: {error}"), self.now),
+                Err(_) => self.composer.mark_failed("Non è stato possibile inviare la bozza.", self.now),
             },
-            Err(error) => self.composer.mark_failed(error.to_string(), self.now),
+            Err(_) => self.composer.mark_failed("Non è stato possibile inviare la bozza.", self.now),
         }
     }
 
@@ -1599,7 +1987,7 @@ impl PostinoApp {
                     self.status = "Bozza spostata nel cestino".to_owned();
                     self.push_toast("Bozza scartata", UndoAction::Move(vec![(id, "drafts".to_owned())]));
                 }
-                Err(error) => self.composer.mark_failed(error.to_string(), self.now),
+                Err(_) => self.composer.mark_failed("Non è stato possibile spostare la bozza nel cestino.", self.now),
             }
             return;
         }
@@ -1632,18 +2020,63 @@ impl PostinoApp {
         } else if let Some(toast) = &self.toast {
             ctx.request_repaint_after(Duration::from_secs_f64((toast.until - self.now).max(0.0)));
         }
+        // Debounce a pane drag: the final fraction is written once the user stops moving, and again
+        // on exit. Screenshots and tests own no settings file and never write one.
+        if self.settings_dirty && self.screenshot.is_none() && self.now - self.settings_saved_at >= SETTINGS_SAVE_DELAY {
+            self.persist_settings();
+        }
+        if let Some(started) = self.loading
+            && self.now - started < LOADING_DELAY
+        {
+            ctx.request_repaint_after(Duration::from_secs_f64(LOADING_DELAY - (self.now - started)));
+        }
     }
 
     fn toast_overlay(&mut self, ctx: &egui::Context) {
+        // A failure is one toast with a dismiss control and, only for the list, a retry. It replaces
+        // the undo toast instead of stacking two messages about the same operation.
+        if let Some(failure) = self.failure.clone() {
+            let toast = Toast::new(failure.message.as_str()).kind(ToastKind::Error).dismiss();
+            let toast = if failure.retry_list { toast.action("Riprova") } else { toast };
+            match toast.show_overlay(ctx, "postino-toast") {
+                Some(ToastResult::Action) => self.retry_failure(),
+                Some(ToastResult::Dismiss) => self.dismiss_failure(),
+                _ => {}
+            }
+            return;
+        }
         let Some(state) = &self.toast else {
             return;
         };
         let message = state.message.clone();
-        if let Some(response) = Toast::new(&message).undo("Annulla").show_overlay(ctx, "postino-toast")
-            && response.clicked()
-        {
+        if let Some(ToastResult::Undo) = Toast::new(&message).undo("Annulla").show_overlay(ctx, "postino-toast") {
             self.undo_last();
         }
+    }
+
+    /// The quiet loading line under the toolbar. It is painted only after [`LOADING_DELAY`]; the
+    /// fade uses the same global animation switch, so reduced motion draws it at full alpha at once.
+    fn loading_line(&mut self, ui: &Ui) {
+        #[cfg(test)]
+        probe::clear_loading(ui);
+        if !self.loading_visible() {
+            return;
+        }
+        let content = ui.ctx().content_rect();
+        let chrome = if self.custom_chrome { ui_size::TITLE_BAR } else { 0.0 };
+        let top = content.top() + chrome + ui_size::TOOLBAR;
+        let rect = Rect::from_min_size(pos2(content.left(), top), Vec2::new(content.width(), 2.0));
+        let progress = ui.ctx().animate_bool_with_time(Id::new("postino-loading"), true, theme::motion_seconds(ui.ctx(), 0.12));
+        let t = theme::tokens(self.dark);
+        let color = if self.dark { t.gold } else { t.gold_ink };
+        let alpha = u8::try_from((progress.clamp(0.0, 1.0) * 255.0).round() as i32).unwrap_or(255);
+        // A foreground-layer painter keeps the line above the list and sidebar panels, which are
+        // added after this call and would otherwise paint over a hairline at their top edge.
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, Id::new("postino-loading-line")));
+        painter.rect_filled(rect, CornerRadius::same(0), Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha));
+        #[cfg(test)]
+        probe::loading(ui, rect, progress);
+        ui.ctx().request_repaint();
     }
 
     fn title_bar(&mut self, ui: &mut Ui) {
@@ -1777,8 +2210,8 @@ impl PostinoApp {
                     ui.add_space(space::SM);
                     let theme_icon = if self.dark { icons::SUN } else { icons::MOON };
                     if IconButton::new(theme_icon, "Cambia tema").show(ui).clicked() {
-                        self.dark = !self.dark;
-                        theme::apply(ui.ctx(), self.dark);
+                        let dark = !self.dark;
+                        self.set_dark(ui.ctx(), dark);
                     }
                 });
             });
@@ -1800,21 +2233,9 @@ impl PostinoApp {
                 let mut label_action = None;
                 let mut editor_action = LabelEditorAction::None;
 
-                // Panels nest in the order they are added. The footer is the outermost bottom
-                // panel, the label drawer sits directly above it, and the folder/label list scrolls
-                // in what remains. Opening the editor therefore never moves the list: it shrinks
-                // the viewport, it does not scroll it.
-                let footer = egui::Panel::bottom("sidebar-footer").exact_size(42.0).frame(Frame::NONE).show_separator_line(false).show(ui, |ui| {
-                    ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                        ui.label(typography::text(Role::Caption, format!("Postino {} · M0 + U0.5", env!("CARGO_PKG_VERSION")), t.text_faint));
-                        ui.label(typography::text(Role::Caption, "Locale · offline", t.text_faint));
-                    });
-                });
-                #[cfg(test)]
-                probe::sidebar_footer(ui, footer.response.rect);
-                #[cfg(not(test))]
-                let _ = footer;
-
+                // Panels nest in the order they are added. The label drawer is a bottom panel, and
+                // the folder/label list scrolls in what remains: opening the editor shrinks the
+                // viewport and never moves the list.
                 if self.label_editor.is_some() {
                     let drawer = egui::Panel::bottom("sidebar-editor")
                         .exact_size(ui_size::LABEL_EDITOR_DRAWER)
@@ -1884,8 +2305,8 @@ impl PostinoApp {
                             response.context_menu(|ui| {
                                 let items = [
                                     menu_item("label_new"),
-                                    MenuItem::new("Rinomina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
-                                    MenuItem::new("Elimina").enabled(false).reason("Le cartelle locali arrivano con lo store M1"),
+                                    MenuItem::new("Rinomina").enabled(false).reason("La modifica delle cartelle arriva con IMAP"),
+                                    MenuItem::new("Elimina").enabled(false).reason("La modifica delle cartelle arriva con IMAP"),
                                     MenuItem::separator(),
                                     menu_item("mark_folder_read"),
                                 ];
@@ -1979,6 +2400,10 @@ impl PostinoApp {
 
     fn list_panel(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
+        #[cfg(test)]
+        probe::clear_bulk_bar(ui);
+        #[cfg(test)]
+        probe::clear_empty_state(ui);
         // The panel width left after the sidebar and the reading pane. It includes the list's own
         // margin; the columns are laid out against the content width inside the panel.
         let list_panel_width = ui.available_width();
@@ -2064,7 +2489,7 @@ impl PostinoApp {
             }
             ui.add_space(space::MD);
             if rows.is_empty() {
-                let mut empty_action = None;
+                let mut menu_action = None;
                 let background = ui.interact(ui.available_rect_before_wrap(), ui.id().with("empty-list-menu"), Sense::click());
                 let has_label_filter = label_filter.is_some();
                 background.context_menu(|ui| {
@@ -2072,71 +2497,59 @@ impl PostinoApp {
                         menu_item("label_new"),
                         menu_item("label_clear_filter").enabled(has_label_filter).reason("Nessun filtro etichetta attivo"),
                         MenuItem::separator(),
-                        menu_item("refresh"),
+                        // Sync does not exist yet: the item is visibly unavailable with the reason,
+                        // never an enabled row that only writes to the status bar.
+                        menu_item("sync"),
                         menu_item("select_all").enabled(false).reason("Non ci sono messaggi da selezionare"),
                         menu_item("compose"),
                         MenuItem::new("Cancella ricerca").icon(icons::CLOSE).enabled(searching).reason("Nessuna ricerca attiva"),
                     ];
                     match Menu::new(&items).show(ui) {
                         Some(0) => {
-                            empty_action = Some(EmptyAction::NewLabel);
+                            menu_action = Some(EmptyMenuAction::NewLabel);
                             ui.close();
                         }
                         Some(1) => {
-                            empty_action = Some(EmptyAction::ClearLabel);
-                            ui.close();
-                        }
-                        Some(3) => {
-                            empty_action = Some(EmptyAction::Refresh);
+                            menu_action = Some(EmptyMenuAction::ClearLabel);
                             ui.close();
                         }
                         Some(5) => {
-                            empty_action = Some(EmptyAction::Compose);
+                            menu_action = Some(EmptyMenuAction::Compose);
                             ui.close();
                         }
                         Some(6) => {
-                            empty_action = Some(EmptyAction::ClearSearch);
+                            menu_action = Some(EmptyMenuAction::ClearSearch);
                             ui.close();
                         }
                         _ => {}
                     }
                 });
                 let label_name = label_filter.as_ref().map(|(_, name, _)| name.as_str());
-                let (icon, title, body, action) = if let Some(name) = label_name {
-                    let scope = scope.clone().unwrap_or_else(|| "in tutte le cartelle".to_owned());
-                    (icons::TAG, "Nessun messaggio", format!("Nessun messaggio con l'etichetta “{name}” {scope}."), Some("Mostra tutte"))
-                } else if searching {
-                    (icons::SEARCH, "Nessun risultato", "Nessun messaggio corrisponde alla ricerca.".to_owned(), Some("Cancella ricerca"))
-                } else if self.folder == "drafts" {
-                    (icons::DRAFTS, "Nessuna bozza", "Le bozze si salvano da sole mentre scrivi.".to_owned(), Some("Scrivi"))
-                } else if self.folder == "inbox" {
-                    (icons::INBOX, "Nessun messaggio", "La posta in arrivo è vuota.".to_owned(), None)
-                } else {
-                    (icons::INBOX, "Nessun messaggio", "Questa cartella è vuota.".to_owned(), Some("Vai a Posta in arrivo"))
-                };
-                let mut state = EmptyState::new(icon, title, &body);
+                let view = self.empty_view(label_name, scope.as_deref());
+                let mut state = EmptyState::new(view.icon, &view.title, &view.body);
+                if let Some((label, _)) = view.primary {
+                    state = state.action(label);
+                }
+                if let Some((label, _)) = view.secondary {
+                    state = state.secondary(label);
+                }
+                #[cfg(test)]
+                probe::empty_state(ui, &view.title, &view.body, view.primary.map(|(label, _)| label), view.secondary.map(|(label, _)| label));
+                let response = state.show(ui);
+                let mut action = None;
+                if response.primary_clicked() {
+                    action = view.primary.map(|(_, action)| action);
+                } else if response.secondary_clicked() {
+                    action = view.secondary.map(|(_, action)| action);
+                }
                 if let Some(action) = action {
-                    state = state.action(action);
+                    self.apply_empty_action(action);
                 }
-                if let Some(response) = state.show(ui)
-                    && response.clicked()
-                {
-                    if label_name.is_some() {
-                        self.clear_label_filter();
-                    } else if searching {
-                        self.query.clear();
-                    } else if self.folder == "drafts" {
-                        self.compose_new();
-                    } else {
-                        self.select_folder("inbox");
-                    }
-                }
-                match empty_action {
-                    Some(EmptyAction::NewLabel) => self.start_label_create(),
-                    Some(EmptyAction::ClearLabel) => self.clear_label_filter(),
-                    Some(EmptyAction::Refresh) => self.status = "Dati demo già aggiornati".to_owned(),
-                    Some(EmptyAction::Compose) => self.compose_new(),
-                    Some(EmptyAction::ClearSearch) => self.query.clear(),
+                match menu_action {
+                    Some(EmptyMenuAction::NewLabel) => self.start_label_create(),
+                    Some(EmptyMenuAction::ClearLabel) => self.apply_empty_action(EmptyAction::ClearLabel),
+                    Some(EmptyMenuAction::Compose) => self.compose_new(),
+                    Some(EmptyMenuAction::ClearSearch) => self.query.clear(),
                     None => {}
                 }
                 return;
@@ -2149,7 +2562,9 @@ impl PostinoApp {
             let mut context_action = None;
             let modifiers = ui.input(|input| input.modifiers);
             let content_width = ui.available_width();
-            let columns = list_columns(content_width);
+            // The date rule is measured on the list panel, before its margins: the plan names the
+            // 499 pt list at 1280×720, of which ~467 pt is content.
+            let columns = list_columns(list_panel_width);
             let show_avatars = show_list_avatars(content_width);
             #[cfg(test)]
             probe::list_width(ui, content_width, list_panel_width);
@@ -2159,11 +2574,18 @@ impl PostinoApp {
             probe::clear_tooltips(ui);
             #[cfg(test)]
             probe::clear_message_rows(ui);
+            #[cfg(test)]
+            probe::clear_row_facts(ui);
+            #[cfg(test)]
+            probe::reset_subject_width(ui);
             self.row_ids.clear();
             let ctx = ui.ctx().clone();
             let _ = &ctx;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let mut focus_rect = None;
+                let mut focus_rects = Vec::new();
+                // The table inserts `item_spacing.x` around every column; at five columns that is
+                // 40 pt the subject cannot spare. The cells carry their own insets instead.
+                ui.spacing_mut().item_spacing.x = 0.0;
                 let mut table = egui_extras::TableBuilder::new(ui)
                     .id_salt("message-list")
                     .striped(false)
@@ -2176,30 +2598,34 @@ impl PostinoApp {
                     table = table.column(egui_extras::Column::exact(30.0));
                 }
                 table = table.column(egui_extras::Column::exact(columns.sender));
+                table = table.column(egui_extras::Column::remainder());
                 if let Some(date) = columns.date {
                     table = table.column(egui_extras::Column::exact(date));
                 }
                 table
-                    .column(egui_extras::Column::remainder())
-                    .column(egui_extras::Column::exact(24.0))
+                    .column(egui_extras::Column::exact(28.0))
                     .header(24.0, |mut header| {
                         header.col(|_| {});
                         if show_avatars {
                             header.col(|_| {});
                         }
                         header.col(|ui| {
+                            ui.add_space(space::XS);
                             ui.add(egui::Label::new(typography::text(Role::Caption, "MITTENTE", t.text_faint)).selectable(false));
                         });
-                        // The date is dropped before the subject is truncated, so the header must
-                        // drop the column with it instead of leaving a hole.
-                        if columns.date.is_some() {
-                            header.col(|ui| {
-                                ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
-                            });
-                        }
                         header.col(|ui| {
+                            ui.add_space(space::XS);
                             ui.add(egui::Label::new(typography::text(Role::Caption, "OGGETTO", t.text_faint)).selectable(false));
                         });
+                        // The compact date sits between the subject and the star, as in every mail
+                        // client; the header drops it with the column instead of leaving a hole.
+                        if columns.date.is_some() {
+                            header.col(|ui| {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
+                                });
+                            });
+                        }
                         header.col(|_| {});
                     })
                     .body(|mut body| {
@@ -2211,12 +2637,16 @@ impl PostinoApp {
                                 FontId::new(type_size::BODY_SMALL, if message.unread { theme::medium() } else { FontFamily::Proportional });
                             let mut sender_truncated = false;
                             let mut subject_truncated = false;
+                            let date_label = format_when(message.date, now_utc);
+                            let accessible = row_accessible_label(message, &date_label, selected);
                             body.row(ui_size::ROW, |mut row| {
                                 row.set_selected(selected);
                                 row.col(|ui| {
                                     if message.unread {
+                                        // Gold ink on ivory; the light gold returns on the forest
+                                        // selection where it measures 6.5:1.
                                         let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                        ui.painter().circle_filled(rect.center(), 3.0, GOLD);
+                                        ui.painter().circle_filled(rect.center(), 3.0, if selected { t.gold } else { t.gold_ink });
                                     }
                                 });
                                 if show_avatars {
@@ -2233,29 +2663,19 @@ impl PostinoApp {
                                 row.col(|ui| {
                                     let name =
                                         if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
+                                    ui.add_space(space::XS);
                                     sender_truncated = !text_fits(ui, name, &row_font, ui.available_width());
                                     let text = RichText::new(name).font(row_font.clone()).color(foreground);
                                     ui.add(egui::Label::new(text).truncate().selectable(false));
                                 });
-                                if columns.date.is_some() {
-                                    row.col(|ui| {
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            ui.add(
-                                                egui::Label::new(typography::mono(
-                                                    format_when(message.date, now_utc),
-                                                    type_size::CAPTION,
-                                                    if selected { t.selected_muted } else { t.text_faint },
-                                                ))
-                                                .selectable(false),
-                                            );
-                                        });
-                                    });
-                                }
                                 row.col(|ui| {
                                     // The cell layout starts content at the top. Centre the two lines
                                     // explicitly so the subject never touches the selected row edge.
                                     let top = ((ui.available_height() - 28.0) * 0.5).max(0.0);
                                     ui.add_space(top);
+                                    ui.add_space(space::XS);
+                                    #[cfg(test)]
+                                    probe::subject_width(ui, ui.available_width());
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
                                         let subject_text =
@@ -2271,26 +2691,57 @@ impl PostinoApp {
                                         ui.add(egui::Label::new(snippet).truncate().selectable(false));
                                     });
                                 });
+                                if columns.date.is_some() {
+                                    row.col(|ui| {
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.add(
+                                                egui::Label::new(typography::mono(
+                                                    date_label.as_str(),
+                                                    type_size::CAPTION,
+                                                    if selected { t.selected_muted } else { t.text_faint },
+                                                ))
+                                                .selectable(false),
+                                            );
+                                        });
+                                    });
+                                }
                                 row.col(|ui| {
+                                    let star_label = if message.starred { "Togli la stella" } else { "Segna con stella" };
+                                    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                                    if response.hovered() {
+                                        let fill = if selected { tokens::mix(t.selected, t.selected_text, 0.12) } else { t.hover };
+                                        ui.painter().rect_filled(rect, CornerRadius::same(radius::SM), fill);
+                                    }
+                                    if response.has_focus() {
+                                        tokens::paint_focus_ring_on(ui, rect, radius::SM, &t, selected);
+                                    }
                                     let star_color = if message.starred {
-                                        if selected { t.gold } else { theme::GOLD_INK }
+                                        if selected { t.gold } else { t.gold_ink }
                                     } else if selected {
                                         t.selected_muted
                                     } else {
                                         t.text_faint
                                     };
-                                    let star = if message.starred {
-                                        icons::icon_filled(icons::STAR_FILL, 13.0, star_color)
-                                    } else {
-                                        icons::icon(icons::STAR, 13.0, star_color)
-                                    };
-                                    let response = ui.add(egui::Label::new(star).sense(Sense::click()).selectable(false));
-                                    if response.clicked() {
+                                    let font = if message.starred { icons::font_filled(13.0) } else { icons::font(13.0) };
+                                    let glyph = if message.starred { icons::STAR_FILL } else { icons::STAR };
+                                    let galley = ui.painter().layout_no_wrap(glyph.to_owned(), font, star_color);
+                                    ui.painter().galley(
+                                        pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5),
+                                        galley,
+                                        Color32::PLACEHOLDER,
+                                    );
+                                    if response.clicked()
+                                        || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter) || input.key_pressed(Key::Space)))
+                                    {
                                         star_clicked = Some(message.id.clone());
                                     }
                                     if response.hovered() {
                                         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                                     }
+                                    #[cfg(test)]
+                                    probe::star(ui, &message.id, rect);
+                                    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, star_label));
+                                    response.on_hover_text(star_label);
                                 });
                                 let response = row.response();
                                 self.row_ids.insert(message.id.clone(), response.id);
@@ -2303,11 +2754,22 @@ impl PostinoApp {
                                 );
                                 #[cfg(test)]
                                 probe::message_row(&ctx, &message.id, row_rect);
+                                #[cfg(test)]
+                                probe::row_facts(&ctx, &message.id, &accessible, response.has_focus());
+                                // Accessibility: every row is a named button. The label carries all
+                                // the facts a sighted user reads from the columns plus the Enter
+                                // affordance, so a screen reader is not left with "message row".
+                                response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
                                 if focused && self.scroll_to_selected {
                                     response.scroll_to_me(None);
                                 }
-                                if focused && !selected {
-                                    focus_rect = Some(row_rect.shrink(1.0));
+                                if response.has_focus() {
+                                    // The ring follows real keyboard focus, not the selection: a
+                                    // selected-but-unfocused row must not look focused, and Tab can
+                                    // land on the list without changing what is selected.
+                                    focus_rects.push((row_rect.shrink(1.0), selected));
+                                    #[cfg(test)]
+                                    probe::focus_ring(&ctx, &message.id);
                                 }
                                 if response.secondary_clicked() {
                                     context_clicked = Some(message.id.clone());
@@ -2361,8 +2823,8 @@ impl PostinoApp {
                             });
                         }
                     });
-                if let Some(rect) = focus_rect {
-                    crate::ui::tokens::paint_focus_ring(ui, rect, radius::CONTROL, &t);
+                for (rect, on_selected) in focus_rects {
+                    crate::ui::tokens::paint_focus_ring_on(ui, rect, radius::CONTROL, &t, on_selected);
                 }
             });
             if self.focus_selected_row {
@@ -2421,15 +2883,23 @@ impl PostinoApp {
                 .show(ui, |ui| self.reading_content(ui, &t, true));
         } else {
             let available = ui.ctx().content_rect().width();
-            let default_width = reading_pane_width(available);
+            let default_width = reading_pane_width_with_ratio(available, self.reading_ratio);
             let max_width = reading_pane_max_width(available);
-            egui::Panel::right("reading")
+            let response = egui::Panel::right("reading")
                 .resizable(true)
                 .default_size(default_width)
                 .min_size(READING_PANE_MIN_SIZE)
                 .max_size(max_width)
                 .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::LG, inset::XL)))
                 .show(ui, |ui| self.reading_content(ui, &t, false));
+            // Remember the width the user dragged to. The fraction is relative to the width left
+            // by the sidebar, so a bigger window keeps the same split instead of the same pixels.
+            let remaining = (available - ui_size::SIDEBAR).max(1.0);
+            let ratio = (response.response.rect.width() / remaining).clamp(0.1, 0.9);
+            if (ratio - self.reading_ratio).abs() > 0.004 {
+                self.reading_ratio = ratio;
+                self.mark_settings_dirty();
+            }
         }
     }
 
@@ -2711,6 +3181,7 @@ impl PostinoApp {
 
     fn status_bar(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
+        let kind = self.status_kind();
         egui::Panel::bottom("status")
             .exact_size(ui_size::STATUS)
             .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(inset::LG, inset::XS)))
@@ -2718,9 +3189,32 @@ impl PostinoApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                    let dot = if self.engine.is_demo() { theme::GOLD } else { t.success };
+                    let dot = match kind {
+                        StatusKind::Demo => t.gold_ink,
+                        StatusKind::Ready => t.success,
+                        StatusKind::Error => t.danger,
+                    };
                     ui.painter().circle_filled(rect.center(), 3.0, dot);
-                    ui.label(typography::text(Role::Meta, self.status.as_str(), t.text_muted));
+                    match kind {
+                        StatusKind::Demo => {
+                            // The one demo notice in the product: a badge with one sentence of
+                            // explanation, not four scattered milestone lines.
+                            let badge = Badge::new("Modalità demo").kind(BadgeKind::Accent).show(ui);
+                            badge.on_hover_text(DEMO_TOOLTIP);
+                        }
+                        StatusKind::Ready => {
+                            ui.label(typography::text(Role::Meta, "Pronto", t.text_muted));
+                        }
+                        StatusKind::Error => {
+                            ui.label(typography::text(Role::Meta, "Errore", t.danger));
+                        }
+                    }
+                    ui.add_space(space::SM);
+                    ui.label(typography::mono(format!("Postino {}", env!("CARGO_PKG_VERSION")), 10.5, t.text_faint));
+                    if !self.status.is_empty() {
+                        ui.add_space(space::MD);
+                        ui.add(egui::Label::new(typography::text(Role::Meta, self.status.as_str(), t.text_muted)).truncate());
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let hint = if self.composer.open {
                             "Ctrl+Invio invia · Esc chiude e conserva"
@@ -2789,7 +3283,7 @@ impl PostinoApp {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Postino").font(FontId::new(22.0, theme::display())).color(t.text));
-                    ui.label(RichText::new(format!("{} · M0 + U0.5", env!("CARGO_PKG_VERSION"))).size(11.0).color(t.text_muted));
+                    ui.label(RichText::new(format!("Versione {}", env!("CARGO_PKG_VERSION"))).size(11.0).color(t.text_muted));
                 });
             });
             ui.add_space(12.0);
@@ -2810,7 +3304,7 @@ impl PostinoApp {
                 });
             }
             ui.add_space(12.0);
-            ui.label(RichText::new("Inter · JetBrains Mono (OFL). Dati demo sintetici.").size(10.5).color(t.text_faint));
+            ui.label(RichText::new("Inter · JetBrains Mono (OFL).").size(10.5).color(t.text_faint));
             ui.label(RichText::new("MIT OR Apache-2.0").size(10.5).color(t.text_faint));
         });
         self.show_about = open;
@@ -3083,7 +3577,7 @@ impl PostinoApp {
                     create = true;
                 }
                 ui.add_space(space::XS);
-                ui.label(typography::text(Role::Caption, "Etichette locali, in memoria fino a M1.", t.text_faint));
+                ui.label(typography::text(Role::Caption, "Le etichette sono locali.", t.text_faint));
             });
         if let Some(menu) = self.label_menu.as_mut() {
             menu.query = query;
@@ -3107,7 +3601,7 @@ impl PostinoApp {
         };
         let targets = plural(state.count as usize, "messaggio", "messaggi");
         let body = format!(
-            "L'etichetta “{}” sarà rimossa da {targets}. Le mail non vengono eliminate; le etichette sono metadati locali in memoria fino a M1. Puoi annullare per 8 secondi.",
+            "L'etichetta “{}” sarà rimossa da {targets}. Le mail non vengono eliminate; le etichette restano su questo computer. Puoi annullare per 8 secondi.",
             state.name
         );
         let mut confirm = false;
@@ -3139,6 +3633,7 @@ impl PostinoApp {
             CommandRule::Message => self.selected.is_some(),
             CommandRule::ActiveLabel => self.label_filter.is_some(),
             CommandRule::LabelFilter => self.label_filter.is_some(),
+            CommandRule::Sync => false,
         }
     }
 
@@ -3214,8 +3709,13 @@ impl PostinoApp {
             "inbox" => self.select_folder("inbox"),
             "starred" => self.select_folder("starred"),
             "theme" => {
-                self.dark = !self.dark;
-                theme::apply(ctx, self.dark);
+                let dark = !self.dark;
+                self.set_dark(ctx, dark);
+            }
+            "reduced_motion" => {
+                let reduced = !self.reduced_motion;
+                self.set_reduced_motion(ctx, reduced);
+                self.status = if reduced { "Animazioni ridotte" } else { "Animazioni attive" }.to_owned();
             }
             "about" => self.show_about = true,
             "shortcuts" => {
@@ -3239,7 +3739,6 @@ impl PostinoApp {
             "previous" => self.step_selection(-1, false),
             "extend_next" => self.step_selection(1, true),
             "extend_previous" => self.step_selection(-1, true),
-            "refresh" => self.status = "Dati demo già aggiornati".to_owned(),
             "mark_folder_read" => {
                 let folder = self.folder.clone();
                 self.mark_all_read(&folder);
@@ -3322,6 +3821,7 @@ impl PostinoApp {
             self.title_bar(ui);
         }
         self.toolbar(ui);
+        self.loading_line(ui);
         self.sidebar(ui);
         // Below 1000 px the side pane cannot keep a usable list, so reading reuses the full path
         // as an overlay. At or above it the pane opens at 52% of the width left by the sidebar,
@@ -3360,6 +3860,14 @@ impl eframe::App for PostinoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Write the last pane width and folder even if the debounce had not fired yet. A capture
+        // never owns a settings path, so this cannot touch the user's file.
+        if self.screenshot.is_none() && self.settings_dirty {
+            self.persist_settings();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3394,12 +3902,68 @@ enum FolderAction {
 }
 
 #[derive(Clone, Copy)]
-enum EmptyAction {
+enum EmptyMenuAction {
     NewLabel,
     ClearLabel,
-    Refresh,
     Compose,
     ClearSearch,
+}
+
+/// What one empty-state button does. The label lives in [`EmptyView`]; the action is data so the
+/// resolver can be tested without a window and the screen never matches on copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmptyAction {
+    ShowAll,
+    ClearLabel,
+    ClearUnread,
+    ClearAttachments,
+    ClearSearch,
+    Compose,
+    Inbox,
+}
+
+/// The copy and the up-to-two ways out of an empty list. Bookkeeping is resolved from the active
+/// filters, never from the folder alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmptyView {
+    icon: &'static str,
+    title: String,
+    body: String,
+    primary: Option<(&'static str, EmptyAction)>,
+    secondary: Option<(&'static str, EmptyAction)>,
+}
+
+/// One sentence, attached to the only demo notice in the product.
+const DEMO_TOOLTIP: &str = "Stai lavorando su dati sintetici: nessun server è collegato e nessun messaggio esce da questo computer.";
+/// The loading line appears only after this delay, so local work that returns in a frame never
+/// flashes a progress indicator.
+const LOADING_DELAY: f64 = 0.2;
+/// Settings are written at most this often while a pane is being dragged.
+const SETTINGS_SAVE_DELAY: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusKind {
+    Demo,
+    Ready,
+    Error,
+}
+
+fn status_kind(demo: bool, failure: bool) -> StatusKind {
+    if failure {
+        StatusKind::Error
+    } else if demo {
+        StatusKind::Demo
+    } else {
+        StatusKind::Ready
+    }
+}
+
+/// The one current failure: the sentence the toast shows and whether reloading the list is a
+/// meaningful retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Failure {
+    message: String,
+    retry_list: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3514,6 +4078,8 @@ enum CommandRule {
     Message,
     ActiveLabel,
     LabelFilter,
+    /// Sync has no implementation yet. It is a visible, explained refusal, never an enabled no-op.
+    Sync,
 }
 
 impl CommandRule {
@@ -3525,6 +4091,7 @@ impl CommandRule {
             Self::Message => Some("Seleziona prima un messaggio"),
             Self::ActiveLabel => Some("Seleziona prima un'etichetta"),
             Self::LabelFilter => Some("Nessun filtro etichetta attivo"),
+            Self::Sync => Some("La sincronizzazione arriva con IMAP"),
         }
     }
 
@@ -3594,11 +4161,16 @@ const COMMANDS: &[Command] = &[
     Command { id: "clear_selection", label: "Deseleziona", icon: icons::X_CIRCLE, shortcut: "Esc", rule: CommandRule::Always, in_palette: true },
     Command { id: "focus_search", label: "Cerca nelle mail", icon: icons::SEARCH, shortcut: "/", rule: CommandRule::Always, in_palette: true },
     Command {
-        id: "next", label: "Messaggio successivo", icon: icons::CHEVRON_DOWN, shortcut: "J / ↓", rule: CommandRule::Always, in_palette: false
+        id: "next",
+        label: "Sposta il focus in basso",
+        icon: icons::CHEVRON_DOWN,
+        shortcut: "J / ↓",
+        rule: CommandRule::Always,
+        in_palette: false,
     },
     Command {
         id: "previous",
-        label: "Messaggio precedente",
+        label: "Sposta il focus in alto",
         icon: icons::CHEVRON_UP,
         shortcut: "K / ↑",
         rule: CommandRule::Always,
@@ -3623,7 +4195,8 @@ const COMMANDS: &[Command] = &[
     Command { id: "close", label: "Chiudi lettura", icon: icons::CLOSE, shortcut: "Esc", rule: CommandRule::Always, in_palette: false },
     Command { id: "undo", label: "Annulla ultima azione", icon: icons::UNDO, shortcut: "Z", rule: CommandRule::Always, in_palette: false },
     Command { id: "palette", label: "Apri i comandi", icon: icons::COMMAND, shortcut: "Ctrl+K", rule: CommandRule::Always, in_palette: false },
-    Command { id: "refresh", label: "Aggiorna", icon: icons::SYNC, shortcut: "", rule: CommandRule::Always, in_palette: false },
+    Command { id: "sync", label: "Aggiorna", icon: icons::SYNC, shortcut: "", rule: CommandRule::Sync, in_palette: false },
+    Command { id: "reduced_motion", label: "Riduci le animazioni", icon: icons::CLOCK, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
         id: "mark_folder_read",
         label: "Segna tutto come letto",
@@ -3653,6 +4226,10 @@ fn command_shortcut(id: &str, fallback: &'static str) -> &'static str {
 
 fn menu_item(id: &str) -> MenuItem<'static> {
     match command(id) {
+        Some(Command { rule: CommandRule::Sync, .. }) => MenuItem::new(command_label(id, "Aggiorna"))
+            .icon(command_icon(id, icons::SYNC))
+            .enabled(false)
+            .reason(command(id).and_then(|command| command.rule.reason()).unwrap_or("")),
         Some(command) => MenuItem::new(command.label).icon(command.icon).shortcut(command.shortcut),
         None => MenuItem::new("Azione non disponibile").enabled(false).reason("Comando non registrato"),
     }
@@ -3686,8 +4263,8 @@ fn reading_context_menu(response: egui::Response, subject: String, sender: Strin
             MenuItem::new("Copia oggetto").icon(icons::COPY),
             MenuItem::new("Copia mittente").icon(icons::COPY),
             MenuItem::separator(),
-            MenuItem::new("Apri in finestra").icon(icons::EXTERNAL).enabled(false).reason("La finestra separata arriva dopo U0.5"),
-            MenuItem::new("Mostra originale").icon(icons::EYE).enabled(false).reason("Il sorgente MIME arriva con lo store M1"),
+            MenuItem::new("Apri in finestra").icon(icons::EXTERNAL).enabled(false).reason("La finestra separata non è ancora disponibile"),
+            MenuItem::new("Mostra originale").icon(icons::EYE).enabled(false).reason("Il sorgente MIME non è ancora disponibile"),
         ];
         match Menu::new(&items).show(ui) {
             Some(0) => {
@@ -3983,13 +4560,21 @@ fn sidebar_scroll_style() -> egui::style::ScrollStyle {
 /// The reading pane takes 52% of the content width left by the sidebar, clamped to 420 pt and 62%,
 /// and it yields space back to the list whenever the list would fall below its 460 pt floor. At
 /// 1280×720 this is a ~541 pt pane and a ~499 pt list instead of the old 666/374 split.
+#[cfg(test)]
 fn reading_pane_width(available: f32) -> f32 {
+    reading_pane_width_with_ratio(available, READING_PANE_DEFAULT_RATIO)
+}
+
+/// The pane width for a stored fraction. The clamps still win: a settings file cannot squeeze the
+/// list below its floor or the pane below 420 pt.
+fn reading_pane_width_with_ratio(available: f32, ratio: f32) -> f32 {
     let remaining = (available - ui_size::SIDEBAR).max(0.0);
     if remaining <= 0.0 {
         return READING_PANE_MIN_SIZE;
     }
     let max = reading_pane_max_width(available);
-    let preferred = (remaining * READING_PANE_DEFAULT_RATIO).clamp(READING_PANE_MIN_SIZE, max);
+    let ratio = if ratio.is_finite() { ratio.clamp(0.1, 0.9) } else { READING_PANE_DEFAULT_RATIO };
+    let preferred = (remaining * ratio).clamp(READING_PANE_MIN_SIZE, max);
     let list_cap = (remaining - ui_size::LIST_MIN).max(READING_PANE_MIN_SIZE);
     preferred.min(list_cap)
 }
@@ -4002,8 +4587,9 @@ fn reading_pane_max_width(available: f32) -> f32 {
     ratio.min((remaining - ui_size::LIST_MIN).max(READING_PANE_MIN_SIZE))
 }
 
-/// The columns of the message table at a given content width. Below 560 pt the date is dropped
-/// first: the subject is what the list is for, and a squeezed date column only truncates it sooner.
+/// The columns of the message table at a given *list panel* width (before the 16 pt side margins).
+/// The compact date is dropped only below 480 pt; the sender narrows below 560 pt so the subject
+/// keeps its 260 pt floor at the 499 pt list the 1280×720 reading split leaves.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ListColumns {
     sender: f32,
@@ -4011,12 +4597,27 @@ struct ListColumns {
 }
 
 fn list_columns(list_width: f32) -> ListColumns {
-    if list_width < ui_size::LIST_DATE_MIN {
-        ListColumns { sender: ui_size::LIST_SENDER_NARROW, date: None }
-    } else {
-        ListColumns { sender: ui_size::LIST_SENDER, date: Some(ui_size::LIST_DATE) }
-    }
+    let sender = if list_width < ui_size::LIST_DATE_MIN + 80.0 { ui_size::LIST_SENDER_NARROW } else { ui_size::LIST_SENDER };
+    if list_width < ui_size::LIST_DATE_MIN { ListColumns { sender, date: None } } else { ListColumns { sender, date: Some(ui_size::LIST_DATE) } }
 }
+
+/// The width the subject cell has at a given list panel width, with the fixed columns (unread
+/// dot, sender, date, star) and the list margins removed. The table's column spacing is set to
+/// zero, so it does not enter the sum. Kept next to [`list_columns`] so the 260 pt promise can be
+/// tested without a window.
+#[cfg(test)]
+fn subject_width(list_width: f32) -> f32 {
+    let columns = list_columns(list_width);
+    // The dot, the sender, the 52 pt date and the 28 pt star, plus the table gutter and the 4 pt
+    // inset in front of the subject text.
+    let fixed = 12.0 + columns.sender + columns.date.unwrap_or(0.0) + 28.0 + TABLE_GUTTER + 4.0;
+    (list_width - 2.0 * space::XL - fixed).max(0.0)
+}
+
+/// The table's own vertical scroll gutter, measured on the real layout. It is taken out of the
+/// subject so the 260 pt promise is about the text that is actually drawn, not the column label.
+#[cfg(test)]
+const TABLE_GUTTER: f32 = 8.0;
 
 /// Would `text` have to be truncated to fit `width` at this font? Used to attach a tooltip only
 /// when something is actually cut off.
@@ -4092,6 +4693,29 @@ fn logo(ui: &mut Ui, size: f32) {
     ui.painter().line_segment([egui::pos2(rect.center().x + half, chevron_y - size * 0.07), egui::pos2(rect.center().x, chevron_y)], gold);
 }
 
+/// What a screen reader hears for one message row. It repeats the visual facts — sender, subject,
+/// unread, attachment, date, selection — and names the Enter affordance, so the row is usable
+/// without seeing which column the pointer is over.
+fn row_accessible_label(message: &MessageSummary, date: &str, selected: bool) -> String {
+    let sender = if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
+    let subject = if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() };
+    let mut label = format!("{sender}. {subject}.");
+    if message.unread {
+        label.push_str(" Non letto.");
+    }
+    if message.has_attachments {
+        label.push_str(" Con allegati.");
+    }
+    label.push(' ');
+    label.push_str(date);
+    label.push('.');
+    if selected {
+        label.push_str(" Selezionato.");
+    }
+    label.push_str(" Premi Invio per aprire.");
+    label
+}
+
 fn format_when(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let local = date.with_timezone(&Local);
     let now = now.with_timezone(&Local);
@@ -4100,7 +4724,8 @@ fn format_when(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
     } else if local.year() == now.year() {
         local.format("%d/%m").to_string()
     } else {
-        local.format("%d/%m/%Y").to_string()
+        // The compact year keeps the column at 44 pt: `dd/MM/yy`, not the old `dd/MM/YYYY`.
+        local.format("%d/%m/%y").to_string()
     }
 }
 
@@ -4209,14 +4834,6 @@ pub(crate) mod probe {
         ctx.data(|data| data.get_temp(id("sidebar-panel")))
     }
 
-    pub fn sidebar_footer(ui: &Ui, rect: Rect) {
-        ui.ctx().data_mut(|data| data.insert_temp(id("sidebar-footer"), rect));
-    }
-
-    pub fn sidebar_footer_rect(ctx: &Context) -> Option<Rect> {
-        ctx.data(|data| data.get_temp(id("sidebar-footer")))
-    }
-
     pub fn sidebar_header(ui: &Ui, name: &str, rect: Rect) {
         ui.ctx().data_mut(|data| {
             data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("sidebar-headers")).insert(name.to_owned(), rect);
@@ -4305,6 +4922,124 @@ pub(crate) mod probe {
 
     pub fn date_column_visible(ctx: &Context) -> Option<bool> {
         ctx.data(|data| data.get_temp(id("date-column")))
+    }
+
+    /// One fact block per message row: the accessible name and whether it held real keyboard focus
+    /// this frame.
+    pub fn row_facts(ctx: &Context, message_id: &str, label: &str, focused: bool) {
+        ctx.data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, (String, bool)>>(id("row-facts"))
+                .insert(message_id.to_owned(), (label.to_owned(), focused));
+        });
+    }
+
+    pub fn clear_row_facts(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("row-facts"), BTreeMap::<String, (String, bool)>::new()));
+        ui.ctx().data_mut(|data| data.insert_temp(id("focus-rings"), Vec::<String>::new()));
+        data_star_clear(ui);
+    }
+
+    pub fn focus_ring(ctx: &Context, message_id: &str) {
+        ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<String>>(id("focus-rings")).push(message_id.to_owned()));
+    }
+
+    pub fn focus_rings(ctx: &Context) -> Vec<String> {
+        ctx.data(|data| data.get_temp(id("focus-rings"))).unwrap_or_default()
+    }
+
+    fn data_star_clear(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("star-rects"), BTreeMap::<String, Rect>::new()));
+    }
+
+    pub fn row_facts_for(ctx: &Context, message_id: &str) -> Option<(String, bool)> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, (String, bool)>>(id("row-facts"))).and_then(|rows| rows.get(message_id).cloned())
+    }
+
+    pub fn focused_rows(ctx: &Context) -> Vec<String> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, (String, bool)>>(id("row-facts")))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, (_, focused))| focused.then_some(id))
+            .collect()
+    }
+
+    pub fn star(ui: &Ui, message_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("star-rects")).insert(message_id.to_owned(), rect);
+        });
+    }
+
+    pub fn star_rect(ctx: &Context, message_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("star-rects"))).and_then(|stars| stars.get(message_id).copied())
+    }
+
+    pub fn subject_width(ui: &Ui, width: f32) {
+        ui.ctx().data_mut(|data| {
+            let current = data.get_temp::<f32>(id("subject-width")).unwrap_or(f32::MAX);
+            data.insert_temp(id("subject-width"), current.min(width));
+        });
+    }
+
+    pub fn reset_subject_width(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("subject-width"), f32::MAX));
+    }
+
+    pub fn subject_width_value(ctx: &Context) -> Option<f32> {
+        ctx.data(|data| data.get_temp(id("subject-width")))
+    }
+
+    pub fn bulk_bar(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("bulk-bar"), Some(rect)));
+    }
+
+    pub fn clear_bulk_bar(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("bulk-bar"), Option::<Rect>::None));
+    }
+
+    pub fn bulk_bar_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<Option<Rect>>(id("bulk-bar")))?
+    }
+
+    #[derive(Clone)]
+    pub struct EmptyProbe {
+        pub title: String,
+        pub body: String,
+        pub primary: Option<String>,
+        pub secondary: Option<String>,
+    }
+
+    pub fn empty_state(ui: &Ui, title: &str, body: &str, primary: Option<&str>, secondary: Option<&str>) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                id("empty"),
+                Some(EmptyProbe {
+                    title: title.to_owned(),
+                    body: body.to_owned(),
+                    primary: primary.map(str::to_owned),
+                    secondary: secondary.map(str::to_owned),
+                }),
+            );
+        });
+    }
+
+    pub fn clear_empty_state(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("empty"), Option::<EmptyProbe>::None));
+    }
+
+    pub fn empty_state_view(ctx: &Context) -> Option<EmptyProbe> {
+        ctx.data(|data| data.get_temp::<Option<EmptyProbe>>(id("empty")))?
+    }
+
+    pub fn loading(ui: &Ui, rect: Rect, alpha: f32) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("loading"), Some((rect, alpha))));
+    }
+
+    pub fn loading_line(ctx: &Context) -> Option<(Rect, f32)> {
+        ctx.data(|data| data.get_temp::<Option<(Rect, f32)>>(id("loading")))?
+    }
+
+    pub fn clear_loading(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("loading"), Option::<(Rect, f32)>::None));
     }
 
     pub fn clear_tooltips(ui: &Ui) {
@@ -4870,21 +5605,40 @@ mod tests {
     }
 
     #[test]
+    fn the_compact_date_fits_its_column() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(400.0, 200.0))), ..Default::default() };
+        let mut width = 0.0;
+        let mut output = ctx.run_ui(raw, |ui| {
+            let galley = ui.painter().layout_no_wrap("24/10/26".to_owned(), FontId::new(type_size::CAPTION, FontFamily::Monospace), Color32::WHITE);
+            width = galley.size().x;
+        });
+        output.textures_delta.clear();
+        assert!(width <= ui_size::LIST_DATE, "dd/MM/yy measures {width} pt, more than the {} pt column", ui_size::LIST_DATE);
+    }
+
+    #[test]
     fn screenshot_states_parse_and_reject_unknown_labels() {
         for (name, state) in [
             ("shell", ScreenshotState::Shell),
             ("reading", ScreenshotState::Reading),
+            ("reading_full", ScreenshotState::ReadingFull),
             ("compose", ScreenshotState::Compose),
             ("palette", ScreenshotState::Palette),
             ("labels", ScreenshotState::Labels),
             ("label_menu", ScreenshotState::LabelMenu),
             ("label_editor", ScreenshotState::LabelEditor),
+            ("empty_unread", ScreenshotState::EmptyUnread),
+            ("empty_attachments", ScreenshotState::EmptyAttachments),
+            ("empty_label_unread", ScreenshotState::EmptyLabelUnread),
         ] {
             assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
         }
         let error = ScreenshotState::parse("nope").expect_err("nope is not a scene");
         assert!(error.contains("unknown screenshot state"), "{error}");
-        assert!(error.contains("shell, reading, compose, palette, labels, label_menu, label_editor"), "{error}");
+        assert!(error.contains("empty_label_unread"), "{error}");
     }
 
     #[test]
@@ -4977,10 +5731,17 @@ mod tests {
         assert!(!reading_overlay(1000.0), "1000 px switches to the side pane");
         assert!(!show_list_avatars(719.0));
         assert!(show_list_avatars(720.0));
-        assert_eq!(list_columns(559.0).date, None, "below 560 the date column is dropped before the subject");
+        // The compact date stays until the panel itself is below 480 pt.
+        assert_eq!(list_columns(479.0).date, None, "below 480 the date column is dropped before the subject");
+        assert_eq!(list_columns(479.0).sender, ui_size::LIST_SENDER_NARROW);
+        assert_eq!(list_columns(480.0).date, Some(ui_size::LIST_DATE));
         assert_eq!(list_columns(559.0).sender, ui_size::LIST_SENDER_NARROW);
-        assert_eq!(list_columns(560.0).date, Some(ui_size::LIST_DATE));
         assert_eq!(list_columns(560.0).sender, ui_size::LIST_SENDER);
+        assert_eq!(list_columns(1280.0).date, Some(52.0), "the compact date needs 52 pt");
+        // The 1280×720 reading split leaves a 499 pt list; the subject keeps its floor there.
+        let list = 1280.0 - ui_size::SIDEBAR - reading_pane_width(1280.0);
+        assert!((list - 499.0).abs() < 2.0, "the list is about 499 pt, got {list}");
+        assert!(subject_width(list) >= 260.0, "the subject gets {} pt at a 499 pt list", subject_width(list));
     }
 
     #[test]
@@ -4998,6 +5759,465 @@ mod tests {
             );
         }
         assert_eq!(label_dot(LabelColor::Success, &light, false), light.success);
+    }
+
+    fn frame_time(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, events: Vec<egui::Event>, time: f64) {
+        let raw =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), time: Some(time), events, ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn the_empty_state_names_each_filter_and_never_blames_the_folder() {
+        let mut app = PostinoApp::demo(true);
+
+        let inbox = app.empty_view(None, None);
+        assert_eq!(inbox.title, "Nessun messaggio");
+        assert_eq!(inbox.body, "La posta in arrivo è vuota.");
+        assert!(inbox.primary.is_none(), "an honestly empty inbox needs no way out");
+
+        app.unread_only = true;
+        let unread = app.empty_view(None, None);
+        assert_eq!(unread.title, "Nessun messaggio non letto");
+        assert_eq!(unread.primary.map(|(label, _)| label), Some("Mostra tutti"));
+        assert!(unread.body.contains("non letti"));
+        assert!(!unread.body.contains("è vuota"), "a filter must never be reported as an empty folder");
+
+        app.unread_only = false;
+        app.attachments_only = true;
+        let attachments = app.empty_view(None, None);
+        assert_eq!(attachments.title, "Nessun messaggio con allegati");
+        assert_eq!(attachments.primary.map(|(label, _)| label), Some("Mostra tutti"));
+        assert!(!attachments.body.contains("è vuota"));
+
+        app.attachments_only = false;
+        app.select_label("lbl_1".to_owned());
+        let label = app.empty_view(Some("Lavoro"), Some("in tutte le cartelle"));
+        assert_eq!(label.title, "Nessun messaggio");
+        assert_eq!(label.body, "Nessun messaggio con l'etichetta “Lavoro” in tutte le cartelle.");
+        assert_eq!(label.primary.map(|(label, _)| label), Some("Togli filtro etichetta"));
+        assert_eq!(label.secondary.map(|(label, _)| label), Some("Mostra tutti"));
+
+        app.unread_only = true;
+        let label_unread = app.empty_view(Some("Lavoro"), Some("in tutte le cartelle"));
+        assert_eq!(label_unread.title, "Nessun messaggio non letto con l'etichetta “Lavoro”");
+        assert_eq!(label_unread.primary.map(|(label, _)| label), Some("Togli filtro “non letti”"));
+        assert!(!label_unread.body.contains("è vuota"));
+
+        app.unread_only = false;
+        app.query = "nessun-risultato".to_owned();
+        let search = app.empty_view(None, None);
+        assert_eq!(search.title, "Nessun risultato");
+        assert_eq!(search.body, "Nessun messaggio corrisponde a “nessun-risultato” in tutte le cartelle.");
+        assert_eq!(search.primary.map(|(label, _)| label), Some("Cancella ricerca"));
+        let search_in_label = app.empty_view(Some("Lavoro"), Some("in tutte le cartelle"));
+        assert!(search_in_label.body.contains("nell'etichetta “Lavoro”"), "{}", search_in_label.body);
+
+        app.query.clear();
+        app.clear_label_filter();
+        app.select_folder("drafts");
+        let drafts = app.empty_view(None, None);
+        assert_eq!(drafts.title, "Nessuna bozza");
+        assert_eq!(drafts.primary.map(|(label, _)| label), Some("Scrivi"));
+
+        app.select_folder("archive");
+        let folder = app.empty_view(None, None);
+        assert_eq!(folder.body, "Questa cartella è vuota.");
+        assert_eq!(folder.primary.map(|(label, _)| label), Some("Vai a Posta in arrivo"));
+    }
+
+    #[test]
+    fn the_three_filter_empty_states_render_and_offer_a_way_out() {
+        let (ctx, _) = ready_app();
+        let wide = Vec2::new(1280.0, 720.0);
+        let cases = [
+            (
+                ScreenshotState::EmptyUnread,
+                "Nessun messaggio non letto",
+                "non ci sono messaggi non letti",
+                Some("Mostra tutti"),
+                None,
+                EmptyAction::ShowAll,
+            ),
+            (
+                ScreenshotState::EmptyAttachments,
+                "Nessun messaggio con allegati",
+                "non ci sono messaggi con allegati",
+                Some("Mostra tutti"),
+                None,
+                EmptyAction::ShowAll,
+            ),
+            (
+                ScreenshotState::EmptyLabelUnread,
+                "Nessun messaggio non letto con l'etichetta “Lavoro”",
+                "con l'etichetta “Lavoro”",
+                Some("Togli filtro “non letti”"),
+                None,
+                EmptyAction::ClearUnread,
+            ),
+        ];
+        for (state, title, body, primary, secondary, action) in cases {
+            let mut app = PostinoApp::demo(true);
+            app.seed_screenshot(state);
+            frame_at(&ctx, &mut app, wide, vec![]);
+            frame_at(&ctx, &mut app, wide, vec![]);
+            let view = probe::empty_state_view(&ctx).expect("the empty state is painted");
+            assert_eq!(view.title, title, "{state:?}");
+            assert!(view.body.contains(body), "{state:?} body is {:?}", view.body);
+            assert!(!view.body.contains("è vuota"), "{state:?} must not blame the folder");
+            assert_eq!(view.primary.as_deref(), primary, "{state:?}");
+            assert_eq!(view.secondary.as_deref(), secondary, "{state:?}");
+            assert!(app.visible_messages().0.is_empty(), "{state:?} must really be empty");
+            app.apply_empty_action(action);
+            frame_at(&ctx, &mut app, wide, vec![]);
+            assert!(!app.visible_messages().0.is_empty(), "{state:?} action must reveal mail");
+            assert!(probe::empty_state_view(&ctx).is_none(), "{state:?} empty state must disappear");
+        }
+    }
+
+    #[test]
+    fn rows_are_named_buttons_and_the_star_is_a_28_pt_control() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1280.0, 720.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        let unread = rows.iter().find(|message| message.unread).expect("a demo unread message");
+        let label = probe::row_facts_for(&ctx, &unread.id).expect("the row registered its accessible name").0;
+        let sender = if unread.from.name.trim().is_empty() { unread.from.email.as_str() } else { unread.from.name.as_str() };
+        assert!(label.contains(sender), "the name names the sender: {label}");
+        assert!(label.contains(unread.subject.as_str()), "the name names the subject: {label}");
+        assert!(label.contains("Non letto"), "{label}");
+        assert!(label.contains("Premi Invio per aprire"), "{label}");
+        assert!(label.contains(&format_when(unread.date, app.now_utc)), "the name carries the date: {label}");
+        if unread.has_attachments {
+            assert!(label.contains("Con allegati"), "{label}");
+        }
+
+        let star = probe::star_rect(&ctx, &unread.id).expect("the star rectangle");
+        assert!(star.width() >= 28.0 && star.height() >= 28.0, "the star target is {star:?}, smaller than 28×28");
+
+        // A click on the star toggles it and never opens the message behind it.
+        click_at(&ctx, &mut app, star.center(), wide);
+        assert_eq!(app.engine.message(&unread.id).map(|message| message.summary.starred), Some(!unread.starred));
+        assert!(!app.reading_open, "a star click must not open the message");
+
+        // A near miss at the star's edge still lands in the target, not on the row.
+        let corner = star.min + Vec2::new(1.0, 1.0);
+        let starred = app.engine.message(&unread.id).is_some_and(|message| message.summary.starred);
+        click_at(&ctx, &mut app, corner, wide);
+        assert_eq!(app.engine.message(&unread.id).map(|message| message.summary.starred), Some(!starred));
+        assert!(!app.reading_open);
+
+        // A selected row says so.
+        app.select_only(unread.id.clone());
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let selected = probe::row_facts_for(&ctx, &unread.id).expect("the selected row").0;
+        assert!(selected.contains("Selezionato."), "{selected}");
+    }
+
+    #[test]
+    fn the_focus_ring_follows_keyboard_focus_and_tab_reaches_the_list() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1280.0, 720.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+
+        // Selected but not keyboard-focused: no ring.
+        let first = app.visible_messages().0[0].id.clone();
+        app.select_only(first.clone());
+        frame_at(&ctx, &mut app, wide, vec![]);
+        assert!(probe::focused_rows(&ctx).is_empty(), "a programmatic selection must not paint a focus ring");
+        assert!(probe::focus_rings(&ctx).is_empty(), "no row held keyboard focus");
+
+        // J requests real keyboard focus on the row.
+        app.clear_selection();
+        frame_at(&ctx, &mut app, wide, vec![key(Key::J, Modifiers::NONE)]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let focused = probe::focused_rows(&ctx);
+        assert_eq!(focused.first().map(String::as_str), Some(first.as_str()), "J focuses the row: {focused:?}");
+        assert!(probe::focus_rings(&ctx).contains(&first), "the focus ring is painted on the focused row");
+        assert_eq!(ctx.memory(|memory| memory.focused()), app.row_ids.get(&first).copied(), "the row widget owns focus");
+
+        // Tab from a fresh app eventually reaches the list without changing the selection.
+        let (ctx, mut app) = ready_app();
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let mut reached = false;
+        for _ in 0..80 {
+            frame_at(&ctx, &mut app, wide, vec![key(Key::Tab, Modifiers::NONE)]);
+            if !probe::focused_rows(&ctx).is_empty() {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "Tab never reached a message row");
+    }
+
+    #[test]
+    fn u_right_after_opening_cancels_the_auto_read() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1200.0, 800.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let id = app
+            .engine
+            .messages()
+            .iter()
+            .find(|message| message.summary.unread)
+            .map(|message| message.summary.id.clone())
+            .expect("an unread demo message");
+        frame_time(&ctx, &mut app, wide, vec![], 10.0);
+        app.open_message(id.clone());
+        assert!(app.pending_read.is_some(), "opening starts the auto-read timer");
+        frame_time(&ctx, &mut app, wide, vec![key(Key::U, Modifiers::NONE)], 10.01);
+        assert!(app.pending_read.is_none(), "U cancels the pending auto-read");
+        frame_time(&ctx, &mut app, wide, vec![], 12.0);
+        app.maybe_complete_read();
+        assert!(app.engine.message(&id).is_some_and(|message| message.summary.unread), "U must win over the timer");
+    }
+
+    #[test]
+    fn a_star_also_cancels_the_auto_read() {
+        let mut app = PostinoApp::demo(true);
+        let id = app
+            .engine
+            .messages()
+            .iter()
+            .find(|message| message.summary.unread)
+            .map(|message| message.summary.id.clone())
+            .expect("an unread demo message");
+        app.now = 5.0;
+        app.open_message(id.clone());
+        app.toggle_star_for(&id);
+        assert!(app.pending_read.is_none(), "an explicit flag action cancels the auto-read");
+        app.now = 6.0;
+        app.maybe_complete_read();
+        assert!(app.engine.message(&id).is_some_and(|message| message.summary.unread));
+    }
+
+    #[test]
+    fn plain_j_k_collapse_and_shift_extends_from_the_anchor() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1200.0, 800.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let (rows, _, _) = app.visible_messages();
+        app.select_only(rows[0].id.clone());
+        frame_at(&ctx, &mut app, wide, vec![]);
+
+        frame_at(&ctx, &mut app, wide, vec![egui::Event::ModifiersChanged(Modifiers::SHIFT), key(Key::J, Modifiers::SHIFT)]);
+        assert_eq!(app.selection.len(), 2, "Shift+J extends from the anchor");
+        assert_eq!(app.anchor.as_deref(), Some(rows[0].id.as_str()));
+        let bulk = probe::bulk_bar_rect(&ctx).expect("the bulk bar is visible while the anchor is alive");
+        assert!(bulk.height() > 0.0);
+
+        frame_at(&ctx, &mut app, wide, vec![key(Key::J, Modifiers::SHIFT)]);
+        assert_eq!(app.selection.len(), 3, "Shift+J extends the range from the anchor: {:?}", app.selection);
+        frame_at(&ctx, &mut app, wide, vec![key(Key::K, Modifiers::SHIFT)]);
+        assert_eq!(app.selection.len(), 2, "Shift+K contracts the range from the anchor");
+        assert!(app.selection.contains(&rows[0].id) && app.selection.contains(&rows[1].id));
+
+        // Plain J moves the focus and collapses to that row; the batch and the bulk bar go.
+        frame_at(&ctx, &mut app, wide, vec![egui::Event::ModifiersChanged(Modifiers::NONE), key(Key::J, Modifiers::NONE)]);
+        assert_eq!(app.selected.as_deref(), Some(rows[2].id.as_str()), "plain J moves the focus");
+        assert_eq!(app.selection.len(), 1, "plain J collapses the selection");
+        assert_eq!(app.anchor.as_deref(), Some(rows[2].id.as_str()), "the anchor follows the collapsed focus");
+        assert!(
+            probe::bulk_bar_rect(&ctx).is_none(),
+            "the bulk bar disappears with the batch: selection {:?}, bulk {:?}",
+            app.selection,
+            probe::bulk_bar_rect(&ctx)
+        );
+        assert!(!app.reading_open);
+    }
+
+    #[test]
+    fn the_reading_pane_width_is_restored_from_settings() {
+        let (ctx, mut app) = ready_app();
+        let size = Vec2::new(1600.0, 900.0);
+        app.reading_ratio = 0.55;
+        let id = app.visible_messages().0[0].id.clone();
+        app.open_message(id);
+        for _ in 0..3 {
+            frame_at(&ctx, &mut app, size, vec![]);
+        }
+        let (content, panel) = probe::list_widths(&ctx).expect("the list width");
+        let remaining = size.x - ui_size::SIDEBAR;
+        let pane = size.x - ui_size::SIDEBAR - panel;
+        assert!((pane / remaining - 0.55).abs() < 0.02, "the stored 0.55 fraction opens the pane at {pane} of {remaining} ({content} list content)");
+        assert!((app.reading_ratio - 0.55).abs() < 0.02, "the measured fraction is written back: {}", app.reading_ratio);
+        assert!((app.settings_snapshot().reading_pane_ratio - app.reading_ratio).abs() < f32::EPSILON, "the snapshot would persist the ratio");
+    }
+
+    #[test]
+    fn the_reading_pane_clamps_a_hostile_fraction() {
+        for ratio in [-1.0, 0.0, 0.99, f32::NAN] {
+            let width = reading_pane_width_with_ratio(1600.0, ratio);
+            let remaining = 1600.0 - ui_size::SIDEBAR;
+            assert!(width >= READING_PANE_MIN_SIZE, "{ratio} produced {width}");
+            assert!(1600.0 - ui_size::SIDEBAR - width >= ui_size::LIST_MIN, "{ratio} squeezed the list: {width}");
+            assert!(width <= remaining * READING_PANE_MAX_RATIO + 0.01, "{ratio} produced an oversized pane: {width}");
+        }
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_app_and_never_include_a_draft() {
+        let mut app = PostinoApp::demo(true);
+        app.compose_new();
+        app.composer.subject = "OGGETTO SEGRETO".to_owned();
+        app.composer.body = "CORPO SEGRETO".to_owned();
+        app.composer.touch(0.0);
+        app.dark = true;
+        app.folder = "archive".to_owned();
+        app.reading_ratio = 0.44;
+        app.reduced_motion = true;
+        let path = crate::settings::test_directory().join(format!("app-round-trip-{}.json", std::process::id()));
+        app.settings_path = Some(path.clone());
+        app.persist_settings();
+
+        let loaded = Settings::load_from(&path);
+        assert!(loaded.dark);
+        assert_eq!(loaded.folder, "archive");
+        assert!((loaded.reading_pane_ratio - 0.44).abs() < f32::EPSILON);
+        assert!(loaded.reduced_motion);
+        let text = std::fs::read_to_string(&path).expect("the settings file");
+        assert!(!text.contains("SEGRETO"), "draft text must never be persisted: {text}");
+        let _ = std::fs::remove_file(&path);
+
+        let mut restored = PostinoApp::demo(true);
+        restored.apply_settings(loaded);
+        assert_eq!(restored.folder, "archive");
+        assert!(restored.dark);
+        assert!(restored.reduced_motion);
+
+        // A folder the engine does not know falls back to the inbox.
+        let unknown = Settings { folder: "cartella-inesistente".to_owned(), ..Settings::default() };
+        restored.apply_settings(unknown);
+        assert_eq!(restored.folder, "inbox");
+    }
+
+    #[test]
+    fn reduced_motion_turns_every_animation_off() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        theme::apply_motion(&ctx, false);
+        assert!(theme::motion_seconds(&ctx, 0.14) > 0.0);
+        assert!((ctx.global_style().animation_time - theme::ANIMATION_TIME).abs() < f32::EPSILON);
+
+        theme::apply_motion(&ctx, true);
+        assert_eq!(theme::motion_seconds(&ctx, 0.14), 0.0);
+        assert_eq!(ctx.global_style().animation_time, 0.0);
+    }
+
+    #[test]
+    fn the_status_bar_has_three_honest_states() {
+        assert_eq!(status_kind(true, false), StatusKind::Demo);
+        assert_eq!(status_kind(false, false), StatusKind::Ready);
+        assert_eq!(status_kind(true, true), StatusKind::Error);
+        assert_eq!(status_kind(false, true), StatusKind::Error);
+
+        let mut app = PostinoApp::demo(true);
+        assert_eq!(app.status_kind(), StatusKind::Demo);
+        app.report_failure("Non è stato possibile leggere i messaggi. Riprova.", true);
+        assert_eq!(app.status_kind(), StatusKind::Error);
+        assert!(app.toast.is_none(), "an error is a toast, not an undo toast");
+        app.dismiss_failure();
+        assert_eq!(app.status_kind(), StatusKind::Demo);
+        assert!(app.list_error_ack, "a dismissed list failure is not re-opened for the same view");
+        app.query = "cambio-vista".to_owned();
+        let _ = app.visible_messages();
+        assert!(!app.list_error_ack, "a new filter is a fresh read and may report again");
+        app.query.clear();
+    }
+
+    #[test]
+    fn an_error_is_one_dismissable_toast_and_never_a_raw_status_line() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1200.0, 800.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let message = "Non è stato possibile aggiornare il messaggio.";
+        app.report_failure(message, false);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        assert!(!app.status.contains(message), "the failure must not also become a status line: {}", app.status);
+        crate::ui::widgets::toast_probe::clear();
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let buttons = crate::ui::widgets::toast_probe::take();
+        let dismiss = buttons.iter().find(|(label, _)| label == "Chiudi").map(|(_, rect)| *rect).expect("the error toast has a dismiss control");
+        assert!(!buttons.iter().any(|(label, _)| label == "Riprova"), "a non-list failure has no meaningful retry");
+        click_at(&ctx, &mut app, dismiss.center(), wide);
+        assert!(app.failure.is_none(), "dismiss clears the failure");
+        assert_eq!(app.status_kind(), StatusKind::Demo);
+
+        // The list failure is the one case with a meaningful retry.
+        app.report_failure("Non è stato possibile leggere i messaggi. Riprova.", true);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        crate::ui::widgets::toast_probe::clear();
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let buttons = crate::ui::widgets::toast_probe::take();
+        let retry = buttons.iter().find(|(label, _)| label == "Riprova").map(|(_, rect)| *rect).expect("the list failure offers a retry");
+        click_at(&ctx, &mut app, retry.center(), wide);
+        assert!(app.failure.is_none());
+        assert_eq!(app.status, "Elenco aggiornato");
+    }
+
+    #[test]
+    fn the_loading_line_waits_for_the_delay_and_never_flickers() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        theme::apply_motion(&ctx, true);
+        let mut app = PostinoApp::demo(true);
+        let wide = Vec2::new(1200.0, 800.0);
+        frame_time(&ctx, &mut app, wide, vec![], 0.0);
+
+        app.begin_loading();
+        frame_time(&ctx, &mut app, wide, vec![], 0.1);
+        assert!(probe::loading_line(&ctx).is_none(), "a short operation must not flash the line");
+        app.end_loading();
+
+        // Work that stays open past the delay is shown, at full alpha under reduced motion.
+        app.begin_loading();
+        frame_time(&ctx, &mut app, wide, vec![], 0.31);
+        let (rect, alpha) = probe::loading_line(&ctx).expect("the delayed loading line");
+        assert!(rect.height() > 0.0);
+        assert_eq!(alpha, 1.0, "reduced motion shows the line at once");
+        app.end_loading();
+        frame_time(&ctx, &mut app, wide, vec![], 0.42);
+        assert!(probe::loading_line(&ctx).is_none());
+    }
+
+    #[test]
+    fn refresh_is_gone_and_sync_is_a_visible_disabled_reason() {
+        assert!(command("refresh").is_none(), "the enabled no-op must not exist");
+        let sync = command("sync").expect("sync is registered");
+        assert_eq!(sync.label, "Aggiorna");
+        let app = PostinoApp::demo(true);
+        assert!(!app.command_enabled(sync));
+        assert!(sync.rule.reason().is_some_and(|reason| reason.contains("IMAP")));
+    }
+
+    #[test]
+    fn the_compact_date_formats_are_the_documented_ones() {
+        let frozen = screenshot_clock().expect("the screenshot clock");
+        let this_year = DateTime::parse_from_rfc3339("2026-03-04T08:15:00Z").expect("a date").with_timezone(&Utc);
+        let older = DateTime::parse_from_rfc3339("2024-12-31T08:15:00Z").expect("a date").with_timezone(&Utc);
+        assert_eq!(format_when(frozen, frozen), frozen.with_timezone(&Local).format("%H:%M").to_string(), "today shows HH:MM");
+        assert_eq!(format_when(this_year, frozen), this_year.with_timezone(&Local).format("%d/%m").to_string(), "this year shows dd/MM");
+        assert_eq!(format_when(older, frozen), older.with_timezone(&Local).format("%d/%m/%y").to_string(), "older shows dd/MM/yy");
+        assert_eq!(format_when(older, frozen).len(), 8, "the compact year is two digits");
+    }
+
+    #[test]
+    fn there_is_exactly_one_demo_notice_and_no_milestone_code_in_the_copy() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        for source in ["app.rs", "ui/widgets/composer.rs", "ui/gallery.rs"] {
+            let path = format!("{root}/{source}");
+            let text = std::fs::read_to_string(&path).expect("the source file");
+            let production = text.split_once("\nmod tests {").map_or(text.as_str(), |(before, _)| before);
+            for forbidden in ["M0 + U0.5", "Locale · offline", "HTML in M5", "metadati in M0", "memoria fino a M1", "dopo U0.5", "store M1"] {
+                assert!(!production.contains(forbidden), "{source} still contains {forbidden:?}");
+            }
+        }
     }
 
     #[test]
@@ -5520,7 +6740,6 @@ mod tests {
         let panel = probe::sidebar_panel_rect(&ctx).expect("the sidebar panel");
         let drawer = probe::editor_drawer_rect(&ctx).expect("the editor drawer");
         let editor = probe::editor_rect(&ctx).expect("the editor content");
-        let footer = probe::sidebar_footer_rect(&ctx).expect("the sidebar footer");
         let header = probe::sidebar_header_rect(&ctx, "CARTELLE").expect("the CARTELLE header");
         let save = probe::saved_at(&ctx).expect("the editor save button");
         let cancel = probe::cancel_at(&ctx).expect("the editor cancel button");
@@ -5530,7 +6749,8 @@ mod tests {
             "the drawer stays inside the sidebar: {drawer:?} vs {panel:?}"
         );
         assert!(drawer.min.y <= editor.min.y && drawer.max.y >= editor.max.y, "the editor is fully inside its drawer");
-        assert!(drawer.max.y <= footer.min.y + 0.5, "the drawer sits above the pinned footer: {drawer:?} vs {footer:?}");
+        assert!(view.max.y <= drawer.min.y + 0.5, "the drawer sits below the scrolling list: {view:?} vs {drawer:?}");
+        assert!(drawer.max.y <= panel.max.y + 0.5, "the drawer ends inside the sidebar: {drawer:?} vs {panel:?}");
         assert!(drawer.contains_rect(save) && drawer.contains_rect(cancel), "Save and Cancel are inside the drawer");
         assert!(header.min.y >= view.min.y - 1.0 && header.max.y <= view.max.y, "the folder header stays visible at the top");
         assert!(header.min.y <= view.min.y + 4.0, "opening the editor must not push CARTELLE down");
@@ -5736,8 +6956,10 @@ mod tests {
         let (content, panel) = probe::list_widths(&ctx).expect("the list width");
         assert!(content >= ui_size::LIST_MIN, "the list content is {content} pt, below the 460 pt floor");
         assert!(panel >= content, "the panel includes the list margin: {panel} vs {content}");
-        assert_eq!(probe::date_column_visible(&ctx), Some(false), "below 560 pt of list width the date column is dropped");
-        assert!(content < ui_size::LIST_DATE_MIN, "the 52%-after-sidebar pane puts the list below the date threshold at 1280");
+        assert!((panel - 499.0).abs() < 2.0, "the reading split leaves a ~499 pt list at 1280×720, got {panel} (content {content})");
+        assert_eq!(probe::date_column_visible(&ctx), Some(true), "a 499 pt list keeps the compact date column");
+        let subject = probe::subject_width_value(&ctx).expect("the subject cell width");
+        assert!(subject >= 260.0, "the subject gets {subject} pt at a {panel} pt list and {content} pt of content, below the 260 pt floor");
 
         // A long subject is the case the tooltip exists for. Drafts have a real subject and are a
         // folder the demo can add to deterministically.

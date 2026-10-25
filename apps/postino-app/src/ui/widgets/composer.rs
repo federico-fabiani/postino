@@ -445,7 +445,7 @@ impl<'a> Composer<'a> {
                     action = Some(FormatAction::Link);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(typography::text(Role::Caption, "Markdown · HTML in M5", t.text_faint));
+                    ui.label(typography::text(Role::Caption, "Markdown", t.text_faint));
                 });
             });
         });
@@ -541,7 +541,7 @@ impl<'a> Composer<'a> {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(icons::icon(icons::PAPERCLIP, ui_size::ICON_SM, t.text_faint));
-                        ui.label(typography::text(Role::Caption, "Trascina un file qui per allegarlo · solo metadati in M0", t.text_faint));
+                        ui.label(typography::text(Role::Caption, "Gli allegati reali arrivano con l'invio", t.text_faint));
                     });
                 });
         }
