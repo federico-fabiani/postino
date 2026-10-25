@@ -3152,7 +3152,6 @@ dependencies = [
  "clap",
  "env_logger",
  "getrandom 0.3.4",
- "keyring-core",
  "log",
  "postino-core",
  "postino-platform",

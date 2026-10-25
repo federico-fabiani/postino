@@ -1168,12 +1168,14 @@ mod tests {
     /// The `--store` path end to end: the key comes from the platform seam (a mock vault here,
     /// never the real Windows vault) and a fresh encrypted database opens with no accounts.
     #[test]
-    fn open_engine_builds_a_store_engine_from_the_keyring() {
-        keyring_core::set_default_store(keyring_core::mock::Store::new().expect("mock keyring"));
+    fn a_store_engine_opens_from_an_in_memory_key() {
+        // The keyring itself is covered by `postino-platform` unit tests with a temp lock path.
+        // This test needs only the store wiring, so it never takes `%LOCALAPPDATA%\Postino`.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("mail.db");
-        let cli = Cli { demo: false, store: Some(path.clone()), json: true, command: Command::Info };
-        let mut engine = open_engine(&cli).expect("the store opens through the keyring");
+        let key = postino_platform::StoreKey::generate().expect("OS random source");
+        let store = postino_store::Store::open(&path, &postino_store::StoreKey::from_bytes(*key.as_bytes())).expect("the store opens");
+        let mut engine = Engine::open(store).expect("the engine opens");
         assert!(engine.is_persistent());
         assert!(!engine.is_demo());
         assert!(engine.accounts().is_empty(), "onboarding is P6");

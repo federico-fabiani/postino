@@ -206,9 +206,11 @@ per action, no hidden mutation.
   subject, body, signature, attachments, formatting bar. Reply/forward open the same composer
   prefilled.
 - Drafts autosave to the engine on every pause; the Drafts folder shows them. `Esc` closes and keeps
-  the draft. `Ctrl+Enter` sends (demo in M0; SMTP in M2).
-- In M0 the send moves the draft to Sent and shows an undo toast. The operation is honest: it is
-  labelled demo until SMTP exists.
+  the draft. `Ctrl+Enter` sends locally: this build opens no SMTP connection.
+- A send moves the draft to Sent and shows an undo toast. The Send button keeps the label
+  **Invia (locale)** and carries the notice `Nessun invio SMTP: il messaggio resta in Inviati su
+  questo computer.` next to it, so the honesty is visible before the click; real submission arrives
+  with M2.
 - The composer is a component, so the future HTML/Tailwind advanced mode can reuse its shell.
 
 Shipped in U0.4: `ComposerState` + `Composer` in `ui/widgets/composer.rs`, autosave after 1.2 s of
@@ -313,7 +315,8 @@ searchable shortcut sheet. Reply/forward arrived in U0.4; labels arrived in U0.5
 
 Shipped in `apps/postino-app/src/ui/widgets/composer.rs` and `apps/postino-app/src/app.rs`.
 `draft_save` creates a draft or patches one in place; `draft_send` moves the draft to Sent locally
-(no SMTP in this build) and is undoable. Attachments are metadata-only in M0, as is the send itself.
+and is undoable. The Send button shows the notice `Nessun invio SMTP: il messaggio resta in Inviati
+su questo computer.` before the click. Attachments are metadata-only in M0, as is the send itself.
 
 ### U0.5 Labels — done
 

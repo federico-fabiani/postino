@@ -2,7 +2,7 @@
 
 **Layer:** foundation. Depends on no other workspace crate; no UI toolkit.
 
-The encrypted local store. One SQLCipher database with schema **v2**, a migration runner on
+The encrypted local store. One SQLCipher database with schema **v3**, a migration runner on
 `PRAGMA user_version`, and a typed repository for the M1 mailbox. The engine drives it through
 `Engine::open` (P3c): the store stays independent of `postino-core` and never reads a keyring.
 
@@ -26,13 +26,18 @@ The encrypted local store. One SQLCipher database with schema **v2**, a migratio
   `SystemTime`, the demo clock and JavaScript; integers sort and index correctly; 64 bits have no
   2038 problem. IMAP/MIME dates are converted at the sync boundary.
 - **Transactions.** Label delete + detach, label batch apply/remove, flag batch, message move,
-  attachment replacement, draft save and any message upsert that changes folders run in one
+  attachment replacement, whole-draft save and any message upsert that changes folders run in one
   transaction. A bad id rolls the whole batch back.
 - **Upserts preserve what they do not own.** `upsert_message` replaces the message row only; label
-  assignments and attachment rows survive a sync refresh. `replace_attachments` is the explicit
-  replacement and keeps `messages.has_attachments` in step.
+  assignments and attachment rows survive a sync refresh. `save_draft_row` keeps the stored
+  `in_reply_to` when the update passes `None`; clearing it needs an explicit field, which does not
+  exist yet. `replace_attachments` is the explicit replacement and keeps
+  `messages.has_attachments` in step.
 
-## Schema v2
+## Schema v3
+
+v3 is additive from v2: it adds `draft_seq`, the draft revision high-water mark, and seeds it from
+`drafts.revision`, so an existing store keeps its revision numbers.
 
 | Table | Purpose |
 |---|---|
@@ -43,8 +48,9 @@ The encrypted local store. One SQLCipher database with schema **v2**, a migratio
 | `labels` | account-scoped or mailbox-wide, name, semantic colour name |
 | `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |
 | `drafts` | revision, updated_at, body, recipients, subject, in_reply_to |
+| `draft_seq` | message id → highest revision ever written; survives a send and a move back |
 | `sync_state` | per-folder uid_next, highest_modseq, last_error (IMAP writers arrive with P5) |
-| `meta` | key/value store from P3a |
+| `meta` | key/value store from P3a; holds the `label_seq` high-water mark |
 
 Indexes cover the hot reads: `messages(folder_id, date DESC)`, `messages(account_id, date DESC)`,
 `message_labels(label_id)`, `attachments(message_id)`, `drafts(updated_at DESC)` and
@@ -65,8 +71,18 @@ Plain data structs in `model.rs` (no `postino-core` dependency), methods in `rep
 - attachments: `replace_attachments`, `attachments`, `list_all_attachments`.
 - hydration: `list_all_messages` plus `list_all_attachments` load a whole mailbox in one query per
   table, with labels and attachments grouped by message; `Engine::open` uses exactly this pair.
-- drafts: `save_draft` (revision++), `get_draft`, `list_drafts`, `delete_draft`.
-- meta: `get_meta`, `set_meta`.
+- drafts: `save_draft_message` is the whole-draft API. It writes the message row, its attachments,
+  the revision row and the Drafts folder counts in one transaction, so a failure leaves no
+  half-saved draft. `send_draft_message` moves the message to Sent and deletes only the `drafts`
+  row, keeping `draft_seq` for a later move back. `delete_draft` removes the revision row and its
+  sequence; `delete_message` does the same plus the message itself. Reads are `get_draft` and
+  `list_drafts`. `save_draft` is only the low-level revision-row write used by tests and fixtures,
+  not a draft API: using it alone recreates the half-write pattern this crate removed.
+- orphan repair: `list_orphan_drafts` finds `drafts` rows with no message row;
+  `repair_orphan_drafts` materialises them in one transaction, and `Engine::open` runs that repair
+  before hydration so a crash from an older build cannot leave a ghost draft.
+- meta: `get_meta`, `set_meta`. `label_seq` is the label id high-water mark; `draft_seq` lives in
+  its own table because it is per draft.
 
 Folder `unread`/`total` are a cache maintained from `messages` on every mutation; `recount_folder`
 repairs them after a bulk import. List totals describe the filtered scope before pagination.
@@ -80,12 +96,15 @@ cargo test -p postino-store
 ```
 
 - `tests/encryption.rs`: keyless reads, wrong key, reopen, no plaintext in DB or WAL.
-- `tests/migrations.rs`: additive v1 → v2 upgrade with meta preserved, idempotent reopen,
-  `SchemaTooNew`, foreign-key enforcement and cascade.
+- `tests/migrations.rs`: additive v1 → v3 upgrade with meta preserved, v2 → v3 `draft_seq`
+  seeding, idempotent reopen, `SchemaTooNew`, foreign-key enforcement and cascade.
 - `tests/repository.rs`: the full round trip (account, folders, message, two recipients, attachment,
   two labels), filters/paging, counts after read/move/delete, cached-count repair, atomic batches,
   label delete detach, draft revisions across reopen, reopen persistence, unknown-id errors and the
   no-plaintext scan over DB/WAL/SHM with repository data.
+- unit tests in `src/repo.rs`: a temporary SQLite trigger aborts the `drafts` or `draft_seq` insert,
+  proving the whole save rolls back (message, attachment, draft, sequence and folder counts) and
+  that the same save succeeds once the trigger is dropped.
 
 ## Not here yet
 

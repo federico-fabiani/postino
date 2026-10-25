@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use postino_core::{Account, Address, Attachment, DraftContent, Engine, Folder, FolderKind, Message, OpError};
 use postino_store::{DraftUpdate, Store, StoreKey};
+use serde_json::json;
 
 const NOW: &str = "2026-10-24T10:42:00Z";
 
@@ -389,6 +390,155 @@ fn a_draft_row_without_a_display_row_is_still_loaded() {
 }
 
 #[test]
+fn an_orphan_draft_with_an_unknown_account_fails_the_open() {
+    let fixture = Fixture::new();
+    // An orphan that names an unknown account cannot be built through `save_draft`: the repository
+    // requires the account to exist. Insert it with a raw connection, exactly as an older build's
+    // crash or a corrupt store could have left it, with foreign keys off for this fixture write.
+    drop(fixture.open());
+    let connection = raw_connection(&fixture);
+    connection.execute_batch("PRAGMA foreign_keys = OFF;").expect("disable foreign keys for the fixture row");
+    connection
+        .execute(
+            "INSERT INTO drafts(id, account_id, revision, updated_at, body_text, to_json, cc_json, bcc_json, subject, in_reply_to)
+             VALUES('drf_orphan', 'acc_missing', 1, ?1, 'Corpo', '[]', '[]', '[]', 'Bozza orfana', NULL)",
+            [now().timestamp_millis()],
+        )
+        .expect("an orphan draft row with an unknown account");
+    drop(connection);
+
+    let error = Engine::open(fixture.open()).err().expect("an orphan with an unknown account must fail the open");
+    assert!(
+        matches!(&error, OpError::Failed(detail) if detail.contains("drf_orphan") && detail.contains("acc_missing")),
+        "the failure must name the draft and the account: {error}"
+    );
+    assert!(fixture.open().get_message("drf_orphan").expect("message row").is_none(), "a failed repair wrote a display row");
+}
+
+#[test]
+fn an_orphan_draft_without_a_drafts_folder_fails_the_open() {
+    let fixture = Fixture::new();
+    {
+        let store = fixture.open();
+        store
+            .upsert_account(&postino_store::Account {
+                id: "acc_test".to_owned(),
+                name: "Test".to_owned(),
+                email: "test@example.com".to_owned(),
+                provider: "manual".to_owned(),
+                signature: String::new(),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("account");
+        // No folder row: `save_draft` itself only needs the account, so this is a repository-built
+        // orphan rather than a raw row.
+        store
+            .save_draft(&DraftUpdate {
+                id: "drf_no_folder".to_owned(),
+                account_id: "acc_test".to_owned(),
+                updated_at: now().timestamp_millis(),
+                body_text: "Corpo".to_owned(),
+                to: Vec::new(),
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Bozza senza cartella".to_owned(),
+                in_reply_to: None,
+            })
+            .expect("orphan draft row");
+    }
+
+    let error = Engine::open(fixture.open()).err().expect("an orphan without a Drafts folder must fail the open");
+    assert!(
+        matches!(&error, OpError::Failed(detail) if detail.contains("drf_no_folder") && detail.contains("acc_test") && detail.contains("Drafts")),
+        "the failure must name the draft, the account and the missing folder: {error}"
+    );
+    assert!(fixture.open().get_message("drf_no_folder").expect("message row").is_none(), "a failed repair wrote a display row");
+}
+
+#[test]
+fn a_repaired_draft_keeps_a_label_and_a_flag_across_a_reopen() {
+    let fixture = Fixture::new();
+    {
+        let store = fixture.open();
+        store
+            .upsert_account(&postino_store::Account {
+                id: "acc_test".to_owned(),
+                name: "Test".to_owned(),
+                email: "test@example.com".to_owned(),
+                provider: "manual".to_owned(),
+                signature: String::new(),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("account");
+        store
+            .upsert_folder(&postino_store::Folder {
+                id: "drafts".to_owned(),
+                account_id: "acc_test".to_owned(),
+                name: "Bozze".to_owned(),
+                kind: postino_store::FolderKind::Drafts,
+                unread: 0,
+                total: 0,
+                uid_validity: None,
+                uid_next: None,
+                last_sync_at: None,
+            })
+            .expect("drafts folder");
+        store
+            .create_label(&postino_store::Label { id: "lbl_7".to_owned(), account_id: None, name: "Riparata".to_owned(), color: "forest".to_owned() })
+            .expect("label");
+        store
+            .save_draft(&DraftUpdate {
+                id: "drf_repaired".to_owned(),
+                account_id: "acc_test".to_owned(),
+                updated_at: now().timestamp_millis(),
+                body_text: "Corpo".to_owned(),
+                to: vec![postino_store::Address::new("Giulia", "giulia.ferri@example.com")],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Bozza riparata".to_owned(),
+                in_reply_to: None,
+            })
+            .expect("orphan draft row");
+    }
+
+    let mut engine = Engine::open(fixture.open()).expect("the orphan is repaired on open");
+    assert_eq!(engine.message("drf_repaired").map(|message| message.summary.folder_id.as_str()), Some("drafts"));
+    assert_eq!(engine.set_label("lbl_7", &["drf_repaired".to_owned()], true).expect("apply a label").1, 1);
+    let flagged = engine.set_flags("drf_repaired", Some(true), Some(true)).expect("set a flag");
+    assert!(flagged.unread && flagged.starred);
+    let drafts = engine.folders().iter().find(|folder| folder.id == "drafts").expect("drafts folder");
+    let engine_counts = (drafts.total, drafts.unread);
+    assert_eq!(engine_counts, (1, 1), "the engine counts did not follow the writes");
+    drop(engine);
+
+    let store = fixture.open();
+    let stored = store.get_message("drf_repaired").expect("row").expect("repaired message row");
+    assert_eq!(stored.summary.labels, vec!["lbl_7".to_owned()], "the label write did not reach the store");
+    assert!(stored.summary.unread && stored.summary.starred, "the flag write did not reach the store");
+    let stored_folder = store.get_folder("drafts").expect("folder").expect("drafts folder");
+    assert_eq!((stored_folder.total, stored_folder.unread), engine_counts, "the store folder counts disagree with the engine after the writes");
+    assert_eq!(
+        store.counts(Some("drafts")).expect("live counts"),
+        postino_store::MessageCounts { total: 1, unread: 1 },
+        "the live message counts disagree with the folder cache"
+    );
+    drop(store);
+
+    let reopened = Engine::open(fixture.open()).expect("reopen the store");
+    let message = reopened.message("drf_repaired").expect("the repaired draft survived the reopen");
+    assert_eq!(message.summary.labels, vec!["lbl_7".to_owned()], "the label was lost on reopen");
+    assert!(message.summary.unread && message.summary.starred, "the flag was lost on reopen");
+    let drafts = reopened.folders().iter().find(|folder| folder.id == "drafts").expect("drafts folder");
+    assert_eq!((drafts.total, drafts.unread), engine_counts, "the reopened engine counts changed");
+    let stored_folder = fixture.open().get_folder("drafts").expect("folder").expect("drafts folder");
+    assert_eq!(
+        (stored_folder.total, stored_folder.unread),
+        (drafts.total, drafts.unread),
+        "the store folder counts disagree with the reopened engine"
+    );
+}
+
+#[test]
 fn a_repo_failure_surfaces_and_leaves_memory_unchanged() {
     let fixture = Fixture::new();
     fixture.seed(&Engine::demo_at(now()));
@@ -482,6 +632,58 @@ fn a_failed_draft_save_leaves_store_rows_and_revision_unchanged() {
     assert_eq!(store_after.get_draft(&first.summary.id).expect("draft").expect("first draft row").revision, before_revision);
     assert_eq!(store_after.attachments(&first.summary.id).expect("attachments"), before_attachments);
     assert_eq!(store_after.get_draft(&second.summary.id).expect("draft").expect("second draft row").revision, 1);
+}
+
+#[test]
+fn a_subject_only_patch_keeps_the_html_body_and_the_reply_link() {
+    const HTML: &str = "<p>Corpo <strong>HTML</strong></p>";
+
+    let fixture = Fixture::new();
+    fixture.seed(&Engine::demo_at(now()));
+    let id = {
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        engine.save_draft(None, None, draft("Oggetto originale", "Corpo originale")).expect("draft").summary.id
+    };
+
+    // Put the two fields the composer does not own into the store: an HTML part on the message row
+    // and the reply linkage on the revision row.
+    {
+        let store = fixture.open();
+        let mut row = store.get_message(&id).expect("row").expect("draft row");
+        row.body_html = Some(HTML.to_owned());
+        store.upsert_message(&row).expect("store the HTML body");
+        let draft_row = store.get_draft(&id).expect("draft row").expect("draft");
+        store
+            .save_draft(&DraftUpdate {
+                id: id.clone(),
+                account_id: draft_row.account_id,
+                updated_at: draft_row.updated_at.saturating_add(1),
+                body_text: draft_row.body_text,
+                to: draft_row.to,
+                cc: draft_row.cc,
+                bcc: draft_row.bcc,
+                subject: draft_row.subject,
+                in_reply_to: Some("<msg_001@example.com>".to_owned()),
+            })
+            .expect("link the reply");
+    }
+
+    let mut engine = Engine::open(fixture.open()).expect("reopen");
+    assert_eq!(engine.message(&id).and_then(|message| message.body_html.as_deref()), Some(HTML), "the HTML body did not survive the engine load");
+    // The registry patch path: only `subject` is present, so `draft_content` keeps the rest.
+    let patched = engine.call("draft_save", json!({ "id": id.clone(), "subject": "Solo l'oggetto cambia" })).expect("patch the subject");
+    assert_eq!(patched["draft"]["summary"]["subject"], "Solo l'oggetto cambia");
+    assert_eq!(patched["draft"]["body_html"], json!(HTML), "the subject-only patch cleared body_html in memory");
+    assert_eq!(patched["draft"]["body_text"], "Corpo originale");
+    drop(engine);
+
+    let reopened = Engine::open(fixture.open()).expect("second reopen");
+    let message = reopened.message(&id).expect("the draft survived");
+    assert_eq!(message.body_html.as_deref(), Some(HTML), "the subject-only patch cleared body_html in the store");
+    assert_eq!(message.body_text, "Corpo originale");
+    let stored = fixture.open().get_draft(&id).expect("draft row").expect("revision row");
+    assert_eq!(stored.in_reply_to.as_deref(), Some("<msg_001@example.com>"), "the subject-only patch cleared in_reply_to");
+    assert_eq!(stored.revision, 3);
 }
 
 #[test]

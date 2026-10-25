@@ -18,6 +18,10 @@ Today the crate owns one seam: the **store key**.
 - Scopes are 1-128 printable characters. Use a stable value (`"default"` for `postino --store`, an
   account id for a per-account store): a different scope is a different key and therefore a
   different database.
+- Every call takes an OS file lock at `<app local data>/Postino/keyring.lock` for the whole
+  load-or-create, including the first read, so two processes cannot disagree about the key. A
+  read-back mismatch adopts the stable 32-byte key the vault actually holds; a vault that keeps
+  changing fails closed after one retry.
 - The crate installs `windows-native-keyring-store` lazily on first use; on platforms without a
   supported native store it returns `PlatformError::Unsupported` rather than writing the key
   somewhere weaker.
@@ -33,9 +37,12 @@ cargo test -p postino-platform
 ```
 
 Every test installs `keyring_core::mock` (or a deliberately broken store) as the default store
-before the first call, so the suite never reads or writes the real vault. Covered: creation is
-idempotent, a reload and a fresh handle return the same 32 bytes, scopes are independent, a missing
-vault and a read failure are readable errors, a short secret is refused, `Debug` is redacted.
+before the first call, and passes its own temporary lock path, so the suite never reads or writes
+the real vault or `%LOCALAPPDATA%\Postino`. Covered: creation is idempotent, a reload and a fresh
+handle return the same 32 bytes, scopes are independent, a missing vault and a read failure are
+readable errors, a short secret is refused, `Debug` is redacted, the first-run lock is exclusive
+across two threads, an existing key is read only under the lock, a foreign key is adopted after a
+read-back mismatch, and an unstable vault fails closed after one retry.
 
 The native Windows path is not part of the default suite. Before a release, run a manual smoke test
 with a throwaway scope and delete the credential afterwards.

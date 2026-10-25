@@ -20,6 +20,24 @@ use crate::model::{
 use crate::ops::{self, OpDef};
 use crate::store_map;
 
+/// A caller-supplied id that does not exist. The engine's pre-checks and the store's `NotFound`
+/// both map to this sentence, so a mistake is `InvalidArgs` whichever layer notices it first.
+pub(crate) fn unknown_account(id: &str) -> OpError {
+    OpError::InvalidArgs(format!("unknown account {id:?}; use an id returned by accounts_list"))
+}
+
+pub(crate) fn unknown_folder(id: &str) -> OpError {
+    OpError::InvalidArgs(format!("unknown folder {id:?}; use an id returned by folders_list"))
+}
+
+pub(crate) fn unknown_message(id: &str) -> OpError {
+    OpError::InvalidArgs(format!("unknown message {id:?}; use an id returned by messages_list"))
+}
+
+pub(crate) fn unknown_label(id: &str) -> OpError {
+    OpError::InvalidArgs(format!("unknown label {id:?}; use an id returned by labels_list"))
+}
+
 const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RECIPIENTS_PER_FIELD: usize = 100;
@@ -201,7 +219,7 @@ impl Engine {
         if name.is_none() && color.is_none() {
             return Err(OpError::InvalidArgs("provide name and/or color".to_owned()));
         }
-        let index = self.labels.iter().position(|label| label.id == id).ok_or_else(|| OpError::Failed(format!("unknown label {id:?}")))?;
+        let index = self.labels.iter().position(|label| label.id == id).ok_or_else(|| unknown_label(id))?;
         let new_name = match name {
             Some(name) => {
                 let name = validate_label_name(name)?;
@@ -227,7 +245,7 @@ impl Engine {
     /// Delete a label and detach it from every message. Returns the removed label and the number
     /// of messages that carried it. Mail is never touched.
     pub fn delete_label(&mut self, id: &str) -> Result<(Label, usize), OpError> {
-        let index = self.labels.iter().position(|label| label.id == id).ok_or_else(|| OpError::Failed(format!("unknown label {id:?}")))?;
+        let index = self.labels.iter().position(|label| label.id == id).ok_or_else(|| unknown_label(id))?;
         if let Some(store) = &self.store {
             store.delete_label(id).map_err(store_map::write_error)?;
         }
@@ -247,7 +265,7 @@ impl Engine {
     /// validated before anything changes, and repeating it changes nothing.
     pub fn set_label(&mut self, id: &str, message_ids: &[String], apply: bool) -> Result<(LabelSummary, usize), OpError> {
         if self.label(id).is_none() {
-            return Err(OpError::Failed(format!("unknown label {id:?}")));
+            return Err(unknown_label(id));
         }
         if message_ids.is_empty() {
             return Err(OpError::InvalidArgs("message_ids must contain at least one message id".to_owned()));
@@ -258,7 +276,7 @@ impl Engine {
         let ids = message_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
         for message_id in &ids {
             if !self.messages.iter().any(|message| message.summary.id == **message_id) {
-                return Err(OpError::Failed(format!("unknown message {message_id:?}")));
+                return Err(unknown_message(message_id));
             }
         }
         if let Some(store) = &self.store {
@@ -308,7 +326,7 @@ impl Engine {
             return Err(OpError::InvalidArgs("provide unread and/or starred".to_owned()));
         }
         if !self.messages.iter().any(|message| message.summary.id == id) {
-            return Err(OpError::Failed(format!("unknown message {id:?}")));
+            return Err(unknown_message(id));
         }
         if let Some(store) = &self.store {
             store.set_flags(&[id.to_owned()], FlagUpdate { unread, starred }).map_err(store_map::write_error)?;
@@ -330,14 +348,13 @@ impl Engine {
     /// Move one message to a regular folder. Virtual folders such as `starred` are views, not
     /// destinations.
     pub fn move_message(&mut self, id: &str, folder_id: &str) -> Result<MessageSummary, OpError> {
-        let target =
-            self.folders.iter().find(|folder| folder.id == folder_id).ok_or_else(|| OpError::Failed(format!("unknown folder {folder_id:?}")))?;
+        let target = self.folders.iter().find(|folder| folder.id == folder_id).ok_or_else(|| unknown_folder(folder_id))?;
         if target.kind.is_virtual() {
             return Err(OpError::InvalidArgs(format!("folder {folder_id:?} is virtual and cannot receive messages")));
         }
         let target_id = target.id.clone();
         if !self.messages.iter().any(|message| message.summary.id == id) {
-            return Err(OpError::Failed(format!("unknown message {id:?}")));
+            return Err(unknown_message(id));
         }
         if let Some(store) = &self.store {
             store.move_messages(&[id.to_owned()], &target_id).map_err(store_map::write_error)?;
@@ -432,10 +449,12 @@ impl Engine {
         validate_unique_attachment_ids(&attachments)?;
         let has_attachments = !attachments.is_empty();
         let summary_snippet = snippet(&draft.body_text);
-        // An update keeps what the draft form does not own: its thread, starred flag and labels.
-        let (thread_id, starred, labels) = match index.and_then(|index| self.messages.get(index)) {
-            Some(current) => (current.summary.thread_id.clone(), current.summary.starred, current.summary.labels.clone()),
-            None => (format!("thr_{message_id}"), false, Vec::new()),
+        // An update keeps what the draft form does not own: its thread, starred flag, labels and
+        // HTML body. The composer patches `body_text`; a subject-only save must not destroy the
+        // stored HTML part.
+        let (thread_id, starred, labels, body_html) = match index.and_then(|index| self.messages.get(index)) {
+            Some(current) => (current.summary.thread_id.clone(), current.summary.starred, current.summary.labels.clone(), current.body_html.clone()),
+            None => (format!("thr_{message_id}"), false, Vec::new(), None),
         };
         let saved = Message {
             summary: MessageSummary {
@@ -455,7 +474,7 @@ impl Engine {
             cc: draft.cc,
             bcc: draft.bcc,
             body_text: draft.body_text,
-            body_html: None,
+            body_html,
             attachments,
         };
 

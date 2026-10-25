@@ -527,6 +527,11 @@ impl Store {
     /// Save a draft revision row. A new id starts at revision 1; an existing id increments the
     /// store-owned sequence by one and takes every editable field. The sequence is written in the
     /// same transaction, so it survives a send and a later move back to Drafts.
+    ///
+    /// This writes only the revision row. A caller saving a real draft uses
+    /// [`Store::save_draft_message`], which also writes the display message, attachments and folder
+    /// counts in the same transaction; using this method alone is the half-write pattern that
+    /// `Engine::open` can only repair after the fact.
     pub fn save_draft(&self, draft: &DraftUpdate) -> Result<Draft, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         require_account(&tx, &draft.account_id)?;
@@ -541,7 +546,8 @@ impl Store {
     ///
     /// Every attachment id is validated before the first write: ids repeated in the request and ids
     /// owned by another message are [`StoreError::DuplicateAttachment`] and
-    /// [`StoreError::AttachmentOwnedByOther`], never a raw UNIQUE constraint. On any error the
+    /// [`StoreError::AttachmentOwnedByOther`], never a raw UNIQUE constraint. A `None` reply link
+    /// keeps the stored one, so a field the caller does not own cannot clear it. On any error the
     /// transaction rolls back and the previous rows are exactly as they were.
     pub fn save_draft_message(&self, message: &Message, attachments: &[Attachment]) -> Result<Draft, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
@@ -786,7 +792,9 @@ fn save_draft_row(tx: &rusqlite::Transaction<'_>, draft: &DraftUpdate) -> Result
              cc_json = excluded.cc_json,
              bcc_json = excluded.bcc_json,
              subject = excluded.subject,
-             in_reply_to = excluded.in_reply_to",
+             -- `None` keeps the stored link: a subject-only patch must not clear it. Clearing needs
+             -- an explicit field, which does not exist yet.
+             in_reply_to = COALESCE(excluded.in_reply_to, drafts.in_reply_to)",
         params![
             draft.id,
             draft.account_id,
@@ -1048,4 +1056,152 @@ fn row_to_draft(row: &Row<'_>) -> rusqlite::Result<Draft> {
         subject: row.get(8)?,
         in_reply_to: row.get(9)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StoreKey;
+
+    /// A trigger-injected failure is the only way to reach the write stages behind the attachment
+    /// pre-check, and it needs the private connection: hence a unit test here, not in `tests/`.
+    fn fixture() -> (tempfile::TempDir, Store) {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("OS random source");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("store.db"), &StoreKey::from_bytes(key)).expect("open the store");
+        store
+            .upsert_account(&Account {
+                id: "acc_1".to_owned(),
+                name: "Studio Verdi".to_owned(),
+                email: "studio@example.com".to_owned(),
+                provider: "demo".to_owned(),
+                signature: String::new(),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("account");
+        store
+            .upsert_folder(&Folder {
+                id: "drafts".to_owned(),
+                account_id: "acc_1".to_owned(),
+                name: "Bozze".to_owned(),
+                kind: FolderKind::Drafts,
+                unread: 0,
+                total: 0,
+                uid_validity: None,
+                uid_next: None,
+                last_sync_at: None,
+            })
+            .expect("drafts folder");
+        (dir, store)
+    }
+
+    fn message() -> Message {
+        Message {
+            summary: MessageSummary {
+                id: "drf_rollback".to_owned(),
+                account_id: "acc_1".to_owned(),
+                folder_id: "drafts".to_owned(),
+                thread_id: "thr_drf_rollback".to_owned(),
+                from: Address::new("Studio Verdi", "studio@example.com"),
+                to: vec![Address::new("Giulia", "giulia@example.com")],
+                subject: "Bozza atomica".to_owned(),
+                snippet: "Corpo".to_owned(),
+                date: 1_700_000_000_000,
+                unread: false,
+                starred: false,
+                has_attachments: true,
+                labels: Vec::new(),
+            },
+            uid: None,
+            message_id: None,
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            body_text: "Corpo".to_owned(),
+            body_html: None,
+            size: None,
+        }
+    }
+
+    fn attachment() -> Attachment {
+        Attachment {
+            id: "att_rollback".to_owned(),
+            filename: "preventivo.pdf".to_owned(),
+            mime: "application/pdf".to_owned(),
+            size: 10,
+            blob_hash: None,
+        }
+    }
+
+    fn count(store: &Store, sql: &str) -> i64 {
+        store.conn.query_row(sql, [], |row| row.get(0)).expect("count rows")
+    }
+
+    fn folder_totals(store: &Store) -> (u32, u32) {
+        let folder = store.get_folder("drafts").expect("folder").expect("drafts folder");
+        (folder.total, folder.unread)
+    }
+
+    fn assert_nothing_written(store: &Store, when: &str) {
+        assert_eq!(count(store, "SELECT COUNT(*) FROM messages WHERE id = 'drf_rollback'"), 0, "the message row survived {when}");
+        assert_eq!(count(store, "SELECT COUNT(*) FROM attachments WHERE message_id = 'drf_rollback'"), 0, "the attachment row survived {when}");
+        assert!(store.get_draft("drf_rollback").expect("read the draft row").is_none(), "the draft row survived {when}");
+        assert_eq!(count(store, "SELECT COUNT(*) FROM draft_seq WHERE message_id = 'drf_rollback'"), 0, "the sequence row survived {when}");
+    }
+
+    #[test]
+    fn a_temporary_drafts_trigger_rolls_back_every_stage_of_the_save() {
+        let (_dir, store) = fixture();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER p3e_abort_draft_insert BEFORE INSERT ON drafts
+                 BEGIN
+                     SELECT RAISE(ABORT, 'p3e injected draft failure');
+                 END;",
+            )
+            .expect("install the drafts trigger");
+        let folder_before = folder_totals(&store);
+        let message = message();
+        let attachment = attachment();
+
+        let error = store.save_draft_message(&message, std::slice::from_ref(&attachment)).expect_err("the trigger must abort the save");
+        assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+        assert_nothing_written(&store, "after the drafts trigger aborted");
+        assert_eq!(folder_totals(&store), folder_before, "the folder count cache moved after the rollback");
+        assert_eq!(store.counts(Some("drafts")).expect("counts"), MessageCounts::default());
+
+        store.conn.execute_batch("DROP TRIGGER p3e_abort_draft_insert;").expect("drop the trigger");
+        let saved = store.save_draft_message(&message, std::slice::from_ref(&attachment)).expect("the same save succeeds without the trigger");
+        assert_eq!(saved.revision, 1);
+        assert!(store.get_message("drf_rollback").expect("message").is_some());
+        assert_eq!(store.attachments("drf_rollback").expect("attachments"), vec![attachment]);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM draft_seq WHERE message_id = 'drf_rollback'"), 1);
+        assert_eq!(folder_totals(&store), (1, 0), "the successful save did not refresh the folder cache");
+    }
+
+    #[test]
+    fn a_failure_after_the_revision_row_rolls_back_the_earlier_stages() {
+        let (_dir, store) = fixture();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER p3e_abort_sequence_insert BEFORE INSERT ON draft_seq
+                 BEGIN
+                     SELECT RAISE(ABORT, 'p3e injected sequence failure');
+                 END;",
+            )
+            .expect("install the sequence trigger");
+        let folder_before = folder_totals(&store);
+        let message = message();
+        let attachment = attachment();
+
+        let error = store.save_draft_message(&message, std::slice::from_ref(&attachment)).expect_err("the trigger must abort the save");
+        assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+        assert_nothing_written(&store, "after the sequence trigger aborted");
+        assert_eq!(folder_totals(&store), folder_before, "the folder count cache moved after the rollback");
+
+        store.conn.execute_batch("DROP TRIGGER p3e_abort_sequence_insert;").expect("drop the trigger");
+        assert_eq!(store.save_draft_message(&message, std::slice::from_ref(&attachment)).expect("save without the trigger").revision, 1);
+    }
 }

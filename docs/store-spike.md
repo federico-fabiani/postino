@@ -211,11 +211,11 @@ What changed since the spike:
   for its exact final length, so formatting never reallocates and leaves an unzeroised copy behind.
   The SQLCipher connection keeps its own copy of the key internally; that copy is outside our reach
   and is still a documented gap, not a solved one.
-- **Schema v2** in `postino-store`: accounts, folders, messages, attachments, labels,
-  message_labels, drafts and sync_state, additive from the v1 `meta` table. Foreign keys on, WAL,
-  `synchronous = FULL`, 5 s busy timeout, Unix-millisecond dates (rationale in the crate docs).
-  The migration runner was extended, not rewritten: existing v1 files upgrade in place and keep
-  their meta rows.
+- **Schema v2, now v3** in `postino-store`: accounts, folders, messages, attachments, labels,
+  message_labels, drafts and sync_state, additive from the v1 `meta` table. P3d's v3 adds
+  `draft_seq`, the draft revision high-water mark. Foreign keys on, WAL, `synchronous = FULL`, 5 s
+  busy timeout, Unix-millisecond dates (rationale in the crate docs). The migration runner was
+  extended, not rewritten: existing v1 and v2 files upgrade in place and keep their rows.
 - **Repository** with plain structs and transactional batches (labels, flags, move, attachments,
   drafts). Message upserts preserve labels and attachments; replacement is explicit.
 - **No plaintext, now with real rows.** The P3a canary test covered `meta`. P3b writes an account,
@@ -228,3 +228,23 @@ What changed since the spike:
 The build cost did not move: `keyring-core`, `windows-native-keyring-store` and `zeroize` are small
 Rust crates, and the warm `postino-platform` + `postino-store` test suite runs in well under a
 second. SQLCipher/OpenSSL still dominate a cold build, exactly as measured above.
+
+## P3d/P3e outcome
+
+> **Packages:** P3d, P3e · **Date:** 2026-10-25 · **Verdict:** the store is v3 and a draft is one
+> whole transaction; the docs now describe that API, not the old half-write.
+
+- **Schema v3** adds `draft_seq(message_id PRIMARY KEY, revision)` and seeds it from
+  `drafts.revision`. A send deletes only the `drafts` row, so a later move back to Drafts continues
+  the revision sequence instead of restarting at 1. `meta.label_seq` is the equivalent high-water
+  mark for label ids: deleting the highest label never hands its id out again.
+- **`save_draft_message` is the draft API.** It writes the display message, its attachments, the
+  revision row and the Drafts folder counts in one `BEGIN IMMEDIATE` transaction; a trigger-injected
+  failure at the `drafts` or `draft_seq` stage leaves every row untouched. `save_draft` still exists
+  as the low-level revision-row write for migrations and fixtures, and is not a way to save a draft.
+- **Orphan repair.** A `drafts` row without a display row is materialised into a real message row in
+  one transaction by `Engine::open` before hydration, so an old build's crash cannot leave a draft
+  that is visible but cannot be flagged, labelled or moved.
+- **Keyring lock.** The whole load-or-create now runs under the OS file lock, including the first
+  read. A read-back mismatch adopts the key the vault actually holds when it is a valid 32-byte key;
+  an unstable vault fails closed after one retry.

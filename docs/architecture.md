@@ -162,14 +162,18 @@ postino --store <path> ── load_or_create_key("default") ──▶ postino-pl
 ```
 
 `load_or_create_key` fails closed: no vault, a failed read, a secret that is not 32 bytes or a
-failed RNG is an error, never a derived key or a plaintext file. First-run creation is serialised
-with an OS file lock at `<app local data>/Postino/keyring.lock`, held across re-read → generate →
-write → read-back; a mismatch is retried once inside the lock and then fails closed. `StoreKey` is
-redacted in `Debug`, has no `Clone` and zeroises its bytes on drop; the SQLCipher pragma is built in
-a zeroising string sized for the exact final length, so it never reallocates. SQLCipher's internal
-copy of the key is the remaining gap, recorded in `docs/store-spike.md`. The store crate never reads
-the keyring, which is what lets its tests run with a random in-memory key. Tests for the platform
-crate install `keyring_core::mock` and never touch the real vault.
+failed RNG is an error, never a derived key or a plaintext file. The whole load-or-create is
+serialised with an OS file lock at `<app local data>/Postino/keyring.lock`: the first read and, on a
+miss, re-read → generate → write → read-back all happen while the lock is held, so a second process
+cannot observe a key between another process's write and read-back. A read-back mismatch adopts the
+stable 32-byte key the vault actually holds, because an existing store may already be encrypted with
+it; a vault that is still changing after one retry fails closed with `ReadBackMismatch`. `StoreKey`
+is redacted in `Debug`, has no `Clone` and zeroises its bytes on drop; the SQLCipher pragma is built
+in a zeroising string sized for the exact final length, so it never reallocates. SQLCipher's
+internal copy of the key is the remaining gap, recorded in `docs/store-spike.md`. The store crate
+never reads the keyring, which is what lets its tests run with a random in-memory key. Tests for the
+platform crate install `keyring_core::mock`, pass a temporary lock path and never touch the real
+vault or `%LOCALAPPDATA%\Postino`.
 
 **Schema v3** (`crates/store/src/lib.rs`): v2 plus `draft_seq(message_id PRIMARY KEY, revision)`,
 which holds the draft revision high-water mark independently from the draft row. Migration v3 seeds
@@ -241,11 +245,12 @@ label create/update/delete and label apply/remove. Reads (`message_get`, `messag
 `labels_list`) never mutate. Account and folder writes remain a P6 seam: onboarding will call
 `upsert_account`/`upsert_folder` before the first engine load.
 
-Store errors are categorised at the `store_map` boundary: caller mistakes (unknown ids, duplicate
-names, account mismatches, repeated or cross-message attachment ids) are `OpError::InvalidArgs` with
-a specific sentence; I/O, wrong key, corruption and schema-too-new are `OpError::Failed` with the
-storage advice and a "rolled back, memory untouched" statement, which every engine write can honour
-because each is one transaction.
+Caller mistakes are `OpError::InvalidArgs` with a specific sentence whichever layer notices them
+first: the engine's in-memory pre-checks and the `store_map` boundary agree on unknown account,
+folder, message and label ids, duplicate names, account mismatches and repeated or cross-message
+attachment ids. I/O, wrong key, corruption, schema-too-new and missing configuration are
+`OpError::Failed` with the storage advice and a "rolled back, memory untouched" statement, which
+every engine write can honour because each is one transaction.
 
 **Counts.** The store keeps `folders.total`/`unread` current inside its own transactions; the engine
 recomputes its in-memory counts after each mutation instead of re-reading the store. The virtual

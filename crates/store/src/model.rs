@@ -230,6 +230,8 @@ pub struct DraftUpdate {
     pub cc: Vec<Address>,
     pub bcc: Vec<Address>,
     pub subject: String,
+    /// Reply linkage. `None` keeps the stored value on an update; there is no explicit clear yet,
+    /// so a field that does not own the link cannot destroy it.
     pub in_reply_to: Option<String>,
 }
 

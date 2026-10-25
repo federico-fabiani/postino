@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::engine::{Engine, OpError};
+use crate::engine::{Engine, OpError, unknown_account, unknown_folder, unknown_label, unknown_message};
 use crate::model::{Account, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, Message, MessageSummary};
 
 /// One operation as the CLI and MCP see it.
@@ -545,7 +545,7 @@ fn folders(engine: &Engine, args: FoldersListArgs) -> Result<Value, OpError> {
     let mut folders = engine.folders().to_vec();
     if let Some(account) = args.account {
         if !engine.accounts().iter().any(|candidate| candidate.id == account) {
-            return Err(OpError::Failed(format!("unknown account {account:?}")));
+            return Err(unknown_account(&account));
         }
         folders.retain(|folder| folder.account_id == account);
     }
@@ -553,7 +553,7 @@ fn folders(engine: &Engine, args: FoldersListArgs) -> Result<Value, OpError> {
 }
 
 fn find_folder<'a>(engine: &'a Engine, id: &str) -> Result<&'a Folder, OpError> {
-    engine.folders().iter().find(|folder| folder.id == id).ok_or_else(|| OpError::Failed(format!("unknown folder {id:?}")))
+    engine.folders().iter().find(|folder| folder.id == id).ok_or_else(|| unknown_folder(id))
 }
 
 fn page_bounds(limit: Option<u32>, offset: Option<u32>) -> (usize, usize) {
@@ -566,7 +566,7 @@ fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
     if let Some(label) = &args.label
         && engine.label(label).is_none()
     {
-        return Err(OpError::Failed(format!("unknown label {label:?}")));
+        return Err(unknown_label(label));
     }
     let folder = match args.folder.as_deref() {
         Some(id) => Some(find_folder(engine, id)?),
@@ -577,12 +577,15 @@ fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
     if let (Some(account), Some(folder)) = (&args.account, folder)
         && folder.account_id != *account
     {
-        return Err(OpError::Failed(format!("folder {:?} does not belong to account {account:?}", folder.id)));
+        return Err(OpError::InvalidArgs(format!(
+            "folder {:?} belongs to account {:?}, not {account:?}; use a folder from the same account",
+            folder.id, folder.account_id
+        )));
     }
     let account_folders = match (&args.account, folder) {
         (Some(account), None) => {
             if !engine.accounts().iter().any(|candidate| candidate.id == *account) {
-                return Err(OpError::Failed(format!("unknown account {account:?}")));
+                return Err(unknown_account(account));
             }
             Some(engine.folders().iter().filter(|folder| folder.account_id == *account).map(|folder| folder.id.as_str()).collect::<BTreeSet<_>>())
         }
@@ -615,7 +618,7 @@ fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
 }
 
 fn message(engine: &Engine, args: MessageGetArgs) -> Result<Value, OpError> {
-    let message = engine.message(&args.id).cloned().ok_or_else(|| OpError::Failed(format!("unknown message {:?}", args.id)))?;
+    let message = engine.message(&args.id).cloned().ok_or_else(|| unknown_message(&args.id))?;
     value(MessageGet { message })
 }
 
@@ -636,7 +639,7 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
     if let Some(label) = &args.label
         && engine.label(label).is_none()
     {
-        return Err(OpError::Failed(format!("unknown label {label:?}")));
+        return Err(unknown_label(label));
     }
 
     let mut rows: Vec<&Message> =
@@ -790,7 +793,7 @@ mod tests {
         assert_eq!(filtered["messages"][0]["id"], "msg_249");
 
         let unknown = engine.call("search", json!({ "query": "rapporto", "label": "lbl_missing" })).expect_err("unknown label");
-        assert!(matches!(unknown, crate::OpError::Failed(_)));
+        assert!(matches!(unknown, crate::OpError::InvalidArgs(_)), "{unknown}");
     }
 
     #[test]
@@ -805,7 +808,7 @@ mod tests {
     fn unknown_folder_fails() {
         let mut engine = Engine::demo();
         let error = engine.call("messages_list", json!({ "folder": "nope" })).expect_err("folder");
-        assert!(matches!(error, crate::OpError::Failed(_)));
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{error}");
     }
 
     #[test]
@@ -813,6 +816,34 @@ mod tests {
         let mut engine = Engine::demo();
         let error = engine.call("search", json!({ "query": "   " })).expect_err("query");
         assert!(matches!(error, crate::OpError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn every_unknown_id_path_is_invalid_args() {
+        let mut engine = Engine::demo();
+        let message = engine.messages()[0].summary.id.clone();
+        let cases = [
+            ("folders_list", json!({ "account": "acc_missing" })),
+            ("messages_list", json!({ "folder": "missing" })),
+            ("messages_list", json!({ "label": "lbl_missing" })),
+            ("messages_list", json!({ "label": "lbl_1", "account": "acc_missing" })),
+            ("messages_list", json!({ "folder": "inbox", "account": "acc_missing" })),
+            ("search", json!({ "query": "posta", "folder": "missing" })),
+            ("search", json!({ "query": "posta", "label": "lbl_missing" })),
+            ("message_get", json!({ "id": "missing" })),
+            ("message_flag", json!({ "id": "missing", "unread": true })),
+            ("message_move", json!({ "id": "missing", "folder": "archive" })),
+            ("message_move", json!({ "id": message, "folder": "missing" })),
+            ("label_update", json!({ "id": "missing", "name": "X" })),
+            ("label_delete", json!({ "id": "missing" })),
+            ("label_apply", json!({ "id": "missing", "message_ids": [message], "apply": true })),
+            ("label_apply", json!({ "id": "lbl_1", "message_ids": ["missing"], "apply": true })),
+        ];
+        for (name, args) in cases {
+            let error = engine.call(name, args.clone()).expect_err("an unknown id must be refused");
+            assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{name} {args} -> {error}");
+            assert!(!error.to_string().contains("free disk space"), "{name} {args} reports a caller mistake as a storage failure");
+        }
     }
 
     #[test]
@@ -841,7 +872,7 @@ mod tests {
     fn moving_an_unknown_message_fails() {
         let mut engine = Engine::demo();
         let error = engine.call("message_move", json!({ "id": "missing", "folder": "archive" })).expect_err("unknown message");
-        assert!(matches!(error, crate::OpError::Failed(_)));
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{error}");
     }
 
     #[test]
@@ -969,7 +1000,7 @@ mod tests {
         assert_eq!(deleted["label"]["name"], "Ufficio");
         assert_eq!(deleted["affected"], 0);
         assert!(engine.label(&id).is_none());
-        assert!(matches!(engine.call("label_update", json!({ "id": id, "name": "X" })), Err(crate::OpError::Failed(_))));
+        assert!(matches!(engine.call("label_update", json!({ "id": id, "name": "X" })), Err(crate::OpError::InvalidArgs(_))));
     }
 
     #[test]
@@ -1006,7 +1037,7 @@ mod tests {
         let mut engine = Engine::demo();
         let error =
             engine.call("label_apply", json!({ "id": "lbl_2", "message_ids": ["msg_001", "missing"], "apply": true })).expect_err("unknown message");
-        assert!(matches!(error, crate::OpError::Failed(_)));
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{error}");
         assert!(
             engine.message("msg_001").is_some_and(|message| !message.summary.labels.iter().any(|label| label == "lbl_2")),
             "the valid message must be untouched when the batch fails"
@@ -1017,7 +1048,7 @@ mod tests {
         ));
         assert!(matches!(
             engine.call("label_apply", json!({ "id": "missing", "message_ids": ["msg_001"], "apply": true })),
-            Err(crate::OpError::Failed(_))
+            Err(crate::OpError::InvalidArgs(_))
         ));
         let ids = (0..501).map(|index| format!("msg_{index:03}")).collect::<Vec<_>>();
         let error = engine.call("label_apply", json!({ "id": "lbl_2", "message_ids": ids, "apply": true })).expect_err("cap");
@@ -1053,9 +1084,9 @@ mod tests {
         assert!(rows.iter().all(|row| row["labels"].as_array().is_some_and(|labels| labels.contains(&json!("lbl_1")))));
 
         let error = engine.call("messages_list", json!({ "label": "lbl_missing" })).expect_err("unknown label");
-        assert!(matches!(error, crate::OpError::Failed(_)));
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{error}");
         let error = engine.call("messages_list", json!({ "folder": "inbox", "label": "lbl_missing" })).expect_err("unknown label with folder");
-        assert!(matches!(error, crate::OpError::Failed(_)));
+        assert!(matches!(error, crate::OpError::InvalidArgs(_)), "{error}");
     }
 
     #[test]

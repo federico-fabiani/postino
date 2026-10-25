@@ -19,6 +19,10 @@ use crate::ui::widgets::{Button, ButtonSize, IconButton, IconButtonSize, Section
 /// long enough that typing a sentence does not write on every key.
 pub const AUTOSAVE_DELAY: f64 = 1.2;
 
+/// Shown next to the Send button before the click, not only in the after-the-fact toast: this
+/// build opens no SMTP connection and the message stays in Sent on this computer.
+pub const SEND_NOTICE: &str = "Nessun invio SMTP: il messaggio resta in Inviati su questo computer.";
+
 /// Each composer gets a fresh text-edit id so undo history and cursor state cannot leak from a
 /// previous message.
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -601,6 +605,12 @@ impl<'a> Composer<'a> {
                         response.send = true;
                     }
                     ui.add_space(space::XS);
+                    let notice = IconButton::new(icons::INFO, SEND_NOTICE).size(IconButtonSize::Sm).show(ui);
+                    #[cfg(test)]
+                    probe::send_notice(SEND_NOTICE, notice.rect);
+                    #[cfg(not(test))]
+                    let _ = notice;
+                    ui.add_space(space::XS);
                     if Button::new("Salva bozza")
                         .icon(icons::SAVE)
                         .size(ButtonSize::Sm)
@@ -719,7 +729,34 @@ pub fn compose_body(signature: &str, quoted: Option<String>) -> String {
 }
 
 #[cfg(test)]
+mod probe {
+    use std::sync::Mutex;
+
+    use eframe::egui::Rect;
+
+    static SEND_NOTICE: Mutex<Option<(&'static str, Rect)>> = Mutex::new(None);
+
+    pub(super) fn send_notice(text: &'static str, rect: Rect) {
+        if let Ok(mut slot) = SEND_NOTICE.lock() {
+            *slot = Some((text, rect));
+        }
+    }
+
+    pub(super) fn take_send_notice() -> Option<(&'static str, Rect)> {
+        SEND_NOTICE.lock().ok().and_then(|slot| *slot)
+    }
+
+    pub(super) fn clear() {
+        if let Ok(mut slot) = SEND_NOTICE.lock() {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use eframe::egui::{Pos2, RawInput, Rect, Vec2};
+
     use super::*;
 
     #[test]
@@ -741,5 +778,33 @@ mod tests {
         state.body_selection = Some((0, 7));
         state.apply_format(FormatAction::Bullet, 2.0);
         assert_eq!(state.body, "• uno\n• due");
+    }
+
+    #[test]
+    fn the_send_notice_says_nothing_leaves_the_machine() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, false);
+        let account = Account {
+            id: "acc_demo".to_owned(),
+            name: "Federico".to_owned(),
+            email: "federico@example.it".to_owned(),
+            provider: "Aruba".to_owned(),
+            signature: String::new(),
+        };
+        let mut state = ComposerState::new(ComposeMode::New);
+        state.to = "giulia.ferri@example.com".to_owned();
+        probe::clear();
+
+        let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = Composer::new(&mut state, &account).show(ui);
+        });
+        output.textures_delta.clear();
+
+        let (notice, rect) = probe::take_send_notice().expect("the composer did not draw the send notice next to Send");
+        assert_eq!(notice, SEND_NOTICE);
+        assert_eq!(SEND_NOTICE, "Nessun invio SMTP: il messaggio resta in Inviati su questo computer.");
+        assert!(rect.width() > 0.0 && rect.height() > 0.0, "the notice has no clickable/tooltip surface: {rect:?}");
     }
 }
