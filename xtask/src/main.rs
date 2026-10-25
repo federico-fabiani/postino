@@ -80,6 +80,7 @@ fn layers() -> Result<()> {
     let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec().context("cargo metadata")?;
     let allowed: HashMap<&str, &[&str]> = HashMap::from([
         ("postino-core", &[][..]),
+        ("postino-platform", &[][..]),
         ("postino-store", &[][..]),
         ("postino-app", &["postino-core"][..]),
         ("postino-cli", &["postino-core"][..]),
@@ -99,10 +100,10 @@ fn layers() -> Result<()> {
                 bail!("layering: {} may not depend on workspace crate {}", package.name, dependency.name);
             }
         }
-        if package.name == "postino-core" {
+        if matches!(package.name.as_str(), "postino-core" | "postino-platform" | "postino-store") {
             for dependency in &package.dependencies {
                 if ui_crates.contains(&dependency.name.as_str()) {
-                    bail!("layering: postino-core must stay headless, but depends on {}", dependency.name);
+                    bail!("layering: {} must stay headless, but depends on {}", package.name, dependency.name);
                 }
             }
         }

@@ -1,0 +1,19 @@
+[package]
+name = "postino-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Platform seams: the OS keyring, and the store key Postino keeps in it"
+
+[dependencies]
+getrandom.workspace = true
+keyring-core.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store.workspace = true
+
+[lints]
+workspace = true

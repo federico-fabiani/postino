@@ -3,10 +3,12 @@
 **Local-first, agent-first mail.** A fast, native email client written in Rust, with one operation
 registry shared by the desktop app, the CLI and an MCP server.
 
-> **Status: M0 walking skeleton + U0 UI foundation.** The shell, the operation registry, the CLI and
-> the MCP server work against a synthetic demo mailbox. IMAP, SMTP, SQLite and the background daemon
-> land in M1-M4. No real account is configured, no mail leaves the machine, and the composer's send
-> is explicitly a local demo.
+> **Status: M0 walking skeleton + U0 UI foundation + the M1 store foundation.** The shell, the
+> operation registry, the CLI and the MCP server work against a synthetic demo mailbox. The encrypted
+> store crate now has the M1 schema, migrations and repository, and the platform crate owns the
+> Windows keyring seam, but neither is wired into the engine yet. IMAP, SMTP, the real mailbox and the
+> background daemon land in M1-M4. No real account is configured, no mail leaves the machine, and the
+> composer's send is explicitly a local demo.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -36,6 +38,9 @@ MCP      ─┘
 - `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
+- The M1 persistence foundation, tested but not wired: an encrypted SQLCipher store with schema v2,
+  additive migrations and a typed repository (`postino-store`), plus the Windows Credential Manager
+  key seam (`postino-platform`). The engine still runs on the in-memory demo.
 - Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
   MCP protocol tests.
 
@@ -94,8 +99,9 @@ Example client configuration:
 }
 ```
 
-Without `--demo`, the engine has no accounts and the tools return empty lists. A real store and
-account onboarding arrive in M1.
+Without `--demo`, the engine has no accounts and the tools return empty lists. The encrypted store
+exists as `postino-store` (P3b) but is not wired into the engine yet; account onboarding arrives with
+P6.
 
 ## Quality gates
 

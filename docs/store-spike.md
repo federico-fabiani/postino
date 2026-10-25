@@ -192,16 +192,38 @@ the app, `journal_mode=WAL`, `synchronous=FULL`, `SQLITE_TEMP_STORE=2` (in memor
 runner on `user_version`. Keep `keyring-core` + `windows-native-keyring-store` for the real key and
 `keyring_core::mock` for tests. Do not adopt libsql, and do not fall back to column-level AEAD.
 
-## P3b first step
+## P3b outcome
 
-Create `crates/platform` (foundation, no workspace dependencies) with one function:
+> **Package:** P3b · **Date:** 2026-10-25 · **Verdict:** the spike's recommendation shipped, with the
+> keyring boundary and the zeroise gap closed as far as user-space allows.
 
-```rust
-pub fn load_or_create_store_key(scope: &str) -> Result<StoreKey, PlatformError>;
-```
+What changed since the spike:
 
-It reads a 32-byte secret from Windows Credential Manager (`service = "postino"`,
-`user = scope`), creates one with `getrandom` on first run, and fails closed if the vault is
-unavailable. Its test swaps `keyring_core::mock` and asserts load-or-create is idempotent; the native
-path stays a manual smoke test. Only after that: wire `postino_store::Store::open` into the daemon
-and add the real schema, in that order. The store crate must not read the keyring itself.
+- **`crates/platform`** now owns the keyring. `load_or_create_key(scope)` reads 32 bytes from the
+  Windows Credential Manager (`service = "postino"`, `user = scope`), creates them with `getrandom`
+  on first run, and fails closed when the vault is unavailable. It depends on `keyring-core` 1.0.1
+  plus `windows-native-keyring-store` 1.1.0 (the split the spike recommended), so tests install
+  `keyring_core::mock` and the same code path runs in memory. No test touches the real vault. The
+  default suite covers idempotent creation, reload, a fresh handle, scope isolation, a missing
+  vault, a read failure and a wrong-length secret; the native path remains a manual smoke test.
+- **Key lifetime, risk 3.** `StoreKey` in both crates has no `Clone`, redacts `Debug`, and zeroises
+  its bytes on drop (`zeroize` 1.9). The raw-key pragma is built inside a zeroising `String`. The
+  SQLCipher connection keeps its own copy of the key internally; that copy is outside our reach and
+  is still a documented gap, not a solved one.
+- **Schema v2** in `postino-store`: accounts, folders, messages, attachments, labels,
+  message_labels, drafts and sync_state, additive from the v1 `meta` table. Foreign keys on, WAL,
+  `synchronous = FULL`, 5 s busy timeout, Unix-millisecond dates (rationale in the crate docs).
+  The migration runner was extended, not rewritten: existing v1 files upgrade in place and keep
+  their meta rows.
+- **Repository** with plain structs and transactional batches (labels, flags, move, attachments,
+  drafts). Message upserts preserve labels and attachments; replacement is explicit.
+- **No plaintext, now with real rows.** The P3a canary test covered `meta`. P3b writes an account,
+  folder, message, recipient, label, attachment metadata and draft with canaries, scans the database
+  and its WAL/SHM for all of them, and also asserts that the store key itself does not appear in the
+  file bytes. Wrong key and schema-too-new still fail closed.
+- **Not wired in.** The engine, CLI and MCP still run the in-memory demo. P3c maps the operations;
+  IMAP writers for `sync_state`, FTS5 and blob files are later packages.
+
+The build cost did not move: `keyring-core`, `windows-native-keyring-store` and `zeroize` are small
+Rust crates, and the warm `postino-platform` + `postino-store` test suite runs in well under a
+second. SQLCipher/OpenSSL still dominate a cold build, exactly as measured above.

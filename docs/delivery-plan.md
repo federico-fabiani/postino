@@ -67,7 +67,9 @@ Status: `todo` · `active` · `review` · `done`.
 | P0.1 | Harness hardening | frozen clock, strict flags, no-hang watchdog, atomic PNG, parser/PNG tests | done |
 | P1 | U0.5 labels | label create/rename/delete/apply/filter in engine, GUI, CLI, MCP; counts; keyboard | done |
 | P2 | U0.5 polish | loading/error/empty states, reduced motion, a11y pass, final light/dark screenshots | todo |
-| P3 | M1 store | SQLite (encryption seam + keyring), migrations, WAL, repository behind the engine | todo |
+| P3a | Store spike | SQLCipher go/no-go with measured build time, size and encrypted-file proof | done |
+| P3b | Store schema + keyring | platform keyring seam, schema v2, repository API, no-plaintext tests | done |
+| P3c | Engine wiring | engine reads/writes the encrypted store; demo path unchanged; reopen test | todo |
 | P4 | M1 MIME | parser/serializer, sanitized HTML subset, plain-text alternative, attachment storage | todo |
 | P5 | M1 IMAP | CAPABILITY/LOGIN/LIST/SELECT/FETCH/IDLE, fake-server tests, offline cache | todo |
 | P6 | M1 onboarding | autodiscovery, Aruba app-password flow, multi-account model, real folder tree | todo |

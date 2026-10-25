@@ -2,40 +2,92 @@
 
 **Layer:** foundation. Depends on no other workspace crate; no UI toolkit.
 
-Encrypted local store. The spike proof for P3a: a SQLCipher database with a 256-bit key supplied by
-the caller, WAL, a fail-closed codec check and one migration runner. `docs/store-spike.md` holds the
-measurements and the decision.
+The encrypted local store. One SQLCipher database with schema **v2**, a migration runner on
+`PRAGMA user_version`, and a typed repository for the M1 mailbox. The engine does not use it yet:
+P3c maps the operations onto this API.
+
+`docs/architecture.md` describes the schema and key flow; `docs/store-spike.md` records why SQLCipher.
 
 ## Contract
 
-- The key is a `StoreKey` (`[u8; 32]`). This crate never reads the OS keyring, the environment or a
-  config file: the app stores the key in the keyring (`postino-platform`, P3b) and hands it over.
-  Tests use a random in-memory key, so they cannot touch the real Windows Credential Manager.
-- `StoreKey`'s `Debug` output is redacted. A key must never reach a log line.
-- Open fails closed (`StoreError::NotEncrypted`) if the linked SQLite has no codec, instead of
-  silently writing plaintext.
-- Pages, WAL frames and the temp store are encrypted. SQLCipher is built with
-  `SQLITE_TEMP_STORE=2`, so temporary tables stay in memory.
-- A wrong key is reported as `WrongKeyOrCorrupt`: SQLCipher cannot tell the two apart, and the error
-  does not pretend otherwise.
-- Migrations are `MIGRATIONS`: index `n - 1` moves `PRAGMA user_version` from `n - 1` to `n`, each
-  in its own transaction. A database from a newer build is refused.
+- **The key is handed in.** `Store::open(path, &StoreKey)` takes 32 bytes. This crate never reads the
+  OS keyring, the environment or a config file. `postino-platform` owns the keyring; tests use a
+  random in-memory key, so they cannot touch the Windows Credential Manager.
+- **`StoreKey` never leaks.** `Debug` is `<redacted>`, the bytes are zeroised on drop, and the
+  SQLCipher pragma is built in a zeroising string. The key is not on disk: a test scans the database,
+  WAL and SHM for the key bytes.
+- **Fail closed.** A missing codec is `NotEncrypted`; a wrong key or damaged file is
+  `WrongKeyOrCorrupt`; a database from a newer build is `SchemaTooNew`. There is no plaintext mode.
+- **Pragmas on open:** `foreign_keys = ON`, `journal_mode = WAL`, `synchronous = FULL`, 5 s busy
+  timeout. SQLCipher is built with `SQLITE_TEMP_STORE=2`, so temp tables stay in memory.
+- **Migrations are append-only.** `MIGRATIONS[n - 1]` moves `user_version` from `n - 1` to `n`, each
+  in its own transaction. Never edit a shipped migration; add the next one.
+- **Dates are Unix milliseconds** (`i64`), not seconds and not text. Milliseconds match
+  `SystemTime`, the demo clock and JavaScript; integers sort and index correctly; 64 bits have no
+  2038 problem. IMAP/MIME dates are converted at the sync boundary.
+- **Transactions.** Label delete + detach, label batch apply/remove, flag batch, message move,
+  attachment replacement, draft save and any message upsert that changes folders run in one
+  transaction. A bad id rolls the whole batch back.
+- **Upserts preserve what they do not own.** `upsert_message` replaces the message row only; label
+  assignments and attachment rows survive a sync refresh. `replace_attachments` is the explicit
+  replacement and keeps `messages.has_attachments` in step.
 
-## Not here yet (P3b)
+## Schema v2
 
-Message, folder, draft, outbox and sync schemas; repository API; FTS5 indexes; blob storage; key
-generation and the keyring round trip. The engine still runs on the in-memory demo.
+| Table | Purpose |
+|---|---|
+| `accounts` | id, name, email, provider, signature, created_at |
+| `folders` | account, name, kind, cached unread/total, `uid_validity`, `uid_next`, `last_sync_at` |
+| `messages` | envelope, JSON recipient lists, flags, body text/HTML, size, optional IMAP uid |
+| `attachments` | metadata only: filename, mime, size, optional blob hash |
+| `labels` | account-scoped or mailbox-wide, name, semantic colour name |
+| `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |
+| `drafts` | revision, updated_at, body, recipients, subject, in_reply_to |
+| `sync_state` | per-folder uid_next, highest_modseq, last_error (IMAP writers arrive with P5) |
+| `meta` | key/value store from P3a |
+
+Indexes cover the hot reads: `messages(folder_id, date DESC)`, `messages(account_id, date DESC)`,
+`message_labels(label_id)`, `attachments(message_id)`, `drafts(updated_at DESC)` and
+`folders(account_id)`. `labels` has `UNIQUE(account_id, name)` plus a partial unique index on
+mailbox-wide names, because SQLite treats `NULL`s as distinct in a plain unique constraint.
+
+## Repository
+
+Plain data structs in `model.rs` (no `postino-core` dependency), methods in `repo.rs`:
+
+- accounts: `upsert_account`, `list_accounts`, `get_account`.
+- folders: `upsert_folder`, `list_folders`, `get_folder`, `recount_folder`.
+- messages: `upsert_message`, `get_message`, `list_messages` (folder/label/all, unread/starred/
+  attachment filters, limit/offset), `counts`, `set_flags`, `move_messages`, `delete_message`.
+- labels: `create_label`, `update_label`, `delete_label`, `get_label`, `list_labels` (live counts),
+  `apply_label`, `remove_label`, `messages_by_label`, `labels_for`.
+- attachments: `replace_attachments`, `attachments`.
+- drafts: `save_draft` (revision++), `get_draft`, `list_drafts`, `delete_draft`.
+- meta: `get_meta`, `set_meta`.
+
+Folder `unread`/`total` are a cache maintained from `messages` on every mutation; `recount_folder`
+repairs them after a bulk import. List totals describe the filtered scope before pagination.
+`list_messages` clamps the page to 1..=500 rows.
 
 ## Tests
 
-```sh
+```powershell
 $env:PATH = "C:\msys64\mingw64\bin;C:\msys64\usr\bin;$env:PATH"
 cargo test -p postino-store
 ```
 
-The integration tests open a database in a temp dir, write and read a row, reopen with the same key,
-refuse a wrong key and assert the file header is not `SQLite format 3`, nor does any file contain the
-written plaintext.
+- `tests/encryption.rs`: keyless reads, wrong key, reopen, no plaintext in DB or WAL.
+- `tests/migrations.rs`: additive v1 → v2 upgrade with meta preserved, idempotent reopen,
+  `SchemaTooNew`, foreign-key enforcement and cascade.
+- `tests/repository.rs`: the full round trip (account, folders, message, two recipients, attachment,
+  two labels), filters/paging, counts after read/move/delete, cached-count repair, atomic batches,
+  label delete detach, draft revisions across reopen, reopen persistence, unknown-id errors and the
+  no-plaintext scan over DB/WAL/SHM with repository data.
+
+## Not here yet
+
+Engine/app/CLI wiring (P3c), IMAP sync writers, MIME parsing, FTS5, encrypted attachment blobs
+(P4), outbox (P7), daemon (M4). `sync_state` has its table but no repository writer until P5.
 
 ## Build prerequisite (Windows GNU)
 

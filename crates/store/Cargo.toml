@@ -4,11 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Encrypted local store: SQLCipher connection, migrations and the key seam"
+description = "Encrypted local store: SQLCipher schema, migrations and repository"
 
 [dependencies]
 rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 getrandom.workspace = true

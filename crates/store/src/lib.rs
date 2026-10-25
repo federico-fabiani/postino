@@ -1,27 +1,167 @@
 //! Encrypted local store.
 //!
 //! One SQLCipher database whose pages, WAL frames and temp store are encrypted with a 256-bit key
-//! supplied by the caller. The key comes from the OS keyring in the app; this crate never reads a
-//! keyring, a config file or the environment, which is also why tests cannot touch the real vault.
+//! supplied by the caller. The key comes from the OS keyring in the app (`postino-platform`, under a
+//! scope the app chooses); this crate never reads a keyring, a config file or the environment, which
+//! is also why tests cannot touch the real vault.
+//!
+//! # Schema and dates
+//!
+//! `PRAGMA user_version` names the schema version; `MIGRATIONS` holds the ordered, additive
+//! migrations. Version 2 is the M1 mailbox schema: accounts, folders, messages, attachments, labels,
+//! message_labels, drafts, sync_state and the P3a `meta` table.
+//!
+//! Every date is a **Unix timestamp in milliseconds** (`i64`). The choice is deliberate:
+//!
+//! - it is the same unit as JavaScript, `SystemTime` arithmetic and the existing demo clock, so a
+//!   client never has to guess between seconds and milliseconds;
+//! - it is timezone-free, sortable as an integer and needs no formatting or locale in SQL;
+//! - integer comparisons keep the `(folder_id, date DESC)` indexes usable, which a text timestamp
+//!   would not;
+//! - 64 bits cover ±292 million years, so there is no year-2038 cliff.
+//!
+//! IMAP `INTERNALDATE` and MIME `Date` are converted at the sync boundary; the store never sees a
+//! string date. `NULL` is only used where the source may genuinely not know (`last_sync_at`,
+//! `uid_validity`, `uid_next`), never as "zero".
+//!
+//! # Transactions
+//!
+//! Every repository mutation that touches more than one row runs in one transaction: label batch
+//! apply/remove, label delete plus detach, attachment replacement, message move, draft save and the
+//! flag batch. Upserts of a message never touch `message_labels` or `attachments`, so a sync refresh
+//! preserves local labels and attachment metadata unless the caller explicitly replaces them.
+
+mod model;
+mod repo;
+
+pub use model::{
+    Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, Label, LabelCount, Message, MessageCounts, MessageFilter,
+    MessagePage, MessageSummary,
+};
 
 use std::fmt;
 use std::path::Path;
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Migrations applied in order: index `n - 1` moves `PRAGMA user_version` from `n - 1` to `n`.
-const MIGRATIONS: &[&str] = &["CREATE TABLE meta(
+///
+/// Never edit a shipped migration: an existing store already ran it. Add a new entry instead.
+const MIGRATIONS: &[&str] = &[
+    // v1 (P3a): the proof only needed a key/value table.
+    "CREATE TABLE meta(
          key   TEXT PRIMARY KEY,
          value TEXT NOT NULL
-     ) WITHOUT ROWID;"];
+     ) WITHOUT ROWID;",
+    // v2 (P3b): the M1 mailbox schema.
+    r#"
+CREATE TABLE accounts(
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    email      TEXT NOT NULL,
+    provider   TEXT NOT NULL,
+    signature  TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE folders(
+    id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    unread       INTEGER NOT NULL DEFAULT 0 CHECK(unread >= 0),
+    total        INTEGER NOT NULL DEFAULT 0 CHECK(total >= 0),
+    uid_validity INTEGER NULL,
+    uid_next     INTEGER NULL,
+    last_sync_at INTEGER NULL
+);
+CREATE INDEX folders_account ON folders(account_id);
+
+CREATE TABLE messages(
+    id              TEXT PRIMARY KEY,
+    account_id      TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    folder_id       TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+    uid             INTEGER NULL,
+    message_id      TEXT NULL,
+    thread_id       TEXT NOT NULL,
+    from_name       TEXT NOT NULL,
+    from_email      TEXT NOT NULL,
+    to_json         TEXT NOT NULL,
+    cc_json         TEXT NOT NULL,
+    bcc_json        TEXT NOT NULL,
+    subject         TEXT NOT NULL,
+    snippet         TEXT NOT NULL,
+    date            INTEGER NOT NULL,
+    unread          INTEGER NOT NULL DEFAULT 0 CHECK(unread IN (0, 1)),
+    starred         INTEGER NOT NULL DEFAULT 0 CHECK(starred IN (0, 1)),
+    has_attachments INTEGER NOT NULL DEFAULT 0 CHECK(has_attachments IN (0, 1)),
+    body_text       TEXT NOT NULL,
+    body_html       TEXT NULL,
+    size            INTEGER NULL
+);
+CREATE INDEX messages_folder_date ON messages(folder_id, date DESC);
+CREATE INDEX messages_account_date ON messages(account_id, date DESC);
+
+CREATE TABLE attachments(
+    id         TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    filename   TEXT NOT NULL,
+    mime       TEXT NOT NULL,
+    size       INTEGER NOT NULL CHECK(size >= 0),
+    blob_hash  TEXT NULL
+);
+CREATE INDEX attachments_message ON attachments(message_id);
+
+CREATE TABLE labels(
+    id         TEXT PRIMARY KEY,
+    account_id TEXT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    color      TEXT NOT NULL,
+    UNIQUE(account_id, name)
+);
+-- SQLite treats NULLs as distinct in UNIQUE(account_id, name), so the table constraint alone would
+-- allow duplicate mailbox-wide label names. This partial index closes that hole.
+CREATE UNIQUE INDEX labels_global_name ON labels(name) WHERE account_id IS NULL;
+
+CREATE TABLE message_labels(
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    label_id   TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    PRIMARY KEY(message_id, label_id)
+) WITHOUT ROWID;
+CREATE INDEX message_labels_label ON message_labels(label_id);
+
+CREATE TABLE drafts(
+    id          TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    revision    INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+    updated_at  INTEGER NOT NULL,
+    body_text   TEXT NOT NULL,
+    to_json     TEXT NOT NULL,
+    cc_json     TEXT NOT NULL,
+    bcc_json    TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    in_reply_to TEXT NULL
+);
+CREATE INDEX drafts_updated ON drafts(updated_at DESC);
+
+CREATE TABLE sync_state(
+    folder_id      TEXT PRIMARY KEY REFERENCES folders(id) ON DELETE CASCADE,
+    uid_next       INTEGER NOT NULL,
+    highest_modseq INTEGER NULL,
+    last_error     TEXT NULL
+) WITHOUT ROWID;
+"#,
+];
 
 /// A 256-bit store key.
 ///
-/// `Debug` is redacted on purpose: a key must never reach a log line.
-#[derive(Clone, PartialEq, Eq)]
+/// `Debug` is redacted on purpose and the bytes are zeroised on drop: a key must never reach a log
+/// line or stay in freed memory.
+#[derive(PartialEq, Eq)]
 pub struct StoreKey([u8; 32]);
 
 impl StoreKey {
@@ -29,19 +169,32 @@ impl StoreKey {
         Self(bytes)
     }
 
+    /// The raw bytes, so a caller can hand them to another component without a formatted copy.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Render the key as SQLCipher's raw-key pragma.
     ///
     /// SQLCipher reads the pragma when the statement is prepared, before bound parameters are
     /// available, so a bound `PRAGMA key = ?` is silently ignored on an existing file. The hex-only
-    /// literal cannot need escaping.
-    fn pragma(&self) -> String {
+    /// literal cannot need escaping. The returned string is zeroised when dropped.
+    fn pragma(&self) -> Zeroizing<String> {
         use fmt::Write as _;
-        let mut hex = String::with_capacity(64);
+        let mut sql = Zeroizing::new(String::with_capacity(80));
+        sql.push_str("PRAGMA key = \"x'");
         for byte in self.0 {
             // Writing into a String is infallible.
-            let _ = write!(hex, "{byte:02x}");
+            let _ = write!(sql, "{byte:02x}");
         }
-        format!("PRAGMA key = \"x'{hex}'\";")
+        sql.push_str("'\";");
+        sql
+    }
+}
+
+impl Drop for StoreKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -61,6 +214,18 @@ pub enum StoreError {
     WrongKeyOrCorrupt,
     #[error("store schema version {found} is newer than this build ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
+    #[error("{entity} {id:?} does not exist")]
+    NotFound { entity: &'static str, id: String },
+    #[error("folder {folder_id:?} belongs to account {folder_account:?}, not {message_account:?}")]
+    AccountMismatch { folder_id: String, message_account: String, folder_account: String },
+    #[error("{entity} {name:?} already exists")]
+    Duplicate { entity: &'static str, name: String },
+    #[error("store row in {table} is not readable: {detail}")]
+    Corrupt { table: &'static str, detail: String },
+    #[error("store value cannot be encoded: {0}")]
+    Encode(#[from] serde_json::Error),
+    #[error("{field} does not fit the store's 64-bit integer range")]
+    OutOfRange { field: &'static str },
 }
 
 fn translate(error: rusqlite::Error) -> StoreError {
@@ -70,7 +235,7 @@ fn translate(error: rusqlite::Error) -> StoreError {
     }
 }
 
-/// An open, migrated store. One connection in WAL mode.
+/// An open, migrated store. One connection in WAL mode; the daemon will own it in M4.
 pub struct Store {
     conn: Connection,
 }
@@ -149,6 +314,11 @@ mod tests {
     #[test]
     fn pragma_uses_the_raw_key_form() {
         let key = StoreKey::from_bytes([0x0f; 32]);
-        assert_eq!(key.pragma(), "PRAGMA key = \"x'0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f'\";");
+        assert_eq!(key.pragma().as_str(), "PRAGMA key = \"x'0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f'\";");
+    }
+
+    #[test]
+    fn schema_version_matches_the_migration_list() {
+        assert_eq!(MIGRATIONS.len(), SCHEMA_VERSION as usize, "bump the schema version and append a migration together");
     }
 }

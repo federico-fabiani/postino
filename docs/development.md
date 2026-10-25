@@ -47,7 +47,8 @@ cargo xtask assets --write               # regenerate ATTRIBUTION.md
 
 ```
 crates/core/        domain, demo engine, operation registry
-crates/store/       encrypted SQLCipher store (P3a proof; not wired into the engine)
+crates/platform/    OS seams: the store key in the Windows Credential Manager
+crates/store/       encrypted SQLCipher store, schema v2, repository (not wired into the engine)
 apps/postino-app/   egui shell
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks
@@ -111,6 +112,11 @@ they have a reason to exist.
 - **CLI:** `run` argument parsing, recipient flags, label subcommands, `messages --label` with and
   without `--folder`, `search --label`, MCP protocol (`initialize`, `tools/list`, `tools/call`,
   errors, notifications).
+- **Store:** schema upgrade from v1, migration idempotence, repository round trips, counts after
+  read/move/delete, atomic batches, draft revisions across reopen, wrong key, schema-too-new and a
+  no-plaintext scan over the database, WAL and SHM.
+- **Platform:** keyring load-or-create against `keyring_core::mock` only; the native vault is a
+  manual, tagged smoke test and never part of the default suite.
 - **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery,
   composer, sidebar label registry, label filter, inline create/rename and the multi-select label
   undo path. The test asserts the shell paints at least one shape.
