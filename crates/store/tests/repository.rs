@@ -271,6 +271,50 @@ fn counts_follow_read_move_and_delete() {
 }
 
 #[test]
+fn mailbox_hydration_reads_every_message_label_and_attachment() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    store.upsert_message(&sample_message("msg_2", INBOX, "Seconda", "Testo", 1_700_000_200_000)).expect("second message");
+    let mut third = sample_message("msg_3", ARCHIVE, "Terza", "Altro testo", 1_700_000_300_000);
+    third.body_html = Some("<p>Altro testo</p>".to_owned());
+    third.summary.unread = false;
+    third.summary.starred = true;
+    store.upsert_message(&third).expect("third message");
+    store
+        .create_label(&Label { id: "lbl_1".to_owned(), account_id: Some(ACCOUNT.to_owned()), name: "Lavoro".to_owned(), color: "forest".to_owned() })
+        .expect("label");
+    store
+        .create_label(&Label { id: "lbl_2".to_owned(), account_id: Some(ACCOUNT.to_owned()), name: "Casa".to_owned(), color: "gold".to_owned() })
+        .expect("label");
+    store.apply_label("lbl_2", &ids(&["msg_1"])).expect("apply lbl_2");
+    store.apply_label("lbl_1", &ids(&["msg_1"])).expect("apply lbl_1");
+    store
+        .replace_attachments(
+            "msg_1",
+            &[
+                Attachment { id: "att_1".to_owned(), filename: "primo.pdf".to_owned(), mime: "application/pdf".to_owned(), size: 7, blob_hash: None },
+                Attachment { id: "att_2".to_owned(), filename: "secondo.png".to_owned(), mime: "image/png".to_owned(), size: 9, blob_hash: None },
+            ],
+        )
+        .expect("attachments");
+
+    let messages = store.list_all_messages().expect("hydrate messages");
+    assert_eq!(messages.iter().map(|message| message.summary.id.as_str()).collect::<Vec<_>>(), vec!["msg_3", "msg_2", "msg_1"]);
+    let first = messages.iter().find(|message| message.summary.id == "msg_1").expect("msg_1");
+    assert_eq!(first.body_text, "Buongiorno, ecco il rapporto di ottobre.");
+    assert_eq!(first.summary.labels, vec!["lbl_1", "lbl_2"], "labels arrive ordered by id");
+    let archived = messages.iter().find(|message| message.summary.id == "msg_3").expect("msg_3");
+    assert_eq!(archived.body_html.as_deref(), Some("<p>Altro testo</p>"));
+
+    let attachments = store.list_all_attachments().expect("hydrate attachments");
+    assert_eq!(attachments.len(), 1, "messages without attachments are absent");
+    let first_attachments = attachments.get("msg_1").expect("msg_1 attachments");
+    assert_eq!(first_attachments.iter().map(|attachment| attachment.filename.as_str()).collect::<Vec<_>>(), vec!["primo.pdf", "secondo.png"]);
+    assert!(!attachments.contains_key("msg_2"));
+}
+
+#[test]
 fn recount_repairs_the_folder_cache() {
     let fixture = Fixture::new();
     let store = fixture.open();

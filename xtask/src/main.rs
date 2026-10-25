@@ -79,11 +79,13 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
 fn layers() -> Result<()> {
     let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec().context("cargo metadata")?;
     let allowed: HashMap<&str, &[&str]> = HashMap::from([
-        ("postino-core", &[][..]),
+        // The engine sits above the foundation: it owns the domain types and drives the encrypted
+        // repository. The store never depends back on it.
+        ("postino-core", &["postino-store"][..]),
         ("postino-platform", &[][..]),
         ("postino-store", &[][..]),
         ("postino-app", &["postino-core"][..]),
-        ("postino-cli", &["postino-core"][..]),
+        ("postino-cli", &["postino-core", "postino-store", "postino-platform"][..]),
         ("xtask", &[][..]),
     ]);
     let ui_crates = ["eframe", "egui", "egui_extras", "winit", "rfd"];

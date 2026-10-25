@@ -3,12 +3,13 @@
 **Local-first, agent-first mail.** A fast, native email client written in Rust, with one operation
 registry shared by the desktop app, the CLI and an MCP server.
 
-> **Status: M0 walking skeleton + U0 UI foundation + the M1 store foundation.** The shell, the
-> operation registry, the CLI and the MCP server work against a synthetic demo mailbox. The encrypted
-> store crate now has the M1 schema, migrations and repository, and the platform crate owns the
-> Windows keyring seam, but neither is wired into the engine yet. IMAP, SMTP, the real mailbox and the
-> background daemon land in M1-M4. No real account is configured, no mail leaves the machine, and the
-> composer's send is explicitly a local demo.
+> **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c).** The
+> shell, the operation registry, the CLI and the MCP server work against a synthetic demo mailbox,
+> and `postino --store <path>` can now run the same operations on the encrypted SQLCipher database:
+> accounts, folders, messages, labels, drafts and flags survive a restart. The desktop app still
+> boots on the demo until onboarding (P6). IMAP, MIME, SMTP and the background daemon land in
+> M1-M4. No real account is configured, no mail leaves the machine, and the composer's send is
+> explicitly a local demo.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -38,11 +39,12 @@ MCP      ─┘
 - `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
-- The M1 persistence foundation, tested but not wired: an encrypted SQLCipher store with schema v2,
-  additive migrations and a typed repository (`postino-store`), plus the Windows Credential Manager
-  key seam (`postino-platform`). The engine still runs on the in-memory demo.
+- The M1 persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema
+  v2, additive migrations and a typed repository (`postino-store`), plus the Windows Credential
+  Manager key seam (`postino-platform`). `Engine::open` loads the mailbox once and writes every
+  mutation through; `Engine::demo()` is unchanged and the desktop app still uses it.
 - Headless rendering tests of the shell, gallery, composer and label flows, operation-schema tests,
-  MCP protocol tests.
+  MCP protocol tests, and store round-trip tests at both the repository and engine level.
 
 ![Postino composer: recipients, subject, Markdown formatting bar, body and attachment, with the draft save state in the footer](docs/images/postino-u04-compose.png)
 
@@ -73,9 +75,18 @@ cargo run -p postino-cli -- --demo label create "Ufficio" --color forest
 cargo run -p postino-cli -- --demo messages --label lbl_1
 cargo run -p postino-cli -- --demo messages --label lbl_1 --folder sent
 cargo run -p postino-cli -- --demo search preventivo --label lbl_1
+
+# Encrypted local store: the same operations, persisted across restarts
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" info
 ```
 
 The app is `postino-app`; the command is `postino`. The product name stays Postino.
+
+`--store` opens or creates the SQLCipher database at that path and takes the key from the OS keyring
+(service `postino`, scope `default`); `--demo` and `--store` are mutually exclusive. A fresh store has
+no accounts until onboarding (P6), so mail commands report that nothing is configured; the store is
+exercised end to end by the test suite today. One process owns the database: do not point two
+`postino --store` commands at the same file.
 
 ### MCP
 
@@ -99,9 +110,9 @@ Example client configuration:
 }
 ```
 
-Without `--demo`, the engine has no accounts and the tools return empty lists. The encrypted store
-exists as `postino-store` (P3b) but is not wired into the engine yet; account onboarding arrives with
-P6.
+Without `--demo`, the engine has no accounts and the tools return empty lists. With
+`--store <path>` the same tools read and write the encrypted database. Account onboarding, which
+creates the first account and folder tree in a fresh store, is the next milestone (P6).
 
 ## Quality gates
 
@@ -157,6 +168,7 @@ The GNU toolchain plus MSYS2 is the path documented here.
 - [Design](docs/design.md): palette, contrast, type, logo.
 - [Development](docs/development.md): toolchain, layout, testing.
 - [Store spike](docs/store-spike.md): P3a encrypted-SQLite evaluation, numbers and decision.
+- [Briefs](docs/briefs/): the package contracts, including P3c engine wiring.
 - [Roadmap](ROADMAP.md): M0 to M6.
 - [Decisions](docs/decisions/): UI, runtime and sync ADRs.
 

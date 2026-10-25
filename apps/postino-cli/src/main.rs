@@ -3,12 +3,17 @@
 //! Both are thin adapters over `postino-core`'s operation registry. `postino run` can call any
 //! operation; the friendly subcommands cover the daily ones. MCP runs only when `postino mcp` is
 //! launched, talks only over stdin/stdout and exits on EOF.
+//!
+//! `--demo` runs the synthetic in-memory mailbox; `--store <path>` runs on the encrypted local store
+//! with the key from the OS keyring. Without either the engine has no accounts until onboarding
+//! (P6). The key is never printed.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod mcp;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +32,9 @@ struct Cli {
     /// Exercise the synthetic demo mailbox (no account configured).
     #[arg(long, global = true)]
     demo: bool,
+    /// Open the encrypted local store at this path. The key is read from the OS keyring.
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "demo")]
+    store: Option<PathBuf>,
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
@@ -56,7 +64,7 @@ enum DraftCommand {
         #[arg(long)]
         send: bool,
     },
-    /// Demo only: move an existing draft to Sent. The demo engine is in-memory; use
+    /// Demo only: move an existing draft to Sent. Nothing is sent over the network; use
     /// `draft save --send` to create and send a draft in one CLI command.
     Send { id: String },
 }
@@ -84,7 +92,7 @@ enum LabelCommand {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Version, platform, data directory and demo mode.
+    /// Version, platform, data directory and whether the mailbox is demo, store-backed or empty.
     Info,
     /// List the operations and their JSON Schemas.
     Tools,
@@ -168,16 +176,43 @@ enum Command {
     Mcp,
 }
 
+/// Keyring scope the CLI uses for its store. A different scope is a different key and therefore a
+/// different database.
+const STORE_KEY_SCOPE: &str = "default";
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).target(env_logger::Target::Stderr).init();
     let cli = Cli::parse();
-    let mut engine = if cli.demo { Engine::demo() } else { Engine::empty() };
+    let mut engine = match open_engine(&cli) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("postino: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run(cli, &mut engine) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("postino: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Build the engine the command asked for: demo, encrypted store, or the empty engine that waits
+/// for onboarding. The store key never leaves this function except inside the store connection.
+fn open_engine(cli: &Cli) -> Result<Engine> {
+    match (&cli.store, cli.demo) {
+        (Some(_), true) => bail!("--demo e --store non possono essere usati insieme: scegli la mailbox sintetica o il database cifrato"),
+        (Some(path), false) => {
+            let key = postino_platform::load_or_create_key(STORE_KEY_SCOPE)
+                .map_err(|error| anyhow::anyhow!("the OS keyring could not provide the store key: {error}"))?;
+            let store = postino_store::Store::open(path, &postino_store::StoreKey::from_bytes(*key.as_bytes()))
+                .map_err(|error| anyhow::anyhow!("opening the store at {}: {error}", path.display()))?;
+            Engine::open(store).map_err(anyhow::Error::new)
+        }
+        (None, true) => Ok(Engine::demo()),
+        (None, false) => Ok(Engine::empty()),
     }
 }
 
@@ -195,7 +230,9 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
             | Command::Label { .. }
     );
     if needs_mail && engine.accounts().is_empty() {
-        bail!("nessun account configurato; riprova con --demo per i dati sintetici");
+        bail!(
+            "nessun account configurato; riprova con --demo per i dati sintetici oppure apri un --store già configurato (l'onboarding arriva con P6)"
+        );
     }
 
     match cli.command {
@@ -209,7 +246,13 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                     info.name,
                     info.version,
                     info.platform,
-                    if info.demo { "demo" } else { "empty" },
+                    if info.demo {
+                        "demo"
+                    } else if info.store {
+                        "store"
+                    } else {
+                        "empty"
+                    },
                     info.data_dir.as_deref().unwrap_or("unknown"),
                     info.operations
                 ))?;
@@ -346,11 +389,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 } else if json_output {
                     print_json(&saved)?;
                 } else {
-                    say(format!(
-                        "Bozza salvata: {}\n{}\nIl motore demo è in memoria: usa --send per inviarla subito.",
-                        draft_id,
-                        format_summary(&saved.draft.summary)
-                    ))?;
+                    say(format!("Bozza salvata: {}\n{}\n{}", draft_id, format_summary(&saved.draft.summary), draft_note(engine)))?;
                 }
             }
             DraftCommand::Send { id } => {
@@ -375,7 +414,8 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                     if result.labels.is_empty() {
                         text.push_str("Nessuna etichetta. Creane una con `label create <nome> --color gold`.\n");
                     }
-                    text.push_str("\nEtichette locali, in memoria fino a M1: nessun server viene aggiornato.\n");
+                    text.push('\n');
+                    text.push_str(labels_note(engine));
                     say(text)?;
                 }
             }
@@ -387,10 +427,11 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                     print_json(&result)?;
                 } else {
                     say(format!(
-                        "Etichetta creata: {} \"{}\" ({})\nEtichette locali, in memoria fino a M1.\n",
+                        "Etichetta creata: {} \"{}\" ({})\n{}",
                         result.label.id,
                         result.label.name,
-                        result.label.color.as_str()
+                        result.label.color.as_str(),
+                        labels_note(engine)
                     ))?;
                 }
             }
@@ -399,7 +440,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 if json_output {
                     print_json(&result)?;
                 } else {
-                    say(format!("Etichetta rinominata: {} \"{}\"\nEtichette locali, in memoria fino a M1.\n", result.label.id, result.label.name))?;
+                    say(format!("Etichetta rinominata: {} \"{}\"\n{}", result.label.id, result.label.name, labels_note(engine)))?;
                 }
             }
             LabelCommand::Delete { id } => {
@@ -407,7 +448,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 if json_output {
                     print_json(&result)?;
                 } else {
-                    say(format_label_delete(&result))?;
+                    say(format_label_delete(&result, labels_note(engine)))?;
                 }
             }
             LabelCommand::Apply { id, message_ids } => {
@@ -415,7 +456,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 if json_output {
                     print_json(&result)?;
                 } else {
-                    say(format_label_change(&result, true))?;
+                    say(format_label_change(&result, true, labels_note(engine)))?;
                 }
             }
             LabelCommand::Remove { id, message_ids } => {
@@ -423,7 +464,7 @@ fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
                 if json_output {
                     print_json(&result)?;
                 } else {
-                    say(format_label_change(&result, false))?;
+                    say(format_label_change(&result, false, labels_note(engine)))?;
                 }
             }
         },
@@ -459,9 +500,27 @@ fn count_label(count: u32, singular: &str, plural: &str) -> String {
     if count == 1 { format!("1 {singular}") } else { format!("{count} {plural}") }
 }
 
-fn format_label_delete(result: &LabelDelete) -> String {
+/// Where a store-backed engine keeps mutations, in words a person can check against what they see
+/// after a restart.
+fn labels_note(engine: &Engine) -> &'static str {
+    if engine.is_persistent() {
+        "Etichette locali, salvate nel database cifrato: nessun server viene aggiornato.\n"
+    } else {
+        "Etichette locali, in memoria (modalità demo): nessun server viene aggiornato.\n"
+    }
+}
+
+fn draft_note(engine: &Engine) -> &'static str {
+    if engine.is_persistent() {
+        "Bozza salvata nel database cifrato: riapri con lo stesso --store per ritrovarla."
+    } else {
+        "Il motore demo è in memoria: usa --send per inviarla subito."
+    }
+}
+
+fn format_label_delete(result: &LabelDelete, note: &str) -> String {
     format!(
-        "Etichetta eliminata: \"{}\" · rimossa da {}.\nLe mail non sono state toccate; le etichette sono metadati locali in memoria fino a M1.\n",
+        "Etichetta eliminata: \"{}\" · rimossa da {}.\nLe mail non sono state toccate; {note}",
         result.label.name,
         count_label(u32::try_from(result.affected).unwrap_or(u32::MAX), "messaggio", "messaggi")
     )
@@ -478,7 +537,7 @@ fn format_label(label: &LabelSummary) -> String {
     )
 }
 
-fn format_label_change(result: &LabelApply, apply: bool) -> String {
+fn format_label_change(result: &LabelApply, apply: bool, note: &str) -> String {
     let message = if result.changed == 0 {
         format!("Nessuna modifica: l'etichetta \"{}\" è già nello stato richiesto.\n", result.label.name)
     } else if apply {
@@ -494,7 +553,7 @@ fn format_label_change(result: &LabelApply, apply: bool) -> String {
             count_label(u32::try_from(result.changed).unwrap_or(u32::MAX), "messaggio", "messaggi")
         )
     };
-    format!("{message}Etichette locali, in memoria fino a M1.\n")
+    format!("{message}{note}")
 }
 
 fn parse_cli_addresses(values: Vec<String>, field: &str) -> Result<Vec<Address>> {
@@ -635,7 +694,7 @@ mod tests {
     }
 
     fn cli(command: Command) -> Cli {
-        Cli { demo: true, json: true, command }
+        Cli { demo: true, store: None, json: true, command }
     }
 
     #[test]
@@ -667,8 +726,9 @@ mod tests {
         call(&mut engine, "label_apply", json!({ "id": label.id, "message_ids": ["msg_001"], "apply": true })).expect("label applied");
         let value = call(&mut engine, "label_delete", json!({ "id": label.id })).expect("label deleted");
         let result = decode::<LabelDelete>(value).expect("delete response");
-        let text = format_label_delete(&result);
+        let text = format_label_delete(&result, labels_note(&engine));
         assert!(text.contains("rimossa da 1 messaggio."), "{text}");
+        assert!(text.contains("in memoria (modalità demo)"), "{text}");
     }
 
     #[test]
@@ -758,5 +818,134 @@ mod tests {
         assert_eq!(addresses.len(), 3);
         assert_eq!(addresses[0].name, "Giulia");
         assert!(parse_cli_addresses(vec!["not-an-address".to_owned()], "--bcc").is_err());
+    }
+
+    /// A store in a throwaway directory with a random key: the suite never touches the real
+    /// keyring and never uses a predictable key.
+    struct TempStore {
+        dir: tempfile::TempDir,
+        key: postino_store::StoreKey,
+    }
+
+    impl TempStore {
+        fn new() -> Self {
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes).expect("OS random source");
+            Self { dir: tempfile::tempdir().expect("temp dir"), key: postino_store::StoreKey::from_bytes(bytes) }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.dir.path().join("mail.db")
+        }
+
+        fn open(&self) -> postino_store::Store {
+            postino_store::Store::open(&self.path(), &self.key).expect("open the store")
+        }
+
+        /// Onboarding is P6, so the test seeds the account and the folders the draft flow needs.
+        fn seed(&self) {
+            let store = self.open();
+            store
+                .upsert_account(&postino_store::Account {
+                    id: "acc_cli".to_owned(),
+                    name: "Test".to_owned(),
+                    email: "test@example.com".to_owned(),
+                    provider: "manual".to_owned(),
+                    signature: String::new(),
+                    created_at: 1_700_000_000_000,
+                })
+                .expect("account");
+            for (id, name, kind) in [
+                ("inbox", "Posta in arrivo", postino_store::FolderKind::Inbox),
+                ("sent", "Inviati", postino_store::FolderKind::Sent),
+                ("drafts", "Bozze", postino_store::FolderKind::Drafts),
+            ] {
+                store
+                    .upsert_folder(&postino_store::Folder {
+                        id: id.to_owned(),
+                        account_id: "acc_cli".to_owned(),
+                        name: name.to_owned(),
+                        kind,
+                        unread: 0,
+                        total: 0,
+                        uid_validity: None,
+                        uid_next: None,
+                        last_sync_at: None,
+                    })
+                    .expect("folder");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_store_keeps_a_draft_across_a_reopen() {
+        let fixture = TempStore::new();
+        fixture.seed();
+
+        let draft_id = {
+            let mut engine = Engine::open(fixture.open()).expect("engine on the store");
+            assert!(engine.is_persistent());
+            assert!(!engine.is_demo(), "store data is not synthetic demo data");
+            let args = json!({
+                "to": [{ "email": "giulia.ferri@example.com" }],
+                "subject": "Bozza persistente",
+                "body_text": "Scritta da CLI"
+            });
+            let saved = call(&mut engine, "draft_save", args).expect("draft_save");
+            let id = saved["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
+            // Second save: the store owns the revision counter.
+            let saved = call(
+                &mut engine,
+                "draft_save",
+                json!({
+                    "id": id,
+                    "to": [{ "email": "giulia.ferri@example.com" }],
+                    "subject": "Bozza persistente",
+                    "body_text": "Scritta da CLI, revisione due"
+                }),
+            )
+            .expect("draft_save update");
+            assert_eq!(saved["draft"]["summary"]["id"], json!(id));
+            id
+        };
+
+        assert_eq!(fixture.open().get_draft(&draft_id).expect("draft row").expect("draft").revision, 2);
+
+        let mut engine = Engine::open(fixture.open()).expect("reopen");
+        let listed: MessagesList =
+            decode(call(&mut engine, "messages_list", json!({ "folder": "drafts" })).expect("messages_list")).expect("messages");
+        assert_eq!(listed.total, 1);
+        assert_eq!(listed.messages[0].id, draft_id);
+        assert_eq!(listed.messages[0].subject, "Bozza persistente");
+        let message: MessageGet = decode(call(&mut engine, "message_get", json!({ "id": draft_id })).expect("message_get")).expect("message");
+        assert_eq!(message.message.body_text, "Scritta da CLI, revisione due");
+    }
+
+    /// The `--store` path end to end: the key comes from the platform seam (a mock vault here,
+    /// never the real Windows vault) and a fresh encrypted database opens with no accounts.
+    #[test]
+    fn open_engine_builds_a_store_engine_from_the_keyring() {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().expect("mock keyring"));
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mail.db");
+        let cli = Cli { demo: false, store: Some(path.clone()), json: true, command: Command::Info };
+        let mut engine = open_engine(&cli).expect("the store opens through the keyring");
+        assert!(engine.is_persistent());
+        assert!(!engine.is_demo());
+        assert!(engine.accounts().is_empty(), "onboarding is P6");
+        assert!(path.is_file(), "the database file was not created");
+        // Reads work on the empty store; the mail commands need an account.
+        let info: AppInfo = decode(call(&mut engine, "app_info", json!({})).expect("app_info")).expect("app info");
+        assert!(info.store && !info.demo);
+        let error = run(Cli { demo: false, store: Some(path), json: true, command: Command::Folders { account: None } }, &mut engine);
+        assert!(error.is_err_and(|error| error.to_string().contains("nessun account")));
+    }
+
+    #[test]
+    fn demo_and_store_cannot_be_combined() {
+        let fixture = TempStore::new();
+        let cli = Cli { demo: true, store: Some(fixture.path()), json: true, command: Command::Info };
+        let error = open_engine(&cli).err().expect("both modes at once must be refused");
+        assert!(error.to_string().contains("--demo e --store"), "{error}");
     }
 }

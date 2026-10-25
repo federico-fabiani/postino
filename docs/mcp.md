@@ -7,13 +7,15 @@ Postino exposes the same operation registry as the app and the CLI through an op
 ```sh
 postino mcp
 postino --demo mcp
+postino --store <path> mcp
 ```
 
 - Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout.
 - It opens no port, starts nothing else, and stops at EOF.
 - Logs, if any, go to stderr. stdout carries protocol messages only.
-- Without `--demo`, the engine has no accounts until the M1 store exists; tool calls return empty
-  lists or a readable error.
+- Without `--demo` and `--store`, the engine has no accounts until onboarding (P6) creates one; tool
+  calls return empty lists or a readable error. `--store` opens the encrypted local database; one
+  process owns it.
 
 Client configuration:
 
@@ -47,7 +49,7 @@ agent can read the message and recover.
 
 | Tool | Read-only | Purpose |
 |---|---|---|
-| `app_info` | yes | Version, platform, data directory, demo flag, operation count |
+| `app_info` | yes | Version, platform, data directory, demo and store flags, operation count |
 | `accounts_list` | yes | Configured accounts |
 | `folders_list` | yes | Folders with unread and total counts |
 | `messages_list` | yes | Message summaries, paginated; `label` alone spans every folder, `folder` narrows it |
@@ -72,11 +74,11 @@ Annotations:
 - `openWorldHint`: false. The server talks to the local engine, not the open internet.
 
 `labels_list`, `label_create`, `label_update`, `label_delete` and `label_apply` are backed by the
-same registry the app and the CLI use. Labels are local metadata held in memory until the M1 store
-exists; they are never sent to a server. Label ids are stable for the life of the label and never
-reused, so an id from a deleted label is dead. Names are trimmed, at most 48 characters, unique
-ignoring case, and refuse control, bidi and format characters (U+061C, U+200B–U+200F, U+202A–U+202E,
-U+2060–U+206F, U+FEFF) that could reorder or hide text.
+same registry the app and the CLI use. Labels are local metadata: in memory in the demo, in the
+encrypted store with `--store`, and never sent to a server. Label ids are stable for the life of the
+label and never reused, so an id from a deleted label is dead. Names are trimmed, at most 48
+characters, unique ignoring case, and refuse control, bidi and format characters (U+061C,
+U+200B–U+200F, U+202A–U+202E, U+2060–U+206F, U+FEFF) that could reorder or hide text.
 
 `messages_list` accepts an optional `label` id. With only `label` it returns every folder; with
 `folder` and `label` it returns their intersection; with neither it defaults to `inbox`. An unknown

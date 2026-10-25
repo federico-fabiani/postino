@@ -3,8 +3,8 @@
 **Layer:** foundation. Depends on no other workspace crate; no UI toolkit.
 
 The encrypted local store. One SQLCipher database with schema **v2**, a migration runner on
-`PRAGMA user_version`, and a typed repository for the M1 mailbox. The engine does not use it yet:
-P3c maps the operations onto this API.
+`PRAGMA user_version`, and a typed repository for the M1 mailbox. The engine drives it through
+`Engine::open` (P3c): the store stays independent of `postino-core` and never reads a keyring.
 
 `docs/architecture.md` describes the schema and key flow; `docs/store-spike.md` records why SQLCipher.
 
@@ -58,10 +58,13 @@ Plain data structs in `model.rs` (no `postino-core` dependency), methods in `rep
 - accounts: `upsert_account`, `list_accounts`, `get_account`.
 - folders: `upsert_folder`, `list_folders`, `get_folder`, `recount_folder`.
 - messages: `upsert_message`, `get_message`, `list_messages` (folder/label/all, unread/starred/
-  attachment filters, limit/offset), `counts`, `set_flags`, `move_messages`, `delete_message`.
+  attachment filters, limit/offset), `list_all_messages`, `counts`, `set_flags`, `move_messages`,
+  `delete_message`.
 - labels: `create_label`, `update_label`, `delete_label`, `get_label`, `list_labels` (live counts),
   `apply_label`, `remove_label`, `messages_by_label`, `labels_for`.
-- attachments: `replace_attachments`, `attachments`.
+- attachments: `replace_attachments`, `attachments`, `list_all_attachments`.
+- hydration: `list_all_messages` plus `list_all_attachments` load a whole mailbox in one query per
+  table, with labels and attachments grouped by message; `Engine::open` uses exactly this pair.
 - drafts: `save_draft` (revision++), `get_draft`, `list_drafts`, `delete_draft`.
 - meta: `get_meta`, `set_meta`.
 
@@ -86,8 +89,9 @@ cargo test -p postino-store
 
 ## Not here yet
 
-Engine/app/CLI wiring (P3c), IMAP sync writers, MIME parsing, FTS5, encrypted attachment blobs
-(P4), outbox (P7), daemon (M4). `sync_state` has its table but no repository writer until P5.
+Desktop-app wiring (P6 onboarding), IMAP sync writers, MIME parsing, FTS5, encrypted attachment blobs
+(P4), outbox (P7), daemon (M4). `sync_state` has its table but no repository writer until P5. The
+engine (P3c) is a client of this crate; this crate never depends on it.
 
 ## Build prerequisite (Windows GNU)
 

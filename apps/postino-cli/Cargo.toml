@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 postino-core.workspace = true
+postino-platform.workspace = true
+postino-store.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -19,6 +21,11 @@ env_logger.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+getrandom.workspace = true
+keyring-core.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

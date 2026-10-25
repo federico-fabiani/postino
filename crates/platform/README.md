@@ -15,8 +15,9 @@ Today the crate owns one seam: the **store key**.
 - Every failure is an error: an unavailable vault, a read error, a secret that is not 32 bytes, a
   random-source failure. There is no derived key and no plaintext fallback. `PlatformError` is safe
   to display: no variant carries secret material.
-- Scopes are 1-128 printable characters. Use a stable value (`"store"`, an account id): a different
-  scope is a different key and therefore a different database.
+- Scopes are 1-128 printable characters. Use a stable value (`"default"` for `postino --store`, an
+  account id for a per-account store): a different scope is a different key and therefore a
+  different database.
 - The crate installs `windows-native-keyring-store` lazily on first use; on platforms without a
   supported native store it returns `PlatformError::Unsupported` rather than writing the key
   somewhere weaker.

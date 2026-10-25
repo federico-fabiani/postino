@@ -1,7 +1,8 @@
 # Postino architecture
 
-> **Status:** M0 walking skeleton + U0 UI foundation + M1 store foundation (P3b) · **Last updated:**
-> 2026-10-25 · **Target:** a local-first, agent-first mail client that is fast on every desktop.
+> **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c) ·
+> **Last updated:** 2026-10-25 · **Target:** a local-first, agent-first mail client that is fast on
+> every desktop.
 
 ## 1. Shape today
 
@@ -9,18 +10,23 @@ One Cargo workspace, edition 2024, Rust 1.95+:
 
 | Path | Role |
 |---|---|
-| `crates/core` | Domain types, the in-memory demo engine, the operation registry and its JSON Schemas |
+| `crates/core` | Domain types, the engine (demo or store-backed), the operation registry and its JSON Schemas |
 | `crates/platform` | OS seams; today the store key in the Windows Credential Manager |
-| `crates/store` | SQLCipher schema v2, migrations and the repository (not wired yet) |
+| `crates/store` | SQLCipher schema v2, migrations and the repository; the engine's persistence layer since P3c |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
 | `apps/postino-cli` | `postino` command line and the opt-in MCP server |
 | `xtask` | `ci`, `layers`, `assets` |
 
-M0 has **no I/O** in the running clients. `Engine::demo()` builds a synthetic account with folders,
-threads, bodies and attachments. The UI, CLI and MCP all read it through the same
-`Engine::call(name, args)` door. Nothing is persisted, nothing is fetched, nothing is sent. The
-store and keyring crates exist and are tested, but P3c is the package that wires them into the
-engine.
+The engine has two sources of truth, chosen at construction:
+
+- `Engine::demo()` / `demo_at()` — synthetic mail in memory, no I/O. This is what the desktop app
+  still boots on until onboarding (P6).
+- `Engine::open(store)` — the encrypted SQLCipher store, loaded once and written through on every
+  mutation. The CLI reaches it with `--store <path>`; the key comes from the OS keyring.
+
+The UI, CLI and MCP read both through the same `Engine::call(name, args)` door. The MCP server and
+the GUI never touch SQL directly. Nothing is fetched from a server and nothing is sent: IMAP is P5,
+SMTP is P7.
 
 ## 2. The seam that matters: operations, not functions
 
@@ -50,8 +56,8 @@ Current operations: `app_info`, `accounts_list`, `folders_list`, `messages_list`
 `message_flag`, `message_move`, `draft_save`, `draft_send`, `search`, `labels_list`, `label_create`,
 `label_update`, `label_delete`, `label_apply`. They are enough to prove the path through all three
 clients. `draft_save` updates one draft in place and `draft_send` is a local demo until SMTP arrives
-in M2; neither opens a network connection. Labels live in the demo engine's memory, count their
-messages on read and are not synced anywhere until the M1 store.
+in M2; neither opens a network connection. Labels are local metadata: in memory in the demo, in the
+encrypted store otherwise, and never synced to a server.
 
 ## 3. The target shape
 
@@ -135,12 +141,12 @@ sync_state(account, folder, uidvalidity, last_uid, modseq)
 
 ### 4.1 Implemented in P3b: schema v2, keyring and repository
 
-The first real persistence layer exists as two crates; nothing in the app calls them yet.
+The first real persistence layer exists as two crates; P3c wires them into the engine.
 
 **Key flow.** `crates/platform` owns the only keyring read in the product:
 
 ```
-app (P3c) ── load_or_create_key("store") ──▶ postino-platform
+postino --store <path> ── load_or_create_key("default") ──▶ postino-platform
                                               │ service = "postino", user = scope
                                               ▼
                                    Windows Credential Manager
@@ -190,9 +196,44 @@ Folder `unread`/`total` are a cache refreshed from `messages` by mutations and r
 `recount_folder`. The list query returns `total`/`unread` for the filtered scope before pagination
 and clamps pages to 1..=500 rows.
 
-**Still in memory:** the demo engine, all operation handlers, labels created from the UI, and the
-composer. **Still missing:** engine wiring (P3c), IMAP writers for `sync_state`, MIME parsing,
-FTS5, encrypted attachment blobs, outbox, daemon.
+### 4.2 Implemented in P3c: the engine on the store
+
+`Engine` holds `store: Option<postino_store::Store>`. `demo()` and `demo_at()` leave it `None` and
+behave exactly as before; `open(store)` hydrates the mailbox and keeps the connection for
+write-through. The store crate does not depend on core: `crates/core/src/store_map.rs` is the only
+translation between domain types and store rows.
+
+**Load once.** `Engine::open` issues one query per table: accounts, folders, messages (with labels
+in a second grouped query), attachments grouped by message, labels and drafts. There is no
+per-message read. A draft that exists only as a `drafts` row is materialised into its Drafts folder,
+so the revision log can never hide mail.
+
+**Write through.** Every mutating operation writes the repository first and only then updates
+memory; a failed write is an `OpError::Failed` with the store's reason and an instruction, and
+memory is untouched. Wired in P3c: `save_draft` (message row, attachment rows, revision row),
+`send_draft` (move to Sent plus delete the draft row), `set_flags`, `move_message`, label
+create/update/delete and label apply/remove. Reads (`message_get`, `messages_list`, `search`,
+`labels_list`) never mutate. Account and folder writes remain a P6 seam: onboarding will call
+`upsert_account`/`upsert_folder` before the first engine load.
+
+**Counts.** The store keeps `folders.total`/`unread` current inside its own transactions; the engine
+recomputes its in-memory counts after each mutation instead of re-reading the store. The virtual
+`starred` folder is derived from message flags and is not a meaningful row in the store's folder
+cache; the engine is authoritative for it.
+
+**Residual windows.** Each repository call is individually transactional, but `save_draft` composes
+three and `send_draft` two. A crash or disk failure between them can leave the store one step ahead
+of memory; the next save repairs the draft, and the message row is always written before the
+revision row. Attachment bytes, IMAP `uid`/`Message-ID` and `size` are not written by the engine yet
+(P4/P5). There is no cross-process locking story beyond SQLite's WAL and busy timeout: one process
+owns the store until the daemon (M4), and the desktop app does not open it yet. The repository
+returns folders and labels ordered by name, so a store engine sees alphabetical order where the demo
+saw creation order; P6 decides the real folder-tree order when onboarding writes it.
+
+**Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
+a store. **Still missing:** onboarding and the default store path (P6), IMAP writers for
+`sync_state` (P5), MIME parsing and encrypted attachment blobs (P4), FTS5 (P9), outbox (P7), the
+daemon (M4).
 
 ## 5. Synchronization
 
@@ -271,3 +312,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-23 | major | M0: workspace, core registry, demo engine, egui shell, CLI, MCP, docs |
 | 2026-10-25 | major | P3a: encrypted SQLCipher store proof and the build decision |
 | 2026-10-25 | major | P3b: platform keyring seam, schema v2, repository and tests |
+| 2026-10-25 | major | P3c: engine loads the store once and writes through; CLI `--store`; demo unchanged |

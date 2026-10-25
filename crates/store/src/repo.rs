@@ -268,6 +268,27 @@ impl Store {
         Ok(MessagePage { messages, total: to_count(total)?, unread: to_count(unread)? })
     }
 
+    /// Every message with its body and label ids, newest first.
+    ///
+    /// This is the mailbox-hydration read: one query for the message rows and one grouped query for
+    /// their labels, no matter how many messages there are. It is deliberately unpaged because the
+    /// caller asked for the whole mailbox; agent-facing lists keep using [`Store::list_messages`],
+    /// whose page size is capped.
+    pub fn list_all_messages(&self) -> Result<Vec<Message>, StoreError> {
+        let mut stmt =
+            self.conn.prepare(&format!("SELECT {SUMMARY_COLUMNS}, {MESSAGE_DETAIL_COLUMNS} FROM messages m ORDER BY m.date DESC, m.id ASC"))?;
+        let rows = stmt.query_map([], row_to_message)?;
+        let mut messages = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("messages", error))?;
+        drop(stmt);
+        let labels = self.labels_by_message_all()?;
+        for message in &mut messages {
+            if let Some(ids) = labels.get(&message.summary.id) {
+                message.summary.labels.clone_from(ids);
+            }
+        }
+        Ok(messages)
+    }
+
     /// Totals for one folder, or for the whole mailbox when `folder_id` is `None`.
     pub fn counts(&self, folder_id: Option<&str>) -> Result<MessageCounts, StoreError> {
         let (total, unread): (i64, i64) = match folder_id {
@@ -507,6 +528,20 @@ impl Store {
         }
         Ok(labels)
     }
+
+    /// Every label assignment in one query, keyed by message. Used by [`Store::list_all_messages`],
+    /// where a per-message `IN` list would grow with the mailbox and eventually hit SQLite's bound
+    /// parameter limit.
+    fn labels_by_message_all(&self) -> Result<HashMap<String, Vec<String>>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT message_id, label_id FROM message_labels ORDER BY message_id, label_id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (message_id, label_id) = row?;
+            labels.entry(message_id).or_default().push(label_id);
+        }
+        Ok(labels)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -538,6 +573,20 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!("SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE message_id = ?1 ORDER BY rowid"))?;
         let rows = stmt.query_map([message_id], row_to_attachment)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every attachment row grouped by message id in one query, in MIME part order. Messages
+    /// without attachments are absent from the map. This is the hydration half of
+    /// [`Store::list_all_messages`].
+    pub fn list_all_attachments(&self) -> Result<HashMap<String, Vec<Attachment>>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!("SELECT message_id, {ATTACHMENT_COLUMNS} FROM attachments ORDER BY message_id, rowid"))?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row_to_attachment_at(row, 1)?)))?;
+        let mut attachments: HashMap<String, Vec<Attachment>> = HashMap::new();
+        for row in rows {
+            let (message_id, attachment) = row?;
+            attachments.entry(message_id).or_default().push(attachment);
+        }
+        Ok(attachments)
     }
 }
 
@@ -805,7 +854,18 @@ fn row_to_label_count(row: &Row<'_>) -> rusqlite::Result<LabelCount> {
 }
 
 fn row_to_attachment(row: &Row<'_>) -> rusqlite::Result<Attachment> {
-    Ok(Attachment { id: row.get(0)?, filename: row.get(1)?, mime: row.get(2)?, size: get_u64(row, 3)?, blob_hash: row.get(4)? })
+    row_to_attachment_at(row, 0)
+}
+
+/// Decode `ATTACHMENT_COLUMNS` starting at `offset`, so a joined query can put a key column first.
+fn row_to_attachment_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<Attachment> {
+    Ok(Attachment {
+        id: row.get(offset)?,
+        filename: row.get(offset + 1)?,
+        mime: row.get(offset + 2)?,
+        size: get_u64(row, offset + 3)?,
+        blob_hash: row.get(offset + 4)?,
+    })
 }
 
 fn row_to_draft(row: &Row<'_>) -> rusqlite::Result<Draft> {

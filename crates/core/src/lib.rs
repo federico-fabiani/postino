@@ -4,7 +4,7 @@
 //! The rule is the same as the Crafting Apps: every user-visible action is an operation with a
 //! typed request, a JSON Schema and a handler. A frontend never reaches past [`Engine`].
 //!
-//! M0 is a walking skeleton: the engine holds synthetic demo mail in memory. IMAP, SMTP, SQLite
+//! The engine runs on synthetic demo mail in memory or on the encrypted local store; IMAP, SMTP
 //! and the daemon arrive in M1-M4. The operation surface is intentionally small and honest.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -13,6 +13,7 @@ pub mod demo;
 pub mod engine;
 pub mod model;
 pub mod ops;
+mod store_map;
 
 pub use engine::{Engine, OpError};
 pub use model::{Account, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, Message, MessageSummary};

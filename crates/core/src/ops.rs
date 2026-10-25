@@ -42,7 +42,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "app_info",
             "Application info",
-            "Version, platform, data directory and whether the engine is running on synthetic demo data.",
+            "Version, platform, data directory, whether the engine is running on synthetic demo data and whether it is backed by the encrypted local store.",
             AppInfoArgs,
             true,
             false
@@ -50,7 +50,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "accounts_list",
             "List accounts",
-            "The configured mail accounts. M0 has at most the synthetic demo account.",
+            "The configured mail accounts. The demo engine has one synthetic account; a store engine returns what onboarding saved.",
             AccountsListArgs,
             true,
             false
@@ -100,7 +100,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search",
             "Search mail",
-            "Case-insensitive search across subjects, people, snippets and bodies of the demo mailbox. Optional `folder` and `label` filters are applied before the row limit; unknown ids are an error.",
+            "Case-insensitive search across subjects, people, snippets and bodies of the local mailbox, demo or store-backed. Optional `folder` and `label` filters are applied before the row limit; unknown ids are an error.",
             SearchArgs,
             true,
             false
@@ -108,7 +108,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "labels_list",
             "List labels",
-            "Every local label with its mailbox-wide total and unread message counts. Labels are local metadata held in memory until M1 and are never synced to a server.",
+            "Every local label with its mailbox-wide total and unread message counts. Labels are local-only metadata: persisted in the encrypted store when one is attached, never synced to a server.",
             LabelsListArgs,
             true,
             false
@@ -116,7 +116,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "label_create",
             "Create a label",
-            "Create a local label with a semantic colour: gold, forest, success, danger or muted. Names are trimmed, 1-48 characters, free of control, bidi and format characters, and unique ignoring case. Ids are never reused. Labels are local metadata until M1.",
+            "Create a local label with a semantic colour: gold, forest, success, danger or muted. Names are trimmed, 1-48 characters, free of control, bidi and format characters, and unique ignoring case. Ids are never reused. Labels are local-only metadata.",
             LabelCreateArgs,
             false,
             false
@@ -124,7 +124,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "label_update",
             "Rename or recolour a label",
-            "Change a label's name and/or semantic colour. Provide at least one field; the name follows label_create validation and the id never changes. Labels are local metadata until M1.",
+            "Change a label's name and/or semantic colour. Provide at least one field; the name follows label_create validation and the id never changes. Labels are local-only metadata.",
             LabelUpdateArgs,
             false,
             false
@@ -132,7 +132,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "label_delete",
             "Delete a label",
-            "Delete a label and detach it from every message that carries it. Returns the deleted label and the number of affected messages. This removes metadata only, never mail; labels are local and in-memory until M1.",
+            "Delete a label and detach it from every message that carries it. Returns the deleted label and the number of affected messages. This removes metadata only, never mail; labels are local-only.",
             LabelDeleteArgs,
             false,
             false
@@ -140,7 +140,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "label_apply",
             "Apply or remove a label",
-            "Apply one label to `message_ids` when `apply` is true, or remove it when false. Accepts 1-500 message ids, is idempotent, and rejects unknown labels or messages before changing anything. Labels are local metadata until M1.",
+            "Apply one label to `message_ids` when `apply` is true, or remove it when false. Accepts 1-500 message ids, is idempotent, and rejects unknown labels or messages before changing anything. Labels are local metadata: kept in the encrypted store when one is attached, never synced to a server.",
             LabelApplyArgs,
             false,
             false
@@ -317,7 +317,10 @@ pub struct AppInfo {
     pub version: String,
     pub platform: String,
     pub data_dir: Option<String>,
+    /// Synthetic demo data, held in memory only.
     pub demo: bool,
+    /// The engine is backed by the encrypted local store, so mutations survive a restart.
+    pub store: bool,
     pub operations: usize,
 }
 
@@ -504,6 +507,7 @@ fn app_info(engine: &Engine) -> AppInfo {
         platform: std::env::consts::OS.to_owned(),
         data_dir: Engine::data_dir().map(|path| path.display().to_string()),
         demo: engine.is_demo(),
+        store: engine.is_persistent(),
         operations: op_defs().len(),
     }
 }
@@ -698,7 +702,7 @@ mod tests {
             })
             .collect();
         let labels = vec![Label { id: "lbl_1".to_owned(), name: "Archivio".to_owned(), color: LabelColor::Forest }];
-        Engine::from_parts(vec![account], vec![folder], messages, labels, false)
+        Engine::from_parts(vec![account], vec![folder], messages, labels, false, None)
     }
 
     #[test]

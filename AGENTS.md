@@ -6,8 +6,9 @@ If a rule here conflicts with a habit from another project, this file wins.
 ## 1. What Postino is
 
 Postino is a local-first, agent-first mail client written in Rust. The desktop app, the `postino`
-CLI and the `postino mcp` server are three clients of **one operation registry**. M0 is a walking
-skeleton: synthetic demo mail in memory, no IMAP, no SMTP, no database yet.
+CLI and the `postino mcp` server are three clients of **one operation registry**. The engine runs on
+synthetic demo mail in memory or on the encrypted local store (`postino --store <path>`); there is
+no IMAP, no SMTP and no daemon yet, and the desktop app still boots on the demo until P6.
 
 **The current milestone is the only source of truth for scope.** Read `ROADMAP.md` before
 starting. Do not build M1 features into M0.
@@ -51,16 +52,18 @@ starting. Do not build M1 features into M0.
 The current workspace is deliberately small:
 
 ```
-apps/postino-app   egui shell            L3
-apps/postino-cli   CLI + MCP server      L3
-crates/core        domain + operations   L1
-xtask              build/quality tasks   tooling
+apps/postino-app   egui shell                     L3
+apps/postino-cli   CLI + MCP server               L3
+crates/core        domain + engine + operations   L2
+crates/store       encrypted store, repository    L1
+crates/platform    keyring seam                   L1
+xtask              build/quality tasks            tooling
 ```
 
 Rules enforced by `cargo xtask layers`:
 
-- `postino-core` depends on no other workspace crate and never on a UI toolkit (`egui`, `eframe`,
-  `winit`, `rfd`).
+- `postino-core` may depend only on `postino-store` (the foundation it drives) and never on a UI
+  toolkit (`egui`, `eframe`, `winit`, `rfd`). The store never depends back on core.
 - `postino-app` and `postino-cli` may depend on `postino-core` and on libraries, never on each other.
 - New crates need a layer and a README before they need code. Planned crates are listed in
   `docs/architecture.md`; do not create speculative stubs.

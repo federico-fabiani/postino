@@ -254,7 +254,7 @@ pub fn seed_at(now: DateTime<Utc>) -> Engine {
     attach(&mut brief, "att_004", "brief-brand.pdf", "application/pdf", 48_912);
     messages.push(labelled(brief, &["lbl_1"]));
 
-    Engine::from_parts(accounts, folders, messages, labels, true)
+    Engine::from_parts(accounts, folders, messages, labels, true, None)
 }
 
 fn labelled(mut message: Message, labels: &[&str]) -> Message {

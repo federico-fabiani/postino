@@ -13,6 +13,8 @@ repository = "https://github.com/federicopostino/postino"
 [workspace.dependencies]
 # internal
 postino-core = { path = "crates/core", version = "0.1.0" }
+postino-platform = { path = "crates/platform", version = "0.1.0" }
+postino-store = { path = "crates/store", version = "0.1.0" }
 
 # foundation
 thiserror = "2"

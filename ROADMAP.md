@@ -57,7 +57,8 @@ interaction model before real mail makes them expensive to change. Full spec:
 
 ## M1 — read real mail
 
-- [ ] SQLCipher store, migrations, WAL, key in the OS keyring.
+- [x] SQLCipher store, migrations, WAL, key in the OS keyring (P3a-P3c; the CLI runs on it, the app
+      still boots on demo until P6).
 - [ ] MIME parser/serializer, sanitized HTML, plain-text alternative, attachment storage.
 - [ ] Account onboarding with autodiscovery and Aruba app-password flow.
 - [ ] IMAP: CAPABILITY, LOGIN/AUTH, LIST, SELECT, UID FETCH envelope/flags/body, IDLE.

@@ -2672,10 +2672,15 @@ dependencies = [
  "chrono",
  "clap",
  "env_logger",
+ "getrandom 0.3.4",
+ "keyring-core",
  "log",
  "postino-core",
+ "postino-platform",
+ "postino-store",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2684,9 +2689,12 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "directories",
+ "getrandom 0.3.4",
+ "postino-store",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

@@ -1,6 +1,6 @@
 # Development
 
-> **Status:** M0 + U0.5 labels · **Last updated:** 2026-10-24
+> **Status:** M0 + U0.5 labels + P3c engine on the encrypted store · **Last updated:** 2026-10-25
 
 ## 1. Toolchain
 
@@ -31,14 +31,16 @@
 ## 2. Commands
 
 ```sh
-cargo run -p postino-app                 # desktop shell, demo data
+cargo run -p postino-app                      # desktop shell, demo data (until P6)
 cargo run -p postino-cli -- --demo info
 cargo run -p postino-cli -- --demo tools
-cargo run -p postino-cli -- --demo mcp   # stdio MCP server
-cargo xtask ci                           # fmt + clippy + tests + layers + assets
-cargo xtask layers                       # dependency rules
-cargo xtask assets                       # asset hashes and licences
-cargo xtask assets --write               # regenerate ATTRIBUTION.md
+cargo run -p postino-cli -- --demo mcp        # stdio MCP server
+cargo run -p postino-cli -- --store mail.db info
+# the mail commands need an onboarded account; a fresh store has none until P6
+cargo xtask ci                                # fmt + clippy + tests + layers + assets
+cargo xtask layers                            # dependency rules
+cargo xtask assets                            # asset hashes and licences
+cargo xtask assets --write                    # regenerate ATTRIBUTION.md
 ```
 
 `cargo xtask` is a Cargo alias in `.cargo/config.toml`.
@@ -46,15 +48,54 @@ cargo xtask assets --write               # regenerate ATTRIBUTION.md
 ## 3. Layout
 
 ```
-crates/core/        domain, demo engine, operation registry
+crates/core/        domain, engine (demo or store-backed), operation registry, store_map
 crates/platform/    OS seams: the store key in the Windows Credential Manager
-crates/store/       encrypted SQLCipher store, schema v2, repository (not wired into the engine)
-apps/postino-app/   egui shell
+crates/store/       encrypted SQLCipher store, schema v2, repository
+apps/postino-app/   egui shell (demo data until P6)
 apps/postino-cli/   CLI + MCP server
 xtask/              quality tasks
 docs/               product, architecture, security, design, ADRs
 assets/fonts/       Inter and JetBrains Mono (OFL)
 assets/brand/       Postino mark and the original sketch
+```
+
+## 3.1 Running on the encrypted store
+
+`postino --store <path>` opens (or creates) the SQLCipher database at `<path>` and loads the
+mailbox into the engine. The key is `postino_platform::load_or_create_key("default")`: 32 random
+bytes created on first use and kept in the OS keyring under service `postino`, user `default`. The
+key is never printed, logged or written to disk by Postino; a different scope or a different key
+cannot read the file. The keyring is the only secret seam, and tests never touch it: every store
+test uses a random `StoreKey` over a temp directory.
+
+What is persisted today: accounts, folders with their cached counts, messages with recipients,
+bodies, flags and labels, attachment metadata, labels, message/label links and draft revisions.
+Writes are write-through: the repository commits first, the engine updates memory second, and a
+failed write returns `OpError::Failed` without changing memory. Moving, flagging, labelling,
+renaming labels and saving/sending drafts all survive a restart.
+
+What is still demo or missing:
+
+- The desktop app always boots `Engine::demo_at`; the store is CLI-only until P6 onboarding chooses
+  the default path and the account it belongs to.
+- A fresh store has no accounts and no folders, and nothing creates them yet. Onboarding is P6. Until
+  then a fresh store answers `--store <path> info` and the mail commands report that no account is
+  configured. The test suite seeds a store through the `postino-store` repository to exercise the
+  flow end to end.
+- One process owns the store. There is no daemon, no pipe and no second writer (M4); the CLI and a
+  future app must not open the same file at once. Do not run two `postino --store` commands against
+  one database.
+- No IMAP, MIME, SMTP, FTS5, attachment bytes or scheduled send. `draft_send` is still a local
+  demo move to Sent and contacts no server.
+- `uid`, `Message-ID`, RFC 822 size and `in_reply_to` are not written by the engine; the columns
+  exist for P4/P5.
+- The database file lives wherever `--store` points; Postino does not create the parent directory.
+
+A quick manual check that persistence works (unit level, no keyring):
+
+```sh
+cargo test -p postino-cli cli_store_keeps_a_draft_across_a_reopen -- --nocapture
+cargo test -p postino-core --test engine_store -- --nocapture
 ```
 
 ## 4. Adding an operation
@@ -114,7 +155,13 @@ they have a reason to exist.
   errors, notifications).
 - **Store:** schema upgrade from v1, migration idempotence, repository round trips, counts after
   read/move/delete, atomic batches, draft revisions across reopen, wrong key, schema-too-new and a
-  no-plaintext scan over the database, WAL and SHM.
+  no-plaintext scan over the database, WAL and SHM; plus the one-query-per-table mailbox hydration
+  used by `Engine::open`.
+- **Engine on the store:** a demo-shaped fixture written to a temp store and reopened (accounts,
+  folders, counts, messages, recipients, labels, attachments, flags), mutations surviving a reopen
+  (draft revision, send, label apply/remove, move, read/star), a repository failure surfacing as
+  `OpError` with memory unchanged, and a no-plaintext scan of the engine's own writes. The CLI test
+  creates a draft in a temp store, reopens and lists it.
 - **Platform:** keyring load-or-create against `keyring_core::mock` only; the native vault is a
   manual, tagged smoke test and never part of the default suite.
 - **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery,
