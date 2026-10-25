@@ -30,14 +30,29 @@
 //! before a byte is decrypted, and a payload that decodes to more than the declared length is a
 //! `CorruptBlob`, never an allocation.
 //!
+//! # Integrity and dedup
+//!
+//! `get` authenticates the ciphertext and then recomputes BLAKE3 over the decrypted plaintext: the
+//! file name is the content hash, so a payload planted under a false name is `CorruptBlob` even
+//! when it was sealed with the right subkey and the right AAD. `put` does not trust the name either:
+//! an existing file is authenticated and compared with the new bytes before it counts as a dedup
+//! hit, and a damaged or foreign file at that name is replaced by the atomic write.
+//!
 //! # Writes
 //!
-//! A put writes `.tmp-<random>` in the target shard with `create_new`, `sync_all`s it, then renames
-//! it over `<hash>.blob`. A rename that loses a race against an identical put is a success: the
-//! content is the name, so both files are byte-identical. A failed write removes its temp file.
+//! A put writes `.tmp-<random>` in the target shard with `create_new` and `sync_all`s it, then
+//! publishes it with `hard_link`: the final name appears atomically and an existing name is never
+//! removed, so a concurrent reader sees either the old complete file or the new one. A name that is
+//! already present is a dedup hit when its bytes match; otherwise a replacing rename heals it (the
+//! only path where a reader can observe a gap, and [`BlobStore::get`] waits through it). A filesystem
+//! without hard links falls back to the replacing rename for every publish. A failed write removes
+//! its temp file.
 //!
-//! A blob is never modified in place, so a reader either sees the previous complete file or the new
-//! one. Blobs are content-addressed and deduplicated: the same bytes are stored once even when ten
+//! Afterwards the shard directory is fsynced on Unix; on Windows the published file is reopened and
+//! flushed, which is the portable half of the job and leaves the directory-entry window documented
+//! in `crates/store/README.md`.
+//!
+//! Blobs are content-addressed and deduplicated: the same bytes are stored once even when ten
 //! messages carry them.
 
 use std::fs::{self, File, OpenOptions};
@@ -85,8 +100,13 @@ const TEMP_ATTEMPTS: usize = 4;
 /// The HKDF context label for blob subkeys. Changing it makes every existing blob unreadable.
 const KEY_CONTEXT: &str = "blob";
 
-/// The directory name created next to the database.
-pub const BLOB_DIR_NAME: &str = "blobs";
+/// How many times a read retries a name that is momentarily absent, and the pause between tries.
+///
+/// An atomic replace is not atomic *against readers* on Windows: the platform can unlink the old
+/// name a scheduling quantum before the new one appears. A concurrent publish or heal is therefore
+/// a window, not a lost blob, and `get` waits through a few of them before reporting `BlobMissing`.
+const MISSING_RETRIES: u32 = 4;
+const MISSING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// The encrypted blob store: one directory tree plus the subkey derived from the store key.
 ///
@@ -129,8 +149,10 @@ impl BlobStore {
 
     /// Store `bytes` and return their lowercase BLAKE3 hex hash.
     ///
-    /// Identical bytes return the same hash and write nothing (dedup). The hash is the file name, so
-    /// it is computed over the plaintext and reveals nothing about the key or the payload.
+    /// An existing file at that name is authenticated and compared before it counts as a dedup hit.
+    /// A new name is published with an atomic hard link; a corrupt or foreign file under an existing
+    /// name is healed with a replacing publish. The hash is computed over the plaintext and reveals
+    /// nothing about the key or the payload.
     pub fn put(&self, bytes: &[u8]) -> Result<String, StoreError> {
         // usize -> u64 is lossless on every target Rust supports (usize is at most 64 bits).
         let original_len = bytes.len() as u64;
@@ -139,7 +161,7 @@ impl BlobStore {
         }
         let hash = blake3::hash(bytes).to_hex().to_string();
         let path = self.path_for(&hash)?;
-        if path.is_file() {
+        if path.is_file() && self.read(&hash, &path, original_len).is_ok_and(|existing| existing.as_slice() == bytes) {
             return Ok(hash);
         }
         let Some(directory) = path.parent() else {
@@ -159,7 +181,10 @@ impl BlobStore {
         header.push(flags);
         header.extend_from_slice(&original_len.to_le_bytes());
         header.extend_from_slice(nonce);
-        write_atomic(&path, &header, ciphertext)?;
+        // A publish never removes an existing name: it hard-links the temp into place, and only a
+        // heal of invalid content falls back to a replacing rename. That keeps the common concurrent
+        // put on a path where a reader sees either the old complete file or the new one, never a gap.
+        write_atomic(&path, &header, ciphertext, || self.read(&hash, &path, original_len).is_ok_and(|existing| existing.as_slice() == bytes))?;
         Ok(hash)
     }
 
@@ -170,10 +195,31 @@ impl BlobStore {
     /// the allocation is bounded by it; [`MAX_BLOB_BYTES`] is an additional hard ceiling.
     pub fn get(&self, hash: &str, max_bytes: u64) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         let path = self.path_for(hash)?;
-        let metadata = match fs::metadata(&path) {
+        self.read(hash, &path, max_bytes)
+    }
+
+    /// Read a blob, tolerating the momentary absence a concurrent replace can create.
+    fn read(&self, hash: &str, path: &Path, max_bytes: u64) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        let mut attempt = 0;
+        loop {
+            match self.read_once(hash, path, max_bytes) {
+                Err(error) if attempt + 1 < MISSING_RETRIES && is_missing(&error) => {
+                    attempt += 1;
+                    std::thread::sleep(MISSING_RETRY_DELAY);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// The read half of [`BlobStore::get`], also used by [`BlobStore::put`] to authenticate an
+    /// existing dedup candidate. Every bound and every check lives here, so dedup cannot take a
+    /// shortcut around the format.
+    fn read_once(&self, hash: &str, path: &Path, max_bytes: u64) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::BlobMissing { hash: hash.to_owned() }),
-            Err(error) => return Err(io_error(&path, error)),
+            Err(error) => return Err(io_error(path, error)),
         };
         if !metadata.is_file() {
             return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the blob path is not a regular file" });
@@ -182,9 +228,9 @@ impl BlobStore {
         if file_len < (HEADER_LEN + postino_crypto::TAG_LEN) as u64 {
             return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the file is shorter than a header and a tag" });
         }
-        let mut file = File::open(&path).map_err(|error| io_error(&path, error))?;
+        let mut file = File::open(path).map_err(|error| io_error(path, error))?;
         let mut header = [0u8; HEADER_LEN];
-        file.read_exact(&mut header).map_err(|error| io_error(&path, error))?;
+        file.read_exact(&mut header).map_err(|error| io_error(path, error))?;
 
         if header.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
             return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the file does not start with the PSTB magic" });
@@ -224,8 +270,8 @@ impl BlobStore {
         };
         // Read the nonce and ciphertext as one buffer: `postino_crypto::open` takes `nonce || ct`.
         let mut sealed = vec![0u8; postino_crypto::NONCE_LEN.saturating_add(ciphertext_len)];
-        file.seek(SeekFrom::Start(NONCE_OFFSET as u64)).map_err(|error| io_error(&path, error))?;
-        file.read_exact(&mut sealed).map_err(|error| io_error(&path, error))?;
+        file.seek(SeekFrom::Start(NONCE_OFFSET as u64)).map_err(|error| io_error(path, error))?;
+        file.read_exact(&mut sealed).map_err(|error| io_error(path, error))?;
 
         let aad = associated_data(hash, flags, original_len)?;
         let plaintext = postino_crypto::open(&self.key, &aad, &sealed).map_err(|_| StoreError::CorruptBlob {
@@ -244,6 +290,11 @@ impl BlobStore {
         };
         if plaintext.len() != original_len_usize {
             return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the decrypted length does not match the header" });
+        }
+        // The name is the content hash. The AAD already binds it, so this only catches a writer who
+        // had the subkey and deliberately sealed different bytes under this name.
+        if blake3::hash(&plaintext).to_hex().as_str() != hash {
+            return Err(StoreError::CorruptBlob { hash: hash.to_owned(), detail: "the decrypted bytes do not hash to the blob name" });
         }
         Ok(plaintext)
     }
@@ -282,7 +333,7 @@ impl BlobStore {
     fn path_for(&self, hash: &str) -> Result<PathBuf, StoreError> {
         decode_hash(hash)?;
         let Some(shard) = hash.get(..2) else {
-            return Err(StoreError::BadHash { hash: echo(hash) });
+            return Err(StoreError::BadHash { length: hash.chars().count() });
         };
         Ok(self.root.join(shard).join(format!("{hash}.blob")))
     }
@@ -301,8 +352,16 @@ fn encode(bytes: &[u8]) -> Result<(u8, Zeroizing<Vec<u8>>), StoreError> {
     Ok((0, Zeroizing::new(bytes.to_vec())))
 }
 
-/// Write a blob through a temp file in the destination shard.
-fn write_atomic(path: &Path, header: &[u8], ciphertext: &[u8]) -> Result<(), StoreError> {
+/// Write a blob through a temp file in the destination shard and publish it.
+///
+/// The publish uses `hard_link`, which creates the final directory entry atomically and fails if the
+/// name exists, so a concurrent writer can never see a half-written or briefly missing blob. When the
+/// name already exists and its bytes are ours (`already_published`), this is a dedup hit and the new
+/// temp is dropped. When the existing bytes are invalid or foreign, a replacing rename heals the
+/// name; that is the only path where a reader can observe a gap, and `BlobStore::read` waits through
+/// it. A filesystem without hard links (some external drives) falls back to the same replacing
+/// rename for every publish.
+fn write_atomic(path: &Path, header: &[u8], ciphertext: &[u8], already_published: impl FnOnce() -> bool) -> Result<(), StoreError> {
     let Some(directory) = path.parent() else {
         return Err(StoreError::BlobRoot { path: path.display().to_string() });
     };
@@ -317,16 +376,56 @@ fn write_atomic(path: &Path, header: &[u8], ciphertext: &[u8]) -> Result<(), Sto
         let _ = fs::remove_file(&temp);
         return Err(io_error(&temp, error));
     }
-    match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
+    match fs::hard_link(&temp, path) {
+        Ok(()) => {
             let _ = fs::remove_file(&temp);
-            // Windows refuses to replace an existing file; POSIX replaces it atomically. A file at
-            // the destination already holds these exact bytes (the name is the content hash), so a
-            // concurrent put of the same content is a no-op success.
-            if path.is_file() { Ok(()) } else { Err(io_error(path, error)) }
+            sync_published(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if already_published() {
+                // Nothing was published; the existing entry is already durable.
+                let _ = fs::remove_file(&temp);
+                Ok(())
+            } else if let Err(error) = fs::rename(&temp, path) {
+                let _ = fs::remove_file(&temp);
+                Err(io_error(path, error))
+            } else {
+                sync_published(path)
+            }
+        }
+        Err(_) => {
+            // No hard-link support on this filesystem; a replacing rename is the portable fallback.
+            if let Err(error) = fs::rename(&temp, path) {
+                let _ = fs::remove_file(&temp);
+                return Err(io_error(path, error));
+            }
+            sync_published(path)
         }
     }
+}
+
+/// Persist the directory entry created by the publish.
+///
+/// The temp file was fsynced before it was published, so the bytes are durable; what remains is the
+/// name. On Unix the shard directory is fsynced. Windows has no portable directory fsync and this
+/// crate must not add unsafe Win32 calls, so it reopens the published file and flushes it: the data is
+/// durable, but a power loss in the microseconds after the publish can still lose the directory
+/// entry. The failure mode is a `BlobMissing` on the next read (never wrong bytes), and the engine
+/// commits the attachment row only after this returns.
+fn sync_published(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        if let Some(directory) = path.parent() {
+            File::open(directory).and_then(|directory| directory.sync_all()).map_err(|error| io_error(directory, error))?;
+        }
+    }
+    // On Windows the handle needs write access for `FlushFileBuffers`; opening without truncation
+    // leaves the blob untouched.
+    #[cfg(windows)]
+    {
+        OpenOptions::new().write(true).open(path).and_then(|file| file.sync_all()).map_err(|error| io_error(path, error))?;
+    }
+    Ok(())
 }
 
 /// Create a fresh `.tmp-<random>` file in `directory` with `create_new`.
@@ -360,17 +459,17 @@ fn associated_data(hash: &str, flags: u8, original_len: u64) -> Result<Vec<u8>, 
 fn decode_hash(hash: &str) -> Result<[u8; 32], StoreError> {
     let bytes = hash.as_bytes();
     if bytes.len() != HASH_HEX_LEN {
-        return Err(StoreError::BadHash { hash: echo(hash) });
+        return Err(StoreError::BadHash { length: hash.chars().count() });
     }
     let mut out = [0u8; 32];
     // 64 bytes -> 32 exact pairs; the length check above guarantees the zip visits every slot.
     let (pairs, _) = bytes.as_chunks::<2>();
     for (slot, pair) in out.iter_mut().zip(pairs) {
         let Some(high) = pair.first().copied().and_then(nibble) else {
-            return Err(StoreError::BadHash { hash: echo(hash) });
+            return Err(StoreError::BadHash { length: hash.chars().count() });
         };
         let Some(low) = pair.get(1).copied().and_then(nibble) else {
-            return Err(StoreError::BadHash { hash: echo(hash) });
+            return Err(StoreError::BadHash { length: hash.chars().count() });
         };
         *slot = (high << 4) | low;
     }
@@ -385,15 +484,6 @@ fn nibble(byte: u8) -> Option<u8> {
     }
 }
 
-/// A bounded, escaped form of a rejected hash for the error message.
-fn echo(hash: &str) -> String {
-    let mut echoed = hash.chars().take(80).collect::<String>();
-    if hash.chars().count() > 80 {
-        echoed.push('…');
-    }
-    echoed
-}
-
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut text = String::with_capacity(bytes.len().saturating_mul(2));
@@ -405,6 +495,15 @@ fn hex(bytes: &[u8]) -> String {
 
 fn io_error(path: &Path, source: std::io::Error) -> StoreError {
     StoreError::Io { path: path.display().to_string(), source }
+}
+
+/// A read failure that a concurrent replace can cause: the name was absent for a moment.
+fn is_missing(error: &StoreError) -> bool {
+    match error {
+        StoreError::BlobMissing { .. } => true,
+        StoreError::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -438,8 +537,13 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_hash_is_echoed_without_its_control_bytes() {
-        let rendered = StoreError::BadHash { hash: echo("a\nb\u{0007}") }.to_string();
-        assert!(!rendered.contains('\n'), "the error carries a raw line break");
+    fn a_rejected_hash_is_not_echoed() {
+        let hostile = format!("{}\n\u{0007}../..", "Z".repeat(40));
+        let error = decode_hash(&hostile).expect_err("not lowercase hex");
+        let rendered = error.to_string();
+        assert!(!rendered.contains('Z'), "the error echoes the rejected input: {rendered}");
+        assert!(!rendered.contains(".."), "the error echoes path syntax: {rendered}");
+        assert!(!rendered.contains('\n'), "the error carries a raw line break: {rendered}");
+        assert!(rendered.contains(&hostile.chars().count().to_string()), "the length is useful for a caller: {rendered}");
     }
 }

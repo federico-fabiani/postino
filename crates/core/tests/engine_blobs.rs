@@ -29,7 +29,7 @@ impl Fixture {
     }
 
     fn blob_root(&self) -> PathBuf {
-        self.dir.path().join("blobs")
+        postino_store::blob_root(&self.path())
     }
 
     fn open(&self) -> Store {
@@ -268,6 +268,71 @@ fn a_four_mib_attachment_goes_through_the_seam_once() {
     assert_eq!(read.len(), content.len());
     assert_eq!(read, content);
     assert_eq!(blob_files(&fixture.blob_root()).len(), 1);
+}
+
+#[test]
+fn a_metadata_patch_cannot_make_stored_bytes_unreadable() {
+    use postino_core::{Address, DraftContent};
+
+    let fixture = Fixture::new();
+    fixture.seed();
+    let mut engine = Engine::open(fixture.open()).expect("engine");
+    let created = engine
+        .save_draft(
+            None,
+            None,
+            DraftContent {
+                to: vec![Address::new("Giulia Ferri", "giulia.ferri@example.com")],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Bozza con allegato grande".to_owned(),
+                body_text: "Corpo".to_owned(),
+                attachments: vec![postino_core::Attachment {
+                    id: String::new(),
+                    filename: "grande.bin".to_owned(),
+                    mime: "application/octet-stream".to_owned(),
+                    size: 0,
+                }],
+            },
+        )
+        .expect("draft");
+    let draft_id = created.summary.id.clone();
+    let attachment_id = created.attachments.first().expect("attachment").id.clone();
+    let content = pseudorandom(2 * 1024 * 1024);
+    engine.store_attachment_bytes(&draft_id, &attachment_id, &content).expect("store 2 MiB");
+    assert_eq!(engine.message(&draft_id).expect("draft").attachments[0].size, content.len() as u64);
+
+    // A client that does not know the bytes patches the draft with a stale size of zero and no hash.
+    engine
+        .call(
+            "draft_save",
+            json!({
+                "id": draft_id.clone(),
+                "attachments": [{
+                    "id": attachment_id.clone(),
+                    "filename": "grande.bin",
+                    "mime": "application/octet-stream",
+                    "size": 0
+                }]
+            }),
+        )
+        .expect("patch");
+    assert_eq!(
+        engine.message(&draft_id).expect("draft").attachments[0].size,
+        content.len() as u64,
+        "memory took the caller's stale size and the read cap would reject the real bytes"
+    );
+    assert_eq!(engine.attachment_bytes(&attachment_id).expect("read in the same process"), content);
+    drop(engine);
+
+    let reopened = Engine::open(fixture.open()).expect("reopen");
+    assert_eq!(
+        reopened.message(&draft_id).expect("draft").attachments[0].size,
+        content.len() as u64,
+        "the attachment row took the caller's stale size"
+    );
+    assert_eq!(reopened.attachment_bytes(&attachment_id).expect("read after reopen"), content);
+    assert_eq!(reopened.attachment_hash(&attachment_id).map(str::len), Some(64));
 }
 
 #[test]

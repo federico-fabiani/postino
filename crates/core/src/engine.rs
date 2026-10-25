@@ -490,7 +490,7 @@ impl Engine {
             Some(current) => (current.summary.thread_id.clone(), current.summary.starred, current.summary.labels.clone(), current.body_html.clone()),
             None => (format!("thr_{message_id}"), false, Vec::new(), None),
         };
-        let saved = Message {
+        let mut saved = Message {
             summary: MessageSummary {
                 id: message_id.clone(),
                 thread_id,
@@ -512,9 +512,32 @@ impl Engine {
             attachments,
         };
 
-        if let Some(store) = &self.store {
+        let persisted = if let Some(store) = &self.store {
             let row = store_map::message_row(&saved, &account.id);
             store.save_draft_message(&row, &store_map::attachment_rows(&saved.attachments)).map_err(store_map::write_error)?;
+            // The repository keeps the stored hash *and size* of an attachment whose id survived the
+            // replacement. Mirror those rows, or memory would cap a 2 MiB blob at a stale size of 0
+            // and refuse to read it until the next restart.
+            Some(store.attachments(&saved.summary.id).map_err(store_map::read_error)?)
+        } else {
+            None
+        };
+        if let Some(rows) = persisted {
+            for id in &replaced_ids {
+                self.blob_hashes.remove(id);
+            }
+            for row in &rows {
+                if let Some(hash) = &row.blob_hash {
+                    self.blob_hashes.insert(row.id.clone(), hash.clone());
+                }
+            }
+            saved.attachments = rows.into_iter().map(store_map::attachment).collect();
+        } else {
+            for id in &replaced_ids {
+                if !saved.attachments.iter().any(|attachment| attachment.id == *id) {
+                    self.blob_hashes.remove(id);
+                }
+            }
         }
 
         match index {
@@ -525,13 +548,6 @@ impl Engine {
                 *message = saved.clone();
             }
             None => self.messages.push(saved.clone()),
-        }
-        // A kept attachment id keeps its in-memory hash (the repository preserves the row's
-        // `blob_hash` when the model carries none); a dropped id loses its hash with its row.
-        for id in &replaced_ids {
-            if !saved.attachments.iter().any(|attachment| attachment.id == *id) {
-                self.blob_hashes.remove(id);
-            }
         }
         self.recount();
         Ok(saved)

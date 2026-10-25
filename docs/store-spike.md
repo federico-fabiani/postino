@@ -266,10 +266,11 @@ records the reasoning.
 
 - `crates/crypto`: HKDF-SHA256 subkeys (`salt = postino.v1`, `info = "blob"`) and XChaCha20-Poly1305
   with a random 24-byte nonce. `Subkey` has no `Clone`, redacts `Debug` and zeroises on drop.
-- `crates/store`: `BlobStore` under `<db parent>/blobs/<xx>/<hash>.blob`, header `PSTB` v1, AAD
-  `magic || version || flags || original_len || hash`, zstd 3 only when it shrinks the payload,
-  bounded decompression, atomic temp + fsync + rename, specific errors. `Store::open` creates the
-  directory and fails if it cannot. `attachments.blob_hash` finally points at something.
+- `crates/store`: `BlobStore` under `<db file>.blobs/<xx>/<hash>.blob` (for `mail.db`, that is
+  `mail.db.blobs`), header `PSTB` v1, AAD `magic || version || flags || original_len || hash`, zstd 3
+  only when it shrinks the payload, bounded decompression, fsync + atomic publish, specific
+  errors. `Store::open` creates the directory and fails if it cannot. `attachments.blob_hash` finally
+  points at something.
 - `crates/core`: `Engine::attachment_bytes` and `Engine::store_attachment_bytes` (repository first,
   memory second), hydrated across a reopen, with a readable error on the demo engine. No operation,
   CLI or UI change: P5b feeds the write, P6 calls the read.
@@ -283,13 +284,35 @@ small and reuse `crypto-common`/`digest` 0.10 from `sha2`. The only new C build 
 uses the same MSYS2 gcc that the vendored OpenSSL already requires.
 
 **No plaintext, proven.** `crates/store/tests/blobs.rs` stores a compressed canary, an uncompressed
-random payload and a database canary, then scans the database, its WAL and every blob file for the
-canary, for the store key and for the canary in any path. `crates/core/tests/engine_blobs.rs` proves
-the seam survives a reopen and that a one-byte flip is `CorruptBlob` → `OpError::Failed` without
-poisoning the message.
+random payload and a database canary, then scans the database, its WAL and SHM **while the store is
+open** and every blob file for the canary, for the store key and for the canary in any path.
+`crates/core/tests/engine_blobs.rs` proves the seam survives a reopen and that a one-byte flip is
+`CorruptBlob` → `OpError::Failed` without poisoning the message.
 
 **Remaining gaps.** No key rotation (rotating the store key would orphan every blob), no garbage
-collection for unreferenced blobs, no passphrase recovery for the keyring entry, and a corrupt blob
-must be removed before the same bytes can be stored again (`put` dedups on the file's existence).
-The header, the file name and the size class are visible without the key, and swap/crash dumps are
-still outside our control; `docs/threat-model.md` §4.3 lists all of it.
+collection for unreferenced blobs, no passphrase recovery for the keyring entry, and the header, the
+file name and the size class are visible without the key. Swap/crash dumps are still outside our
+control; `docs/threat-model.md` §4.3 lists all of it.
+
+## P4c outcome
+
+> **Package:** P4c · **Date:** 2026-10-25 · **Verdict:** the blob layer no longer trusts a name, a
+> file or a caller's metadata.
+
+- **Namespace per database file.** Blobs live in `<db file>.blobs` (`mail.db.blobs`), so two stores
+  in one folder cannot see or overwrite each other. Moving a store means moving the database and its
+  `.blobs` directory together.
+- **Dedup authenticates and heals.** `put` decrypts and compares an existing file before it reports
+  a dedup hit; a corrupt or foreign file at that name is replaced by the publish. The old "remove the
+  damaged blob first" step is gone.
+- **Content hash verified.** `get` recomputes BLAKE3 over the plaintext, so content sealed under a
+  false name by a holder of the subkey is `CorruptBlob`.
+- **Durable publish.** A temp file is fsynced and published with `hard_link` (or a replacing rename
+  when the filesystem has no links), so a concurrent reader never sees a half-written or briefly
+  missing blob; Unix fsyncs the shard directory after the publish, Windows reopens and flushes the
+  file, leaving only the documented directory-entry window (a lost name reads as `BlobMissing`, never
+  as wrong bytes).
+- **Metadata cannot shrink a blob.** A surviving attachment keeps the stored size as well as the
+  stored hash, and the engine mirrors the rewritten rows into memory; a draft patch with a stale size
+  of 0 can no longer make a 2 MiB attachment unreadable.
+- **Errors do not echo ids.** `BadHash` reports only the expected shape and the actual length.

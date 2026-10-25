@@ -761,24 +761,30 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message) -> Resu
 
 /// Replace attachment rows and `has_attachments` inside an open transaction.
 ///
-/// A draft re-save carries no blob hash (the core attachment is metadata only), so the hash of an
-/// attachment id that survives the replacement is kept: the bytes are still on disk and the row
-/// would otherwise point at nothing. Dropping an attachment id drops its pointer; the blob itself
-/// stays because another message may reference the same content.
+/// A draft re-save carries no blob hash (the core attachment is metadata only), so the hash **and
+/// the size** of an attachment id that survives the replacement are kept: the bytes on disk are
+/// canonical, and a stale caller size would push the stored blob above the read cap (`size + slack`)
+/// and make it unreadable. Dropping an attachment id drops its pointer; the blob itself stays
+/// because another message may reference the same content.
 fn replace_attachments_in_tx(tx: &rusqlite::Transaction<'_>, message_id: &str, attachments: &[Attachment]) -> Result<(), StoreError> {
-    let mut kept: HashMap<String, String> = HashMap::new();
+    let mut stored: HashMap<String, (String, i64)> = HashMap::new();
     {
-        let mut stmt = tx.prepare("SELECT id, blob_hash FROM attachments WHERE message_id = ?1 AND blob_hash IS NOT NULL")?;
-        let rows = stmt.query_map([message_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut stmt = tx.prepare("SELECT id, blob_hash, size FROM attachments WHERE message_id = ?1 AND blob_hash IS NOT NULL")?;
+        let rows = stmt.query_map([message_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?;
         for row in rows {
-            let (id, hash) = row?;
-            kept.insert(id, hash);
+            let (id, hash, size) = row?;
+            stored.insert(id, (hash, size));
         }
     }
     tx.execute("DELETE FROM attachments WHERE message_id = ?1", [message_id])?;
     for attachment in attachments {
-        let size = to_i64(attachment.size, "attachment size")?;
-        let blob_hash = attachment.blob_hash.clone().or_else(|| kept.get(&attachment.id).cloned());
+        let caller_size = to_i64(attachment.size, "attachment size")?;
+        let (blob_hash, size) = match stored.get(&attachment.id) {
+            Some((stored_hash, stored_size)) if attachment.blob_hash.as_ref().is_none_or(|incoming| incoming == stored_hash) => {
+                (Some(stored_hash.clone()), *stored_size)
+            }
+            _ => (attachment.blob_hash.clone(), caller_size),
+        };
         tx.execute(
             "INSERT INTO attachments(id, message_id, filename, mime, size, blob_hash) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![attachment.id, message_id, attachment.filename, attachment.mime, size, blob_hash],

@@ -109,7 +109,8 @@ Exactly what is encrypted, and with what:
   configured in memory so temp tables never reach disk. Subjects, addresses, bodies, flags, labels,
   folder names, draft revisions, attachment names/types/sizes and their blob hashes are ciphertext on
   disk. The file begins with a random per-database salt, not `SQLite format 3`.
-- **Attachment bytes** (`<db parent>/blobs/<xx>/<hash>.blob`): XChaCha20-Poly1305 under a subkey
+- **Attachment bytes** (`<db file>.blobs/<xx>/<hash>.blob`, for example `mail.db.blobs/…`):
+  XChaCha20-Poly1305 under a subkey
   derived with HKDF-SHA256 (salt `postino.v1`, label `blob`) from the same 256-bit store key. The file
   is `PSTB`, version 1: magic, version, flags, original length, a 24-byte random nonce, and the
   ciphertext with a 16-byte tag. The AAD binds magic, version, flags, plaintext length and the BLAKE3
@@ -142,10 +143,11 @@ What is **not** encrypted, and the consequence:
   can read that. Postino does not lock pages, disable paging or promise to. Full-disk encryption and
   an OS that does not dump secrets are the mitigations, and they are the user's.
 - **SQLCipher's internal key copy.** The connection keeps its own key schedule and page cache; Rust
-  code cannot zeroise it. `postino-crypto`'s cipher also expands the subkey for the duration of a
-  call, and a *rejected* ciphertext leaves a transient decrypted buffer to the allocator before the
-  tag check fails. Neither is written to disk by Postino, logged or returned, and closing them would
-  mean a custom in-place AEAD construction.
+  code cannot zeroise it. `postino-crypto` also keeps three transient copies that Rust cannot wipe:
+  the `Hkdf<Sha256>` value holds the PRK-derived HMAC state until it drops, the cipher expands the
+  subkey for the duration of a call, and a *rejected* ciphertext leaves a decrypted buffer to the
+  allocator before the tag check fails. None of them is written to disk by Postino, logged or
+  returned, and closing them would mean a custom in-place AEAD construction and hand-rolled HMAC.
 - **Orphaned blobs.** A crash between writing a blob and committing the attachment row leaves an
   encrypted, deduplicated file with no row pointing at it. There is no garbage collector yet; a
   deleted message also leaves its blob because another message may share the content.
@@ -181,7 +183,7 @@ crash-dump entry above.
 
 ### 4.6 Data loss
 
-- Saves are atomic (write temp, fsync, rename).
+- Saves are atomic: write a temp file, fsync it, then publish (rename or hard link).
 - The outbox is a journal; a crash replays idempotently.
 - Drafts keep revisions and recover after restart.
 - A sync bug must never delete server mail. Expunge is explicit.

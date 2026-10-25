@@ -228,6 +228,6 @@ fn store_address(address: &Address) -> store::Address {
     store::Address::new(address.name.clone(), address.email.clone())
 }
 
-fn attachment(row: store::Attachment) -> Attachment {
+pub(crate) fn attachment(row: store::Attachment) -> Attachment {
     Attachment { id: row.id, filename: row.filename, mime: row.mime, size: row.size }
 }

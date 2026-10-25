@@ -15,14 +15,17 @@
 //! bytes when dropped. No error variant carries key material or plaintext: [`CryptoError`] messages
 //! name the failure, never a byte.
 //!
-//! Two copies are outside this crate's reach and are documented in `docs/threat-model.md`:
+//! Three pieces of state are outside this crate's reach and are documented in
+//! `docs/threat-model.md`:
 //!
+//! - [`derive_key`] builds an `Hkdf<Sha256>` value that holds the PRK-derived HMAC state until it
+//!   drops. The crate exposes no way to wipe that value, and hand-rolling HMAC-SHA256 to zeroise it
+//!   would be a worse trade than the documented gap;
 //! - the RustCrypto cipher keeps its own expanded key state while a call runs;
 //! - `open` decrypts into a temporary buffer before the tag is checked, so a rejected ciphertext
 //!   leaves a transient unauthenticated plaintext buffer to the allocator.
 //!
-//! Neither is persisted, logged or returned. Closing them needs a custom in-place construction and
-//! is not worth the risk of hand-rolling the AEAD composition.
+//! None of them is persisted, logged or returned.
 //!
 //! # Nonces
 //!
@@ -93,6 +96,9 @@ pub enum CryptoError {
 ///
 /// `context` is a domain-separation label, for example `"blob"`. It is validated so a label cannot
 /// be empty, oversized or contain control characters that would make two labels look alike in a log.
+///
+/// The intermediate `Hkdf<Sha256>` value holds the PRK-derived HMAC state until it drops and is not
+/// zeroised; see the crate docs for why this is a documented gap rather than a hand-rolled HMAC.
 pub fn derive_key(master: &[u8; 32], context: &str) -> Result<Subkey, CryptoError> {
     if context.is_empty() || context.len() > MAX_CONTEXT_LEN || !context.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(CryptoError::InvalidContext);

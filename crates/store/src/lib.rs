@@ -34,16 +34,17 @@
 //!
 //! # Blobs
 //!
-//! Attachment bytes are not rows. `Store::open` also opens `<db parent>/blobs`, a content-addressed
-//! directory of XChaCha20-Poly1305 files sealed with an HKDF subkey of the same store key (see
-//! [`BlobStore`] and `docs/architecture.md` §4.5). The database keeps only the hash, and the hash is
-//! computed over the plaintext, so identical attachments are stored once.
+//! Attachment bytes are not rows. `Store::open` also opens `<db file>.blobs` (for `mail.db`, that is
+//! `mail.db.blobs`), a content-addressed directory of XChaCha20-Poly1305 files sealed with an HKDF
+//! subkey of the same store key (see [`BlobStore`] and `docs/architecture.md` §4.5). The database
+//! keeps only the hash, and the hash is computed over the plaintext, so identical attachments are
+//! stored once. The directory belongs to the file, so two stores in one folder never share it.
 
 mod blob;
 mod model;
 mod repo;
 
-pub use blob::{BLOB_DIR_NAME, BlobStore};
+pub use blob::BlobStore;
 pub use model::{
     Account, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, Label, LabelCount, Message, MessageCounts, MessageFilter,
     MessagePage, MessageSummary,
@@ -257,8 +258,8 @@ pub enum StoreError {
     Encode(#[from] serde_json::Error),
     #[error("{field} does not fit the store's 64-bit integer range")]
     OutOfRange { field: &'static str },
-    #[error("blob hash {hash:?} is not 64 lowercase hex characters")]
-    BadHash { hash: String },
+    #[error("a blob id must be exactly 64 lowercase hex characters; this one is {length} characters long")]
+    BadHash { length: usize },
     #[error("blob {hash} is not in the blob store")]
     BlobMissing { hash: String },
     #[error("blob {hash} is corrupt: {detail}")]
@@ -290,33 +291,35 @@ fn translate(error: rusqlite::Error) -> StoreError {
     }
 }
 
-/// An open, migrated store. One connection in WAL mode plus the sibling blob directory; the daemon
-/// will own both in M4.
+/// An open, migrated store. One connection in WAL mode plus the blob directory named after the
+/// database file; the daemon will own both in M4.
 pub struct Store {
     conn: Connection,
     blobs: BlobStore,
 }
 
-/// The blob directory that belongs to a database file: `<db parent>/blobs`.
+/// The blob directory that belongs to a database file: `mail.db` → `mail.db.blobs`.
 ///
-/// Every store in the same folder shares it, which is what makes dedup work across accounts and
-/// what keeps a backup of the folder self-contained. A relative database path without a parent
-/// resolves to `./blobs`.
+/// Deriving from the file, not from its folder, means two databases in one directory never share a
+/// blob namespace. Moving a store means moving the database file and its `.blobs` directory
+/// together; renaming only one of them hides the attachments (the store then starts an empty blob
+/// directory and the old rows read as `BlobMissing`).
 pub fn blob_root(path: &Path) -> PathBuf {
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    parent.join(BLOB_DIR_NAME)
+    use std::ffi::OsString;
+    let mut name = path.file_name().map_or_else(|| OsString::from("store"), std::ffi::OsStr::to_os_string);
+    name.push(".blobs");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
 }
 
 impl Store {
-    /// Open or create the database at `path`, apply pending migrations and open the sibling blob
-    /// directory.
+    /// Open or create the database at `path`, apply pending migrations and open its blob directory.
     ///
     /// The database has to be readable before the blob directory is created, so a wrong key cannot
-    /// leave a stray `blobs/` next to somebody else's database. A blob directory that cannot be
-    /// created fails the open: losing attachments later is worse than failing now.
+    /// leave a stray `mail.db.blobs/` next to somebody else's database. A blob directory that cannot
+    /// be created fails the open: losing attachments later is worse than failing now.
     pub fn open(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
         let mut conn = Connection::open(path)?;
         conn.execute_batch(&key.pragma()).map_err(translate)?;

@@ -58,10 +58,11 @@ MCP      ─┘
   shell still shows demo mail.
 - Encrypted attachment bytes (P4b): `postino-crypto` derives an HKDF-SHA256 `blob` subkey from the
   store key and seals bytes with XChaCha20-Poly1305; `postino-store` keeps each distinct attachment
-  content once under `<db parent>/blobs/<xx>/<hash>.blob` (BLAKE3 name, zstd only when it helps,
-  bounded reads, atomic writes), and `attachments.blob_hash` finally points at something. The engine
-  exposes `attachment_bytes` and `store_attachment_bytes`, with tests across a reopen; sync (P5b)
-  and the reading pane (P6) are the consumers, so no operation, CLI command or screen uses it yet.
+  content once under `<db file>.blobs/<xx>/<hash>.blob` (BLAKE3 name, zstd only when it helps,
+  authenticated dedup that heals a damaged file, bounded reads, atomic writes), and
+  `attachments.blob_hash` finally points at something. The engine exposes `attachment_bytes` and
+  `store_attachment_bytes`, with tests across a reopen; sync (P5b) and the reading pane (P6) are the
+  consumers, so no operation, CLI command or screen uses it yet.
 - The M1 network foundation as a crate (`postino-net`, P5a): an IMAP4rev1 client over implicit TLS
   or STARTTLS, with the operating system's certificate verifier and no way to switch verification
   off. It logs in with `AUTHENTICATE PLAIN` or `LOGIN`, lists folders with special-use and modified

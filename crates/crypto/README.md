@@ -34,17 +34,18 @@ plaintext + AAD ──XChaCha20-Poly1305(random 24-byte nonce)──▶ nonce ||
 
 ## What this crate does not claim
 
-Two copies are outside its reach and are recorded in `docs/threat-model.md` §4.3:
+Three pieces of state are outside its reach and are recorded in `docs/threat-model.md` §4.3:
 
+- `derive_key` builds an `Hkdf<Sha256>` value that holds the PRK-derived HMAC state until it drops.
+  The crate exposes no way to wipe it, and hand-rolling HMAC-SHA256 to zeroise it would be a worse
+  trade than the documented gap.
 - the RustCrypto cipher expands the key into its own state for the duration of a call;
 - `open` decrypts into a temporary buffer before the tag is verified, so a rejected ciphertext
   leaves a transient unauthenticated plaintext buffer to the allocator.
 
-Neither is persisted, logged or returned. Closing them would mean a custom in-place AEAD
-construction, which is a worse trade than the documented gap.
-
-There is no key rotation, no key wrapping and no password-based derivation. The master key is 32
-random bytes from the OS keyring (`postino-platform`), and this crate never reads a keyring.
+None of them is persisted, logged or returned. There is no key rotation, no key wrapping and no
+password-based derivation. The master key is 32 random bytes from the OS keyring
+(`postino-platform`), and this crate never reads a keyring.
 
 ## API
 

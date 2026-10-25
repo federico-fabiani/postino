@@ -16,7 +16,7 @@ fn random_key() -> StoreKey {
     StoreKey::from_bytes(bytes)
 }
 
-/// The blob store a database at `<dir>/mail.db` uses: `<dir>/blobs`.
+/// The blob store a database at `<dir>/mail.db` uses: `<dir>/mail.db.blobs`.
 fn blobs_in(dir: &Path, key: &StoreKey) -> BlobStore {
     BlobStore::open(blob_root(&dir.join("mail.db")), key).expect("open the blob store")
 }
@@ -101,6 +101,144 @@ fn identical_bytes_are_stored_once() {
     assert!(files.contains(&blob_path(&store, &first)));
     assert!(files.contains(&blob_path(&store, &third)));
     assert!(temp_files(store.root()).is_empty(), "a put left a temp file behind");
+}
+
+#[test]
+fn a_corrupt_file_is_replaced_by_the_next_put_of_the_same_bytes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = blobs_in(dir.path(), &random_key());
+    let content = compressible();
+    let hash = store.put(&content).expect("put");
+
+    let path = blob_path(&store, &hash);
+    let mut bytes = std::fs::read(&path).expect("read the blob");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&path, &bytes).expect("corrupt the tag");
+    assert!(matches!(store.get(&hash, content.len() as u64).err(), Some(StoreError::CorruptBlob { .. })), "the fixture is not corrupt");
+
+    // Dedup must authenticate before it reports success and must heal a damaged file.
+    assert_eq!(store.put(&content).expect("put over a corrupt file"), hash);
+    assert_eq!(store.get(&hash, content.len() as u64).expect("read the repaired blob").as_slice(), content.as_slice());
+    assert!(temp_files(store.root()).is_empty(), "the repair left a temp file behind");
+}
+
+#[test]
+fn a_foreign_key_cannot_dedup_bytes_it_cannot_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = blobs_in(dir.path(), &random_key());
+    let content = b"scritto con la chiave del primo store";
+    let hash = first.put(content).expect("first put");
+
+    let second = blobs_in(dir.path(), &random_key());
+    assert!(second.put(content).is_ok(), "the second store must be able to write its own bytes");
+    assert_eq!(second.get(&hash, 1024).expect("the second key reads its own bytes").as_slice(), content);
+    assert!(matches!(first.get(&hash, 1024).err(), Some(StoreError::CorruptBlob { .. })), "the foreign key's file was not replaced");
+}
+
+#[test]
+fn content_planted_under_a_false_name_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let key = random_key();
+    let store = blobs_in(dir.path(), &key);
+    let subkey = postino_crypto::derive_key(key.as_bytes(), "blob").expect("derived blob subkey");
+
+    // A writer who has the subkey can produce a perfectly valid file. Here the name belongs to
+    // "innocent bytes" while the sealed payload is something else: the AEAD authenticates, and only
+    // recomputing BLAKE3 over the plaintext catches it.
+    let innocent = b"the bytes the name promises";
+    let planted = b"something else entirely";
+    let name = blake3::hash(innocent).to_hex().to_string();
+    let sealed = seal_with(&subkey, &name, planted);
+    let path = blob_path(&store, &name);
+    std::fs::create_dir_all(path.parent().expect("shard")).expect("shard directory");
+    std::fs::write(&path, &sealed).expect("plant the file");
+
+    let error = store.get(&name, 1024).expect_err("a false name must not be served");
+    assert!(matches!(error, StoreError::CorruptBlob { .. }), "{error}");
+}
+
+/// Build a version-1 blob file for `planted` with AAD and name `hash`, using the real subkey.
+/// The format is written here independently of the crate, so a drift in either side fails the test.
+fn seal_with(subkey: &postino_crypto::Subkey, hash: &str, planted: &[u8]) -> Vec<u8> {
+    let mut hash_bytes = [0u8; 32];
+    let raw = hash.as_bytes();
+    for (slot, pair) in hash_bytes.iter_mut().zip(raw.as_chunks::<2>().0) {
+        let high = (pair[0] as char).to_digit(16).expect("validated hex") as u8;
+        let low = (pair[1] as char).to_digit(16).expect("validated hex") as u8;
+        *slot = (high << 4) | low;
+    }
+    let mut aad = Vec::new();
+    aad.extend_from_slice(b"PSTB");
+    aad.push(1);
+    aad.push(0);
+    aad.extend_from_slice(&(planted.len() as u64).to_le_bytes());
+    aad.extend_from_slice(&hash_bytes);
+    let sealed = postino_crypto::seal(subkey, &aad, planted).expect("seal");
+    let mut file = Vec::with_capacity(38 + sealed.len());
+    file.extend_from_slice(b"PSTB");
+    file.push(1);
+    file.push(0);
+    file.extend_from_slice(&(planted.len() as u64).to_le_bytes());
+    file.extend_from_slice(&sealed);
+    file
+}
+
+#[test]
+fn a_flag_or_in_cap_length_flip_breaks_the_aad() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = blobs_in(dir.path(), &random_key());
+    let text = compressible();
+    let text_hash = store.put(&text).expect("put text");
+    let text_path = blob_path(&store, &text_hash);
+    let text_file = std::fs::read(&text_path).expect("read");
+    assert_eq!(text_file[5], 1, "the fixture must be compressed");
+
+    let random = incompressible(2048);
+    let random_hash = store.put(&random).expect("put random");
+    let random_path = blob_path(&store, &random_hash);
+    let random_file = std::fs::read(&random_path).expect("read");
+    assert_eq!(random_file[5], 0, "the fixture must be uncompressed");
+
+    // Compressed payload with the bit cleared: the length still matches, so only the AAD flags bind it.
+    let mut cleared = text_file.clone();
+    cleared[5] = 0;
+    std::fs::write(&text_path, &cleared).expect("clear the flag");
+    assert_auth_failure(store.get(&text_hash, text.len() as u64).expect_err("a cleared flag was accepted"));
+
+    // Uncompressed payload with the bit set.
+    let mut set = random_file.clone();
+    set[5] = 1;
+    std::fs::write(&random_path, &set).expect("set the flag");
+    assert_auth_failure(store.get(&random_hash, random.len() as u64).expect_err("a set flag was accepted"));
+
+    // A length inside the caller's cap still has to match the AAD and the payload. The longer value
+    // reaches decryption (the file is not longer than its declared length), so authentication is the
+    // check that must reject it.
+    for delta in [64u64, 1024] {
+        let mut longer = text_file.clone();
+        let declared = (text.len() as u64).saturating_add(delta);
+        longer[6..14].copy_from_slice(&declared.to_le_bytes());
+        std::fs::write(&text_path, &longer).expect("extend the declared length");
+        let error = store.get(&text_hash, declared).expect_err("a different length must not authenticate");
+        assert_auth_failure(error);
+    }
+    let mut shorter = text_file.clone();
+    shorter[6..14].copy_from_slice(&(text.len() as u64 / 2).to_le_bytes());
+    std::fs::write(&text_path, &shorter).expect("shrink the declared length");
+    assert!(matches!(store.get(&text_hash, text.len() as u64).err(), Some(StoreError::CorruptBlob { .. })), "a shorter declared length was accepted");
+
+    std::fs::write(&text_path, &text_file).expect("restore");
+    assert_eq!(store.get(&text_hash, text.len() as u64).expect("restored").as_slice(), text.as_slice());
+}
+
+/// The AAD must be what rejects a flipped flag or an in-cap length, not a downstream length or hash
+/// check: if the field leaves the AAD, the detail changes even when the read still fails.
+fn assert_auth_failure(error: StoreError) {
+    match &error {
+        StoreError::CorruptBlob { detail, .. } if detail.starts_with("the ciphertext did not authenticate") => {}
+        other => panic!("expected an authentication failure, got {other}"),
+    }
 }
 
 #[test]
@@ -201,12 +339,27 @@ fn hashes_are_validated_before_any_path_is_built() {
         "g".repeat(64),
         "0".repeat(63),
         "0".repeat(65),
+        // Windows path shapes that must never become a path component.
+        r"C:\Windows\System32\config\SAM".to_owned(),
+        r"\\?\C:\Windows\System32\config\SAM".to_owned(),
+        r"\\server\share\mail.db.blobs\00\blob".to_owned(),
+        "name:stream".to_owned(),
+        "trailing-dot.".to_owned(),
+        "trailing-space ".to_owned(),
+        "PROGRA~1.DB".to_owned(),
+        format!("{}.", "0".repeat(63)),
+        format!("{} ", "0".repeat(63)),
+        r"C:\db.blobs\00\blob".to_owned(),
     ];
     for hash in &bad {
         assert!(matches!(store.get(hash, 1024).err(), Some(StoreError::BadHash { .. })), "get accepted {hash:?}");
         assert!(matches!(store.has(hash).err(), Some(StoreError::BadHash { .. })), "has accepted {hash:?}");
         assert!(matches!(store.remove(hash).err(), Some(StoreError::BadHash { .. })), "remove accepted {hash:?}");
     }
+    // A rejected id must not come back in the error text: an agent reading it could learn a path.
+    let error = store.get(r"C:\Windows\System32\config\SAM", 1024).expect_err("a Windows path is not a hash");
+    let rendered = error.to_string();
+    assert!(!rendered.contains("Windows") && !rendered.contains(r"C:\"), "the error echoed the rejected input: {rendered}");
     assert!(!outside.exists(), "a rejected hash created a file outside the blob root");
     assert!(files_under(store.root()).is_empty(), "a rejected hash wrote inside the blob root");
 }
@@ -321,21 +474,25 @@ fn the_blob_and_the_database_carry_no_plaintext() {
     let dir = tempfile::tempdir().expect("temp dir");
     let key = random_key();
     let content = format!("{CANARY}-{}", "ripetuto ".repeat(400)).into_bytes();
-    {
-        let store = Store::open(&dir.path().join("mail.db"), &key).expect("open the store");
-        // The blob is compressed (repetitive), which must still not leak the canary anywhere.
-        let hash = store.blobs().put(&content).expect("put");
-        assert!(store.blobs().has(&hash).expect("has"));
-        // An uncompressed blob too: random bytes cannot be compressed, so they sit in the file as
-        // ciphertext only.
-        let random = incompressible(2048);
-        let random_hash = store.blobs().put(&random).expect("put random");
-        assert_eq!(std::fs::read(blob_path(store.blobs(), &random_hash)).expect("read")[5], 0);
-        store.set_meta("canary", CANARY).expect("write a database canary");
-    }
 
+    let store = Store::open(&dir.path().join("mail.db"), &key).expect("open the store");
+    // The blob is compressed (repetitive), which must still not leak the canary anywhere.
+    let hash = store.blobs().put(&content).expect("put");
+    assert!(store.blobs().has(&hash).expect("has"));
+    // An uncompressed blob too: random bytes cannot be compressed, so they sit in the file as
+    // ciphertext only.
+    let random = incompressible(2048);
+    let random_hash = store.blobs().put(&random).expect("put random");
+    assert_eq!(std::fs::read(blob_path(store.blobs(), &random_hash)).expect("read")[5], 0);
+    store.set_meta("canary", CANARY).expect("write a database canary");
+
+    // The WAL and SHM exist only while a connection has the database open: scan before dropping it,
+    // or the test would prove nothing about them.
     let files = files_under(dir.path());
-    assert!(files.len() >= 3, "expected the database, its WAL and at least two blobs, found {}", files.len());
+    let names = files.iter().map(|path| path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()).collect::<Vec<_>>();
+    assert!(names.iter().any(|name| name.ends_with("-wal")), "the WAL was not present while the store was open: {names:?}");
+    assert!(names.iter().any(|name| name.ends_with("-shm")), "the SHM was not present while the store was open: {names:?}");
+    assert!(files.len() >= 4, "expected the database, WAL, SHM and two blobs, found {}", files.len());
     for path in &files {
         let bytes = std::fs::read(path).expect("read a store file");
         assert!(!contains(&bytes, CANARY.as_bytes()), "plaintext leaked into {}", path.display());
@@ -344,6 +501,7 @@ fn the_blob_and_the_database_carry_no_plaintext() {
     }
 
     // The bytes are still readable through the API: encryption, not loss.
+    drop(store);
     let store = Store::open(&dir.path().join("mail.db"), &key).expect("reopen");
     let hash = store.blobs().put(&content).expect("dedup after reopen");
     assert_eq!(store.blobs().get(&hash, content.len() as u64).expect("get").as_slice(), content.as_slice());
@@ -353,14 +511,14 @@ fn the_blob_and_the_database_carry_no_plaintext() {
 fn store_open_creates_the_blob_directory_next_to_the_database() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = Store::open(&dir.path().join("mail.db"), &random_key()).expect("open");
-    assert_eq!(store.blobs().root(), dir.path().join("blobs"));
+    assert_eq!(store.blobs().root(), dir.path().join("mail.db.blobs"));
     assert!(store.blobs().root().is_dir());
 }
 
 #[test]
 fn store_open_fails_when_the_blob_path_is_a_file() {
     let dir = tempfile::tempdir().expect("temp dir");
-    std::fs::write(dir.path().join("blobs"), b"not a directory").expect("a file in the blob directory's place");
+    std::fs::write(dir.path().join("mail.db.blobs"), b"not a directory").expect("a file in the blob directory's place");
     let error = match Store::open(&dir.path().join("mail.db"), &random_key()) {
         Ok(_) => panic!("a file at the blob root must fail the open"),
         Err(error) => error,
@@ -369,10 +527,25 @@ fn store_open_fails_when_the_blob_path_is_a_file() {
 }
 
 #[test]
-fn a_relative_database_path_puts_blobs_under_the_relative_blobs_folder() {
-    let relative = Path::new("mail.db");
-    assert_eq!(blob_root(relative), Path::new(".").join("blobs"));
-    assert_eq!(blob_root(Path::new("/postino/mail.db")), Path::new("/postino").join("blobs"));
+fn the_blob_root_is_derived_from_the_database_file() {
+    assert_eq!(blob_root(Path::new("mail.db")), Path::new("mail.db.blobs"));
+    assert_eq!(blob_root(Path::new("/postino/mail.db")), Path::new("/postino/mail.db.blobs"));
+    assert_eq!(blob_root(Path::new("/postino/archive")), Path::new("/postino/archive.blobs"));
+}
+
+#[test]
+fn two_databases_in_one_folder_never_share_a_blob_namespace() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let key = random_key();
+    let first = Store::open(&dir.path().join("first.db"), &key).expect("first store");
+    let second = Store::open(&dir.path().join("second.db"), &key).expect("second store");
+    assert_eq!(first.blobs().root(), dir.path().join("first.db.blobs"));
+    assert_eq!(second.blobs().root(), dir.path().join("second.db.blobs"));
+    assert_ne!(first.blobs().root(), second.blobs().root());
+
+    let hash = first.blobs().put(b"only the first store's bytes").expect("put");
+    assert!(first.blobs().has(&hash).expect("has"));
+    assert!(!second.blobs().has(&hash).expect("has"), "the second store can see the first store's namespace");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -465,22 +638,77 @@ fn a_hash_cannot_be_written_through_another_message() {
 }
 
 #[test]
-fn replacing_attachments_keeps_the_hash_of_a_kept_id() {
+fn replacing_attachments_keeps_the_stored_hash_and_size_of_a_kept_id() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = Store::open(&dir.path().join("mail.db"), &random_key()).expect("open");
     seed_message(&store);
-    let hash = store.blobs().put(b"allegato uno").expect("put");
-    store.set_attachment_blob_hash("msg_1", "att_1", Some(&hash), 11).expect("set");
+    let content = b"allegato uno";
+    let hash = store.blobs().put(content).expect("put");
+    store.set_attachment_blob_hash("msg_1", "att_1", Some(&hash), content.len() as u64).expect("set");
 
-    // A draft re-save re-sends the attachment metadata with no hash and drops att_2.
-    store.replace_attachments("msg_1", &[attachment("att_1", 11)]).expect("replace");
+    // A draft re-save re-sends the attachment metadata with no hash and a stale size of zero.
+    store.replace_attachments("msg_1", &[attachment("att_1", 0)]).expect("replace");
     let rows = store.attachments("msg_1").expect("attachments");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "att_1");
     assert_eq!(rows[0].blob_hash.as_deref(), Some(hash.as_str()), "a metadata-only replace detached the stored bytes");
+    assert_eq!(rows[0].size, content.len() as u64, "a stale caller size shrank the row below the stored blob");
+    assert_eq!(store.blobs().get(&hash, rows[0].size + 1024).expect("the stored bytes stay readable").as_slice(), content);
 
     // Clearing is explicit.
-    store.set_attachment_blob_hash("msg_1", "att_1", None, 11).expect("clear");
+    store.set_attachment_blob_hash("msg_1", "att_1", None, 0).expect("clear");
     assert_eq!(store.attachments("msg_1").expect("attachments")[0].blob_hash, None);
     assert!(store.blobs().has(&hash).expect("has"), "clearing the pointer deleted the deduplicated blob");
+}
+
+/// The directory fsync after the publish has no observable effect a test can assert without simulating
+/// power loss. This exercises the Unix path end to end: a failure in `File::open(dir).sync_all()`
+/// would surface as an error from `put`. On Windows the published-file flush runs on every publish
+/// and is covered by the rest of this file.
+#[cfg(unix)]
+#[test]
+fn a_put_syncs_the_shard_directory_after_the_rename() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = blobs_in(dir.path(), &random_key());
+    let content = b"durable bytes on a unix filesystem";
+    let hash = store.put(content).expect("put with a shard-directory fsync");
+    assert_eq!(store.get(&hash, 1024).expect("get").as_slice(), content);
+}
+
+/// Eight writers race to publish the same fresh content, round after round, while every writer also
+/// reads it back immediately. A replacing publish on Windows can unlink the old name a scheduling
+/// quantum before the new one appears; this failed with `BlobMissing` before the publish moved to
+/// `hard_link` (and the read gained its bounded retry). The round count is a compromise: enough
+/// interleavings to hit the window, small enough for the default suite.
+#[test]
+fn concurrent_publish_and_read_never_hide_the_blob() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = blobs_in(dir.path(), &random_key());
+    for round in 0..100u32 {
+        let content = std::sync::Arc::new(round_content(4096 + round as usize));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let store = &store;
+                let content = std::sync::Arc::clone(&content);
+                scope.spawn(move || {
+                    let hash = store.put(&content[..]).expect("concurrent put");
+                    let read = store.get(&hash, content.len() as u64 + 1024).expect("concurrent get saw no blob");
+                    assert_eq!(read.len(), content.len());
+                });
+            }
+        });
+    }
+}
+
+fn round_content(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut bytes = Vec::with_capacity(len);
+    while bytes.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes.truncate(len);
+    bytes
 }

@@ -379,19 +379,20 @@ the database and seals it with a subkey derived from the same store key.
 
 ```
 D:\mail\mail.db                      SQLCipher: metadata, subjects, bodies, rows
-D:\mail\blobs\0a\0a3f…c9.blob        XChaCha20-Poly1305: one attachment content, once
+D:\mail\mail.db.blobs\0a\0a3f…c9.blob  XChaCha20-Poly1305: one attachment content, once
 ```
 
-**Layout.** `Store::open` creates and opens `<db parent>/blobs` after the schema is readable and
+**Layout.** `Store::open` creates and opens `<db file>.blobs` after the schema is readable and
 before the engine sees the store; a directory that cannot be created fails the open instead of
-losing attachments later. Every blob is `blobs/<first two hex chars>/<hash>.blob`, where the hash is
-the lowercase BLAKE3 hex of the **plaintext**. One directory is shared by every store in the same
-folder, which is what lets dedup work across accounts and keeps a folder backup self-contained. The
-hash is validated as exactly 64 lowercase hex characters before any path is assembled, so `..`,
-separators, uppercase hex and short/long values are `BadHash` and never reach the filesystem.
-A relative database path resolves to `./blobs`. Two databases with **different** keys in one folder
-therefore share a directory neither can fully read (the other's blobs are `CorruptBlob`): keep one
-key per folder.
+losing attachments later. Every blob is `mail.db.blobs/<first two hex chars>/<hash>.blob`, where the
+hash is the lowercase BLAKE3 hex of the **plaintext**. The namespace is derived from the database
+file, not its folder, so two stores in one directory never share blobs or keys. Moving a store means
+moving the database and its `.blobs` directory together; renaming only the database starts an empty
+blob directory, and the old attachment rows read as `BlobMissing`. A relative database path resolves
+next to itself (`mail.db` → `mail.db.blobs`). The hash is validated as exactly 64 lowercase hex
+characters before any path is assembled, so `..`, separators, Windows stream and UNC forms, trailing
+dots/spaces and uppercase hex are `BadHash` and never reach the filesystem; the error reports only
+the length, never the rejected string.
 
 **Header, version 1.**
 
@@ -418,6 +419,17 @@ caller's `max_bytes` is refused **before** decryption, and `MAX_BLOB_BYTES` (64 
 ceiling whatever the caller passes. The engine reads with `recorded size + 1 MiB`, so a corrupted
 length field cannot become an allocation.
 
+**Dedup and integrity.** The file name is the content hash, but neither `put` nor `get` trusts it.
+`put` authenticates an existing file and compares its plaintext with the new bytes before it reports
+a dedup hit; a corrupt or foreign file at that name (wrong key, damaged tag, planted content) is
+healed by the publish, which makes `put` the repair path and removes the old "remove it and retry"
+recovery step. `get` recomputes BLAKE3 over the decrypted plaintext and compares it with the
+requested name, so content sealed under a false name by someone who holds the subkey is
+`CorruptBlob`, not mail. Both checks run inside the same bounded read, with the declared length capped
+before allocation. The price of an authenticated dedup hit is one decrypt-and-hash of the existing
+file, bounded by the candidate length; it is the trade for a blob namespace that heals itself without
+a separate repair command.
+
 **Keys.** The blob key is `HKDF-SHA256(salt = "postino.v1", ikm = store key, info = "blob")`, held
 in `postino_crypto::Subkey`: no `Clone`, redacted `Debug`, zeroised on drop. A nonce is 24 random
 bytes from the OS RNG for every seal. A different store key, a different label or a different AAD is
@@ -425,11 +437,19 @@ bytes from the OS RNG for every seal. A different store key, a different label o
 rotation does not exist yet: rotating the store key makes every existing blob unreadable, and that
 is recorded in `docs/threat-model.md`.
 
-**Writes.** A put writes `.tmp-<random>` in the target shard with `create_new`, `sync_all`s it and
-renames it over `<hash>.blob`. A failed write removes its temp. A rename that loses a race against
-an identical put is a success because the name is the content; eight concurrent puts of the same
-bytes leave one file and no temp. Identical bytes are stored once (dedup), and a put of existing
-bytes writes nothing.
+**Writes and durability.** A put writes `.tmp-<random>` in the target shard with `create_new`,
+`sync_all`s it and publishes it with `hard_link`, which creates the final name atomically and never
+removes an existing one: a concurrent reader sees either the complete old file or the complete new
+one. An existing name holding the same bytes is a dedup hit; invalid or foreign bytes are healed with
+a replacing rename (the one path where a reader can observe a gap, so `get` retries a missing name
+for up to 8 ms before reporting `BlobMissing`). A filesystem without hard links falls back to the
+replacing rename for every publish. A failed write removes its temp. After publishing, the shard
+directory is fsynced on Unix; Windows has no portable directory fsync and this crate adds no unsafe
+Win32 call, so it reopens the published file and flushes it. The remaining Windows window is the
+directory entry: a power loss in the microseconds after the publish can lose the name, which reads as
+`BlobMissing` on the next open (never wrong bytes) because the engine commits the attachment row only
+after the put returns. Identical bytes are stored once (dedup), and a put of already verified bytes
+writes nothing.
 
 **What is encrypted where.**
 
@@ -452,17 +472,18 @@ bytes writes nothing.
 **Engine seam (no operation).** `Engine::attachment_bytes(attachment_id)` reads through the store
 (P6 reading pane), capped at the recorded size plus 1 MiB. `Engine::store_attachment_bytes` takes
 `(message_id, attachment_id, bytes)` and is repository-first, memory-second: put the blob, update the
-attachment row's `blob_hash` and exact `size`, then the in-memory size and the engine's hash map. A
-failed row write leaves the row and the message untouched; the blob file may remain as an
-unreferenced, deduplicated file. `has_attachments` never changes on this path because the row
-already exists. The demo engine and a store-less engine answer with a readable `OpError::Failed`.
-Consumers: sync (P5b) calls the write for every ingested attachment; the reading pane (P6) calls the
-read to preview or save.
+attachment row's `blob_hash` and exact `size`, then memory. A failed row write leaves the row and the
+message untouched; the blob file may remain as an unreferenced, deduplicated file (and is reused by
+the next attempt). `has_attachments` never changes on this path because the row already exists. A
+draft re-save replaces the attachment rows from metadata that carries no hash and may carry a stale
+size; the repository keeps the stored hash **and** the stored size for an id that survives, and the
+engine re-reads the rows after the write so memory cannot disagree with the bytes on disk. The demo
+engine and a store-less engine answer with a readable `OpError::Failed`. Consumers: sync (P5b) calls
+the write for every ingested attachment; the reading pane (P6) calls the read to preview or save.
 
-**Recovery.** `put` deduplicates on the file's existence, so a damaged file has to be removed with
-`BlobStore::remove(hash)` before the same content can be written again. The engine's read path never
-mutates. There is no garbage collection yet: deleting a message leaves its blob file, because
+**Cleanup.** There is no garbage collection yet: deleting a message leaves its blob file, because
 another message may reference the same content; P9 or the daemon will sweep unreferenced hashes.
+`BlobStore::remove` exists for an explicit delete and for tests, not as a repair step.
 
 ## 5. Synchronization
 
@@ -550,4 +571,5 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P3d: schema v3 (`draft_seq`, `label_seq`), atomic draft save/send, draft patch semantics, per-account Sent, orphan repair, keyring first-run lock, categorised store errors |
 | 2026-10-25 | major | P4a: `postino-mime` parses, sanitizes and serializes MIME with bounds, warnings and injection guards |
 | 2026-10-25 | major | P4b: `postino-crypto` derives HKDF subkeys and seals with XChaCha20-Poly1305; `postino-store` gains a deduplicated, compressed, encrypted blob directory for attachment bytes and the engine gains the attachment read/write seam |
+| 2026-10-25 | minor | P4c: blob review closure — per-database-file blob namespace, authenticated dedup that heals a corrupt file, BLAKE3 verification on read, durable publish, size-preserving attachment patches, no echoed ids |
 | 2026-10-25 | major | P5a: `postino-net` speaks IMAP4rev1 over implicit TLS or STARTTLS with OS verification, bounded lines/literals/commands, typed errors and a scripted hostile-server corpus; the sync loop and store writes are still missing |

@@ -19,11 +19,12 @@ seam (P4b): the store stays independent of `postino-core` and never reads a keyr
 - **The key never leaks.** `Debug` is `<redacted>`, the bytes are zeroised on drop, and the SQLCipher
   pragma is built in a zeroising string. The key is not on disk: a test scans the database, WAL and
   SHM for the key bytes.
-- **Blobs are a sibling directory.** `Store::open` creates and opens `<db parent>/blobs` and derives
-  the blob subkey with HKDF-SHA256 (salt `postino.v1`, label `blob`). A directory that cannot be
-  created fails the open instead of losing attachments later. Every store in the same folder shares
-  the directory, which is what makes dedup work across accounts; two databases with different keys in
-  one folder therefore see each other's blobs as `CorruptBlob`, so keep one key per folder.
+- **Blobs are a sibling directory named after the file.** `Store::open` creates and opens
+  `<db file>.blobs` (`mail.db` → `mail.db.blobs`) and derives the blob subkey with HKDF-SHA256
+  (salt `postino.v1`, label `blob`). A directory that cannot be created fails the open instead of
+  losing attachments later. The namespace belongs to one database file, so two stores in one folder
+  never share it. Moving a store means moving the database and its `.blobs` directory together;
+  renaming only one of them hides the attachments (`BlobMissing` on read).
 - **Fail closed.** A missing codec is `NotEncrypted`; a wrong key or damaged file is
   `WrongKeyOrCorrupt`; a database from a newer build is `SchemaTooNew`. There is no plaintext mode.
 - **Pragmas on open:** `foreign_keys = ON`, `journal_mode = WAL`, `synchronous = FULL`, 5 s busy
@@ -40,40 +41,55 @@ seam (P4b): the store stays independent of `postino-core` and never reads a keyr
   assignments and attachment rows survive a sync refresh. `save_draft_row` keeps the stored
   `in_reply_to` when the update passes `None`; clearing it needs an explicit field, which does not
   exist yet. `replace_attachments` is the explicit replacement and keeps
-  `messages.has_attachments` in step; it also keeps the `blob_hash` of an attachment id that
-  survives the replacement, so a draft re-save cannot detach bytes that are already on disk.
+  `messages.has_attachments` in step; for an attachment id that survives it keeps both the stored
+  `blob_hash` and the stored `size`, because the bytes on disk are canonical and a stale caller size
+  would shrink the read cap below the blob.
 
 ## Blobs
 
 The full format is in `docs/architecture.md` §4.5. The essentials:
 
 ```
-blobs/<first two hex chars>/<64 lowercase hex>.blob
+mail.db                              SQLCipher database
+mail.db.blobs/<first two hex chars>/<64 lowercase hex>.blob
   PSTB | version 1 | flags | original_len u64 LE | 24-byte nonce | ciphertext || tag
 ```
 
 - `BlobStore::open(root, &StoreKey)` derives the subkey; `put(bytes)` returns the lowercase BLAKE3
-  hex of the plaintext and writes nothing when that file already exists (dedup). `get(hash,
-  max_bytes)` authenticates and returns `Zeroizing<Vec<u8>>`; `has` and `remove` are the other two
-  operations.
+  hex of the plaintext. `get(hash, max_bytes)` authenticates, verifies the content hash and returns
+  `Zeroizing<Vec<u8>>`; `has` and `remove` are the other two operations.
 - The hash is validated as exactly 64 lowercase hex characters before any path is built. `..`,
-  separators, uppercase hex and short/long values are `BadHash`; no path is ever assembled from an
-  unvalidated value.
+  separators, Windows path and stream forms, trailing dots/spaces, uppercase hex and short/long
+  values are `BadHash`; no path is ever assembled from an unvalidated value, and the error reports
+  only the length, never the rejected string.
 - The AAD is `magic || version || flags || original_len || hash bytes`. A blob cannot be renamed to
-  another hash, truncated, extended or swapped with another. A wrong key is the same
+  another hash, truncated, extended, re-flagged or swapped with another. A wrong key is the same
   `CorruptBlob` as a flipped byte, because an attacker must not learn which one they achieved.
+- `get` also recomputes BLAKE3 over the decrypted bytes and compares them with the name: a payload
+  sealed under a false name by someone who has the subkey is `CorruptBlob`, not content.
 - zstd level 3 is used only when the compressed frame is smaller than the plaintext (flag bit 0).
   Reads check the declared length against the caller's `max_bytes` **before** decryption, cap it at
   `MAX_BLOB_BYTES` (64 MiB), and decompress with `zstd::bulk::Decompressor` into a buffer of exactly
   the declared length. `decompress_all` is never used.
-- Writes go through `.tmp-<random>` with `create_new`, `sync_all` and a rename in the shard
-  directory. A failed write removes its temp. A concurrent put of the same content is a no-op
-  success: the content is the name.
+- Dedup does not trust the name. `put` authenticates and compares an existing file before it reports
+  a dedup hit; a corrupt or foreign file at that name is replaced by the atomic write, so `put` is
+  also the heal path. There is no separate "repair" operation. The cost is one authenticated read of
+  the existing file (bounded by the candidate length), which is the trade for a namespace that can
+  heal itself.
+- Writes go through `.tmp-<random>` with `create_new` and `sync_all`, then publish with `hard_link`:
+  the final name appears atomically and an existing name is never removed, so a concurrent reader
+  sees the old complete file or the new one, never a gap. A name that already holds the same bytes is
+  a dedup hit; a name with invalid or foreign bytes is healed with a replacing rename. A filesystem
+  without hard links falls back to that rename for every publish, and `get` retries a momentarily
+  missing name for a few milliseconds before reporting `BlobMissing`. A failed write removes its temp.
+- After a publish the shard directory is fsynced on Unix; on Windows the published file is reopened
+  and flushed, which leaves a microsecond directory-entry window after the publish. The failure mode
+  is a `BlobMissing` on the next read, never wrong bytes, and the engine commits the attachment row
+  only after the put returns.
 - Errors: `BadHash`, `BlobMissing`, `CorruptBlob`, `BlobTooLarge`, `BlobRoot`, `Io`, `Compression`,
   `Random`, `Crypto`. None carries plaintext or key material.
-- Recovery: `put` deduplicates on the file's existence, so a damaged file has to be removed with
-  `remove(hash)` before the same bytes can be written again. The engine's read path never deletes
-  anything.
+- The blob directory has no garbage collector yet: deleting a message leaves its blob, because
+  another message may reference the same content.
 
 ## Schema v3
 
@@ -111,8 +127,8 @@ Plain data structs in `model.rs` (no `postino-core` dependency), methods in `rep
   `apply_label`, `remove_label`, `messages_by_label`, `labels_for`.
 - attachments: `replace_attachments`, `attachments`, `list_all_attachments`, `find_attachment`
   (one row plus its message id) and `set_attachment_blob_hash(message, attachment, hash, size)`,
-  which the engine calls after a blob write. `replace_attachments` preserves the hash of an id that
-  survives the replacement; clearing it is explicit.
+  which the engine calls after a blob write. `replace_attachments` preserves the hash **and size** of
+  an id that survives the replacement; clearing it is explicit.
 - hydration: `list_all_messages` plus `list_all_attachments` load a whole mailbox in one query per
   table, with labels and attachments grouped by message; `Engine::open` uses exactly this pair.
 - drafts: `save_draft_message` is the whole-draft API. It writes the message row, its attachments,
@@ -140,12 +156,14 @@ cargo test -p postino-store
 ```
 
 - `tests/encryption.rs`: keyless reads, wrong key, reopen, no plaintext in DB or WAL.
-- `tests/blobs.rs`: blob round trip and reopen, dedup (one file for identical bytes), wrong key,
-  tampered ciphertext/tag/nonce, a swapped file, an oversized declared length, non-hex and traversal
-  hashes, temp cleanup on success and on a failed rename, eight concurrent puts of the same content,
-  compression only when it helps, the header layout and hexdump, remove/has, a no-plaintext scan of
-  the database and every blob file (including the key bytes), blob-directory creation and failure,
-  and the attachment-row pointer behaviour.
+- `tests/blobs.rs`: blob round trip and reopen, dedup (one file for identical bytes), dedup over a
+  corrupt file (heals it), a foreign key's file (replaced, then readable), wrong key, tampered
+  ciphertext/tag/nonce, a flag or in-cap length flip, content planted under a false name, a swapped
+  file, an oversized declared length, non-hex/Windows/traversal ids without echo, temp cleanup on
+  success and on a failed rename, eight concurrent puts, compression only when it helps, the header
+  layout and hexdump, remove/has, a no-plaintext scan of the database, WAL and SHM while the store is
+  open (plus every blob file and the key bytes), per-file blob roots, and the attachment-row hash and
+  size behaviour.
 - `tests/migrations.rs`: additive v1 → v3 upgrade with meta preserved, v2 → v3 `draft_seq`
   seeding, idempotent reopen, `SchemaTooNew`, foreign-key enforcement and cascade.
 - `tests/repository.rs`: the full round trip (account, folders, message, two recipients, attachment,
