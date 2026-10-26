@@ -84,7 +84,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | done |
 | P8 | M2 compose | attachment bytes, signatures per identity, reply/forward recipients and headers, size caps | done |
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, v7 inert tables | done |
-| P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | done |
+| P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | review |
 | P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | todo |
 | P10 | M4 daemon | `postino-daemon`, named pipe/UDS + token, tray, autostart, clients | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
