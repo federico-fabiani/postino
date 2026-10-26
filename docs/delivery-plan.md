@@ -79,9 +79,9 @@ Status: `todo` · `active` · `review` · `done`.
 | P6a | Accounts backend | credentials, schema v4, account/sync operations, CLI and MCP, sensitive filtering | done |
 | P6b | M1 onboarding UI | autodiscovery screen, Aruba app-password flow, app on real data | done |
 | P6c | M1 reading + settings | text reading pane, safe links, attachment Save, full settings, chrome cleanup | done |
-| P6c-fix | M1 review closure | filename-warning bypass, effective link destination, narrow-overlay Retry, demo Save, test depth, settings minors | active |
+| P6c-fix | M1 review closure | filename-warning bypass, effective link destination, narrow-overlay Retry, demo Save, test depth, settings minors | done |
 | P6d | M1 remote-content count | schema v6 `messages.remote_images`, carry `remote_images_blocked` MIME→sync→store, render stored truth | todo |
-| P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | active |
+| P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | review |
 | P8 | M2 compose | attachment bytes, signatures per identity, reply/forward recipients and headers, size caps | todo |
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, saved search model | todo |
 | P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | todo |
@@ -92,9 +92,11 @@ Status: `todo` · `active` · `review` · `done`.
 
 P0-P2 close U0. P3-P6d make M1 real; P7-P8 close M2. Each package may split when the brief is too
 large; splits are recorded here. The P6c blind review found one filename-warning blocker and several
-major UX/test gaps; P6c-fix closes them in the main worktree. P7 runs on its own branch and worktree
-so the two streams do not share a Cargo target; the branch merges only after `cargo xtask ci` is green
-and the P6c-fix review is triaged. P6d is deliberately after P7 because it needs the next schema slot.
+major UX/test gaps; P6c-fix closes them. P7 runs on its own branch and worktree so the two streams do
+not share a Cargo target; its first blind review found two blockers (duplicate submission after a
+cancel, raw server text in the journal) and eight majors, so the branch stays in review until the
+closure fixes and a second blind review are green. P6d is deliberately after P7 because it needs the
+next schema slot.
 
 ## 5. Delighters backlog
 
