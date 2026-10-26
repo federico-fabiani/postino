@@ -79,6 +79,8 @@ Status: `todo` · `active` · `review` · `done`.
 | P6a | Accounts backend | credentials, schema v4, account/sync operations, CLI and MCP, sensitive filtering | done |
 | P6b | M1 onboarding UI | autodiscovery screen, Aruba app-password flow, app on real data | done |
 | P6c | M1 reading + settings | text reading pane, safe links, attachment Save, full settings, chrome cleanup | done |
+| P6c-fix | M1 review closure | filename-warning bypass, effective link destination, narrow-overlay Retry, demo Save, test depth, settings minors | active |
+| P6d | M1 remote-content count | carry `remote_images_blocked` from MIME through sync/store after schema v5; render it only from stored truth | todo |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | active |
 | P8 | M2 compose | attachments bytes, signatures per identity, scheduled send, undo send | todo |
 | P9 | M3 organize | threads, FTS5 search, rules, label mapping, attachment preview/save | todo |
@@ -86,10 +88,11 @@ Status: `todo` · `active` · `review` · `done`.
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
 
-P0-P2 close U0. P3-P6c make M1 real; P7-P8 close M2. Each package may split when the brief is too
-large; splits are recorded here. P7 runs on its own branch and worktree so a blind P6c review can
-proceed with the warm main target; the branch merges only after `cargo xtask ci` is green and the
-review findings are triaged.
+P0-P2 close U0. P3-P6d make M1 real; P7-P8 close M2. Each package may split when the brief is too
+large; splits are recorded here. The P6c blind review found one filename-warning blocker and several
+major UX/test gaps; P6c-fix closes them in the main worktree. P7 runs on its own branch and worktree
+so the two streams do not share a Cargo target; the branch merges only after `cargo xtask ci` is green
+and the P6c-fix review is triaged. P6d is deliberately after P7 because it needs the next schema slot.
 
 ## 5. Delighters backlog
 
