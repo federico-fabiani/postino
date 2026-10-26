@@ -199,8 +199,72 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search_reindex",
             "Rebuild the search index",
-            "Delete and rebuild the encrypted full-text and rank indexes from the stored message rows in resumable 500-row batches. Idempotent; it never vacuums the database and never contacts a server. It is a single-process maintenance action: do not run it from the desktop and MCP at once. Returns the document count and duration. Thread rows are created by P9b and stay 0 here.",
+            "Delete and rebuild the encrypted full-text and rank indexes from the stored message rows in resumable 500-row batches. Idempotent; it never vacuums the database and never contacts a server. It is a single-process maintenance action: do not run it from the desktop and MCP at once. Returns the document count and duration. It also rebuilds the thread cache from the stored messages; it does not re-derive the thread id of mail cached before P9b.",
             SearchReindexArgs,
+            false,
+            false
+        ),
+        def!(
+            "threads_list",
+            "List conversations",
+            "Conversation rows, newest first: id, subject, plain snippet, unique participants, mailbox-wide message/unread/starred counts, labels and the latest message id. A folder, label, unread, starred or attachment filter decides which threads are listed; it never narrows the counts on a row. `total`, `unread_threads` and `unread_messages` describe the filtered scope. At most 200 rows per page and offset 5000. Read-only and offline.",
+            ThreadsListArgs,
+            true,
+            false
+        ),
+        def!(
+            "thread_get",
+            "Get a conversation",
+            "One conversation and an ascending page of its message summaries (at most 200; bodies are read with message_get). `resolved_id` is the current id after a merge: pass an old id and it still resolves through the alias table. `truncated` says whether more messages exist after the page. Read-only and offline.",
+            ThreadGetArgs,
+            true,
+            false
+        ),
+        def!(
+            "thread_flag",
+            "Change conversation flags",
+            "Set the read/unread or starred state of every message in one conversation, up to 500 messages. At least one flag is required. Idempotent: repeating the same state returns `changed: 0`. Returns the refreshed thread row. This is local state only; it never contacts a server.",
+            ThreadFlagArgs,
+            false,
+            false
+        ),
+        def!(
+            "saved_searches_list",
+            "List saved searches",
+            "Every saved search for one account, by name ignoring case, with computed `total`/`unread` counts and `valid`/`error`. A stored query whose label or folder no longer exists is `valid: false`, never a dead entry; its last counts are zero and the error says why. `recent` is the last eight successful queries, newest first. Counts are cached until the mailbox changes. Read-only and offline.",
+            SavedSearchesListArgs,
+            true,
+            false
+        ),
+        def!(
+            "saved_search_create",
+            "Save a search",
+            "Store a named search for one account. Names are 1-48 characters, unique ignoring case and capped at 12 per account. The query is the documented search language and is validated now: an unclosed quote, an unknown label or an unknown folder is refused. `sort` is `relevance` (default) or `date`. Returns the row with its computed counts. Saved searches are local metadata in the encrypted store.",
+            SavedSearchCreateArgs,
+            false,
+            false
+        ),
+        def!(
+            "saved_search_update",
+            "Update a saved search",
+            "Change the name, query and/or sort of one saved search. At least one field is required; the id and account never change. The query is validated like saved_search_create. Returns the row with recomputed counts.",
+            SavedSearchUpdateArgs,
+            false,
+            false
+        ),
+        def!(
+            "saved_search_delete",
+            "Delete a saved search",
+            "Delete one saved search row. This removes local metadata only, never a message. Returns the deleted row.",
+            SavedSearchDeleteArgs,
+            false,
+            true
+        ),
+        def!(
+            "saved_search_recent_clear",
+            "Clear recent searches",
+            "Forget one account's eight recent successful queries. They live only in the encrypted store's `meta` table and are never sent anywhere. Returns whether anything was removed.",
+            SavedSearchRecentClearArgs,
             false,
             false
         ),
@@ -551,6 +615,98 @@ pub struct SearchReindexArgs {}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ThreadsListArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Folder id or exact folder name. `starred` is the virtual starred view.
+    pub folder: Option<String>,
+    /// Label id or exact label name.
+    pub label: Option<String>,
+    /// Only threads with at least one unread message in scope.
+    #[serde(default)]
+    pub unread_only: bool,
+    /// Only threads with at least one starred message in scope.
+    #[serde(default)]
+    pub starred_only: bool,
+    /// Only threads with at least one message carrying an attachment in scope.
+    #[serde(default)]
+    pub with_attachments: bool,
+    /// Page size, 1-200. Defaults to 50.
+    pub limit: Option<u32>,
+    /// Rows to skip before the page, 0-5000. Defaults to 0.
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadGetArgs {
+    /// Thread id from threads_list. An id merged into another still resolves.
+    pub id: String,
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Message page size, 1-200. Defaults to 50.
+    pub limit: Option<u32>,
+    /// Messages to skip, 0-5000.
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadFlagArgs {
+    pub id: String,
+    pub account: Option<String>,
+    /// New read state: true means unread.
+    pub unread: Option<bool>,
+    pub starred: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SavedSearchesListArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SavedSearchCreateArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// 1-48 characters, unique per account ignoring case, at most 12 rows per account.
+    pub name: String,
+    /// The documented search language, validated before it is stored.
+    pub query: String,
+    /// relevance (default) or date.
+    pub sort: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SavedSearchUpdateArgs {
+    pub id: String,
+    /// New name. Omit to keep the current one.
+    pub name: Option<String>,
+    /// New query. Omit to keep the current one.
+    pub query: Option<String>,
+    /// New sort. Omit to keep the current one.
+    pub sort: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SavedSearchDeleteArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SavedSearchRecentClearArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LabelsListArgs {}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -816,9 +972,54 @@ impl SearchStatusResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchReindexResult {
     pub documents: u32,
-    /// Thread rows refreshed. P9a creates the table but does not derive threads, so this is 0.
+    /// Thread cache rows rebuilt from the stored messages.
     pub threads: u32,
     pub took_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadsListResult {
+    pub threads: Vec<crate::model::ThreadSummary>,
+    pub total: u32,
+    pub unread_threads: u32,
+    pub unread_messages: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadGetResult {
+    pub thread: crate::model::ThreadSummary,
+    pub messages: Vec<MessageSummary>,
+    pub total: u32,
+    pub truncated: bool,
+    pub resolved_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadFlagOutput {
+    pub thread: crate::model::ThreadSummary,
+    pub changed: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSearchesListResult {
+    pub searches: Vec<crate::model::SavedSearch>,
+    pub recent: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSearchResult {
+    pub search: crate::model::SavedSearch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSearchDeleteResult {
+    pub search: crate::model::SavedSearch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSearchRecentClearResult {
+    pub account: String,
+    pub cleared: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1026,6 +1227,46 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "search_reindex" => {
             let _args: SearchReindexArgs = parse(args)?;
             search_reindex(engine)
+        }
+        "threads_list" => {
+            let args: ThreadsListArgs = parse(args)?;
+            threads_list(engine, args)
+        }
+        "thread_get" => {
+            let args: ThreadGetArgs = parse(args)?;
+            thread_get(engine, args)
+        }
+        "thread_flag" => {
+            let args: ThreadFlagArgs = parse(args)?;
+            let result = engine.thread_flag(args.account.as_deref(), &args.id, args.unread, args.starred)?;
+            value(ThreadFlagOutput { thread: result.thread, changed: result.changed })
+        }
+        "saved_searches_list" => {
+            let args: SavedSearchesListArgs = parse(args)?;
+            let searches = engine.saved_searches_list(args.account.as_deref())?;
+            let recent = engine.recent_searches(args.account.as_deref())?;
+            value(SavedSearchesListResult { searches, recent })
+        }
+        "saved_search_create" => {
+            let args: SavedSearchCreateArgs = parse(args)?;
+            let search = engine.create_saved_search(args.account.as_deref(), &args.name, &args.query, args.sort.as_deref())?;
+            value(SavedSearchResult { search })
+        }
+        "saved_search_update" => {
+            let args: SavedSearchUpdateArgs = parse(args)?;
+            let search = engine.update_saved_search(&args.id, args.name.as_deref(), args.query.as_deref(), args.sort.as_deref())?;
+            value(SavedSearchResult { search })
+        }
+        "saved_search_delete" => {
+            let args: SavedSearchDeleteArgs = parse(args)?;
+            let search = engine.delete_saved_search(&args.id)?;
+            value(SavedSearchDeleteResult { search })
+        }
+        "saved_search_recent_clear" => {
+            let args: SavedSearchRecentClearArgs = parse(args)?;
+            let account = engine.requested_account_id(args.account.as_deref(), "saved_search_recent_clear")?;
+            let cleared = engine.clear_recent_searches(Some(&account))?;
+            value(SavedSearchRecentClearResult { account, cleared })
         }
         "labels_list" => {
             let _: LabelsListArgs = parse(args)?;
@@ -1298,6 +1539,11 @@ fn flag(engine: &mut Engine, args: MessageFlagArgs) -> Result<Value, OpError> {
 }
 
 fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
+    value(execute_search(engine, args)?)
+}
+
+/// The one search execution path shared by the `search` operation and the saved-search counts.
+pub(crate) fn execute_search(engine: &Engine, args: SearchArgs) -> Result<SearchResult, OpError> {
     let parsed = crate::search::parse(&args.query)
         .map_err(|error| OpError::InvalidArgs(format!("search query: {} at position {}", error.code, error.position)))?;
     let account = search_account(engine, args.account.as_deref())?;
@@ -1343,7 +1589,7 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
         let _ = store.ensure_search_index_batch();
         let status = store.search_status().map_err(store_map::read_error)?;
         if !status.ready {
-            return value(SearchResult {
+            return Ok(SearchResult {
                 query: parsed.text,
                 total: 0,
                 total_capped: false,
@@ -1383,7 +1629,7 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
     };
     let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let messages = hits.iter().map(|hit| hit.message.clone()).collect();
-    value(SearchResult { query: parsed.text, total, total_capped, hits, messages, took_ms, index: None })
+    Ok(SearchResult { query: parsed.text, total, total_capped, hits, messages, took_ms, index: None })
 }
 
 fn expression_uses_fts(expression: Option<&postino_store::SearchExpr>) -> bool {
@@ -1407,7 +1653,43 @@ fn search_status(engine: &Engine) -> Result<Value, OpError> {
 fn search_reindex(engine: &Engine) -> Result<Value, OpError> {
     let store = engine.require_store_for_read("search_reindex")?;
     let outcome = store.search_reindex().map_err(store_map::read_error)?;
-    value(SearchReindexResult { documents: outcome.documents, threads: 0, took_ms: outcome.took_ms })
+    let threads = store.refresh_all_threads().map_err(store_map::read_error)?;
+    value(SearchReindexResult { documents: outcome.documents, threads, took_ms: outcome.took_ms })
+}
+
+fn threads_list(engine: &Engine, args: ThreadsListArgs) -> Result<Value, OpError> {
+    let request = crate::engine::ThreadListRequest {
+        account: args.account,
+        folder: args.folder,
+        label: args.label,
+        unread_only: args.unread_only,
+        starred_only: args.starred_only,
+        with_attachments: args.with_attachments,
+        limit: args.limit,
+        offset: args.offset,
+    };
+    let page = engine.threads_list(&request)?;
+    value(ThreadsListResult { threads: page.threads, total: page.total, unread_threads: page.unread_threads, unread_messages: page.unread_messages })
+}
+
+fn thread_get(engine: &Engine, args: ThreadGetArgs) -> Result<Value, OpError> {
+    let detail = engine.thread_get(args.account.as_deref(), &args.id, args.limit, args.offset)?;
+    value(ThreadGetResult {
+        thread: detail.thread,
+        messages: detail.messages,
+        total: detail.total,
+        truncated: detail.truncated,
+        resolved_id: detail.resolved_id,
+    })
+}
+
+/// Parse and resolve a saved query without executing it. The registration path uses this so an
+/// unknown label or folder is refused at save time instead of appearing as a valid but empty row.
+pub(crate) fn validate_search_query(engine: &Engine, query: &str, account: Option<&str>) -> Result<(), OpError> {
+    let parsed =
+        crate::search::parse(query).map_err(|error| OpError::InvalidArgs(format!("search query: {} at position {}", error.code, error.position)))?;
+    translate_search(&parsed.expr, engine, account)?;
+    Ok(())
 }
 
 /// Resolve the account scope of a search: one account is implied, several require an explicit id.

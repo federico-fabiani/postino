@@ -24,17 +24,18 @@ pub mod vault;
 
 pub use engine::{
     AccountRequest, AccountSetup, AccountUpdateRequest, Engine, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS,
-    MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup,
+    MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup, ThreadDetailResult, ThreadFlagResult, ThreadListRequest, ThreadPageResult,
 };
 pub use model::{
     Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
-    Provider, ServerSettings, SmtpSettings,
+    Provider, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
 };
 pub use ops::{
     AccountAdd, AccountRemove, AccountSignature, AccountTest, AccountUpdate, AccountsList, AppInfo, DraftAttachmentResult, DraftSave, DryRunResult,
     FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageFlag, MessageGet, MessagesList, OpDef, OutboxAction,
-    OutboxListResult, SearchHit, SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport,
-    SyncStatusReport, SyncStatusView, op_defs,
+    OutboxListResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchHit,
+    SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView,
+    ThreadFlagOutput, ThreadGetResult, ThreadsListResult, op_defs,
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
 pub use postino_sync::{SyncPhase, SyncStatus};

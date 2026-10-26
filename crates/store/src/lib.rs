@@ -48,16 +48,19 @@
 mod blob;
 mod model;
 mod repo;
+mod saved;
 mod search;
+mod threads;
 
 pub use blob::BlobStore;
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
     Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
-    SEARCH_TOTAL_CAP, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer, SyncState,
-    UidEntry,
+    SEARCH_TOTAL_CAP, SavedSearch, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer,
+    SyncState, ThreadDetail, ThreadFilter, ThreadPage, ThreadSummary, UidEntry,
 };
 pub use repo::{MAX_OUTBOX_ROWS, UNCERTAIN_AFTER_CRASH};
+pub use saved::RECENT_SEARCHES_KEY_PREFIX;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -600,6 +603,11 @@ impl Store {
         )
         .map_err(translate)?;
         migrate(&mut conn)?;
+        // The thread cache is derived data. Its page is ordered by `last_date` and scoped by account;
+        // without this index a 100k mailbox sorts the whole cache on every list. This is cache
+        // maintenance, not a schema migration: `user_version` stays 7 and an existing store gains
+        // the index on its next normal open. A read-only open never creates it.
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS threads_account_date ON threads(account_id, last_date DESC, id);").map_err(translate)?;
         let blobs = BlobStore::open(blob_root(path), key)?;
         Ok(Self { conn, blobs, path: path.to_path_buf() })
     }

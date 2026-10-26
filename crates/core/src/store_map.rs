@@ -11,7 +11,8 @@ use postino_store::StoreError;
 
 use crate::engine::OpError;
 use crate::model::{
-    Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, MailTls, Message, MessageSummary, ServerSettings, SmtpSettings, snippet,
+    Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, MailTls, Message, MessageSummary, SavedSearch, ServerSettings, SmtpSettings,
+    ThreadSummary, snippet,
 };
 
 /// Unix milliseconds: the store's only date format (see the `postino-store` crate docs).
@@ -158,6 +159,40 @@ pub(crate) fn label(row: store::LabelCount) -> Result<Label, OpError> {
 pub(crate) fn label_row(id: &str, name: &str, color: LabelColor) -> store::Label {
     // Labels are mailbox-wide until onboarding gets per-account identities (P6).
     store::Label { id: id.to_owned(), account_id: None, name: name.to_owned(), color: color.as_str().to_owned() }
+}
+
+/// A saved search row. Counts are computed by the engine against the current index, so a hydrated
+/// row starts valid with zero counts and is filled by `saved_searches_list`.
+pub(crate) fn saved_search(row: store::SavedSearch) -> SavedSearch {
+    SavedSearch {
+        id: row.id,
+        account_id: row.account_id,
+        name: row.name,
+        query: row.query,
+        sort: row.sort,
+        valid: true,
+        error: None,
+        total: 0,
+        unread: 0,
+    }
+}
+
+pub(crate) fn thread_summary(row: store::ThreadSummary) -> ThreadSummary {
+    ThreadSummary {
+        id: row.id,
+        account_id: row.account_id,
+        subject: row.subject,
+        snippet: row.snippet,
+        participants: row.participants.iter().map(address).collect(),
+        last_date: date_or_epoch(row.last_date),
+        message_count: row.message_count,
+        unread_count: row.unread_count,
+        starred_count: row.starred_count,
+        has_attachments: row.has_attachments,
+        latest_message_id: row.latest_message_id,
+        labels: row.labels,
+        state: row.state,
+    }
 }
 
 pub(crate) fn summary(row: store::MessageSummary) -> MessageSummary {

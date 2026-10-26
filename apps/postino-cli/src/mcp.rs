@@ -161,7 +161,7 @@ fn tools_list(engine: &Engine, allow_send: bool) -> Value {
                 "annotations": {
                     "readOnlyHint": def.read_only,
                     "destructiveHint": def.destructive,
-                    "idempotentHint": def.read_only || matches!(def.name, "message_flag" | "label_apply" | "label_update"),
+                    "idempotentHint": def.read_only || matches!(def.name, "message_flag" | "label_apply" | "label_update" | "thread_flag"),
                     "openWorldHint": matches!(def.name, "account_test" | "sync_now" | "outbox_retry")
                 }
             });
@@ -711,6 +711,119 @@ mod tests {
         assert_eq!(response["result"]["isError"], json!(true));
         let text = response["result"]["content"][0]["text"].as_str().expect("text");
         assert!(text.contains("base64") || text.contains("no local store") || text.contains("demo"), "{text}");
+    }
+
+    #[test]
+    fn threads_and_saved_search_tools_are_exposed_and_round_trip_through_mcp() {
+        let mut engine = Engine::demo();
+        let tools = request(&mut engine, "tools/list");
+        let definitions = tools["result"]["tools"].as_array().expect("tools");
+        for name in [
+            "threads_list",
+            "thread_get",
+            "thread_flag",
+            "saved_searches_list",
+            "saved_search_create",
+            "saved_search_update",
+            "saved_search_delete",
+            "saved_search_recent_clear",
+        ] {
+            let tool = definitions.iter().find(|tool| tool["name"] == name).unwrap_or_else(|| panic!("{name} is missing"));
+            assert!(tool["inputSchema"].is_object());
+            assert!(tool["annotations"]["readOnlyHint"].is_boolean());
+        }
+        let flag = definitions.iter().find(|tool| tool["name"] == "thread_flag").expect("thread_flag");
+        assert_eq!(flag["annotations"]["idempotentHint"], json!(true));
+        assert!(definitions.iter().all(|tool| tool["name"] != "account_add"), "sensitive tools stay absent");
+
+        let listed = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 70, "method": "tools/call",
+                "params": { "name": "threads_list", "arguments": { "folder": "inbox" } }
+            }),
+        )
+        .expect("response");
+        let threads = listed["result"]["structuredContent"]["threads"].as_array().expect("threads");
+        assert!(threads.iter().any(|thread| thread["id"] == "thr_preventivo"), "{listed}");
+
+        let detail = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 71, "method": "tools/call",
+                "params": { "name": "thread_get", "arguments": { "id": "thr_preventivo" } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(detail["result"]["structuredContent"]["messages"].as_array().map(Vec::len), Some(3));
+
+        let flag = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 72, "method": "tools/call",
+                "params": { "name": "thread_flag", "arguments": { "id": "thr_preventivo", "unread": false } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(flag["result"]["structuredContent"]["changed"], 2);
+        let again = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 73, "method": "tools/call",
+                "params": { "name": "thread_flag", "arguments": { "id": "thr_preventivo", "unread": false } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(again["result"]["structuredContent"]["changed"], 0);
+
+        let created = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 74, "method": "tools/call",
+                "params": { "name": "saved_search_create", "arguments": { "name": "Fatture", "query": "label:Fatture" } }
+            }),
+        )
+        .expect("response");
+        assert!(created.get("error").is_none(), "{created}");
+        let id = created["result"]["structuredContent"]["search"]["id"].as_str().expect("id").to_owned();
+        let saved = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 75, "method": "tools/call",
+                "params": { "name": "saved_searches_list", "arguments": {} }
+            }),
+        )
+        .expect("response");
+        assert_eq!(saved["result"]["structuredContent"]["searches"][0]["name"], "Fatture");
+        let deleted = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 76, "method": "tools/call",
+                "params": { "name": "saved_search_delete", "arguments": { "id": id } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(deleted["result"]["structuredContent"]["search"]["name"], "Fatture");
+        let cleared = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 77, "method": "tools/call",
+                "params": { "name": "saved_search_recent_clear", "arguments": {} }
+            }),
+        )
+        .expect("response");
+        assert!(cleared.get("error").is_none(), "{cleared}");
+
+        let stale = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 78, "method": "tools/call",
+                "params": { "name": "saved_search_create", "arguments": { "name": "Manca", "query": "label:Inesistente" } }
+            }),
+        )
+        .expect("response");
+        assert_eq!(stale["result"]["isError"], json!(true));
+        assert!(stale["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("unknown label")));
     }
 
     #[test]

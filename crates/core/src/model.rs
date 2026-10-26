@@ -349,6 +349,42 @@ pub struct LabelSummary {
     pub unread_count: u32,
 }
 
+/// One conversation row. Counts are mailbox-wide; a folder or label view only decides which
+/// threads are listed. `state` is `unread` when any message is unread, otherwise `read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub id: String,
+    pub account_id: String,
+    pub subject: String,
+    pub snippet: String,
+    /// Unique senders, earliest first, at most five.
+    pub participants: Vec<Address>,
+    pub last_date: DateTime<Utc>,
+    pub message_count: u32,
+    pub unread_count: u32,
+    pub starred_count: u32,
+    pub has_attachments: bool,
+    pub latest_message_id: Option<String>,
+    /// Union of the labels carried by the thread's messages, at most eight.
+    pub labels: Vec<String>,
+    pub state: String,
+}
+
+/// A saved search as the UI and agents see it. `valid: false` means the stored query no longer
+/// resolves (a deleted label or folder); the row stays visible instead of becoming a dead entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSearch {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub query: String,
+    pub sort: String,
+    pub valid: bool,
+    pub error: Option<String>,
+    pub total: u32,
+    pub unread: u32,
+}
+
 /// The list-row shape. Bodies are fetched separately so a mailbox list stays cheap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSummary {

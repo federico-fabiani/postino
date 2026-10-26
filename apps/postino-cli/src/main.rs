@@ -27,7 +27,8 @@ use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
     LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OpError, OutboxAction, OutboxListResult,
-    Provider, SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, VaultError,
+    Provider, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup,
+    SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
 };
 use postino_platform::Keyring;
 use serde::Serialize;
@@ -123,6 +124,70 @@ enum LabelCommand {
     Apply { id: String, message_ids: Vec<String> },
     /// Remove a label from one or more messages.
     Remove { id: String, message_ids: Vec<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThreadCommand {
+    /// Read one conversation and an ascending page of its messages.
+    Get {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    /// Set the read/star state of every message in a conversation.
+    Flag {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, conflicts_with = "read")]
+        unread: bool,
+        #[arg(long, conflicts_with = "unread")]
+        read: bool,
+        #[arg(long, conflicts_with = "unstar")]
+        starred: bool,
+        #[arg(long, conflicts_with = "starred")]
+        unstar: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SavedCommand {
+    /// List saved searches with computed counts and recent queries.
+    List {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Save a named search. The query is the documented search language.
+    Create {
+        name: String,
+        query: String,
+        #[arg(long)]
+        account: Option<String>,
+        /// relevance (default) or date.
+        #[arg(long)]
+        sort: Option<String>,
+    },
+    /// Change the name, query and/or sort of a saved search.
+    Update {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        sort: Option<String>,
+    },
+    /// Delete a saved search.
+    Delete { id: String },
+    /// Forget the eight recent queries of one account.
+    RecentClear {
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -380,6 +445,40 @@ enum Command {
         #[command(subcommand)]
         command: LabelCommand,
     },
+    /// List conversations, newest first.
+    Threads {
+        #[arg(long)]
+        account: Option<String>,
+        /// Folder id or exact folder name.
+        #[arg(long)]
+        folder: Option<String>,
+        /// Label id or exact label name.
+        #[arg(long)]
+        label: Option<String>,
+        /// Only threads with an unread message in scope.
+        #[arg(long)]
+        unread: bool,
+        /// Only threads with a starred message in scope.
+        #[arg(long)]
+        starred: bool,
+        /// Only threads with an attachment in scope.
+        #[arg(long)]
+        attachments: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    /// Read or flag one conversation.
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommand,
+    },
+    /// List, save, update or delete saved searches.
+    Saved {
+        #[command(subcommand)]
+        command: SavedCommand,
+    },
     /// Call any operation with JSON or key=value arguments.
     Run {
         op: String,
@@ -544,6 +643,9 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } | Command::SearchStatus => true,
         Command::Read { mark_read, .. } => !mark_read,
         Command::Label { command } => matches!(command, LabelCommand::List),
+        Command::Threads { .. } => true,
+        Command::Thread { command } => matches!(command, ThreadCommand::Get { .. }),
+        Command::Saved { command } => matches!(command, SavedCommand::List { .. }),
         Command::Outbox { command } => matches!(command, OutboxCommand::List { .. }),
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
         // operation is refused before dispatch and must not create one either.
@@ -591,6 +693,9 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             | Command::Send { .. }
             | Command::Outbox { .. }
             | Command::Label { .. }
+            | Command::Threads { .. }
+            | Command::Thread { .. }
+            | Command::Saved { .. }
     );
     if needs_mail && engine.accounts().is_empty() {
         bail!(
@@ -1120,6 +1225,153 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 }
             }
         },
+        Command::Threads { account, folder, label, unread, starred, attachments, limit, offset } => {
+            let result: ThreadsListResult = decode(call(
+                engine,
+                "threads_list",
+                json!({
+                    "account": account,
+                    "folder": folder,
+                    "label": label,
+                    "unread_only": unread,
+                    "starred_only": starred,
+                    "with_attachments": attachments,
+                    "limit": limit,
+                    "offset": offset
+                }),
+            )?)?;
+            if json_output {
+                print_json(&result)?;
+            } else {
+                let mut text = format!(
+                    "{} · {} non letti · {} messaggi non letti\n",
+                    threads_text(result.total as usize),
+                    result.unread_threads,
+                    result.unread_messages
+                );
+                for thread in &result.threads {
+                    let participants = thread.participants.iter().map(Address::display).collect::<Vec<_>>().join(", ");
+                    text.push_str(&format!(
+                        "{}  {}  {}/{}  {}\n  {}\n",
+                        thread.id,
+                        thread.last_date.format("%Y-%m-%d %H:%M"),
+                        thread.unread_count,
+                        thread.message_count,
+                        participants,
+                        thread.subject
+                    ));
+                }
+                say(text)?;
+            }
+        }
+        Command::Thread { command } => match command {
+            ThreadCommand::Get { id, account, limit, offset } => {
+                let result: ThreadGetResult =
+                    decode(call(engine, "thread_get", json!({ "id": id, "account": account, "limit": limit, "offset": offset }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    let mut text = format!("{}\n", result.thread.subject);
+                    for message in &result.messages {
+                        text.push_str(&format!("{}  {}  {}\n", message.id, message.date.format("%Y-%m-%d %H:%M"), message.from.display()));
+                    }
+                    if result.truncated {
+                        text.push_str(&format!("… {} messaggi in totale\n", result.total));
+                    }
+                    if result.resolved_id != id {
+                        text.push_str(&format!("id attuale: {}\n", result.resolved_id));
+                    }
+                    say(text)?;
+                }
+            }
+            ThreadCommand::Flag { id, account, unread, read, starred, unstar } => {
+                let unread = if unread {
+                    Some(true)
+                } else if read {
+                    Some(false)
+                } else {
+                    None
+                };
+                let starred = if starred {
+                    Some(true)
+                } else if unstar {
+                    Some(false)
+                } else {
+                    None
+                };
+                if unread.is_none() && starred.is_none() {
+                    return Err(usage("thread flag needs --unread, --read, --starred or --unstar".to_owned()));
+                }
+                let result: ThreadFlagOutput =
+                    decode(call(engine, "thread_flag", json!({ "id": id, "account": account, "unread": unread, "starred": starred }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("{} · {} messaggi aggiornati\n", result.thread.subject, result.changed))?;
+                }
+            }
+        },
+        Command::Saved { command } => match command {
+            SavedCommand::List { account } => {
+                let result: SavedSearchesListResult = decode(call(engine, "saved_searches_list", json!({ "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    let mut text = String::new();
+                    for search in &result.searches {
+                        let state = if search.valid {
+                            format!("{} · {} non letti", search.total, search.unread)
+                        } else {
+                            format!("non valida: {}", search.error.as_deref().unwrap_or("query non risolvibile"))
+                        };
+                        text.push_str(&format!("{}  {}  [{}]  {}\n", search.id, search.name, search.sort, state));
+                    }
+                    if result.searches.is_empty() {
+                        text.push_str("Nessuna ricerca salvata.\n");
+                    }
+                    if !result.recent.is_empty() {
+                        text.push_str("Recenti: ");
+                        text.push_str(&result.recent.join(" · "));
+                        text.push('\n');
+                    }
+                    say(text)?;
+                }
+            }
+            SavedCommand::Create { name, query, account, sort } => {
+                let result: SavedSearchResult =
+                    decode(call(engine, "saved_search_create", json!({ "account": account, "name": name, "query": query, "sort": sort }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("{}  {}  {}\n", result.search.id, result.search.name, result.search.query))?;
+                }
+            }
+            SavedCommand::Update { id, name, query, sort } => {
+                let result: SavedSearchResult =
+                    decode(call(engine, "saved_search_update", json!({ "id": id, "name": name, "query": query, "sort": sort }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("{}  {}  {}\n", result.search.id, result.search.name, result.search.query))?;
+                }
+            }
+            SavedCommand::Delete { id } => {
+                let result: SavedSearchDeleteResult = decode(call(engine, "saved_search_delete", json!({ "id": id }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Ricerca eliminata: {}\n", result.search.name))?;
+                }
+            }
+            SavedCommand::RecentClear { account } => {
+                let result: SavedSearchRecentClearResult = decode(call(engine, "saved_search_recent_clear", json!({ "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(if result.cleared { "Ricerche recenti cancellate.\n" } else { "Nessuna ricerca recente da cancellare.\n" })?;
+                }
+            }
+        },
         Command::Run { op, args, params } => {
             if engine.tools().into_iter().any(|def| def.name == op && def.sensitive) {
                 return Err(usage(format!(
@@ -1309,6 +1561,10 @@ fn read_password_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<Zeroizing
         return Err(usage("the password read from stdin is empty"));
     }
     Ok(Zeroizing::new(password))
+}
+
+fn threads_text(count: usize) -> String {
+    if count == 1 { "1 conversazione".to_owned() } else { format!("{count} conversazioni") }
 }
 
 fn format_accounts(accounts: &[AccountView], warnings: &[String]) -> String {

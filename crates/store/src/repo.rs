@@ -14,6 +14,7 @@ use crate::model::{
     Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
     SyncState, UidEntry,
 };
+use crate::threads;
 use crate::{REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError};
 
 /// Largest page a caller can request. A mailbox list never needs more, and the cap bounds memory.
@@ -305,8 +306,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// Claim the earliest `append_pending` row whose Sent append is due and unowned — either never
-    /// claimed, or claimed by a worker whose lease expired — in one transaction.
+    /// Claim the earliest `append_pending` row whose Sent append is due and unowned â€” either never
+    /// claimed, or claimed by a worker whose lease expired â€” in one transaction.
     ///
     /// The claim writes `lease_at` and increments `append_attempts`, the counter the append backoff
     /// uses. Two passes (the app and the CLI, or two app instances) can therefore never APPEND the
@@ -537,7 +538,7 @@ impl Store {
 /// The fixed sentence written when a crash leaves a `sending` row behind. It never contains an
 /// address, a subject, a server name or server text.
 pub const UNCERTAIN_AFTER_CRASH: &str =
-    "Postino si è fermato durante l'invio; il messaggio potrebbe essere stato accettato. Controlla Inviati prima di riprovare.";
+    "Postino si Ã¨ fermato durante l'invio; il messaggio potrebbe essere stato accettato. Controlla Inviati prima di riprovare.";
 
 // ---------------------------------------------------------------------------------------------
 // Folders
@@ -599,7 +600,15 @@ impl Store {
     /// [`Store::replace_attachments`].
     pub fn upsert_message(&self, message: &Message) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
+        let previous: Option<String> =
+            tx.query_row("SELECT thread_id FROM messages WHERE id = ?1", [&message.summary.id], |row| row.get(0)).optional()?;
         upsert_message_row(&tx, message, true)?;
+        threads::refresh_thread_in_tx(&tx, &message.summary.account_id, &message.summary.thread_id)?;
+        if let Some(previous) = previous
+            && previous != message.summary.thread_id
+        {
+            threads::refresh_thread_in_tx(&tx, &message.summary.account_id, &previous)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -713,12 +722,15 @@ impl Store {
         }
         let tx = self.conn.unchecked_transaction()?;
         let mut touched = BTreeSet::new();
+        let mut thread_touches: Vec<(String, String)> = Vec::new();
         let mut changed = 0usize;
         for id in ids {
-            let folder: Option<String> = tx.query_row("SELECT folder_id FROM messages WHERE id = ?1", [id], |row| row.get(0)).optional()?;
-            let Some(folder) = folder else {
+            let row: Option<(String, String)> =
+                tx.query_row("SELECT folder_id, thread_id FROM messages WHERE id = ?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+            let Some((folder, thread)) = row else {
                 return Err(StoreError::NotFound { entity: "message", id: id.clone() });
             };
+            let account: String = tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [&folder], |row| row.get(0))?;
             tx.execute(
                 "UPDATE messages SET unread = COALESCE(?1, unread), starred = COALESCE(?2, starred) WHERE id = ?3",
                 params![update.unread, update.starred, id],
@@ -726,10 +738,16 @@ impl Store {
             if update.unread.is_some() {
                 touched.insert(folder);
             }
+            if update.unread.is_some() || update.starred.is_some() {
+                thread_touches.push((account, thread));
+            }
             changed += 1;
         }
         for folder in touched {
             refresh_folder_counts(&tx, &folder)?;
+        }
+        for (account, thread) in thread_touches {
+            threads::refresh_thread_in_tx(&tx, &account, &thread)?;
         }
         tx.commit()?;
         changed_count(changed)
@@ -774,16 +792,23 @@ impl Store {
     /// message row was already gone (stale draft rows are still cleaned up).
     pub fn delete_message(&self, id: &str) -> Result<bool, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let folder: Option<String> = tx.query_row("SELECT folder_id FROM messages WHERE id = ?1", [id], |row| row.get(0)).optional()?;
+        let row: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT m.folder_id, m.thread_id, f.account_id FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
         tx.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
         tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
         tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
-        if let Some(folder) = &folder {
+        if let Some((folder, thread, account)) = &row {
             refresh_folder_counts(&tx, folder)?;
+            threads::refresh_thread_in_tx(&tx, account, thread)?;
         }
         tx.commit()?;
-        Ok(folder.is_some())
+        Ok(row.is_some())
     }
 
     /// Insert or replace one synced message and its attachment metadata in a single transaction.
@@ -794,13 +819,26 @@ impl Store {
     /// message row and every attachment row back together; blob files already written are
     /// unreferenced but harmless, because the blob store is content-addressed.
     pub fn upsert_synced_message(&self, message: &Message, attachments: &[Attachment]) -> Result<(), StoreError> {
-        self.upsert_synced_message_with_refs(message, attachments, None, &[])
+        let tx = self.conn.unchecked_transaction()?;
+        let previous: Option<String> =
+            tx.query_row("SELECT thread_id FROM messages WHERE id = ?1", [&message.summary.id], |row| row.get(0)).optional()?;
+        upsert_message_row(&tx, message, false)?;
+        replace_attachments_in_tx(&tx, &message.summary.id, attachments)?;
+        threads::refresh_thread_in_tx(&tx, &message.summary.account_id, &message.summary.thread_id)?;
+        if let Some(previous) = previous
+            && previous != message.summary.thread_id
+        {
+            threads::refresh_thread_in_tx(&tx, &message.summary.account_id, &previous)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The sync bulk path with the message's threading headers. `in_reply_to` is the normalised
     /// parent `Message-ID`; `references` is the bounded chain in the order it appeared. Both are
     /// written in the same transaction as the message row and its attachments, so P9b never sees a
-    /// cached message whose chain is missing.
+    /// cached message whose chain is missing. The thread id is derived here, from the cache and the
+    /// message's own headers, and the cache rows it touches are refreshed before the commit.
     pub fn upsert_synced_message_with_refs(
         &self,
         message: &Message,
@@ -809,6 +847,8 @@ impl Store {
         references: &[String],
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
+        let previous: Option<String> =
+            tx.query_row("SELECT thread_id FROM messages WHERE id = ?1", [&message.summary.id], |row| row.get(0)).optional()?;
         upsert_message_row(&tx, message, false)?;
         replace_attachments_in_tx(&tx, &message.summary.id, attachments)?;
         let references_json = if references.is_empty() { None } else { Some(serde_json::to_string(references)?) };
@@ -816,6 +856,26 @@ impl Store {
             "UPDATE messages SET in_reply_to = ?1, references_json = ?2 WHERE id = ?3",
             params![in_reply_to, references_json, message.summary.id],
         )?;
+        let subject_norm = normalise_subject(&message.summary.subject);
+        threads::assign_thread_in_tx(
+            &tx,
+            &message.summary.account_id,
+            &message.summary.id,
+            message.message_id.as_deref(),
+            in_reply_to,
+            references,
+            message.summary.date,
+            &message.summary.subject,
+            &subject_norm,
+        )?;
+        if let Some(previous) = previous
+            && tx
+                .query_row("SELECT thread_id FROM messages WHERE id = ?1", [&message.summary.id], |row| row.get::<_, String>(0))
+                .optional()?
+                .is_some_and(|current| current != previous)
+        {
+            threads::refresh_thread_in_tx(&tx, &message.summary.account_id, &previous)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -915,21 +975,30 @@ impl Store {
         }
         let tx = self.conn.unchecked_transaction()?;
         require_folder(&tx, folder_id)?;
+        let account: String = tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [folder_id], |row| row.get(0))?;
         let mut removed = 0usize;
+        let mut touched_threads = Vec::new();
         for id in message_ids {
             let is_draft: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM drafts WHERE id = ?1)", [id], |row| row.get(0))?;
             if is_draft {
                 continue;
             }
+            let thread: Option<String> = tx
+                .query_row("SELECT thread_id FROM messages WHERE id = ?1 AND folder_id = ?2", params![id, folder_id], |row| row.get(0))
+                .optional()?;
             let deleted = tx.execute("DELETE FROM messages WHERE id = ?1 AND folder_id = ?2", params![id, folder_id])?;
             if deleted > 0 {
                 tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
+                if let Some(thread) = thread {
+                    touched_threads.push(thread);
+                }
             }
             removed += deleted;
         }
         if removed > 0 {
             refresh_folder_counts(&tx, folder_id)?;
         }
+        threads::refresh_threads_in_tx(&tx, &account, touched_threads)?;
         tx.commit()?;
         changed_count(removed)
     }
@@ -944,6 +1013,18 @@ impl Store {
     pub fn reset_folder_messages(&self, folder_id: &str) -> Result<u32, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         require_folder(&tx, folder_id)?;
+        let account: String = tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [folder_id], |row| row.get(0))?;
+        let mut touched_threads = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT thread_id FROM messages
+                 WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)",
+            )?;
+            let rows = stmt.query_map([folder_id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                touched_threads.push(row?);
+            }
+        }
         tx.execute(
             "DELETE FROM meta WHERE key IN (
                  SELECT 'reply_to:' || id FROM messages
@@ -955,6 +1036,7 @@ impl Store {
             tx.execute("DELETE FROM messages WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)", [folder_id])?;
         tx.execute("DELETE FROM sync_state WHERE folder_id = ?1", [folder_id])?;
         refresh_folder_counts(&tx, folder_id)?;
+        threads::refresh_threads_in_tx(&tx, &account, touched_threads)?;
         tx.commit()?;
         changed_count(removed)
     }
@@ -1300,6 +1382,7 @@ impl Store {
         let draft = draft_update_from_message(message, in_reply_to);
         let saved = save_draft_row(&tx, &draft)?;
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
+        threads::refresh_thread_in_tx(&tx, &message.summary.account_id, &message.summary.thread_id)?;
         tx.commit()?;
         Ok(saved)
     }
@@ -1325,6 +1408,14 @@ impl Store {
             }
             _ => None,
         };
+        let mut touched_threads = vec![message.summary.thread_id.clone()];
+        if let Some(duplicate) = merge_duplicate
+            && duplicate != message.summary.id
+            && let Some(thread) =
+                tx.query_row("SELECT thread_id FROM messages WHERE id = ?1", [duplicate], |row| row.get::<_, String>(0)).optional()?
+        {
+            touched_threads.push(thread);
+        }
         upsert_message_row(&tx, message, true)?;
         if let Some(uid) = adopted_uid {
             tx.execute("UPDATE messages SET uid = ?2 WHERE id = ?1", params![message.summary.id, uid])?;
@@ -1337,6 +1428,7 @@ impl Store {
             tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{duplicate}")])?;
         }
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
+        threads::refresh_threads_in_tx(&tx, &message.summary.account_id, touched_threads)?;
         tx.commit()?;
         Ok(adopted_uid)
     }
@@ -1433,6 +1525,7 @@ impl Store {
             let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)", [&message.summary.id], |row| row.get(0))?;
             if !exists {
                 upsert_message_row(&tx, message, true)?;
+                threads::refresh_thread_in_tx(&tx, &message.summary.account_id, &message.summary.thread_id)?;
                 repaired += 1;
             }
         }
@@ -1703,11 +1796,29 @@ fn address_list_text(addresses: &[Address]) -> String {
     addresses.iter().map(|address| address_text(Some(address))).collect::<Vec<_>>().join(", ")
 }
 
-/// Normalise a subject for P9b's fallback comparison: lowercase, collapsed whitespace and a bounded
-/// length. It is derived data, never accepted from a caller.
+/// Normalise a subject for P9b's fallback comparison: strip repeated `Re:`/`Fwd:`/`Fw:` prefixes,
+/// lowercase, collapse whitespace and bound the length. It is derived data, never accepted from a
+/// caller. P9a never read the column; P9b compares it only after every reference is absent.
 fn normalise_subject(subject: &str) -> String {
+    let mut rest = subject.trim();
+    loop {
+        let lower = rest.to_lowercase();
+        let prefix = if lower.starts_with("re:") {
+            3
+        } else if lower.starts_with("fwd:") {
+            4
+        } else if lower.starts_with("fw:") {
+            3
+        } else {
+            break;
+        };
+        match rest.get(prefix..) {
+            Some(after) => rest = after.trim_start(),
+            None => break,
+        }
+    }
     let mut text = String::new();
-    for word in subject.split_whitespace() {
+    for word in rest.split_whitespace() {
         if !text.is_empty() {
             text.push(' ');
         }
@@ -1889,7 +2000,7 @@ fn get_draft(conn: &rusqlite::Connection, id: &str) -> Result<Option<Draft>, Sto
         .map_err(|error| corrupt_on_decode("drafts", error))
 }
 
-fn duplicate(entity: &'static str, name: &str, error: rusqlite::Error) -> StoreError {
+pub(crate) fn duplicate(entity: &'static str, name: &str, error: rusqlite::Error) -> StoreError {
     match &error {
         rusqlite::Error::SqliteFailure(code, _) if code.code == ErrorCode::ConstraintViolation => {
             StoreError::Duplicate { entity, name: name.to_owned() }
@@ -1902,7 +2013,7 @@ fn to_i64(value: u64, field: &'static str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::OutOfRange { field })
 }
 
-fn to_count(value: i64) -> Result<u32, StoreError> {
+pub(crate) fn to_count(value: i64) -> Result<u32, StoreError> {
     u32::try_from(value).map_err(|_| StoreError::OutOfRange { field: "row count" })
 }
 
@@ -1910,7 +2021,7 @@ fn changed_count(value: usize) -> Result<u32, StoreError> {
     u32::try_from(value).map_err(|_| StoreError::OutOfRange { field: "changed rows" })
 }
 
-fn corrupt_on_decode(table: &'static str, error: rusqlite::Error) -> StoreError {
+pub(crate) fn corrupt_on_decode(table: &'static str, error: rusqlite::Error) -> StoreError {
     match error {
         rusqlite::Error::FromSqlConversionFailure(_, _, source) => StoreError::Corrupt { table, detail: source.to_string() },
         other => StoreError::Sqlite(other),
@@ -1926,7 +2037,7 @@ fn decode_addresses(row: &Row<'_>, index: usize) -> rusqlite::Result<Vec<Address
     serde_json::from_str(&text).map_err(|error| decode_error(index, error))
 }
 
-fn get_u32(row: &Row<'_>, index: usize) -> rusqlite::Result<u32> {
+pub(crate) fn get_u32(row: &Row<'_>, index: usize) -> rusqlite::Result<u32> {
     let value: i64 = row.get(index)?;
     u32::try_from(value).map_err(|error| rusqlite::Error::FromSqlConversionFailure(index, Type::Integer, Box::new(error)))
 }

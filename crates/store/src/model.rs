@@ -437,6 +437,85 @@ impl Default for SearchFilter {
     }
 }
 
+/// The thread-list query. A scope filter keeps a thread only when at least one of its messages
+/// matches; the counts on the row stay mailbox-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadFilter {
+    pub account_id: Option<String>,
+    pub folder_id: Option<String>,
+    pub label_id: Option<String>,
+    pub unread: Option<bool>,
+    pub starred: Option<bool>,
+    pub has_attachments: Option<bool>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+impl Default for ThreadFilter {
+    fn default() -> Self {
+        Self { account_id: None, folder_id: None, label_id: None, unread: None, starred: None, has_attachments: None, limit: 50, offset: 0 }
+    }
+}
+
+/// One cached conversation. `message_count`, `unread_count` and `starred_count` are mailbox-wide;
+/// a folder or label view only decides which threads are listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub account_id: String,
+    pub id: String,
+    pub subject: String,
+    pub snippet: String,
+    /// Unique senders, earliest first, at most [`MAX_THREAD_PARTICIPANTS`].
+    pub participants: Vec<Address>,
+    /// Unix milliseconds.
+    pub last_date: i64,
+    pub message_count: u32,
+    pub unread_count: u32,
+    pub starred_count: u32,
+    pub has_attachments: bool,
+    pub latest_message_id: Option<String>,
+    /// Union of the labels carried by the thread's messages, at most [`MAX_THREAD_LABELS`].
+    pub labels: Vec<String>,
+    /// `unread` when any message is unread, otherwise `read`.
+    pub state: String,
+}
+
+/// The largest participant list a thread row carries to the UI.
+pub const MAX_THREAD_PARTICIPANTS: usize = 5;
+/// The largest label union a thread row carries to the UI.
+pub const MAX_THREAD_LABELS: usize = 8;
+/// One thread page plus the totals for the scope before pagination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPage {
+    pub threads: Vec<ThreadSummary>,
+    pub total: u32,
+    pub unread_threads: u32,
+    /// Sum of the mailbox-wide unread counts of the listed threads.
+    pub unread_messages: u32,
+}
+
+/// One thread with a page of its messages, ascending by date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadDetail {
+    pub thread: ThreadSummary,
+    pub messages: Vec<MessageSummary>,
+    pub total: u32,
+}
+
+/// A saved search. `query` is the documented search language; `sort` is `relevance` or `date`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSearch {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub query: String,
+    pub sort: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub updated_at: i64,
+}
+
 /// One search result row. `body_text` is a bounded prefix of the stored plain-text body (64 KiB at
 /// most) and exists only so the engine can build a plain-text snippet in Rust; `body_html` is never
 /// read by search. `rank` is `bm25` ascending and is internal to ordering.

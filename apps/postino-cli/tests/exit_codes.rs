@@ -164,3 +164,42 @@ fn account_list_on_the_demo_succeeds_and_prints_no_secret() {
     assert!(stdout.contains("federico@example.it"), "{stdout}");
     assert!(!stdout.to_lowercase().contains("password"), "{stdout}");
 }
+
+#[test]
+fn threads_and_saved_searches_round_trip_through_the_cli() {
+    let (code, stdout, stderr) = run(&["--demo", "threads", "--folder", "inbox", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("thr_preventivo"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&["--demo", "thread", "get", "thr_preventivo", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("msg_001") && stdout.contains("msg_003"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&["--demo", "thread", "flag", "thr_preventivo", "--read", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("\"changed\": 2"), "{stdout}");
+
+    // The demo resets between processes, so this proves the command surface and the returned shape;
+    // CRUD persistence across calls is covered by the engine, MCP and store tests.
+    let (code, stdout, stderr) = run(&["--demo", "saved", "create", "Fatture", "label:Fatture", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("\"valid\": true"), "{stdout}");
+    assert!(stdout.contains("Fatture"), "{stdout}");
+    let (code, _stdout, stderr) = run(&["--demo", "saved", "list", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, _, stderr) = run(&["--demo", "saved", "recent-clear"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, _, stderr) = run(&["--demo", "saved", "delete", "saved_404"], None);
+    assert_eq!(code, 2, "an unknown saved-search id is a usage error: {stderr}");
+    assert!(stderr.contains("unknown saved search"), "{stderr}");
+}
+
+#[test]
+fn a_bad_saved_search_is_a_usage_error_and_writes_nothing() {
+    let (code, _, stderr) = run(&["--demo", "saved", "create", "Rotta", "subject:\"unclosed"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("query"), "{stderr}");
+    let (code, _, stderr) = run(&["--demo", "saved", "create", "Sort", "is:unread", "--sort", "random"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("sort"), "{stderr}");
+}

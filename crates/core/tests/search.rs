@@ -293,7 +293,7 @@ fn status_and_reindex_are_operations() {
     assert_eq!(status["indexed"], 3);
     let rebuilt = engine.call("search_reindex", json!({})).expect("reindex");
     assert_eq!(rebuilt["documents"], 3);
-    assert_eq!(rebuilt["threads"], 0);
+    assert_eq!(rebuilt["threads"], 3, "the reindex also rebuilds the thread cache from the stored messages");
 }
 
 #[test]

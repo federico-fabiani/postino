@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::model::{
     Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
-    Provider, SmtpSettings, snippet,
+    Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::outbox::{
@@ -44,6 +44,14 @@ pub(crate) fn unknown_folder(id: &str) -> OpError {
 
 pub(crate) fn unknown_message(id: &str) -> OpError {
     OpError::InvalidArgs(format!("unknown message {id:?}; use an id returned by messages_list"))
+}
+
+pub(crate) fn unknown_thread(id: &str) -> OpError {
+    OpError::InvalidArgs(format!("unknown thread {id:?}; use an id returned by threads_list"))
+}
+
+pub(crate) fn unknown_saved_search(id: &str) -> OpError {
+    OpError::InvalidArgs(format!("unknown saved search {id:?}; use an id returned by saved_searches_list"))
 }
 
 fn draft_changed(id: &str) -> OpError {
@@ -76,6 +84,47 @@ pub const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 const MAX_LABEL_NAME_CHARS: usize = 48;
 const MAX_LABEL_MESSAGES: usize = 500;
+/// `thread_flag` changes at most this many messages in one call.
+const MAX_THREAD_MESSAGES: usize = 500;
+
+/// The `threads_list` query as the engine sees it, after the operation parser has validated types.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadListRequest {
+    pub account: Option<String>,
+    pub folder: Option<String>,
+    pub label: Option<String>,
+    pub unread_only: bool,
+    pub starred_only: bool,
+    pub with_attachments: bool,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// One thread page plus the scope totals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPageResult {
+    pub threads: Vec<ThreadSummary>,
+    pub total: u32,
+    pub unread_threads: u32,
+    pub unread_messages: u32,
+}
+
+/// One thread and an ascending page of its messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadDetailResult {
+    pub thread: ThreadSummary,
+    pub messages: Vec<MessageSummary>,
+    pub total: u32,
+    pub truncated: bool,
+    pub resolved_id: String,
+}
+
+/// The result of a thread flag change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadFlagResult {
+    pub thread: ThreadSummary,
+    pub changed: u32,
+}
 
 /// Slack added to an attachment's recorded size when its bytes are read back. A stored blob that is
 /// larger than the metadata plus this slack is refused before it is decrypted: a corrupt or swapped
@@ -266,7 +315,29 @@ pub struct Engine {
     /// not to a message summary or to a body. The engine owns this small map and the serializer reads
     /// it; `save_draft` keeps the stored link when a patch omits it.
     reply_links: HashMap<String, String>,
+    /// Saved searches in name order. The store is authoritative; this is the hydrated copy the UI
+    /// lists every frame, refreshed after every CRUD call.
+    saved_searches: Vec<SavedSearch>,
+    /// Computed saved-search counts, keyed by the engine revision. A count scan over the index is
+    /// expensive at 100k, so the list reuses it until a write invalidates the revision.
+    saved_counts: RefCell<Option<(u64, HashMap<String, SavedCount>)>>,
+    /// Recent successful queries per account, newest first, at most eight. Persisted in the
+    /// encrypted `meta` table for a store-backed engine and kept in memory for the demo.
+    recent_searches: HashMap<String, Vec<String>>,
 }
+
+/// The computed half of a saved-search row.
+#[derive(Debug, Clone, Default)]
+struct SavedCount {
+    valid: bool,
+    error: Option<String>,
+    total: u32,
+    unread: u32,
+}
+
+pub(crate) const MAX_SAVED_SEARCHES: u32 = 12;
+pub(crate) const MAX_SAVED_SEARCH_NAME_CHARS: usize = 48;
+pub(crate) const MAX_RECENT_SEARCHES: usize = 8;
 
 impl Engine {
     /// An engine with no accounts. Every list is empty until a store or demo data is attached.
@@ -295,6 +366,9 @@ impl Engine {
             blob_hashes: HashMap::new(),
             draft_snapshots: HashMap::new(),
             reply_links: HashMap::new(),
+            saved_searches: Vec::new(),
+            saved_counts: RefCell::new(None),
+            recent_searches: HashMap::new(),
         }
     }
 
@@ -411,6 +485,17 @@ impl Engine {
         let reply_links =
             drafts.iter().filter_map(|draft| draft.in_reply_to.clone().map(|parent| (draft.id.clone(), parent))).collect::<HashMap<_, _>>();
         let draft_snapshots = drafts.into_iter().map(|draft| (draft.id, draft.revision)).collect::<HashMap<_, _>>();
+        // P9a stores have messages but no thread cache. Build it once here, from the message rows,
+        // so the first `threads_list` is a cache read and never a full derivation.
+        store.ensure_thread_cache().map_err(store_map::read_error)?;
+        let saved_searches = store.list_saved_searches(None).map_err(store_map::read_error)?.into_iter().map(store_map::saved_search).collect();
+        let mut recent_searches = HashMap::new();
+        for account in &accounts {
+            let recent = store.recent_searches(&account.id).map_err(store_map::read_error)?;
+            if !recent.is_empty() {
+                recent_searches.insert(account.id.clone(), recent);
+            }
+        }
 
         let mut engine = Self::from_summaries(accounts, folders, messages, labels, false, Some(store));
         engine.vault = vault;
@@ -418,6 +503,8 @@ impl Engine {
         engine.blob_hashes = blob_hashes;
         engine.reply_links = reply_links;
         engine.draft_snapshots = draft_snapshots;
+        engine.saved_searches = saved_searches;
+        engine.recent_searches = recent_searches;
         Ok(engine)
     }
 
@@ -471,6 +558,9 @@ impl Engine {
             blob_hashes: HashMap::new(),
             draft_snapshots: HashMap::new(),
             reply_links: HashMap::new(),
+            saved_searches: Vec::new(),
+            saved_counts: RefCell::new(None),
+            recent_searches: HashMap::new(),
         };
         engine.rebuild_message_index();
         engine.recount();
@@ -652,6 +742,439 @@ impl Engine {
             .filter(|message| message.labels.iter().any(|candidate| candidate == id))
             .fold((0u32, 0u32), |(total, unread), message| (total.saturating_add(1), unread.saturating_add(if message.unread { 1 } else { 0 })));
         Some(LabelSummary { id: label.id.clone(), name: label.name.clone(), color: label.color, message_count, unread_count })
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Threads (P9b)
+    // -----------------------------------------------------------------------------------------
+
+    /// Threads with at least one message in scope. Row counts are mailbox-wide.
+    pub fn threads_list(&self, request: &ThreadListRequest) -> Result<ThreadPageResult, OpError> {
+        let account = self.requested_account(request.account.as_deref(), "threads_list")?;
+        let folder = match request.folder.as_deref() {
+            Some(value) => Some(self.resolve_thread_folder(value, &account.id)?),
+            None => None,
+        };
+        let label = match request.label.as_deref() {
+            Some(value) => Some(self.resolve_thread_label(value)?),
+            None => None,
+        };
+        let (folder_id, starred) = match folder {
+            Some(folder) if folder.kind == FolderKind::Starred => (None, Some(true)),
+            Some(folder) => (Some(folder.id), request.starred_only.then_some(true)),
+            None => (None, request.starred_only.then_some(true)),
+        };
+        let limit = request.limit.unwrap_or(50).clamp(1, 200);
+        let offset = request.offset.unwrap_or(0).min(5_000);
+        if let Some(store) = &self.store {
+            let page = store
+                .list_threads(&postino_store::ThreadFilter {
+                    account_id: Some(account.id.clone()),
+                    folder_id,
+                    label_id: label.as_ref().map(|label| label.id.clone()),
+                    unread: request.unread_only.then_some(true),
+                    starred,
+                    has_attachments: request.with_attachments.then_some(true),
+                    limit,
+                    offset,
+                })
+                .map_err(store_map::read_error)?;
+            return Ok(ThreadPageResult {
+                threads: page.threads.into_iter().map(store_map::thread_summary).collect(),
+                total: page.total,
+                unread_threads: page.unread_threads,
+                unread_messages: page.unread_messages,
+            });
+        }
+        Ok(self.demo_threads(&account.id, folder_id.as_deref(), label.as_ref().map(|label| label.id.as_str()), request, starred, limit, offset))
+    }
+
+    /// One thread with an ascending page of its messages. An old merged id resolves through aliases.
+    pub fn thread_get(&self, account: Option<&str>, id: &str, limit: Option<u32>, offset: Option<u32>) -> Result<ThreadDetailResult, OpError> {
+        let account = self.requested_account(account, "thread_get")?;
+        let limit = limit.unwrap_or(50).clamp(1, 200);
+        let offset = offset.unwrap_or(0).min(5_000);
+        if let Some(store) = &self.store {
+            let detail = store.get_thread(&account.id, id, limit, offset).map_err(store_map::read_error)?.ok_or_else(|| unknown_thread(id))?;
+            let total = detail.total;
+            return Ok(ThreadDetailResult {
+                thread: store_map::thread_summary(detail.thread),
+                messages: detail.messages.into_iter().map(store_map::summary).collect(),
+                total,
+                truncated: total > offset.saturating_add(limit),
+                resolved_id: store.canonical_thread(&account.id, id).map_err(store_map::read_error)?,
+            });
+        }
+        let scoped = self.demo_thread_messages(&account.id, id);
+        if scoped.is_empty() {
+            return Err(unknown_thread(id));
+        }
+        let total = u32::try_from(scoped.len()).unwrap_or(u32::MAX);
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let take = usize::try_from(limit).unwrap_or(0);
+        let messages = scoped.iter().skip(start).take(take).map(|message| (*message).clone()).collect::<Vec<_>>();
+        Ok(ThreadDetailResult {
+            thread: self.demo_thread_summary(&account.id, id).ok_or_else(|| unknown_thread(id))?,
+            truncated: total > offset.saturating_add(limit),
+            resolved_id: id.to_owned(),
+            messages,
+            total,
+        })
+    }
+
+    /// Set the read/star state of every message in one thread. At most 500 messages; idempotent.
+    pub fn thread_flag(&mut self, account: Option<&str>, id: &str, unread: Option<bool>, starred: Option<bool>) -> Result<ThreadFlagResult, OpError> {
+        if unread.is_none() && starred.is_none() {
+            return Err(OpError::InvalidArgs("provide unread and/or starred".to_owned()));
+        }
+        let account = self.requested_account(account, "thread_flag")?;
+        let (ids, before, resolved) = if let Some(store) = &self.store {
+            let ids = store.thread_message_ids(&account.id, id).map_err(store_map::read_error)?;
+            let before = store.thread_flags(&account.id, id).map_err(store_map::read_error)?;
+            let resolved = store.canonical_thread(&account.id, id).map_err(store_map::read_error)?;
+            (ids, before, resolved)
+        } else {
+            let scoped = self.demo_thread_messages(&account.id, id);
+            if scoped.is_empty() {
+                return Err(unknown_thread(id));
+            }
+            let before = scoped.iter().map(|message| (message.id.clone(), message.unread, message.starred)).collect();
+            (scoped.iter().map(|message| message.id.clone()).collect(), before, id.to_owned())
+        };
+        if ids.is_empty() {
+            return Err(unknown_thread(id));
+        }
+        if ids.len() > MAX_THREAD_MESSAGES {
+            return Err(OpError::InvalidArgs(format!(
+                "thread {resolved:?} has {} messages; thread_flag changes at most {MAX_THREAD_MESSAGES} at once",
+                ids.len()
+            )));
+        }
+        let changed = before
+            .iter()
+            .filter(|(_, was_unread, was_starred)| {
+                unread.is_some_and(|wanted| wanted != *was_unread) || starred.is_some_and(|wanted| wanted != *was_starred)
+            })
+            .count();
+        if changed > 0 {
+            if let Some(store) = &self.store {
+                store.set_flags(&ids, postino_store::FlagUpdate { unread, starred }).map_err(store_map::write_error)?;
+                self.bump_revision();
+                self.recount();
+            } else {
+                for (message_id, was_unread, was_starred) in &before {
+                    let next_unread = unread.unwrap_or(*was_unread);
+                    let next_starred = starred.unwrap_or(*was_starred);
+                    if next_unread != *was_unread || next_starred != *was_starred {
+                        self.set_flags(message_id, unread, starred)?;
+                    }
+                }
+            }
+        }
+        let thread = self.thread_summary(&account.id, &resolved).ok_or_else(|| unknown_thread(id))?;
+        Ok(ThreadFlagResult { thread, changed: u32::try_from(changed).unwrap_or(u32::MAX) })
+    }
+
+    /// One thread row by id, for the operation results and the UI.
+    pub fn thread_summary(&self, account_id: &str, id: &str) -> Option<ThreadSummary> {
+        if let Some(store) = &self.store {
+            return store.get_thread(account_id, id, 1, 0).ok().flatten().map(|detail| store_map::thread_summary(detail.thread));
+        }
+        self.demo_thread_summary(account_id, id)
+    }
+
+    fn resolve_thread_folder(&self, value: &str, account: &str) -> Result<Folder, OpError> {
+        let wanted = value.to_lowercase();
+        self.folders
+            .iter()
+            .find(|folder| account == folder.account_id && (folder.id == value || folder.name.to_lowercase() == wanted))
+            .cloned()
+            .ok_or_else(|| unknown_folder(value))
+    }
+
+    fn resolve_thread_label(&self, value: &str) -> Result<Label, OpError> {
+        let wanted = value.to_lowercase();
+        self.labels.iter().find(|label| label.id == value || label.name.to_lowercase() == wanted).cloned().ok_or_else(|| unknown_label(value))
+    }
+
+    fn demo_thread_messages<'a>(&'a self, account_id: &str, id: &str) -> Vec<&'a MessageSummary> {
+        let mut messages = self
+            .messages
+            .iter()
+            .filter(|message| {
+                message.thread_id == id
+                    && self.folders.iter().find(|folder| folder.id == message.folder_id).is_some_and(|folder| folder.account_id == account_id)
+            })
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|message| (message.date, message.id.clone()));
+        messages
+    }
+
+    fn demo_thread_summary(&self, account_id: &str, id: &str) -> Option<ThreadSummary> {
+        let messages = self.demo_thread_messages(account_id, id);
+        let first = *messages.first()?;
+        let latest = *messages.last()?;
+        let mut participants: Vec<Address> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        let mut unread_count = 0u32;
+        let mut starred_count = 0u32;
+        for message in &messages {
+            unread_count = unread_count.saturating_add(u32::from(message.unread));
+            starred_count = starred_count.saturating_add(u32::from(message.starred));
+            if participants.len() < 5 && !participants.iter().any(|known| known.email.eq_ignore_ascii_case(&message.from.email)) {
+                participants.push(message.from.clone());
+            }
+            for label in &message.labels {
+                if labels.len() < 8 && !labels.contains(label) {
+                    labels.push(label.clone());
+                }
+            }
+        }
+        Some(ThreadSummary {
+            id: id.to_owned(),
+            account_id: account_id.to_owned(),
+            subject: first.subject.clone(),
+            snippet: latest.snippet.clone(),
+            participants,
+            last_date: latest.date,
+            message_count: u32::try_from(messages.len()).unwrap_or(u32::MAX),
+            unread_count,
+            starred_count,
+            has_attachments: messages.iter().any(|message| message.has_attachments),
+            latest_message_id: Some(latest.id.clone()),
+            labels,
+            state: if unread_count > 0 { "unread".to_owned() } else { "read".to_owned() },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn demo_threads(
+        &self,
+        account_id: &str,
+        folder_id: Option<&str>,
+        label_id: Option<&str>,
+        request: &ThreadListRequest,
+        starred: Option<bool>,
+        limit: u32,
+        offset: u32,
+    ) -> ThreadPageResult {
+        let in_scope = |message: &MessageSummary| {
+            self.folders.iter().find(|folder| folder.id == message.folder_id).is_some_and(|folder| folder.account_id == account_id)
+                && folder_id.is_none_or(|id| message.folder_id == id)
+                && label_id.is_none_or(|id| message.labels.iter().any(|label| label == id))
+                && (!request.unread_only || message.unread)
+                && starred.is_none_or(|wanted| message.starred == wanted)
+                && (!request.with_attachments || message.has_attachments)
+        };
+        let ids = self.messages.iter().filter(|message| in_scope(message)).map(|message| message.thread_id.clone()).collect::<BTreeSet<_>>();
+        let mut threads = ids.iter().filter_map(|id| self.demo_thread_summary(account_id, id)).collect::<Vec<_>>();
+        threads.sort_by(|left, right| right.last_date.cmp(&left.last_date).then(left.id.cmp(&right.id)));
+        let total = u32::try_from(threads.len()).unwrap_or(u32::MAX);
+        let unread_threads = u32::try_from(threads.iter().filter(|thread| thread.unread_count > 0).count()).unwrap_or(u32::MAX);
+        let unread_messages = threads.iter().fold(0u32, |sum, thread| sum.saturating_add(thread.unread_count));
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let take = usize::try_from(limit).unwrap_or(0);
+        threads = threads.into_iter().skip(start).take(take).collect();
+        ThreadPageResult { threads, total, unread_threads, unread_messages }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Saved searches (P9b)
+    // -----------------------------------------------------------------------------------------
+
+    /// Saved searches for one account with their computed counts. Counts are cached until the next
+    /// engine write, so a frame loop does not rescan the index.
+    pub fn saved_searches_list(&self, account: Option<&str>) -> Result<Vec<SavedSearch>, OpError> {
+        let account = self.requested_account(account, "saved_searches_list")?;
+        self.saved_search_views(&account.id)
+    }
+
+    /// The recent successful queries of one account, newest first.
+    pub fn recent_searches(&self, account: Option<&str>) -> Result<Vec<String>, OpError> {
+        let account = self.requested_account(account, "saved_searches_list")?;
+        Ok(self.recent_searches.get(&account.id).cloned().unwrap_or_default())
+    }
+
+    fn saved_search_views(&self, account_id: &str) -> Result<Vec<SavedSearch>, OpError> {
+        let selected = self.saved_searches.iter().filter(|saved| saved.account_id == account_id).cloned().collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let revision = self.revision;
+        let mut cache = self.saved_counts.borrow_mut();
+        let fresh = matches!(cache.as_ref(), Some((cached, _)) if *cached == revision);
+        if !fresh {
+            *cache = Some((revision, HashMap::new()));
+        }
+        let counts = cache.as_mut().map(|(_, counts)| counts).ok_or_else(|| OpError::Failed("the saved-search cache is unavailable".to_owned()))?;
+        let mut views = Vec::with_capacity(selected.len());
+        for mut saved in selected {
+            if !counts.contains_key(&saved.id) {
+                let count = self.saved_search_count(&saved);
+                counts.insert(saved.id.clone(), count);
+            }
+            if let Some(count) = counts.get(&saved.id) {
+                saved.valid = count.valid;
+                saved.error.clone_from(&count.error);
+                saved.total = count.total;
+                saved.unread = count.unread;
+            }
+            views.push(saved);
+        }
+        Ok(views)
+    }
+
+    fn saved_search_count(&self, saved: &SavedSearch) -> SavedCount {
+        let sort = match saved.sort.as_str() {
+            "date" => crate::ops::SearchSort::Date,
+            _ => crate::ops::SearchSort::Relevance,
+        };
+        let args = |unread_only: bool| crate::ops::SearchArgs {
+            query: saved.query.clone(),
+            account: Some(saved.account_id.clone()),
+            folder: None,
+            label: None,
+            limit: Some(1),
+            offset: Some(0),
+            unread_only,
+            with_attachments: false,
+            sort: Some(sort),
+        };
+        let total = match crate::ops::execute_search(self, args(false)) {
+            Ok(result) if result.index.is_none() => result.total,
+            Ok(_) => return SavedCount { valid: false, error: Some("the search index is not ready".to_owned()), total: 0, unread: 0 },
+            Err(OpError::InvalidArgs(error)) => return SavedCount { valid: false, error: Some(error), total: 0, unread: 0 },
+            Err(error) => return SavedCount { valid: false, error: Some(error.to_string()), total: 0, unread: 0 },
+        };
+        let unread = match crate::ops::execute_search(self, args(true)) {
+            Ok(result) => result.total,
+            Err(_) => 0,
+        };
+        SavedCount { valid: true, error: None, total: u32::try_from(total).unwrap_or(u32::MAX), unread: u32::try_from(unread).unwrap_or(u32::MAX) }
+    }
+
+    pub fn create_saved_search(&mut self, account: Option<&str>, name: &str, query: &str, sort: Option<&str>) -> Result<SavedSearch, OpError> {
+        let account = self.requested_account(account, "saved_search_create")?;
+        let name = validate_saved_name(name)?;
+        let query = validate_saved_query(self, &account.id, query)?;
+        let sort = validate_saved_sort(sort)?;
+        let count = self.saved_searches.iter().filter(|saved| saved.account_id == account.id).count();
+        if u32::try_from(count).unwrap_or(u32::MAX) >= MAX_SAVED_SEARCHES {
+            return Err(OpError::InvalidArgs(format!(
+                "account {:?} already has {MAX_SAVED_SEARCHES} saved searches; delete one before adding another",
+                account.id
+            )));
+        }
+        if self.saved_searches.iter().any(|saved| saved.account_id == account.id && saved.name.eq_ignore_ascii_case(&name)) {
+            return Err(OpError::InvalidArgs(format!("a saved search named {name:?} already exists; names are unique ignoring case")));
+        }
+        let id = self.next_saved_search_id();
+        let now = Utc::now().timestamp_millis();
+        let saved = SavedSearch { id, account_id: account.id.clone(), name, query, sort, valid: true, error: None, total: 0, unread: 0 };
+        if let Some(store) = &self.store {
+            store
+                .create_saved_search(&postino_store::SavedSearch {
+                    id: saved.id.clone(),
+                    account_id: saved.account_id.clone(),
+                    name: saved.name.clone(),
+                    query: saved.query.clone(),
+                    sort: saved.sort.clone(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .map_err(store_map::write_error)?;
+        }
+        let id = saved.id.clone();
+        self.saved_searches.push(saved);
+        self.bump_revision();
+        self.saved_search_views(&account.id)?
+            .into_iter()
+            .find(|saved| saved.id == id)
+            .ok_or_else(|| OpError::Failed("the new saved search disappeared".to_owned()))
+    }
+
+    pub fn update_saved_search(&mut self, id: &str, name: Option<&str>, query: Option<&str>, sort: Option<&str>) -> Result<SavedSearch, OpError> {
+        if name.is_none() && query.is_none() && sort.is_none() {
+            return Err(OpError::InvalidArgs("provide name, query and/or sort".to_owned()));
+        }
+        let index = self.saved_searches.iter().position(|saved| saved.id == id).ok_or_else(|| unknown_saved_search(id))?;
+        let account_id = self.saved_searches.get(index).map(|saved| saved.account_id.clone()).ok_or_else(|| unknown_saved_search(id))?;
+        let current_name = self.saved_searches.get(index).map(|saved| saved.name.clone()).unwrap_or_default();
+        let resolved_name = match name {
+            Some(name) => validate_saved_name(name)?,
+            None => current_name,
+        };
+        if self.saved_searches.iter().any(|saved| saved.id != id && saved.account_id == account_id && saved.name.eq_ignore_ascii_case(&resolved_name))
+        {
+            return Err(OpError::InvalidArgs(format!("a saved search named {resolved_name:?} already exists; names are unique ignoring case")));
+        }
+        let resolved_query = match query {
+            Some(query) => validate_saved_query(self, &account_id, query)?,
+            None => self.saved_searches.get(index).map(|saved| saved.query.clone()).unwrap_or_default(),
+        };
+        let resolved_sort = match sort {
+            Some(sort) => validate_saved_sort(Some(sort))?,
+            None => self.saved_searches.get(index).map(|saved| saved.sort.clone()).unwrap_or_else(|| "relevance".to_owned()),
+        };
+        if let Some(store) = &self.store {
+            store.update_saved_search(id, Some(&resolved_name), Some(&resolved_query), Some(&resolved_sort)).map_err(store_map::write_error)?;
+        }
+        if let Some(saved) = self.saved_searches.get_mut(index) {
+            saved.name = resolved_name;
+            saved.query = resolved_query;
+            saved.sort = resolved_sort;
+        }
+        self.bump_revision();
+        self.saved_search_views(&account_id)?.into_iter().find(|saved| saved.id == id).ok_or_else(|| unknown_saved_search(id))
+    }
+
+    pub fn delete_saved_search(&mut self, id: &str) -> Result<SavedSearch, OpError> {
+        let index = self.saved_searches.iter().position(|saved| saved.id == id).ok_or_else(|| unknown_saved_search(id))?;
+        if let Some(store) = &self.store {
+            store.delete_saved_search(id).map_err(store_map::write_error)?;
+        }
+        let removed = self.saved_searches.remove(index);
+        self.bump_revision();
+        Ok(removed)
+    }
+
+    /// Remember one successful query. Duplicates move to the front; the list stays at eight entries.
+    pub fn record_recent_search(&mut self, account: Option<&str>, query: &str) -> Result<(), OpError> {
+        let account = self.requested_account(account, "saved_searches_list")?;
+        let query = query.trim();
+        if query.is_empty() || crate::search::parse(query).is_err() {
+            return Ok(());
+        }
+        let entry = self.recent_searches.entry(account.id.clone()).or_default();
+        entry.retain(|candidate| candidate != query);
+        entry.insert(0, query.to_owned());
+        entry.truncate(MAX_RECENT_SEARCHES);
+        let recent = entry.clone();
+        if let Some(store) = &self.store {
+            store.set_recent_searches(&account.id, &recent).map_err(store_map::write_error)?;
+        }
+        Ok(())
+    }
+
+    /// Remove one account's recent list. Returns whether anything was stored.
+    pub fn clear_recent_searches(&mut self, account: Option<&str>) -> Result<bool, OpError> {
+        let account = self.requested_account(account, "saved_search_recent_clear")?;
+        let had = self.recent_searches.remove(&account.id).is_some_and(|recent| !recent.is_empty());
+        if let Some(store) = &self.store {
+            let stored = store.clear_recent_searches(&account.id).map_err(store_map::write_error)?;
+            return Ok(had || stored);
+        }
+        Ok(had)
+    }
+
+    fn next_saved_search_id(&self) -> String {
+        let highest = self
+            .saved_searches
+            .iter()
+            .filter_map(|saved| saved.id.strip_prefix("saved_").and_then(|rest| rest.parse::<u64>().ok()))
+            .max()
+            .unwrap_or(0);
+        format!("saved_{}", highest.saturating_add(1))
     }
 
     /// Every configured account with its IMAP server and last sync status. The demo account has
@@ -1186,6 +1709,11 @@ impl Engine {
                 accounts.iter().map(|account| format!("{:?}", account.id)).collect::<Vec<_>>().join(", ")
             ))),
         }
+    }
+
+    /// The resolved account id, for operations whose result names the account it touched.
+    pub(crate) fn requested_account_id(&self, id: Option<&str>, operation: &str) -> Result<String, OpError> {
+        self.requested_account(id, operation).map(|account| account.id)
     }
 
     fn load_password(&self, account_id: &str, operation: &str) -> Result<Zeroizing<String>, OpError> {
@@ -3391,6 +3919,48 @@ fn validate_label_name(name: &str) -> Result<String, OpError> {
 
 fn is_bidi_or_format_control(character: char) -> bool {
     matches!(character, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+}
+
+/// A saved search is label-like: 1-48 characters, no controls and no bidi/format tricks.
+fn validate_saved_name(name: &str) -> Result<String, OpError> {
+    let name = name.trim();
+    let characters = name.chars().count();
+    if characters == 0 {
+        return Err(OpError::InvalidArgs("a saved-search name must have 1-48 characters after trimming".to_owned()));
+    }
+    if characters > MAX_SAVED_SEARCH_NAME_CHARS {
+        return Err(OpError::InvalidArgs(format!("a saved-search name must have 1-{MAX_SAVED_SEARCH_NAME_CHARS} characters after trimming")));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(OpError::InvalidArgs("a saved-search name must not contain control characters".to_owned()));
+    }
+    if name.chars().any(is_bidi_or_format_control) {
+        return Err(OpError::InvalidArgs(
+            "a saved-search name must not contain bidi or format control characters (U+061C, U+200B-U+200F, U+202A-U+202E, U+2060-U+206F, U+FEFF)"
+                .to_owned(),
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn validate_saved_sort(sort: Option<&str>) -> Result<String, OpError> {
+    match sort.map(str::trim).filter(|sort| !sort.is_empty()) {
+        None => Ok("relevance".to_owned()),
+        Some("relevance") => Ok("relevance".to_owned()),
+        Some("date") => Ok("date".to_owned()),
+        Some(other) => Err(OpError::InvalidArgs(format!("sort must be \"relevance\" or \"date\", not {other:?}"))),
+    }
+}
+
+/// A saved query is validated against the current registry: a deleted label or folder is refused on
+/// save, and a row that outlives one becomes visibly stale in `saved_searches_list`.
+fn validate_saved_query(engine: &Engine, account: &str, query: &str) -> Result<String, OpError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(OpError::InvalidArgs("a saved search needs a non-empty query".to_owned()));
+    }
+    crate::ops::validate_search_query(engine, query, Some(account))?;
+    Ok(query.to_owned())
 }
 
 fn validate_draft(draft: &DraftContent) -> Result<(), OpError> {
