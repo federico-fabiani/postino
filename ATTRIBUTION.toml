@@ -397,7 +397,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f6e70135919ccec4705edf1ca03a314bfdf1d34e7447debc651904f5d8cf7791"
+sha256 = "47415be0a0e8c3def2a5c141032834433a2e5b1989d414211684e732bae4a14d"
 usage = "Documentation screenshot of the offline banner with cached mail still readable"
 
 [[asset]]
@@ -437,7 +437,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f63de90af85d53d3cd1029e793a42bb855a446e9ed2de9e5ba11fdd80f5eafca"
+sha256 = "a2352a9a8c451d194a8ee9857b1cbd2a7be91cb355b68719fc07eb61659fd9f2"
 usage = "Documentation screenshot of the dark offline state"
 
 [[asset]]
@@ -467,7 +467,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "c6973670b56c9d382be2ab8456b069c6cb634ac478e03832a06f23b19b824791"
+sha256 = "2634b36f8cd563524d6fce566685481c12e304b9913e806583071aaa3471c88d"
 usage = "Documentation screenshot of the text reading pane, safe link and attachment Save chip"
 
 [[asset]]
@@ -477,7 +477,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "819131d4d53dbc548c8106f1aa21162a1f871b13986ae8dfbc1d7a02342e4a92"
+sha256 = "fadc242578d7ee1af39fc7971a8514b12206e3e37af3030711e642ba8b1fe56e"
 usage = "Documentation screenshot of the full-destination link confirmation sheet"
 
 [[asset]]
@@ -517,7 +517,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "208c17d45d36e28824313b3572132af04dd4276e5e1079ab5cb5b4bfbc3d6f29"
+sha256 = "1db60a64b42c6dfcf9048eb5f7a39ebe36d5d29db0383675c591c00249069d4c"
 usage = "Documentation screenshot of the pinned attachment strip and Save button at the minimum window"
 
 [[asset]]
@@ -527,8 +527,8 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "c4a3a203d76dfc42ba6bbb76f1afb4df3b13338570158e823db0bd34734b3246"
-usage = "Documentation screenshot of the effective-host confirmation sheet at the minimum window"
+sha256 = "cd2009341e12911ff22a0c681fd980264528f0791ede1fc9f895ed928665c175"
+usage = "Documentation screenshot of the host/recipient link confirmation sheet at the minimum window"
 
 [[asset]]
 path = "docs/images/postino-p6c-settings-980-dark.png"

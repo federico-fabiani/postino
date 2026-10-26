@@ -657,6 +657,8 @@ impl PostinoApp {
                     self.pending_link = Some(PendingLink {
                         url: "https://example.com/preventivo/postino-2026?token=anteprima".to_owned(),
                         host: "example.com".to_owned(),
+                        recipient: None,
+                        mailto: false,
                         idn: false,
                         non_ascii: false,
                         backslash: false,
@@ -4096,6 +4098,7 @@ impl PostinoApp {
                 .show(ui, |ui| {
                     for attachment in &message.attachments {
                         let mut save_clicked = false;
+                        let display_name = reading::safe_filename(&attachment.filename);
                         Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
                             ui,
                             |ui| {
@@ -4104,7 +4107,10 @@ impl PostinoApp {
                                     ui.add_space(space::SM);
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
-                                        ui.label(typography::strong(Role::Secondary, attachment.filename.as_str(), t.text));
+                                        // Show the sanitized name: a sender-controlled bidi control
+                                        // must not reorder the chip while the warning classifies the
+                                        // sanitized Save name.
+                                        ui.label(typography::strong(Role::Secondary, display_name.as_str(), t.text));
                                         ui.label(typography::text(
                                             Role::Caption,
                                             format!("{} · {}", attachment.mime, format_size(attachment.size)),
@@ -4157,6 +4163,8 @@ impl PostinoApp {
         probe::clear_actions(ui);
         #[cfg(test)]
         probe::clear_attachment_saves(ui);
+        #[cfg(test)]
+        probe::clear_links(ui);
         let is_draft = self
             .engine
             .folders()
@@ -4355,10 +4363,18 @@ impl PostinoApp {
         ui.label(typography::text(Role::Caption, "Vista testo · il rendering HTML arriverà con il visualizzatore isolato.", t.text_faint));
         ui.add_space(space::MD);
         // A pinned strip keeps the attachment and its Save button visible at 980×600, where the body
-        // scroll would otherwise push it below the fold. The body gets the remaining height so its
-        // last line is clipped above the strip instead of painting under it.
-        let strip_height = if message.attachments.is_empty() { 0.0 } else { reading_attachment_strip_height(message.attachments.len()) };
-        let body_height = (ui.available_height() - strip_height).max(80.0);
+        // scroll would otherwise push it below the fold. The strip never takes the body's minimum:
+        // with many attachments it shrinks and its internal scroll list takes over.
+        let available_height = ui.available_height();
+        let strip_height = if message.attachments.is_empty() {
+            0.0
+        } else {
+            reading_attachment_strip_height(message.attachments.len()).min((available_height - 80.0).max(72.0))
+        };
+        let body_height = (available_height - strip_height).max(0.0);
+        // A whole message shares one link budget; the scanner also rejects a link over the byte
+        // bound, so a hostile body cannot create unlimited widgets or a huge dialog.
+        let mut link_budget = reading::MAX_LINKS_PER_MESSAGE;
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), body_height), Layout::top_down(Align::Min), |ui| {
             egui::ScrollArea::vertical()
                 .id_salt(("reading-scroll", message.summary.id.as_str()))
@@ -4375,13 +4391,19 @@ impl PostinoApp {
                             Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
                                 ui,
                                 |ui| {
-                                    if let Some(link) = link_paragraph(ui, paragraph, t, true) {
+                                    let (link, used) = link_paragraph(ui, paragraph, t, true, link_budget);
+                                    if let Some(link) = link {
                                         clicked_link = Some(link);
                                     }
+                                    link_budget = link_budget.saturating_sub(used);
                                 },
                             );
-                        } else if let Some(link) = link_paragraph(ui, paragraph, t, false) {
-                            clicked_link = Some(link);
+                        } else {
+                            let (link, used) = link_paragraph(ui, paragraph, t, false, link_budget);
+                            if let Some(link) = link {
+                                clicked_link = Some(link);
+                            }
+                            link_budget = link_budget.saturating_sub(used);
                         }
                         ui.add_space(space::LG);
                     }
@@ -4443,6 +4465,8 @@ impl PostinoApp {
         self.pending_link = Some(PendingLink {
             url: link.url.clone(),
             host: link.host.clone(),
+            recipient: link.recipient.clone(),
+            mailto: link.mailto,
             idn: link.idn,
             non_ascii: link.non_ascii,
             backslash: link.backslash,
@@ -4474,29 +4498,50 @@ impl PostinoApp {
         if let Some(link) = self.pending_link.as_mut() {
             link.focus_cancel = false;
         }
-        // The sheet never replaces the raw URL with a parsed one: the full string stays visible so a
-        // person can compare it, and the normalized host sits on its own line as the effective
-        // destination the browser will contact.
-        let mut body = format!("Aprire questo indirizzo nel browser?\n\n{}\n\nHost di destinazione: {}", pending.url, pending.host);
+        // The sheet never replaces the raw URL with a parsed one. The effective destination is
+        // described honestly: a `mailto:` opens a mail client and names its recipient, an ASCII host
+        // is the browser host, and a non-ASCII host is only the spelling in the link (the browser
+        // will use punycode). The full URL sits last in a bounded scroll area.
+        let mut body = if pending.mailto {
+            let recipient = pending.recipient.as_deref().unwrap_or(pending.host.as_str());
+            format!("Aprire questo indirizzo nel client di posta?\n\nDestinatario: {recipient}")
+        } else if pending.non_ascii {
+            format!("Aprire questo indirizzo nel browser?\n\nDominio nel link: {}", pending.host)
+        } else {
+            format!("Aprire questo indirizzo nel browser?\n\nHost di destinazione: {}", pending.host)
+        };
         if pending.backslash {
             body.push_str(
-                "\n\nAttenzione: l'indirizzo contiene una barra rovesciata (\\). Il browser la tratta come separatore di percorso: il sito aperto è quello indicato come “Host di destinazione”.",
+                "\n\nAttenzione: l'indirizzo contiene una barra rovesciata (\\). Il browser la tratta come separatore di percorso: il sito aperto è quello indicato sopra.",
             );
         }
         if pending.idn {
             if pending.non_ascii {
-                body.push_str(
-                    "\n\nAttenzione: il dominio contiene caratteri non ASCII e il browser lo aprirà nella forma punycode (xn--). Verifica che sia il sito che ti aspetti.",
-                );
+                if pending.mailto {
+                    body.push_str(
+                        "\n\nAttenzione: il dominio del destinatario contiene caratteri non ASCII e il client di posta lo userà nella forma punycode (xn--). Verifica che sia il destinatario che ti aspetti.",
+                    );
+                } else {
+                    body.push_str(
+                        "\n\nAttenzione: il dominio contiene caratteri non ASCII e il browser lo aprirà nella forma punycode (xn--). Verifica che sia il sito che ti aspetti.",
+                    );
+                }
             } else {
                 body.push_str("\n\nAttenzione: il dominio usa la codifica punycode (xn--). Verifica che sia il sito che ti aspetti.");
             }
         }
+        body.push_str("\n\nIndirizzo completo:\n");
+        body.push_str(&pending.url);
         let mut confirm = false;
         let mut cancel = false;
         let response =
             egui::Modal::new(Id::new("postino-link-confirm")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
-                let response = Dialog::new("Aprire il link?", &body, "Apri").secondary("Annulla").width(520.0).focus_secondary(focus_cancel).show(ui);
+                let response = Dialog::new("Aprire il link?", &body, "Apri")
+                    .secondary("Annulla")
+                    .width(520.0)
+                    .body_scroll_height(220.0)
+                    .focus_secondary(focus_cancel)
+                    .show(ui);
                 confirm = response.primary;
                 cancel = response.secondary;
             });
@@ -4985,13 +5030,14 @@ impl PostinoApp {
                         }
                         ui.add_space(space::XS);
                         let can_open = self.store_path.is_some();
-                        if Button::new("Apri la cartella degli allegati")
+                        let open_button = Button::new("Apri la cartella degli allegati")
                             .icon(icons::FOLDER)
                             .enabled(can_open)
                             .disabled_reason("La modalità demo non ha una cartella dati")
-                            .show(ui)
-                            .clicked()
-                        {
+                            .show(ui);
+                        #[cfg(test)]
+                        probe::settings_action(ui, "open_folder", open_button.rect);
+                        if open_button.clicked() {
                             open_folder = true;
                         }
 
@@ -5006,10 +5052,15 @@ impl PostinoApp {
                         ui.add_space(space::XS);
                         ui.horizontal(|ui| {
                             let licences_button = Button::ghost("Licenze e attribuzioni").icon(icons::INFO).show(ui);
+                            #[cfg(test)]
+                            probe::settings_action(ui, "licences", licences_button.rect);
                             if licences_button.clicked() {
                                 licences = true;
                             }
-                            if Button::ghost("Scorciatoie da tastiera").icon(icons::KEYBOARD).show(ui).clicked() {
+                            let shortcuts_button = Button::ghost("Scorciatoie da tastiera").icon(icons::KEYBOARD).show(ui);
+                            #[cfg(test)]
+                            probe::settings_action(ui, "shortcuts", shortcuts_button.rect);
+                            if shortcuts_button.clicked() {
                                 shortcuts = true;
                             }
                         });
@@ -5209,12 +5260,12 @@ impl PostinoApp {
                             _ => t.text_muted,
                         };
                         ui.add(egui::Label::new(typography::text(Role::Meta, text, color)).truncate());
-                        // The banner lives in the list panel; at the 980 overlay that panel is not
-                        // drawn, so the status bar is the one place that can still offer Retry.
-                        let overlay_offline = self.reading_open
-                            && reading_overlay(ui.ctx().content_rect().width())
-                            && matches!(self.sync_view, SyncView::Offline { .. });
-                        if (self.sync_error_needs_retry() || overlay_offline) && self.can_add_account() {
+                        // The banner lives in the list panel. The list is hidden by the 980 overlay
+                        // **and** by full-screen reading at any width, so the status bar must carry
+                        // the one Retry in both cases.
+                        let reading_hides_list = self.reading_open && (self.reading_full || reading_overlay(ui.ctx().content_rect().width()));
+                        let reading_offline = reading_hides_list && matches!(self.sync_view, SyncView::Offline { .. });
+                        if (self.sync_error_needs_retry() || reading_offline) && self.can_add_account() {
                             ui.add_space(space::XS);
                             let retry = Button::ghost("Riprova").size(ButtonSize::Sm).show(ui);
                             #[cfg(test)]
@@ -6175,8 +6226,11 @@ enum SyncView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingLink {
     url: String,
-    /// The effective host the browser will contact, already normalized by `reading::find_links`.
+    /// The host or recipient domain, already normalized by `reading::find_links`.
     host: String,
+    /// The explicit `mailto:` recipient, shown instead of a browser host.
+    recipient: Option<String>,
+    mailto: bool,
     idn: bool,
     non_ascii: bool,
     backslash: bool,
@@ -6527,15 +6581,30 @@ fn truncate_link_label(label: &str) -> String {
     shown
 }
 
+/// A hover tooltip is capped; the sheet has the full URL in a scrollable body.
+fn truncate_tooltip_url(url: &str) -> String {
+    if url.chars().count() <= reading::MAX_LINK_TOOLTIP_CHARS {
+        return url.to_owned();
+    }
+    let mut shown = url.chars().take(reading::MAX_LINK_TOOLTIP_CHARS.saturating_sub(1)).collect::<String>();
+    shown.push('…');
+    shown
+}
+
 /// Render one paragraph with clickable links. Only `reading::find_links` decides what is a link;
 /// everything else stays ordinary selectable text. The caller opens the confirmation sheet.
-fn link_paragraph(ui: &mut Ui, paragraph: &str, t: &Tokens, muted: bool) -> Option<ExtractedLink> {
-    let links = reading::find_links(paragraph);
+///
+/// Returns the clicked link and how many link widgets this paragraph consumed from the message
+/// budget.
+fn link_paragraph(ui: &mut Ui, paragraph: &str, t: &Tokens, muted: bool, limit: usize) -> (Option<ExtractedLink>, usize) {
+    let links =
+        if limit >= reading::MAX_LINKS_PER_PARAGRAPH { reading::find_links(paragraph) } else { reading::find_links_limited(paragraph, limit) };
     if links.is_empty() {
         let color = if muted { t.text_muted } else { t.text };
         ui.add(egui::Label::new(typography::text(Role::Body, paragraph, color)).selectable(true));
-        return None;
+        return (None, 0);
     }
+    let used = links.len();
     let text_color = if muted { t.text_muted } else { t.text };
     let font = FontId::new(type_size::BODY, FontFamily::Proportional);
     let mut clicked = None;
@@ -6555,7 +6624,9 @@ fn link_paragraph(ui: &mut Ui, paragraph: &str, t: &Tokens, muted: bool) -> Opti
             };
             let shown = truncate_link_label(label);
             let rich = RichText::new(shown).font(font.clone()).color(t.gold_ink).underline();
-            let response = ui.add(egui::Link::new(rich)).on_hover_text(link.url.as_str());
+            let response = ui.add(egui::Link::new(rich)).on_hover_text(truncate_tooltip_url(&link.url));
+            #[cfg(test)]
+            probe::link_widget(ui, &link.url, response.rect);
             if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
                 clicked = Some(link.clone());
             }
@@ -6567,7 +6638,7 @@ fn link_paragraph(ui: &mut Ui, paragraph: &str, t: &Tokens, muted: bool) -> Opti
             ui.add(egui::Label::new(RichText::new(after).font(font).color(text_color)).wrap_mode(egui::TextWrapMode::Wrap).selectable(true));
         }
     });
-    clicked
+    (clicked, used)
 }
 
 fn reading_context_menu(response: egui::Response, subject: String, sender: String) {
@@ -7059,7 +7130,9 @@ fn format_size(bytes: u64) -> String {
 /// classifier as the suggested name.
 fn attachment_destination_kind(path: &Path) -> Option<DangerousKind> {
     let name = path.file_name()?.to_string_lossy();
-    reading::dangerous_kind(&reading::safe_filename(&name))
+    // The sanitized name preserves a truncated extension; classifying the raw name too catches a
+    // path the dialog returned with a long stem that the suggestion would shorten.
+    reading::dangerous_kind(&reading::safe_filename(&name)).or_else(|| reading::dangerous_kind(&name))
 }
 
 /// Encode the viewport surface exactly as eframe captured it. `ColorImage` is sRGB with the same
@@ -7181,6 +7254,28 @@ pub(crate) mod probe {
 
     pub fn retry_count(ctx: &Context) -> usize {
         ctx.data(|data| data.get_temp::<Vec<Rect>>(id("retry-buttons"))).map_or(0, |buttons| buttons.len())
+    }
+
+    pub fn retry_rects(ctx: &Context) -> Vec<Rect> {
+        ctx.data(|data| data.get_temp::<Vec<Rect>>(id("retry-buttons"))).unwrap_or_default()
+    }
+
+    pub fn clear_links(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("link-widgets"), BTreeMap::<String, Rect>::new()));
+    }
+
+    pub fn link_widget(ui: &Ui, url: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("link-widgets")).insert(url.to_owned(), rect);
+        });
+    }
+
+    pub fn link_rect(ctx: &Context, url: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("link-widgets"))).and_then(|links| links.get(url).copied())
+    }
+
+    pub fn link_count(ctx: &Context) -> usize {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("link-widgets"))).map_or(0, |links| links.len())
     }
 
     pub fn clear_attachment_saves(ui: &Ui) {
@@ -7479,6 +7574,16 @@ pub(crate) mod probe {
         ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("settings-copy"))).and_then(|rows| rows.get(key).copied())
     }
 
+    pub fn settings_action(ui: &Ui, key: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("settings-actions")).insert(key.to_owned(), rect);
+        });
+    }
+
+    pub fn settings_action_rect(ctx: &Context, key: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("settings-actions"))).and_then(|rows| rows.get(key).copied())
+    }
+
     pub fn settings_scroll(ui: &Ui, viewport: Rect, content: Vec2, offset: Vec2) {
         ui.ctx().data_mut(|data| {
             data.insert_temp(id("settings-scroll-view"), viewport);
@@ -7709,6 +7814,26 @@ mod tests {
 
     fn click(ctx: &egui::Context, app: &mut PostinoApp, pos: egui::Pos2) {
         click_at(ctx, app, pos, Vec2::new(1200.0, 800.0));
+    }
+
+    /// A click whose release-frame platform output is returned, for clipboard assertions.
+    fn click_at_output(ctx: &egui::Context, app: &mut PostinoApp, pos: egui::Pos2, size: Vec2) -> egui::PlatformOutput {
+        frame_at(ctx, app, size, vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events: vec![pointer(pos, false)],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+        output.platform_output
+    }
+
+    fn copied_text(output: &egui::PlatformOutput) -> Option<String> {
+        output.commands.iter().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
     }
 
     /// Let a modal animate in and register its probes without injecting input.
@@ -9593,7 +9718,7 @@ mod tests {
     }
 
     fn test_directory(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join("opencode").join("p6b-postino").join(format!("{name}-{}", std::process::id()));
+        let path = std::env::temp_dir().join("opencode").join("p6c-fix2-postino").join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&path);
         let _ = std::fs::remove_file(path.join("mail.db"));
         let _ = std::fs::remove_dir_all(path.join("mail.db.blobs"));
@@ -10070,6 +10195,7 @@ mod tests {
         theme::apply(&ctx, false);
         let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
         assert!(text.iter().any(|line| line.contains("Sostituire il file?")), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("I dati del file esistente saranno persi")), "the overwrite body must name the loss: {text:?}");
         assert_eq!(std::fs::read(&path).expect("old content is intact"), b"vecchio contenuto");
         assert!(saver.writes().is_empty());
         click_dialog_button(&ctx, &mut app, Vec2::new(980.0, 600.0), "Sostituire il file?", true);
@@ -10097,6 +10223,7 @@ mod tests {
             let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
             assert!(text.iter().any(|line| line.contains("Salvare un file potenzialmente pericoloso?")), "{text:?}");
             assert!(text.iter().any(|line| line.contains("setup.exe") || line.contains("report.docm")), "{text:?}");
+            assert!(text.iter().any(|line| line.contains(kind.message())), "the warning body must carry the reason: {text:?}");
             click_dialog_button(&ctx, &mut app, Vec2::new(980.0, 600.0), "Salvare un file potenzialmente pericoloso?", true);
             assert_eq!(saver.choose_calls(), 1, "the path is chosen only after the warning");
             assert_eq!(std::fs::read(&path).expect("saved after confirmation"), b"warning bytes");
@@ -10227,6 +10354,8 @@ mod tests {
         app.pending_link = Some(PendingLink {
             url: "javascript:alert(1)".to_owned(),
             host: "example.com".to_owned(),
+            recipient: None,
+            mailto: false,
             idn: false,
             non_ascii: false,
             backslash: false,
@@ -10240,6 +10369,8 @@ mod tests {
             range: 0..10,
             url: "javascript:alert(1)".to_owned(),
             host: "example.com".to_owned(),
+            recipient: None,
+            mailto: false,
             idn: false,
             non_ascii: false,
             backslash: false,
@@ -10269,13 +10400,41 @@ mod tests {
         assert!(text.iter().any(|line| line.contains("Host di destinazione: evil.example")), "{text:?}");
         assert!(text.iter().any(|line| line.contains("barra rovesciata")), "{text:?}");
 
-        // A Cyrillic host has no literal xn-- label but the browser punycodes it.
+        // A Cyrillic host has no literal xn-- label but the browser punycodes it. The line names the
+        // spelling in the link, not a host the browser will contact.
         let cyrillic = reading::find_links("https://аpple.com/x").pop().expect("a non-ASCII link");
         app.pending_link = None;
         app.request_link_open(&cyrillic);
         let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
         assert!(text.iter().any(|line| line.contains("caratteri non ASCII")), "{text:?}");
-        assert!(text.iter().any(|line| line.contains("Host di destinazione: аpple.com")), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("Dominio nel link: аpple.com")), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains("Host di destinazione")), "a non-ASCII spelling is not the browser host: {text:?}");
+
+        // A mailto opens a mail client and names its explicit recipient, not a browser host.
+        let mailto = reading::find_links("mailto:help@example.com?subject=Preventivo").pop().expect("a mailto link");
+        app.pending_link = None;
+        app.request_link_open(&mailto);
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("client di posta")), "{text:?}");
+        assert!(text.iter().any(|line| line.contains("Destinatario: help@example.com")), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains("Host di destinazione")), "{text:?}");
+    }
+
+    #[test]
+    fn the_reading_pane_link_widget_opens_the_sheet() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        app.seed_screenshot(ScreenshotState::ReadingAttachments);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(1280.0, 800.0);
+        settle_at(&ctx, &mut app, size);
+        let url = "https://example.com/preventivo/postino-2026?token=anteprima";
+        let link = probe::link_rect(&ctx, url).expect("the reading-pane link widget");
+        click_at(&ctx, &mut app, link.center(), size);
+        let pending = app.pending_link.as_ref().expect("clicking the link opens the sheet");
+        assert_eq!(pending.url, url);
     }
 
     #[test]
@@ -10286,6 +10445,12 @@ mod tests {
             "https://user:pass@bank.example/",
             "mailto:help@example.com?bcc=attacker@evil.example",
             "mailto:help@example.com?cc=attacker@evil.example",
+            "mailto:attacker@evil.example,help@example.com",
+            "mailto:attacker@evil.example%2Chelp@example.com",
+            "mailto:attacker@evil.example;help@example.com",
+            "mailto:help@example.com?attach=C:\\Users\\feder\\secret.pdf",
+            "mailto:help@example.com?attachment=%5C%5Cattacker.example%5Cshare%5Csecret.pdf",
+            "mailto:help@example.com?%61ttach=%5C%5Cattacker.example%5Cshare%5Csecret.pdf",
         ] {
             assert!(reading::find_links(raw).is_empty(), "{raw}");
             assert!(!reading::is_allowed_url(raw), "{raw}");
@@ -10301,8 +10466,10 @@ mod tests {
         for dark in [false, true] {
             app.dark = dark;
             theme::apply(&ctx, dark);
-            let content = ctx.content_rect();
             let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            // Capture after the first settled frame: `Context::default()` starts with a huge
+            // placeholder viewport, which would make the light assertions vacuous.
+            let content = ctx.content_rect();
             let text = runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>();
             for section in ["ACCOUNT", "ASPETTO", "DATI", "INFORMAZIONI", "Licenze e attribuzioni", "Scorciatoie da tastiera"] {
                 assert!(text.iter().any(|line| line.contains(section)), "missing {section}: {text:?}");
@@ -10388,6 +10555,87 @@ mod tests {
     }
 
     #[test]
+    fn settings_actions_are_real_buttons() {
+        let (mut app, _, _) = seeded_attachment_app("p6c-settings-actions", "report.pdf", Some(b"bytes"));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        let store_path = app.store_path.clone().expect("the store path");
+        let store = store_path.display().to_string();
+        let blob = postino_store::blob_root(&store_path).display().to_string();
+        let _ = std::fs::create_dir_all(postino_store::blob_root(&store_path));
+        app.open_settings(&ctx, None);
+
+        settle_at(&ctx, &mut app, size);
+        let copy = probe::settings_copy_rect(&ctx, "store").expect("Copia archivio");
+        let output = click_at_output(&ctx, &mut app, copy.center(), size);
+        assert_eq!(copied_text(&output).as_deref(), Some(store.as_str()), "Copia archivio puts the path on the clipboard");
+
+        settle_at(&ctx, &mut app, size);
+        let copy = probe::settings_copy_rect(&ctx, "blob").expect("Copia allegati");
+        let output = click_at_output(&ctx, &mut app, copy.center(), size);
+        assert_eq!(copied_text(&output).as_deref(), Some(blob.as_str()), "Copia allegati puts the blob path on the clipboard");
+
+        let opener = RecordingFolderOpener::new();
+        app.folder_opener = opener.clone();
+        settle_at(&ctx, &mut app, size);
+        let open = probe::settings_action_rect(&ctx, "open_folder").expect("Apri la cartella");
+        click_at(&ctx, &mut app, open.center(), size);
+        assert_eq!(opener.opened(), vec![postino_store::blob_root(&store_path)], "the real folder button calls the injected opener");
+
+        settle_at(&ctx, &mut app, size);
+        let licences = probe::settings_action_rect(&ctx, "licences").expect("Licenze e attribuzioni");
+        click_at(&ctx, &mut app, licences.center(), size);
+        assert!(app.show_licences, "the real Licenze button opens the local dialog");
+        frame_at(&ctx, &mut app, size, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.show_licences);
+        // Reopen settings: the nested licences modal and the settings modal both see Escape, so the
+        // test reopens rather than asserting which modal closed first.
+        app.open_settings(&ctx, None);
+
+        settle_at(&ctx, &mut app, size);
+        let shortcuts = probe::settings_action_rect(&ctx, "shortcuts").expect("Scorciatoie da tastiera");
+        click_at(&ctx, &mut app, shortcuts.center(), size);
+        assert!(app.show_shortcuts, "the real shortcut button opens the sheet");
+    }
+
+    #[test]
+    fn settings_shows_each_accounts_own_last_sync() {
+        let now = Utc::now();
+        let first = (now - chrono::Duration::hours(2)).timestamp_millis();
+        let second = (now - chrono::Duration::minutes(20)).timestamp_millis();
+        let mut app = booted_app("p6c-settings-sync", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+            for (account, last_success) in [("acc_a", first), ("acc_b", second)] {
+                let status = postino_sync::SyncStatus {
+                    state: postino_sync::SyncPhase::Idle,
+                    last_attempt: last_success,
+                    last_success: Some(last_success),
+                    error: None,
+                    folders_done: 1,
+                    folders_total: 1,
+                    messages: 1,
+                };
+                store
+                    .set_meta(&postino_sync::status_key(account), &serde_json::to_string(&status).expect("status JSON"))
+                    .expect("seed the sync status");
+            }
+        });
+        let expected_first = format!("Ultimo sync: {}", format_millis(first, app.now_utc));
+        let expected_second = format!("Ultimo sync: {}", format_millis(second, app.now_utc));
+        assert_ne!(expected_first, expected_second);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.open_settings(&ctx, None);
+        let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
+        assert!(text.iter().any(|line| line.contains(&expected_first) && line.contains("a@example.com")), "acc_a shows its own sync: {text:?}");
+        assert!(text.iter().any(|line| line.contains(&expected_second) && line.contains("b@example.com")), "acc_b shows its own sync: {text:?}");
+    }
+
+    #[test]
     fn the_palette_entry_opens_settings_and_the_licences_dialog_is_local() {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
@@ -10459,7 +10707,7 @@ mod tests {
         let mut width = 0.0;
         let mut output = ctx.run_ui(raw, |ui| {
             ui.set_max_width(320.0);
-            link_paragraph(ui, &text, &t, false);
+            link_paragraph(ui, &text, &t, false, reading::MAX_LINKS_PER_MESSAGE);
             width = ui.min_rect().width();
         });
         output.textures_delta.clear();
@@ -10483,6 +10731,12 @@ mod tests {
         app.sync_view = SyncView::Offline { last_sync: Some(1_700_000_000_000) };
         frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
         assert_eq!(probe::retry_count(&ctx), 1, "only the offline banner offers Retry");
+        // Click the banner's Retry. With no worker, `request_sync` writes its refusal; a dead button
+        // would leave the status empty.
+        app.sync_worker = None;
+        let banner_retry = probe::retry_rects(&ctx)[0];
+        click_at(&ctx, &mut app, banner_retry.center(), Vec2::new(1200.0, 800.0));
+        assert_eq!(app.status, "Il servizio di sincronizzazione non è disponibile", "the banner Retry calls request_sync");
         app.sync_view = SyncView::Error { reason: "credenziali rifiutate".to_owned(), last_sync: None };
         frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
         assert_eq!(probe::retry_count(&ctx), 1, "only the status bar offers Retry for an error");
@@ -10494,8 +10748,93 @@ mod tests {
         app.open_message(id);
         frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), Vec::new());
         assert_eq!(probe::retry_count(&ctx), 1, "the 980 reading overlay keeps exactly one Retry");
+        app.status.clear();
+        let status_retry = probe::retry_rects(&ctx)[0];
+        click_at(&ctx, &mut app, status_retry.center(), Vec2::new(980.0, 600.0));
+        assert_eq!(app.status, "Il servizio di sincronizzazione non è disponibile", "the compact status Retry calls request_sync");
         frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
         assert_eq!(probe::retry_count(&ctx), 1, "the wide reading split still has exactly one Retry");
+        app.reading_full = true;
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
+        assert_eq!(probe::retry_count(&ctx), 1, "wide full-screen reading keeps exactly one Retry");
+    }
+
+    #[test]
+    fn the_attachment_chip_shows_a_sanitized_name() {
+        let (mut app, message_id, _) = seeded_attachment_app("p6c-bidi-chip", "invoice\u{202E}fdp.exe", Some(b"chip bytes"));
+        app.open_message(message_id);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
+        assert!(!text.iter().any(|line| line.contains('\u{202E}')), "the chip must not render a bidi control: {text:?}");
+        assert!(text.iter().any(|line| line.contains("invoicefdp.exe")), "the sanitized name is visible: {text:?}");
+    }
+
+    #[test]
+    fn four_attachments_fit_the_980_reading_pane() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        let mut message = app.engine.message(&id).cloned().expect("the open message");
+        message.attachments = (0..4)
+            .map(|index| Attachment {
+                id: format!("att_many_{index}"),
+                filename: format!("allegato-{index}.pdf"),
+                mime: "application/pdf".to_owned(),
+                size: 1024,
+            })
+            .collect();
+        app.screenshot_message = Some(message);
+        app.open_message(id);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        settle_at(&ctx, &mut app, size);
+        let content = ctx.content_rect();
+        let strip = probe::reading_attachments_rect(&ctx).expect("the pinned attachment strip");
+        assert!(content.contains_rect(strip), "the 4-attachment strip is off-screen: {strip:?}");
+        assert!(strip.height() > 0.0);
+        let save = probe::attachment_save_rect(&ctx, "att_many_0").expect("the first attachment Save");
+        assert!(strip.contains_rect(save), "the first attachment must stay visible: {save:?} in {strip:?}");
+    }
+
+    #[test]
+    fn a_hostile_message_caps_link_widgets() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        let mut message = app.engine.message(&id).cloned().expect("the open message");
+        message.body_text = (0..100).map(|index| format!("https://example.com/{index}")).collect::<Vec<_>>().join("\n\n");
+        app.screenshot_message = Some(message);
+        app.open_message(id);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        settle_at(&ctx, &mut app, Vec2::new(1280.0, 800.0));
+        assert_eq!(probe::link_count(&ctx), reading::MAX_LINKS_PER_MESSAGE, "the per-message link budget caps widgets");
+    }
+
+    #[test]
+    fn an_overlong_chosen_name_keeps_its_extension_warning() {
+        let long_name = format!("{}.exe", "a".repeat(130));
+        let path = directory("save-long-chosen").join(&long_name);
+        let _ = std::fs::remove_file(&path);
+        let (mut app, _, attachment) = seeded_attachment_app("p6c-long-chosen", "report.pdf", Some(b"long bytes"));
+        let saver = RecordingFileSaver::new();
+        saver.set_path(Some(path.clone()));
+        app.file_saver = saver.clone();
+        app.request_attachment_save(&attachment);
+        let warning = app.attachment_warning.as_ref().expect("the long chosen .exe must be warned");
+        assert_eq!(warning.dangerous, Some(DangerousKind::Executable));
+        assert!(saver.writes().is_empty());
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        click_dialog_button(&ctx, &mut app, Vec2::new(980.0, 600.0), "Salvare un file potenzialmente pericoloso?", true);
+        assert_eq!(std::fs::read(&path).expect("saved after the warning"), b"long bytes");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -10598,6 +10937,9 @@ mod tests {
         assert!(shown.chars().count() <= reading::MAX_LINK_LABEL_CHARS, "{shown}");
         assert!(shown.ends_with('…'));
         assert_eq!(truncate_link_label("https://example.com/short"), "https://example.com/short");
+        let tooltip = truncate_tooltip_url(&"t".repeat(reading::MAX_LINK_TOOLTIP_CHARS + 100));
+        assert!(tooltip.chars().count() <= reading::MAX_LINK_TOOLTIP_CHARS, "{tooltip}");
+        assert!(tooltip.ends_with('…'));
     }
 
     #[test]

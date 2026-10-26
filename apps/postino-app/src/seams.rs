@@ -52,14 +52,41 @@ impl FileSaver for RfdFileSaver {
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
-        std::fs::write(path, bytes).map_err(|error| error.to_string())
+        // Write the replacement to a sibling temp file and rename it over the destination. A failed
+        // write never truncates the original file.
+        let mut temp_os = path.as_os_str().to_os_string();
+        temp_os.push(format!(".{}.postino.tmp", std::process::id()));
+        let temp = PathBuf::from(temp_os);
+        if let Err(error) = std::fs::write(&temp, bytes) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+        if let Err(error) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+        Ok(())
     }
 
     fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|error| error.to_string())?;
-        file.write_all(bytes).map_err(|error| error.to_string())
+        write_new_with(path, bytes, |file, bytes| {
+            use std::io::Write as _;
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
     }
+}
+
+/// Create a new file, run the write, and remove the file this call created when the write fails.
+/// The injected writer lets tests exercise a partial/failed write without a full disk.
+fn write_new_with(path: &Path, bytes: &[u8], write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|error| error.to_string())?;
+    if let Err(error) = write(&mut file, bytes) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 /// The production file-manager adapter. It invokes the platform opener directly, never a shell.
@@ -133,6 +160,12 @@ impl FolderOpener for UnavailableFolderOpener {
 mod tests {
     use super::*;
 
+    fn test_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join("opencode").join("p6c-fix2-postino");
+        let _ = std::fs::create_dir_all(&directory);
+        directory
+    }
+
     #[test]
     fn the_unavailable_adapters_fail_readably_without_side_effects() {
         let link = UnavailableLinkOpener.open("https://example.com").expect_err("no browser in tests");
@@ -140,5 +173,37 @@ mod tests {
         assert_eq!(CancellingFileSaver.choose_path("a.txt").expect("cancelled"), None);
         let folder = UnavailableFolderOpener.open(Path::new(".")).expect_err("no shell in tests");
         assert!(folder.contains("non disponibile"));
+    }
+
+    #[test]
+    fn a_failed_new_write_removes_its_partial_file() {
+        let path = test_directory().join(format!("partial-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let result = write_new_with(&path, b"partial bytes", |file, bytes| {
+            use std::io::Write as _;
+            file.write_all(&bytes[..4])?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(result.is_err());
+        assert!(!path.exists(), "a failed write_new must remove the file it created");
+    }
+
+    #[test]
+    fn overwrite_writes_through_a_temp_file_and_keeps_the_original_on_failure() {
+        let path = test_directory().join(format!("overwrite-{}.bin", std::process::id()));
+        std::fs::write(&path, b"old").expect("the original file");
+        RfdFileSaver.write(&path, b"new bytes").expect("the overwrite");
+        assert_eq!(std::fs::read(&path).expect("the replaced file"), b"new bytes");
+        let temp = PathBuf::from(format!("{}.{}.postino.tmp", path.display(), std::process::id()));
+        assert!(!temp.exists(), "the temp file must be renamed away");
+
+        // A directory at the temp path makes the temp write fail before the rename. The original
+        // must stay intact.
+        std::fs::create_dir(&temp).expect("the blocking directory");
+        let result = RfdFileSaver.write(&path, b"replacement");
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).expect("the original survives"), b"new bytes");
+        let _ = std::fs::remove_dir(&temp);
+        let _ = std::fs::remove_file(&path);
     }
 }

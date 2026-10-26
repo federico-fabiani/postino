@@ -260,7 +260,7 @@ pub fn three_folders() -> Vec<TestFolder> {
 
 /// A private test directory for P6c files. Nothing outside it may be removed.
 pub fn directory(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join("opencode").join("p6c-postino").join(format!("{name}-{}", std::process::id()));
+    let path = std::env::temp_dir().join("opencode").join("p6c-fix2-postino").join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&path);
     path
 }

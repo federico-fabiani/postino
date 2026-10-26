@@ -10,19 +10,33 @@ const ALLOWED_PREFIXES: [&str; 3] = ["http://", "https://", "mailto:"];
 const TRAILING_PUNCTUATION: [char; 12] = ['.', ',', ';', ':', '!', '?', ')', ']', '}', '»', '”', '’'];
 /// A crafted body can carry thousands of links in one paragraph. The pane keeps the first few
 /// clickable and renders the rest as ordinary text.
-const MAX_LINKS_PER_PARAGRAPH: usize = 16;
-/// A displayed inline link is capped; the full URL stays in the hover tooltip and the confirmation
-/// sheet, so truncating the visible label never changes what the opener receives.
+pub const MAX_LINKS_PER_PARAGRAPH: usize = 16;
+/// The whole message is bounded too: a body of many tiny paragraphs must not create unlimited
+/// widgets or confirmation sheets.
+pub const MAX_LINKS_PER_MESSAGE: usize = 64;
+/// A link scanner stops at this many bytes. The sheet and tooltip never receive a multi-megabyte
+/// string, and a URL longer than this is not presented as clickable text.
+pub const MAX_LINK_BYTES: usize = 4096;
+/// A displayed inline link and its hover tooltip are capped; the confirmation sheet shows the full
+/// URL in a scrollable body, so truncating the inline label never changes what the opener receives.
 pub const MAX_LINK_LABEL_CHARS: usize = 120;
+pub const MAX_LINK_TOOLTIP_CHARS: usize = 512;
+/// A suggested filename is bounded, but its final extension is preserved so a 130-character stem
+/// cannot hide `.exe` from the chosen-path warning.
+pub const MAX_FILENAME_CHARS: usize = 120;
 
 /// One allowed link found in a message body. `range` indexes the original UTF-8 string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtractedLink {
     pub range: Range<usize>,
     pub url: String,
-    /// The host the browser will actually use: lowercased, without userinfo, port or brackets. For
-    /// a `mailto:` URL this is the recipient domain.
+    /// The host the browser will actually use for `http`/`https`: lowercased, without userinfo, port
+    /// or brackets. For a `mailto:` URL this is the recipient domain.
     pub host: String,
+    /// The full `mailto:` recipient (before the query), for an explicit `Destinatario:` line.
+    pub recipient: Option<String>,
+    /// The link is a `mailto:` URL: the sheet must say “client di posta”, not “browser”.
+    pub mailto: bool,
     /// A host with a literal `xn--` label **or** non-ASCII characters, so the sheet must warn.
     pub idn: bool,
     /// The host contains non-ASCII characters: the browser will display it in punycode.
@@ -34,18 +48,24 @@ pub struct ExtractedLink {
 /// Links the reader may present. Only absolute `http`, `https` and `mailto` URLs survive; anything
 /// else is ordinary text, never a clickable target.
 ///
-/// Userinfo (`user@host`) and `mailto:` queries that add `to`, `cc` or `bcc` recipients are
-/// rejected outright: the visible sheet must never hide a second destination.
+/// Userinfo (`user@host`) is rejected. A `mailto:` may carry only `subject` and `body` query fields:
+/// `to`, `cc`, `bcc`, `attach`/`attachment`, comma/semicolon recipient lists and every unknown field
+/// are rejected, so the visible sheet cannot hide a second destination or a local file.
 #[must_use]
 pub fn find_links(text: &str) -> Vec<ExtractedLink> {
-    let lower = text.to_ascii_lowercase();
+    find_links_limited(text, MAX_LINKS_PER_PARAGRAPH)
+}
+
+/// [`find_links`] with a caller-supplied cap, used by the reading pane to keep a per-message budget.
+#[must_use]
+pub fn find_links_limited(text: &str, limit: usize) -> Vec<ExtractedLink> {
     let mut links = Vec::new();
     let mut search = 0;
     while search < text.len() {
-        if links.len() >= MAX_LINKS_PER_PARAGRAPH {
+        if links.len() >= limit {
             break;
         }
-        let Some(start) = earliest_prefix(&lower, search) else {
+        let Some(start) = earliest_prefix(text, search) else {
             break;
         };
         if !starts_at_a_word_boundary(text, start) {
@@ -56,6 +76,10 @@ pub fn find_links(text: &str) -> Vec<ExtractedLink> {
             search = start.saturating_add(1);
             continue;
         };
+        if end.saturating_sub(start) > MAX_LINK_BYTES {
+            search = end;
+            continue;
+        }
         let Some(raw) = text.get(start..end) else {
             search = end.max(start.saturating_add(1));
             continue;
@@ -70,9 +94,16 @@ pub fn find_links(text: &str) -> Vec<ExtractedLink> {
     links
 }
 
-fn earliest_prefix(lower: &str, from: usize) -> Option<usize> {
-    let tail = lower.get(from..)?;
-    ALLOWED_PREFIXES.iter().filter_map(|prefix| tail.find(prefix).map(|position| from.saturating_add(position))).min()
+/// Find the earliest allowed scheme without copying the paragraph to lowercase on every frame.
+fn earliest_prefix(text: &str, from: usize) -> Option<usize> {
+    let tail = text.get(from..)?;
+    tail.char_indices().find_map(|(offset, _)| {
+        let position = from.saturating_add(offset);
+        ALLOWED_PREFIXES
+            .iter()
+            .any(|prefix| text.get(position..position.saturating_add(prefix.len())).is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix)))
+            .then_some(position)
+    })
 }
 
 fn starts_at_a_word_boundary(text: &str, start: usize) -> bool {
@@ -84,7 +115,6 @@ fn starts_at_a_word_boundary(text: &str, start: usize) -> bool {
 
 fn link_end(text: &str, start: usize) -> Option<usize> {
     let tail = text.get(start..)?;
-    let lower = tail.to_ascii_lowercase();
     let mut end = start;
     for (offset, character) in tail.char_indices() {
         if character.is_whitespace() || matches!(character, '<' | '>' | '"' | '\'' | '`' | '\u{00A0}') {
@@ -93,18 +123,21 @@ fn link_end(text: &str, start: usize) -> Option<usize> {
         // Two adjacent URLs in prose (`…/foo,https://…`) must not become one merged target.
         if matches!(character, ',' | ';') {
             let after = offset.saturating_add(character.len_utf8());
-            if lower.get(after..).is_some_and(starts_with_url_scheme) {
+            if tail.get(after..).is_some_and(starts_with_url_scheme) {
                 break;
             }
         }
         end = start.saturating_add(offset).saturating_add(character.len_utf8());
+        if end.saturating_sub(start) > MAX_LINK_BYTES {
+            break;
+        }
     }
     let end = trim_trailing_punctuation(text, start, end);
     (end > start).then_some(end)
 }
 
 fn starts_with_url_scheme(tail: &str) -> bool {
-    ALLOWED_PREFIXES.iter().any(|prefix| tail.starts_with(prefix))
+    ALLOWED_PREFIXES.iter().any(|prefix| tail.get(..prefix.len()).is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix)))
 }
 
 fn trim_trailing_punctuation(text: &str, start: usize, mut end: usize) -> usize {
@@ -146,6 +179,9 @@ fn closing_bracket_is_unmatched(text: &str, start: usize, end: usize, close: cha
 }
 
 fn classify_link(raw: &str, range: Range<usize>) -> Option<ExtractedLink> {
+    if raw.len() > MAX_LINK_BYTES {
+        return None;
+    }
     if raw.chars().any(|character| character.is_control() || is_format_control(character) || character.is_whitespace()) {
         return None;
     }
@@ -154,7 +190,6 @@ fn classify_link(raw: &str, range: Range<usize>) -> Option<ExtractedLink> {
     }
     let lower = raw.to_ascii_lowercase();
     let (scheme, rest) = lower.split_once(':')?;
-    let backslash = raw.contains('\\');
     match scheme {
         "http" | "https" => {
             let rest = rest.strip_prefix("//")?;
@@ -166,40 +201,102 @@ fn classify_link(raw: &str, range: Range<usize>) -> Option<ExtractedLink> {
             if authority.is_empty() || authority.contains('@') {
                 return None;
             }
-            let host = if let Some(inside) = authority.strip_prefix('[') {
-                let end = inside.find(']')?;
-                inside.get(..end)?
-            } else {
-                authority.split(':').next()?
-            };
+            let host = parse_authority(authority)?;
             if !is_valid_host(host) {
                 return None;
             }
             let non_ascii = !host.is_ascii();
             let idn = non_ascii || host.split('.').any(|label| label.to_ascii_lowercase().starts_with("xn--"));
-            Some(ExtractedLink { range, url: raw.to_owned(), host: host.to_owned(), idn, non_ascii, backslash })
+            // A backslash only matters for a browser path; a mailto body is not a URL path.
+            let backslash = raw.contains('\\');
+            Some(ExtractedLink { range, url: raw.to_owned(), host: host.to_owned(), recipient: None, mailto: false, idn, non_ascii, backslash })
         }
         "mailto" => {
             let (address, query) = match rest.split_once('?') {
                 Some((address, query)) => (address, Some(query)),
                 None => (rest, None),
             };
+            // Keep the recipient's original spelling for the sheet; the lowercased form above is
+            // only for validation and query keys.
+            let raw_rest = raw.get(scheme.len().saturating_add(1)..)?;
+            let raw_address = raw_rest.split('?').next()?;
+            // A comma or semicolon is an address-list separator in many mail handlers, and the
+            // displayed host would only name the last recipient. Reject the whole list, including
+            // the percent-encoded forms.
+            if address.contains(',') || address.contains(';') {
+                return None;
+            }
+            let decoded = decode_percent(address);
+            if decoded.contains(',') || decoded.contains(';') || decoded.matches('@').count() != 1 || address.to_ascii_lowercase().contains("%25") {
+                return None;
+            }
             let (local, domain) = address.rsplit_once('@')?;
             if local.is_empty() || !is_valid_host(domain) {
                 return None;
             }
-            // A hidden Cc/Bcc is not a "full destination" a person can read from an opaque query.
+            // Only `subject` and `body` are display/prefill fields. `to`, `cc`, `bcc`, `attach` and
+            // `attachment` can add a recipient or make a mail handler read a local/UNC file, and an
+            // unknown field is not something the sheet can honestly describe.
             if let Some(query) = query
-                && query_has_hidden_recipient(query)
+                && !query.is_empty()
+                && !mailto_query_is_allowed(query)
             {
                 return None;
             }
             let non_ascii = !domain.is_ascii();
             let idn = non_ascii || domain.split('.').any(|label| label.to_ascii_lowercase().starts_with("xn--"));
-            Some(ExtractedLink { range, url: raw.to_owned(), host: domain.to_owned(), idn, non_ascii, backslash })
+            Some(ExtractedLink {
+                range,
+                url: raw.to_owned(),
+                host: domain.to_owned(),
+                recipient: Some(raw_address.to_owned()),
+                mailto: true,
+                idn,
+                non_ascii,
+                backslash: false,
+            })
         }
         _ => None,
     }
+}
+
+/// Parse the authority of an http(s) URL. A bracketed literal must close at the end of the authority
+/// (optionally followed by `:port`), and a bare host may carry at most one numeric port.
+fn parse_authority(authority: &str) -> Option<&str> {
+    if let Some(inside) = authority.strip_prefix('[') {
+        let close = inside.find(']')?;
+        let host = inside.get(..close)?;
+        let after = inside.get(close.saturating_add(1)..)?;
+        if !after.is_empty() {
+            let port = after.strip_prefix(':')?;
+            if !valid_port(port) {
+                return None;
+            }
+        }
+        if !is_ipv6_literal(host) {
+            return None;
+        }
+        return Some(host);
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if port.is_some_and(|port| !valid_port(port)) {
+        return None;
+    }
+    Some(host)
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) && port.parse::<u16>().is_ok()
+}
+
+fn is_ipv6_literal(host: &str) -> bool {
+    !host.is_empty()
+        && host.contains(':')
+        && host.chars().any(|character| character.is_ascii_hexdigit())
+        && host.chars().all(|character| character.is_ascii_hexdigit() || matches!(character, ':' | '.'))
 }
 
 fn is_valid_host(host: &str) -> bool {
@@ -209,10 +306,10 @@ fn is_valid_host(host: &str) -> bool {
     host.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | ':') || !character.is_ascii())
 }
 
-fn query_has_hidden_recipient(query: &str) -> bool {
-    query.split('&').any(|field| {
-        let key = field.split('=').next().unwrap_or_default();
-        matches!(decode_percent(key).to_ascii_lowercase().as_str(), "to" | "cc" | "bcc")
+fn mailto_query_is_allowed(query: &str) -> bool {
+    query.split('&').all(|field| {
+        let key = field.split_once('=').map_or(field, |(key, _)| key);
+        matches!(decode_percent(key).to_ascii_lowercase().as_str(), "subject" | "body")
     })
 }
 
@@ -261,21 +358,25 @@ pub fn is_allowed_url(url: &str) -> bool {
 /// A filename that is safe as a Save suggestion: no directory component, control character,
 /// bidi/format control or Windows-reserved punctuation, no trailing dot or space, bounded length,
 /// and never an empty name or a Windows device name.
+///
+/// When a long name must be truncated, the final extension is preserved. A chosen path is a local
+/// trust boundary: this function sanitises the name, but does not canonicalise a symlink, reparse
+/// point or NTFS alternate data stream that the person selected in the native dialog. The reserved
+/// list covers the classic ASCII Win32 device names; `COM¹`/`COM²`/`COM³`, `CONIN$`/`CONOUT$` and
+/// stream suffixes remain local-path edge cases.
 #[must_use]
 pub fn safe_filename(raw: &str) -> String {
     let last = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
-    let mut cleaned = String::new();
-    for character in last.chars() {
-        if character.is_control() || is_format_control(character) {
-            continue;
-        }
-        if matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
-            cleaned.push('_');
-        } else {
-            cleaned.push(character);
-        }
-        if cleaned.chars().count() >= 120 {
-            break;
+    let extension = trailing_extension(last);
+    let mut cleaned = sanitize_component(last, MAX_FILENAME_CHARS);
+    if cleaned.chars().count() >= MAX_FILENAME_CHARS
+        && let Some(extension) = extension
+    {
+        let stem_limit = MAX_FILENAME_CHARS.saturating_sub(extension.chars().count().saturating_add(1));
+        let stem = sanitize_component(last, stem_limit);
+        let stem = stem.trim_end_matches(|character: char| character.is_whitespace() || character == '.');
+        if !stem.is_empty() {
+            cleaned = format!("{stem}.{extension}");
         }
     }
     // Unicode whitespace includes NBSP, thin space and narrow no-break space; Windows also drops
@@ -287,6 +388,39 @@ pub fn safe_filename(raw: &str) -> String {
     }
     let stem = cleaned.split('.').next().unwrap_or(cleaned).trim_end();
     if is_reserved_device_name(stem) { format!("_{cleaned}") } else { cleaned.to_owned() }
+}
+
+fn sanitize_component(raw: &str, limit: usize) -> String {
+    let mut cleaned = String::new();
+    for character in raw.chars() {
+        if character.is_control() || is_format_control(character) {
+            continue;
+        }
+        if matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            cleaned.push('_');
+        } else {
+            cleaned.push(character);
+        }
+        if cleaned.chars().count() >= limit {
+            break;
+        }
+    }
+    cleaned
+}
+
+/// The final ASCII extension of the raw name, ignoring trailing whitespace/dots and bidi/format
+/// controls. Only a short alphanumeric extension is preserved, so this cannot smuggle punctuation
+/// or a path into the truncated suggestion.
+fn trailing_extension(raw: &str) -> Option<String> {
+    let tail = raw.chars().rev().take(64).collect::<Vec<_>>().into_iter().rev().collect::<String>();
+    let tail = tail.chars().filter(|character| !character.is_control() && !is_format_control(*character)).collect::<String>();
+    let trimmed = tail.trim_end_matches(|character: char| character.is_whitespace() || character == '.');
+    let (_, extension) = trimmed.rsplit_once('.')?;
+    if (1..=16).contains(&extension.chars().count()) && extension.chars().all(|character| character.is_ascii_alphanumeric()) {
+        Some(extension.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 fn is_reserved_device_name(stem: &str) -> bool {
@@ -385,11 +519,69 @@ mod tests {
             "mailto:help@example.com?cc=attacker@evil.example",
             "mailto:help@example.com?to=attacker@evil.example",
             "mailto:help@example.com?b%63c=attacker@evil.example",
+            "mailto:help@example.com?attach=C:\\Users\\feder\\secret.pdf",
+            "mailto:help@example.com?attachment=%5C%5Cattacker.example%5Cshare%5Csecret.pdf",
+            "mailto:help@example.com?%61ttach=%5C%5Cattacker.example%5Cshare%5Csecret.pdf",
+            "mailto:help@example.com?unknown=value",
+            "mailto:help@example.com?subject=Preventivo&bcc=attacker@evil.example",
         ] {
             assert!(find_links(raw).is_empty(), "{raw}");
             assert!(!is_allowed_url(raw), "{raw}");
         }
-        assert!(find_links("mailto:help@example.com?subject=Preventivo").pop().is_some());
+        for raw in [
+            "mailto:help@example.com?subject=Preventivo",
+            "mailto:help@example.com?body=Ciao%20Federico",
+            "mailto:help@example.com?subject=Preventivo&body=Ciao",
+        ] {
+            assert!(find_links(raw).pop().is_some(), "{raw}");
+            assert!(is_allowed_url(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn mailto_recipient_lists_are_rejected_not_merged() {
+        for raw in [
+            "mailto:attacker@evil.example,help@example.com?subject=Preventivo",
+            "mailto:attacker@evil.example%2Chelp@example.com?subject=Preventivo",
+            "mailto:attacker@evil.example;help@example.com",
+            "mailto:attacker@evil.example%3Bhelp@example.com",
+            "mailto:attacker@evil.example%252Chelp@example.com",
+            "mailto:attacker@evil.example,help@example.com",
+        ] {
+            assert!(find_links(raw).is_empty(), "{raw}");
+            assert!(!is_allowed_url(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_mailto_link_keeps_the_explicit_recipient() {
+        let link = find_links("mailto:help@example.com?subject=Preventivo").pop().expect("a mailto link");
+        assert!(link.mailto);
+        assert_eq!(link.recipient.as_deref(), Some("help@example.com"));
+        assert_eq!(link.host, "example.com");
+
+        let cased = find_links("mailto:Help@Example.com?subject=Preventivo").pop().expect("a cased mailto link");
+        assert_eq!(cased.recipient.as_deref(), Some("Help@Example.com"), "the recipient line keeps the original spelling");
+    }
+
+    #[test]
+    fn malformed_authorities_are_not_links() {
+        for raw in ["https://[::1]extra/x", "https://[evil.example]/x", "https://example.com:80:90/x", "https://example.com:/x", "https://[:]/x"] {
+            assert!(find_links(raw).is_empty(), "{raw}");
+            assert!(!is_allowed_url(raw), "{raw}");
+        }
+        assert!(find_links("https://[::1]:443/x").pop().is_some());
+        assert!(find_links("https://example.com:443/x").pop().is_some());
+    }
+
+    #[test]
+    fn overlong_links_are_never_presented() {
+        let long = format!("https://example.com/{}", "a".repeat(MAX_LINK_BYTES));
+        assert!(find_links(&long).is_empty(), "a link over the bound is plain text");
+        assert!(!is_allowed_url(&long));
+        let at_bound = format!("https://example.com/{}", "a".repeat(MAX_LINK_BYTES - "https://example.com/".len()));
+        assert_eq!(at_bound.len(), MAX_LINK_BYTES);
+        assert!(find_links(&at_bound).pop().is_some(), "a link at the documented bound is still allowed");
     }
 
     #[test]
@@ -429,6 +621,7 @@ mod tests {
     fn a_hostile_paragraph_is_bounded() {
         let paragraph = (0..200).map(|index| format!("https://example.com/{index}")).collect::<Vec<_>>().join(" ");
         assert_eq!(find_links(&paragraph).len(), MAX_LINKS_PER_PARAGRAPH);
+        assert_eq!(find_links_limited(&paragraph, 5).len(), 5);
     }
 
     #[test]
@@ -438,7 +631,22 @@ mod tests {
         assert_eq!(safe_filename("a:b?.txt"), "a_b_.txt");
         assert_eq!(safe_filename(".."), "allegato");
         assert_eq!(safe_filename("   "), "allegato");
-        assert!(safe_filename(&"a".repeat(200)).chars().count() <= 120);
+        assert!(safe_filename(&"a".repeat(200)).chars().count() <= MAX_FILENAME_CHARS);
+    }
+
+    #[test]
+    fn a_truncated_filename_keeps_its_extension() {
+        let long_exe = format!("{}.exe", "a".repeat(130));
+        let safe = safe_filename(&long_exe);
+        assert!(safe.chars().count() <= MAX_FILENAME_CHARS, "{safe}");
+        assert!(safe.ends_with(".exe"), "{safe}");
+        assert_eq!(dangerous_kind(&safe), Some(DangerousKind::Executable));
+
+        let long_pdf = format!("{}.pdf", "b".repeat(200));
+        let safe = safe_filename(&long_pdf);
+        assert!(safe.chars().count() <= MAX_FILENAME_CHARS, "{safe}");
+        assert!(safe.ends_with(".pdf"), "{safe}");
+        assert_eq!(dangerous_kind(&safe), None);
     }
 
     #[test]
@@ -463,6 +671,8 @@ mod tests {
         }
         assert_eq!(dangerous_kind("report.pdf"), None);
         assert_eq!(dangerous_kind("no-extension"), None);
+        assert_eq!(dangerous_kind("setup.exe.bak"), None, "a suffix after the extension is not the extension");
+        assert_eq!(dangerous_kind("setup.exe1"), None);
         assert_eq!(dangerous_kind("setup.exe\u{00A0}"), Some(DangerousKind::Executable), "trailing whitespace must not hide the extension");
     }
 }

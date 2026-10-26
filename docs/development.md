@@ -227,15 +227,17 @@ The desktop shell is the only place that leaves Rust for a user action. Each exi
 an unavailable or recording one:
 
 - `LinkOpener` — `webbrowser` in production; `RecordingLinkOpener` in tests. The UI allowlists the
-  scheme in `reading::find_links`, shows the effective host, and rechecks the URL again in
+  scheme in `reading::find_links`, shows the host/recipient line, and rechecks the URL again in
   `confirm_pending_link` at the opener boundary, so a recorder only ever sees an allowed URL the
   person confirmed.
 - `FileSaver` — `rfd`'s native Save dialog plus an exclusive `write_new` (or `write` after the
   overwrite confirmation) in production; `RecordingFileSaver` in tests. The app classifies the
   sanitized suggested name, re-classifies the chosen path, checks overwrite itself and writes the
-  exact blob bytes once. `CancellingFileSaver` is the default in the demo/screenshot constructor so
-  a stray click cannot open a dialog; a real `--demo` launch also disables Save because the
-  synthetic attachment has no bytes.
+  exact blob bytes once. A failed new write removes its own partial file; an overwrite writes a
+  sibling temp file and renames it, so a failed write cannot truncate the original.
+  `CancellingFileSaver` is the default in the demo/screenshot constructor so a stray click cannot
+  open a dialog; a real `--demo` launch also disables Save because the synthetic attachment has no
+  bytes.
 - `FolderOpener` — the platform file manager in production; `RecordingFolderOpener` in tests and an
   unavailable adapter elsewhere. It only receives the blob directory derived from the store path.
 
@@ -308,7 +310,7 @@ the docs fixture), `palette` (command palette open), `labels` (Lavoro filter act
 with a seeded updated-at state), `offline` (a cached message open under the offline banner),
 `reading_attachments` (a deterministic message with a safe link and one PDF
 attachment in the pinned strip), `link_confirm` (the same message under the full-destination sheet,
-which shows the effective host as well as the exact URL) and `settings` (the full settings dialog).
+which shows the host/recipient line as well as the exact URL) and `settings` (the full settings dialog).
 The onboarding, mailbox and P6c scenes are deterministic fixtures; they do not read a store or touch
 the network, and the P6c scenes install the unavailable/cancelling seams so no native dialog or
 browser can open. `--dark` applies the dark theme.

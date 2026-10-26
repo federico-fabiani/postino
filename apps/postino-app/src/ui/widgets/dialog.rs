@@ -1,6 +1,6 @@
 //! The content of a modal dialog. The modal layer, scrim and focus trap belong to the screen.
 
-use eframe::egui::{Align, Frame, Layout, Margin, Stroke, Ui};
+use eframe::egui::{Align, Frame, Label, Layout, Margin, ScrollArea, Stroke, Ui};
 
 use crate::ui::tokens::{self, inset, radius, space};
 use crate::ui::typography::{self, Role};
@@ -22,12 +22,23 @@ pub struct Dialog<'a> {
     focus_primary: bool,
     focus_secondary: bool,
     width: f32,
+    body_max_height: Option<f32>,
 }
 
 impl<'a> Dialog<'a> {
     #[must_use]
     pub fn new(title: &'a str, body: &'a str, primary: &'a str) -> Self {
-        Self { title, body, primary, secondary: None, danger: false, focus_primary: false, focus_secondary: false, width: 420.0 }
+        Self {
+            title,
+            body,
+            primary,
+            secondary: None,
+            danger: false,
+            focus_primary: false,
+            focus_secondary: false,
+            width: 420.0,
+            body_max_height: None,
+        }
     }
 
     #[must_use]
@@ -65,6 +76,14 @@ impl<'a> Dialog<'a> {
         self
     }
 
+    /// Bound a long body inside a scroll area. The link sheet uses it so a 4 KiB URL cannot make a
+    /// dialog taller than the window; the body stays selectable for copying.
+    #[must_use]
+    pub fn body_scroll_height(mut self, height: f32) -> Self {
+        self.body_max_height = Some(height);
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> DialogResponse {
         let t = tokens::tokens(ui.visuals().dark_mode);
         let mut result = DialogResponse::default();
@@ -74,7 +93,13 @@ impl<'a> Dialog<'a> {
                 ui.set_width(self.width);
                 ui.label(typography::strong(Role::Emphasis, self.title, t.text));
                 ui.add_space(space::SM);
-                ui.label(typography::text(Role::Secondary, self.body, t.text_muted));
+                if let Some(height) = self.body_max_height {
+                    ScrollArea::vertical().id_salt(("dialog-body", self.title)).max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.add(Label::new(typography::text(Role::Secondary, self.body, t.text_muted)).selectable(true));
+                    });
+                } else {
+                    ui.label(typography::text(Role::Secondary, self.body, t.text_muted));
+                }
                 ui.add_space(space::XL);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let primary = if self.danger { Button::danger(self.primary) } else { Button::new(self.primary).kind(ButtonKind::Primary) };

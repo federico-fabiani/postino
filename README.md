@@ -50,11 +50,13 @@ MCP      ─┘
   narrows it; ids are stable and never reused. Rename, delete and apply/remove are undoable in the
   app; creating a label is not an undo step. Labels are in-memory metadata until M1.
 - A text reading pane with sender, recipients, Cc, date, subject and label chips, a quiet “Vista
-  testo” note, and safe links. Only absolute `http`, `https` and `mailto` are clickable; the full
-  destination and the effective host appear in the confirmation sheet, and only **Apri** hands it to
-  the system browser. A punycode (`xn--`) or non-ASCII host warns first, and userinfo, backslash
-  tricks and `mailto:` Cc/Bcc queries are refused. No `javascript:`, `file:`, `data:`, `vbscript:`
-  or relative target is ever a link.
+  testo” note, and safe links. Only absolute `http`, `https` and `mailto` are clickable; the
+  confirmation sheet keeps the full URL and, for a web link, names the domain as written (an ASCII
+  host, or the Unicode spelling with a punycode warning when it is not ASCII); a `mailto:` names its
+  explicit recipient and uses “client di posta”, not “browser”. Only **Apri** hands it to the system
+  browser or mail client. Userinfo and `mailto:` recipient lists, Cc/Bcc, `attach` fields and unknown
+  query fields are refused; a backslash authority is accepted only with a warning. No `javascript:`,
+  `file:`, `data:`, `vbscript:` or relative target is ever a link.
 - Attachment Save through the native Save dialog writes the exact blob bytes, warns before saving an
   executable or macro-enabled file (including a `.exe` chosen in the dialog), refuses to replace an
   existing file until confirmed, and reports a missing blob as a readable toast. In `--demo` Save is
@@ -262,8 +264,11 @@ The GNU toolchain plus MSYS2 is the path documented here.
   but the blocked-image count is not surfaced in the pane yet: carrying it through sync and the store
   is the P6d follow-up after the schema v5 work. In `--demo` the synthetic attachments have no bytes, so
   Save is disabled with that reason rather than reporting a corrupt file. A link reaches the system
-  browser only after the confirmation sheet, and Save writes attachment bytes to the chosen path
-  without opening the file. See [docs/product.md](docs/product.md).
+  browser or mail client only after the confirmation sheet, and Save writes attachment bytes to the
+  chosen path without opening the file. The chosen path is a local trust boundary: the app sanitizes
+  the suggested filename and re-classifies the chosen name, but does not canonicalize a symlink,
+  reparse point or NTFS alternate data stream that the person selects. See
+  [docs/product.md](docs/product.md).
 
 ## Documentation
 
