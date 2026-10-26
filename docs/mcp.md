@@ -79,6 +79,14 @@ agent can read the message and recover.
 | `search` | yes | FTS5 search with fields, phrases, prefixes and AND/OR/NOT; bm25 order, plain snippets, pageable |
 | `search_status` | yes | Index readiness, FTS/rank row-id drift, document/message counts, database+WAL size, last error and last index update |
 | `search_reindex` | no | Delete and rebuild the encrypted FTS and rank indexes in resumable batches; single-process only |
+| `threads_list` | yes | Conversation rows with participants, subject, snippet, date, state, mailbox-wide counts and labels; folder/label/flag scope, pageable |
+| `thread_get` | yes | One conversation and an ascending page of ≤ 200 message summaries; old merged ids resolve through aliases |
+| `thread_flag` | no | Set read/starred on every message of a thread (≤ 500); idempotent, returns the refreshed row and the real transition count |
+| `saved_searches_list` | yes | Saved searches with computed total/unread counts, `valid`/`error` for a stale query, and the eight recent queries |
+| `saved_search_create` | no | Save a named query (≤ 12 per account, unique ignoring case; query validated now) |
+| `saved_search_update` | no | Change the name, query and/or sort of one saved search |
+| `saved_search_delete` | no | Delete one saved search; local metadata only, never a message |
+| `saved_search_recent_clear` | no | Forget one account's recent queries from the encrypted `meta` table |
 | `labels_list` | yes | Labels with mailbox-wide total and unread counts |
 | `label_create` | no | Create a local label with a semantic colour |
 | `label_update` | no | Rename and/or recolour a label; the id is stable |
@@ -201,6 +209,31 @@ error code and byte position; the query itself is never echoed into a log. The o
 / `with_attachments` are filters in the same scope as the page. `search_status` is offline and
 read-only; `search_reindex` is a local write and never contacts a server. It is a single-process
 maintenance action: do not run it from the desktop and MCP at the same time.
+
+## Conversations and saved searches over MCP
+
+`threads_list` returns one row per conversation with `{id, subject, snippet, participants, last_date,
+message_count, unread_count, starred_count, has_attachments, latest_message_id, labels, state}`.
+`folder`, `label`, `unread_only`, `starred_only` and `with_attachments` decide which conversations are
+listed; the counts on a row stay mailbox-wide. `total`, `unread_threads` and `unread_messages` describe
+the filtered scope. `thread_get` returns an ascending page of ≤ 200 message summaries; bodies are read
+with `message_get`. An id merged into another conversation still resolves, and `resolved_id` is the
+current one. `thread_flag` sets `unread` and/or `starred` on every message of one thread (≤ 500),
+returns the refreshed row and the number of real transitions, and a repeat returns `changed: 0`.
+Thread archive/delete is not a separate tool: call `message_move` for the ids returned by
+`thread_get`.
+
+`threads_list`, `thread_get` and `saved_searches_list` are read-only. `thread_flag`,
+`saved_search_create`, `saved_search_update` and `saved_search_recent_clear` are local writes, and
+`saved_search_delete` is the only destructive one (metadata only). None is sensitive and none opens a
+network connection. MCP marks `thread_flag` idempotent.
+
+`saved_searches_list` returns `{searches, recent}`. A search whose label or folder was deleted later
+is `valid: false` with `error` and zero counts; it is not hidden. `saved_search_create` takes
+`{account?, name, query, sort?}` and validates the query (parse plus label/folder resolution) before
+storing it; names are 1–48 characters, unique per account ignoring case, at most 12 per account.
+`sort` is `relevance` or `date`. `recent` holds the last eight successful queries in the encrypted
+`meta.recent_searches:<account>` value; `saved_search_recent_clear` forgets them.
 
 
 `draft_save` refuses CR/LF in addresses or the subject, validates every recipient, and returns the

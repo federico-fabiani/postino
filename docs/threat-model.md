@@ -360,14 +360,47 @@ crash-dump entry above.
   database+WAL size; `search_reindex` rebuilds from the encrypted rows. Opening a pending index does
   not block mail; the shell advances batches. `search_reindex` is a single-process maintenance action:
   there is no cross-process advisory lock, so do not run it from the desktop and MCP at once. A failed
-  v7 migration rolls back to v6. The inert P9b/P9c tables hold no P9a data.
+  v7 migration rolls back to v6. P9b now owns the `threads`, `thread_aliases` and `saved_searches`
+  tables; the P9c rule tables remain inert.
 - **Residual.** SQLite's row store keeps a 2 KiB body inline in `messages`; a covering summary index
   keeps those pages out of the open scan, but 100k summaries still take 268–357 ms to load and decode in
   the measured debug build. The app holds summaries and a small body cache, not a second index. The
   open target is missed and reported; the RSS target is not established (the 154.7–156.5 MiB figure is the
   seeding test process's high-water mark, not an opened mailbox).
 
-## 5. Out of scope
+### 4.9 Conversations and saved searches (P9b)
+
+- **Untrusted references.** `References` and `In-Reply-To` are bounded before they become cache keys:
+  one angle-bracket pair is trimmed, controls are refused, each reference is at most 512 bytes and the
+  chain is capped at 32 entries, deduplicated, and a self-reference is ignored. Alias chains are
+  bounded at 16 with a visited set, so a damaged `thread_aliases` row cannot make resolution loop. All
+  values are bound; no reference text is interpolated into SQL.
+- **Merge safety.** The cache update, the message moves, the alias and the row deletion are one
+  transaction. A merge into the smallest id is deterministic for the same candidate set; a late
+  reference that resolves to a deleted id follows the alias. An empty thread row is deleted rather
+  than left as a stale conversation. A message with more than 500 members refuses `thread_flag`
+  instead of changing part of it, and a UI bulk action over the 200-message page refuses with a
+  sentence.
+- **Subject fallback.** Only a message with no references and no parent, a reply/forward prefix, a
+  normalised subject of at least 8 bytes, and exactly one thread inside the 14-day window attaches.
+  Two matches drop the fallback; subject text is never used to merge two existing threads, so a
+  generic “Re: update” cannot fuse unrelated conversations.
+- **Saved queries are local metadata.** Names and query text live in SQLCipher; at most 12 per account,
+  unique ignoring case, and the query is parsed and resolved before it is stored. A query whose label
+  or folder disappears is shown as invalid with a reason and no counts, never silently broadened. The
+  eight recent queries live in `meta.recent_searches:<account>` inside the encrypted database and are
+  cleared by an explicit command. No query, subject or address is logged; saved-search errors name the
+  stale label or folder to the caller but never reach a log.
+- **Counts are derived.** `total`/`unread` use the same bound search path as `search`, capped at
+  10 000, and are cached only by engine revision. A pending index reports the saved search as invalid
+  with “the search index is not ready” instead of a wrong number.
+- **Residual.** A conversation folder view at 100k crosses the covering message index (360–449 ms
+  P95 on the debug host) and misses the 100 ms budget; it is reported, not hidden. Mail cached by P9a
+  keeps its P9a placeholder thread ids until an explicit rebuild; no pre-P9 headers are re-read at
+  open. The one-time P9a cache build adds ~2 s to the first open of a 100k store and nothing to later
+  opens.
+
+
 
 - A compromised operating system, kernel, firmware or keylogger.
 - A compromised mail provider.

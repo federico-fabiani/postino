@@ -84,7 +84,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | done |
 | P8 | M2 compose | attachment bytes, signatures per identity, reply/forward recipients and headers, size caps | done |
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, v7 inert tables | done |
-| P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | active |
+| P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | done |
 | P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | todo |
 | P10 | M4 daemon | `postino-daemon`, named pipe/UDS + token, tray, autostart, clients | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
@@ -101,8 +101,12 @@ after its blind review closure: real attachment bytes, per-account signatures, r
 headers and the 20/25 MiB caps, with no schema change. M2 is complete. P9a is done after its review
 closure: schema v7, the body-free read path, FTS5 query language, operations, UI and 100k evidence.
 The search first-page target is met (51 ms P50 at 100k); open misses its 150 ms target and RSS is
-unverified, both stated in the architecture table. P9b/P9c inherit the inert v7 tables and need no
-migration.
+unverified, both stated in the architecture table. P9b is done in two green commits: P9b1 is the
+reference-chain engine, thread cache, operations, CLI/MCP and 20k/100k evidence; P9b2 is the
+conversation view, saved searches, screenshots and docs. The account-wide `threads_list` target is met
+(82 ms P50 / 92 ms P95 at 100k); the folder-scoped list misses it (360–449 ms P95) and is reported in
+the architecture/threat-model tables. P9b adds an idempotent cache index on normal open but no schema
+version change; P9c still inherits the inert v7 rule tables and needs no migration.
 
 ## 5. Delighters backlog
 

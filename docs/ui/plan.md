@@ -243,11 +243,41 @@ per action, no hidden mutation.
 - A pending index shows `Indice di ricerca in preparazione (x/y)` in the list header; the shell advances
   one 500-row batch per tick, so opening the mailbox never blocks on the rebuild. A failed build shows
   the stored Italian reason from `search_status.last_error`; `search_reindex` remains available from
-  the CLI. Saved searches and a recent-query row are P9b.
+  the CLI.
 - 980×600 light/dark screenshots: `docs/images/postino-p9a-search.png`,
   `postino-p9a-search-dark.png`, `postino-p9a-search-error.png`,
   `postino-p9a-search-error-dark.png`. The headless render test asserts the results, syntax help and
   parse error at the minimum size.
+
+### 6.6 Conversations and saved searches (P9b)
+
+- **Folder views list conversations by default.** A row shows the subject (reply/forward prefixes
+  stripped), the participants (first two names), the date and `n messaggi · m non letti`; the
+  unread dot is gold ink on ivory and gold on the forest selection, and the mailbox-wide label ids
+  are carried in the data model. J/K move the selected row without opening it, Enter loads the
+  conversation and opens its latest unread message, `Esc` goes back to the list.
+- **Search stays flat.** Entering a query switches the list to the message table; the palette command
+  **Conversazioni** groups the *search hits* by thread (counts describe the hits, not the mailbox).
+  Clearing the query restores the folder's threaded default. `Messaggi` in the chip row is the same
+  toggle.
+- **Reading a conversation.** The top of the reading pane is a `CONVERSAZIONE` banner: subject,
+  `n messaggi · m non letti`, and one compact card per message (sender and time). Exactly one card is
+  expanded; J/K move it, Enter opens it, R/A/F reply/reply-all/forward it. E/U/S act on the whole
+  thread and one undo restores the batch; the same actions are in the row context menu. A thread over
+  the 200-message page refuses a bulk action with a sentence instead of acting on part of it. At
+  980×600 the pane is the existing full overlay (`Torna alla posta`, Esc).
+- **RICERCHE** sits under ETICHETTE: at most 12 named searches, with unread/total counts, a gold dot
+  when valid and a danger dot plus “Ricerca non valida” when its label or folder disappeared. Clicking
+  applies it: the query replaces the field, the label filter clears, and the current folder is kept
+  only when the query contains `folder:`; Esc restores the previous query, folder, filters and view.
+  `Salva ricerca` (field `+`, palette) opens the sidebar drawer with a name and the query; rename and
+  edit reuse it; delete shows an undo toast. Applying or saving scrolls the section into view.
+- The last eight successful queries appear as chips when the search field is focused and empty;
+  **Cancella ricerche recenti** in the palette clears them. They live only in the encrypted store.
+- 980×600 light/dark screenshots: `docs/images/postino-p9b-threads-980.png`,
+  `postino-p9b-threads-980-dark.png`, `postino-p9b-conversation-980.png`,
+  `postino-p9b-conversation-980-dark.png`, `postino-p9b-saved-searches-980.png`,
+  `postino-p9b-saved-searches-980-dark.png`.
 
 ## 7. Compose and drafts
 

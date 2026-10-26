@@ -9,7 +9,9 @@ registry shared by the desktop app, the CLI and an MCP server.
 > data (P6b) + the text reading pane, safe links, attachment Save and full settings (P6c) + SMTP
 > submission and the outbox (P7) + compose depth: attachment bytes, per-account signatures and
 > reply/forward headers (P8) + encrypted FTS5 search with a documented query language, a
-> body-free read path and schema v7 (P9a).** The desktop app opens the encrypted SQLCipher store by default,
+> body-free read path and schema v7 (P9a) + conversations from the reference chain, thread
+> operations, the one-open-card conversation view and saved searches (P9b).** The desktop app opens
+> the encrypted SQLCipher store by default,
 > offers a guided Aruba/Gmail/custom onboarding with a real connection test and background sync, and
 > reads cached mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI
 > and the MCP server use the same operation registry: `postino --store <path>` (or the default
@@ -28,6 +30,12 @@ registry shared by the desktop app, the CLI and an MCP server.
 > server-side signatures are explicitly out of scope for M2.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
+
+![Conversations at 980×600: participants, subject, date and mailbox-wide counts](docs/images/postino-p9b-threads-980.png)
+
+![An open conversation at 980×600: one expanded card, the others one click away](docs/images/postino-p9b-conversation-980.png)
+
+![Saved searches at 980×600: RICERCHE under ETICHETTE and an applied query](docs/images/postino-p9b-saved-searches-980.png)
 
 ![Encrypted search at 980×600: query chips, syntax help and bm25-ranked results](docs/images/postino-p9a-search.png)
 
@@ -80,13 +88,36 @@ MCP      ─┘
   reading width), data (store and blob paths with a copy action, open the blob folder) and version,
   licences and shortcuts; every section fits 980×600 and returns focus to the account switcher on
   `Esc`.
-- Thirty-two typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
+- Forty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
   `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_flag`, `message_move`,
   `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
   `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`,
-  `search_status`, `search_reindex`, `labels_list`, `label_create`, `label_update`, `label_delete`,
+  `search_status`, `search_reindex`, `threads_list`, `thread_get`, `thread_flag`,
+  `saved_searches_list`, `saved_search_create`, `saved_search_update`, `saved_search_delete`,
+  `saved_search_recent_clear`, `labels_list`, `label_create`, `label_update`, `label_delete`,
   `label_apply`.
+- **Conversations (P9b).** Thread ids come from the message's reference chain: an incoming
+  `References`/`In-Reply-To` is normalised, bounded and resolved against the cached conversations; an
+  unresolved reference becomes a phantom root waiting for its parent, two resolved threads merge into
+  the smallest id and the old id stays as an alias. A late parent joins the children, a subject
+  fallback attaches only a `Re:`/`Fwd:` message with a normalised subject of at least 8 bytes to
+  exactly one thread within 14 days, and a duplicate `Message-ID` resolves through the smallest local
+  id. Folder views list one row per conversation with participants, subject, date and mailbox-wide
+  unread/starred/message counts; `/` search stays flat until **Conversazioni** in the palette turns it
+  into grouped results. Opening a thread shows one expanded card, `J`/`K` move the open card,
+  `Enter` opens it, `R`/`A`/`F` reply/reply-all/forward it, and `E`/`U`/`S` act on the whole thread
+  with one undo. `threads_list`, `thread_get` and `thread_flag` are the operation surface; `thread_get`
+  follows aliases and the cache is rebuilt by `search_reindex`.
+- **Saved searches (P9b).** The sidebar's **RICERCHE** section (under ETICHETTE) saves up to 12 named
+  queries per account with unique names ignoring case. Applying one replaces the query, clears the
+  label filter and keeps the folder only when the query names one; `Esc` restores the previous query,
+  folder and filters. Counts are computed and cached until the mailbox changes; a query whose label or
+  folder was deleted is shown as invalid with the reason, not hidden. The last eight successful
+  queries live in the encrypted `meta.recent_searches:<account>` table and appear as chips when the
+  search field is focused and empty; “Cancella ricerche recenti” clears them. Rename, edit and delete
+  are undoable, and `saved_searches_list` plus the four CRUD/recent operations expose the same surface
+  to agents.
 - **Encrypted search (P9a).** `search` runs on the FTS5 index inside SQLCipher, not over an in-memory
   body vector: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:`, `has:`,
   `before:`/`after:`, `larger:`/`smaller:`, quoted phrases, `*` prefixes and uppercase `AND`/`OR`/`NOT`
@@ -107,11 +138,12 @@ MCP      ─┘
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
 - The persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema v7
-  (the v5 outbox, the v6 remote-image count and the v7 search columns/index plus inert P9b/P9c
-  tables), additive migrations and a typed repository (`postino-store`), plus the OS keyring seam
-  (`postino-platform`). `Engine::open` loads summaries once, repairs orphan drafts, writes every
-  mutation through in one transaction and keeps store errors categorised; the desktop app boots on
-  the store, with `--demo` as the synthetic fallback.
+  (the v5 outbox, the v6 remote-image count, the v7 search columns/index, the conversation cache and
+  the saved-search/rules tables), additive migrations and a typed repository (`postino-store`), plus
+  the OS keyring seam (`postino-platform`). `Engine::open` loads summaries once, repairs orphan
+  drafts, builds the conversation cache for a P9a store once, writes every mutation through in one
+  transaction and keeps store errors categorised; the desktop app boots on the store, with `--demo`
+  as the synthetic fallback.
 - The M1 MIME foundation as a crate (`postino-mime`, P4a): bounded RFC 5322/2045 parsing with
   recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
@@ -226,8 +258,9 @@ MCP      ─┘
 ![The signature editor in the dark theme at 980×600](docs/images/postino-p8-signature-980-dark.png)
 
 The last four captures were exported from a 1.25× scaled Windows host, so the PNGs are 1225×750 while
-the layout and every headless test are 980×600. The composer still has no schedule control:
-scheduling is `postino send --at` or `send_schedule` over MCP until the UI action lands.
+the layout and every headless test are 980×600. The P9b conversation and saved-search captures use the
+same harness and physical size. The composer still has no schedule control: scheduling is `postino
+send --at` or `send_schedule` over MCP until the UI action lands.
 
 Everything below the UI is headless and has no egui dependency.
 
@@ -247,6 +280,12 @@ cargo run -p postino-cli -- --demo read msg_001
 cargo run -p postino-cli -- --demo search fattura
 cargo run -p postino-cli -- --demo search "from:giulia is:unread" --sort date
 cargo run -p postino-cli -- --demo search "subject:\"fattura 2026\" OR label:lbl_1"
+cargo run -p postino-cli -- --demo threads --folder inbox
+cargo run -p postino-cli -- --demo thread get thr_preventivo
+cargo run -p postino-cli -- --demo thread flag thr_preventivo --read
+cargo run -p postino-cli -- --demo saved create "Fatture" "label:Fatture" --sort date
+cargo run -p postino-cli -- --demo saved list
+cargo run -p postino-cli -- --demo saved recent-clear
 cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" search-status
 cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" search-reindex
 cargo run -p postino-cli -- --demo run messages_list folder=inbox limit=2

@@ -360,6 +360,12 @@ cargo run -p postino-app -- --screenshot compose --size 980x600 --out docs/image
 cargo run -p postino-app -- --screenshot compose --size 980x600 --dark --out docs/images/postino-p8-compose-980-dark.png
 cargo run -p postino-app -- --screenshot settings_signature --size 980x600 --out docs/images/postino-p8-signature-980.png
 cargo run -p postino-app -- --screenshot settings_signature --size 980x600 --dark --out docs/images/postino-p8-signature-980-dark.png
+cargo run -p postino-app -- --screenshot threads --size 980x600 --out docs/images/postino-p9b-threads-980.png
+cargo run -p postino-app -- --screenshot threads --size 980x600 --dark --out docs/images/postino-p9b-threads-980-dark.png
+cargo run -p postino-app -- --screenshot conversation --size 980x600 --out docs/images/postino-p9b-conversation-980.png
+cargo run -p postino-app -- --screenshot conversation --size 980x600 --dark --out docs/images/postino-p9b-conversation-980-dark.png
+cargo run -p postino-app -- --screenshot saved_searches --size 980x600 --out docs/images/postino-p9b-saved-searches-980.png
+cargo run -p postino-app -- --screenshot saved_searches --size 980x600 --dark --out docs/images/postino-p9b-saved-searches-980-dark.png
 ```
 
 The states are `shell` (demo inbox, no selection), `reading` (first inbox message open),
@@ -376,8 +382,10 @@ with a seeded updated-at state), `offline` (a cached message open under the offl
 `reading_attachments` (a deterministic sanitized message with one stored blocked remote image, a safe
 link and one PDF attachment in the pinned strip), `link_confirm` (the same message under the
 full-destination sheet, which shows the host/recipient line as well as the exact URL), `settings`
-(the full settings dialog) and `settings_signature` (the same dialog with the per-account Firma editor
-open and a seeded signature). The onboarding, mailbox, P6c, P6d and P8 scenes are deterministic
+(the full settings dialog), `settings_signature` (the same dialog with the per-account Firma editor
+open and a seeded signature), `threads` (the demo inbox grouped by conversation), `conversation`
+(the preventivo thread open with one expanded card) and `saved_searches` (three saved searches with
+the `from:giulia` one applied). The onboarding, mailbox, P6c, P6d, P8 and P9b scenes are deterministic
 fixtures; they do not read a store or touch the network, and the P6c/P8 scenes install the
 unavailable/cancelling seams so no native dialog or browser can open. The `reading_attachments`
 message is **stored truth**: its HTML is already sanitized (no remote `src`, no tracker) and

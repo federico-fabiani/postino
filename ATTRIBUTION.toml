@@ -631,6 +631,66 @@ license_file = "LICENSE-MIT"
 sha256 = "f02edaebabea771a1fbeb00c8640d0744f7b1c684ef63d1f09a7f76a7189ee75"
 usage = "Documentation screenshot of the dark-theme search parse error"
 
+[[asset]]
+path = "docs/images/postino-p9b-threads-980.png"
+title = "Postino conversations at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "b4235b58a626878db508caf90774b2a620a269e5948bfdbcddb3f47d6cffc29c"
+usage = "Documentation screenshot of conversation rows, participants and mailbox-wide counts at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p9b-threads-980-dark.png"
+title = "Postino conversations at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "6cd898e0c3b2902e331c2a4e77d16f7d19faa0fe40ce7f3e250b4cbdee4d40df"
+usage = "Documentation screenshot of dark-theme conversation rows at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p9b-conversation-980.png"
+title = "Postino open conversation at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "77e83b03b7359f172496c59f0289b39b8e96f97aa62215f6a59a169432122c31"
+usage = "Documentation screenshot of the one-open-card conversation overlay and its actions at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p9b-conversation-980-dark.png"
+title = "Postino open conversation at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "e3526d07939b9c0fec01cb4fae791479501c4f284d4bb8696f7554fd0a8be5bc"
+usage = "Documentation screenshot of dark-theme conversation cards at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p9b-saved-searches-980.png"
+title = "Postino saved searches at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "0d538657458c7701ab6eb4cb2a3789ee5a4b5acb012f666679042ebdef516214"
+usage = "Documentation screenshot of the RICERCHE sidebar and an applied saved search at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p9b-saved-searches-980-dark.png"
+title = "Postino saved searches at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "b47fc5b91fd774f6de27f29275894eb908b3c7603f079c9db0d5b0bfa5e27c0e"
+usage = "Documentation screenshot of dark-theme saved searches and recent queries at the minimum window"
+
 [[dependency]]
 name = "Phosphor Icons"
 version = "bundled with egui-phosphor 0.14.0"

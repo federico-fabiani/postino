@@ -4,7 +4,8 @@
 > crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) + sync into the store (P5b) +
 > accounts and credentials (P6a) + app on real mail (P6b/P6c) + remote-content count (P6d) + SMTP
 > submission and the outbox (P7) + compose depth: attachment bytes, signatures per account and
-> reply/forward headers (P8) + encrypted FTS5 search, the body-free read path and schema v7 (P9a) ·
+> reply/forward headers (P8) + encrypted FTS5 search, the body-free read path and schema v7 (P9a) +
+> conversation derivation/merge/alias, the conversation view and saved searches (P9b) ·
 > **Last updated:** 2026-10-26 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
@@ -19,7 +20,7 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounds, typed errors |
 | `crates/platform` | OS seams: store key and account credentials in the OS keyring |
-| `crates/store` | SQLCipher schema v7, migrations, the repository, FTS5 search, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7, P9a) |
+| `crates/store` | SQLCipher schema v7, migrations, the repository, FTS5 search, the conversation cache, saved searches, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7, P9a, P9b) |
 | `crates/sync` | One account from IMAP into the store, plus submission serialization and the Sent append (P5b, P7) |
 | `crates/testkit` | Test-only fake IMAP/SMTP servers, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -116,10 +117,10 @@ decision and the migration path.
 | Crate | Responsibility |
 |---|---|
 | `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
-| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a) |
+| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b) |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
 | `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. Autodiscovery and QRESYNC later |
-| `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler and full threading later |
+| `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler later |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
 | `postino-rules` | local rules and Sieve generation |
 | `postino-ipc` | JSON-RPC over pipe/socket, token, versioning |
@@ -314,9 +315,10 @@ the daemon (M4). The repository returns folders and labels ordered by name; onbo
 server's folder tree in that order.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
-a store. **Still missing:** full threading and saved searches (P9b), local rules (P9c), the daemon
-scheduler (M4) and HTML rendering (M5). The default store path, the account/sync operations and their
-CLI/MCP bindings landed in P6a (§4.7); the body-free read path and search landed in P9a (§4.11).
+a store. **Still missing:** local rules (P9c), the daemon scheduler (M4) and HTML rendering (M5). The
+default store path, the account/sync operations and their CLI/MCP bindings landed in P6a (§4.7); the
+body-free read path and search landed in P9a (§4.11); conversations and saved searches landed in P9b
+(§4.12).
 
 ### 4.3 Implemented in P4a: the MIME crate
 
@@ -592,9 +594,11 @@ row. The same Message-ID in another folder is a move: the row keeps its id and l
 folder wins `folder_id`. A message without a Message-ID that moves gets a new id, so its labels
 cannot follow; the old row is removed only after the new copy exists, at the end of a complete run.
 
-**Threading.** `thread_id` is the first `References` entry, else `In-Reply-To`, else the message's own
-Message-ID (or the local id when it has none), all without angle brackets. That is a stable
-placeholder that links a reply to a root; full JWZ threading is P9b.
+**Threading.** Sync stores the bounded `References` chain and `In-Reply-To` (no angle brackets) with
+the message, and writes a provisional thread id (first reference, else parent, else own Message-ID or
+local id). `postino-store` re-derives the id from the cached conversations in the same transaction
+(P9b, §4.12): phantom roots, late-parent joins, merges and aliases live in the store, not in the IMAP
+client. The sync layer never invents a server-side thread; IMAP `THREAD` is not used.
 
 **Flags.** Server flags are applied only when a message is first inserted: `\Seen` becomes
 `unread = false`, `\Flagged` becomes `starred = true`. On later runs the local `unread`/`starred` are
@@ -658,8 +662,9 @@ run or an explicit `recount_folder`.
 
 **Not synced.** Server-side filters and rules, flag changes pushed out, `EXPUNGE`, `APPEND` of drafts
 or sent mail, `CONDSTORE`/`QRESYNC` increments, a folder-removal pass (a folder deleted on the server
-keeps its cached rows until a later package decides), full JWZ threading (P9b) and any periodic
-scheduler. P9a adds the FTS trigger path to every synced message; P6a adds the operations and the CLI/MCP bindings; P6b adds the worker, so a run starts on
+keeps its cached rows until a later package decides) and any periodic
+scheduler. Threading is derived locally from the synced references (P9b), not requested from the
+server; there is no `THREAD` command. P9a adds the FTS trigger path to every synced message; P6a adds the operations and the CLI/MCP bindings; P6b adds the worker, so a run starts on
 launch, on Refresh, or from onboarding. There is still no daemon and no timer inside the process.
 
 **Evidence.** The scripted server moved to `postino-testkit`, and the sync tests script real protocol
@@ -1203,7 +1208,96 @@ incremental sync were not measured in P9a and are not claimed.
 
 
 
+### 4.12 Implemented in P9b: conversations and saved searches
+
+A conversation is identified by an account-scoped **root reference**, not by a local message id.
+`postino-store::threads` derives it when a message is written, in the same transaction as the row:
+the first `References` entry that resolves to a cached thread wins; otherwise the first usable
+reference is the phantom root; otherwise the `In-Reply-To` parent thread, then the parent itself,
+then the message's own `Message-ID`, then its local id. A reference is trimmed of one angle-bracket
+pair, refused when it contains a control or exceeds 512 bytes, the chain is capped at 32 entries and
+deduplicated, and a self-reference is ignored. A reference resolves through the smallest local
+`Message-ID` copy, an existing thread row or the alias table; alias chains are bounded at 16 so a
+damaged table cannot loop. Two resolved threads merge into the lexicographically smallest id, every
+message moves, the old row is deleted and an `thread_aliases(old_id,new_id)` entry keeps old links
+working; `thread_get` follows it and returns `resolved_id`. A message whose own `Message-ID` names a
+phantom thread adopts it, which is how a late parent joins the replies that were waiting for it.
+Unresolved sibling references are aliased to the chosen root, so a root that arrives later joins the
+same conversation. Ids change only on a merge.
+
+The subject fallback is deliberately narrow: no `References` and no `In-Reply-To`, a `Re:`/`Fwd:`/`Fw:`
+prefix, a normalised subject of at least 8 bytes, and exactly one distinct thread with that subject
+inside a ±14-day window. It attaches this message to that thread; it never merges two threads, and two
+matching threads drop the fallback. A message re-fetch is idempotent, a reopen reads the stored ids,
+and a `UIDVALIDITY` reset re-derives the same ids from the same headers. Mail cached by P9a keeps its
+P9a placeholder ids until an explicit rebuild; P9b does not re-read every pre-P9 message at open (that
+would add a full mailbox derivation to the startup path). `search_reindex` rebuilds the cache rows,
+not the ids.
+
+`threads` is a cache. Counts are mailbox-wide, the subject is the earliest message's subject, and
+`latest_message_id` is the row a click opens. Ingest, flag changes, deletes, merges and draft sends
+refresh only the affected rows; `Store::refresh_all_threads` rebuilds the table from `messages` in one
+transaction, and `Engine::open` runs it once when a P9a store has messages but an empty cache. A folder
+or label view lists threads with at least one message in scope without narrowing the counts on the
+row. `Store::list_threads` reads a page from the cache and the latest snippet per row **after** the
+`LIMIT`, so a 100k cache never joins every message before the page. The cache gets an idempotent
+`threads(account_id,last_date DESC,id)` index on normal open: it is derived-cache maintenance, not a
+schema version (`user_version` stays 7), and a read-only open never creates it.
+
+**Operations.** `threads_list {account?,folder?,label?,unread_only?,starred_only?,with_attachments?,
+limit?,offset?}` returns `{threads,total,unread_threads,unread_messages}` with participants, subject,
+snippet, date, state, counts and labels. `thread_get {id,account?,limit?,offset?}` returns ascending
+message summaries (≤200), `total`, `truncated` and `resolved_id`; bodies stay behind `message_get`.
+`thread_flag {id,account?,unread?,starred?}` changes every message in the thread (≤500), is
+idempotent and reports the refreshed row plus the real transition count. Archive/delete stay
+`message_move` over the thread's ids, so one undo covers the batch. All three are local and offline;
+none is sensitive, and MCP marks `thread_flag` idempotent.
+
+**UI.** Folder views list one row per conversation by default: participants, subject, date, message
+and unread counts, mailbox-wide labels. A search starts flat and the **Conversazioni** command groups
+its hits instead. Opening a row shows the conversation banner at the top of the reading pane, one
+compact card per message and exactly one expanded message: `J`/`K` move the open card, `Enter` opens
+the latest unread, `R`/`A`/`F` reply/reply-all/forward it, `E`/`U`/`S` act on the whole thread, and
+`Esc` goes back to the list. At 980×600 the reading pane is the full overlay the P2b layout already
+uses. A thread with more than the 200-message page refuses a bulk move/flag with a sentence instead
+of acting on part of it.
+
+**Saved searches.** `saved_searches` holds at most 12 names per account (unique ignoring case), 1–48
+characters, with the documented query language and `sort` `relevance`/`date`. Create and update
+parse and resolve the query now, so an unclosed quote, an unknown label or an unknown folder is
+refused instead of stored; a label or folder deleted later leaves the row visible as `valid:false`
+with `error`, never a dead entry. Counts (`total`, `unread`) are computed by the same search path as
+`search`, cached by engine revision, and a pending FTS index reports invalid with “the search index
+is not ready”. Applying a saved search replaces the query, clears the label filter and keeps the
+current folder only when the saved query contains `folder:`; `Esc` restores the query, folder, filters
+and threaded mode. The last eight successful queries live in `meta.recent_searches:<account>` inside
+SQLCipher; the sidebar shows them as chips while the empty search field is focused and the palette
+has an explicit clear command. Rename, edit and delete are undoable; CRUD leaves the packaged store
+in the encrypted database.
+
+**Evidence.** The P9b fixture has 100 000 messages, 2 KiB bodies and 50 messages in one grouped
+thread; 20 000 runs in CI and 100 000 behind `POSTINO_SLOW_TESTS=1`. On the Windows GNU host (debug,
+SQLCipher 4.19 / SQLite 3.53.4), five runs after the cache was built:
+
+| Measure | 20k | 100k | P9b target |
+|---|---|---|---|
+| `threads_list` account-wide P50 | 11.8 ms | 82.1 ms | < 100 ms |
+| `threads_list` account-wide P95 | 12.5 ms | 91.6 ms | < 100 ms |
+| `threads_list` folder view P50 | 69.2 ms | 360.6 ms | reported |
+| `threads_list` folder view P95 | 69.2 ms | 448.7 ms | reported |
+| `thread_get` 50 P50 | 0.4 ms | 0.5 ms | < 50 ms |
+| `thread_get` 50 P95 | 1.1 ms | 1.2 ms | < 50 ms |
+| First open of a P9a store (thread cache build) | 478 ms | 1 952 ms | one-time, reported |
+| Later open | unchanged from P9a | unchanged from P9a | not re-measured |
+
+The account-wide list meets its target. **The folder view misses it at 100k:** deciding which
+conversations have a message in a folder crosses the covering message index (100k entries) and then
+counts the matching thread cache; a denormalised folder scope in the cache is the next step. The P9a
+upgrade cost is a one-time cache build, not part of a steady-state open. No new dependency, no
+migration, and the FTS index is not consulted by thread listing.
+
 ## 5. Synchronization
+
 
 IMAP is the synchronization protocol. There is no Postino server.
 
@@ -1309,3 +1403,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-26 | major | P7: SMTP submission over implicit TLS/STARTTLS, schema v5 outbox journal, exact-bytes-before-network queue, lease/backoff/auth-halt state machine, uncertain-after-DATA policy, independent Sent APPEND with `\Seen`, `message_send`/`send_schedule`/outbox operations, CLI send/outbox, MCP `--allow-send`, desktop worker and outbox dialog |
 | 2026-10-26 | minor | P6d: schema v6 `messages.remote_images`, `ParsedMessage::remote_images_blocked` carried through sync and the store, `message_get` field and the Italian reading-pane line from stored truth; no HTML rendering and no remote fetch |
 | 2026-10-26 | major | P9a: body-free store read path (summaries + owned cached `message`), schema v7 search columns and contentless-delete FTS5, recursive-descent query language with canonical printer, typed bound execution with bm25 ranking, `search`/`search_status`/`search_reindex`, CLI/MCP/UI parity, 100k evidence |
+| 2026-10-26 | major | P9b: reference-chain conversation derivation with phantom joins, order-independent merges and aliases, bounded subject fallback, cached thread rows with mailbox-wide counts, thread operations, one-open-card conversation view at 980, saved searches with stale-aware computed counts, recent queries in encrypted meta, CLI/MCP parity, 20k/100k evidence |

@@ -1,7 +1,7 @@
 # Postino roadmap
 
 > **Current milestone:** M2 complete for SMTP/outbox and compose depth (P7/P8); M3 organize has
-> started with encrypted search (P9a). Threads, saved searches and rules (P9b/P9c), full draft APPEND
+> started with encrypted search (P9a) and conversations/saved searches (P9b). Local rules (P9c), full draft APPEND
 > and HTML compose remain · **Last updated:** 2026-10-26
 >
 > M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
@@ -146,7 +146,16 @@ interaction model before real mail makes them expensive to change. Full spec:
 
 ## M3 — organize
 
-- [ ] Threading (References/In-Reply-To, JWZ fallback), thread view.
+- [x] Threading (P9b): account-scoped root reference from `References`/`In-Reply-To`, one-level
+      resolution with phantom roots, late-parent joins, order-independent merges into the smallest id
+      and aliases, duplicate-Message-ID canonicalisation and the bounded subject fallback. Cached
+      `threads` rows with mailbox-wide counts, `threads_list`/`thread_get`/`thread_flag`, the
+      one-open-card conversation view with thread archive/delete in one undo, CLI/MCP parity and
+      20k/100k evidence. 100k account-wide list P50 82.1 ms / P95 91.6 ms; the folder view missed the
+      target (360–449 ms P95) and is recorded in the architecture table.
+- [x] Saved searches (P9b): RICERCHE under ETICHETTE, ≤12 named queries with computed stale-aware
+      counts, apply/replace/Esc-restore, recent queries in encrypted `meta`, rename/edit/delete with
+      undo, CLI and MCP CRUD.
 - [x] FTS5 search with operators and ranking (P9a): encrypted contentless-delete index, schema v7,
       the documented grammar with a recursive-descent parser and canonical printer, typed bound SQL
       with bm25/date order, plain snippets, 200-hit/5k-offset caps, `search_status`/`search_reindex`,
@@ -154,11 +163,11 @@ interaction model before real mail makes them expensive to change. Full spec:
       (store page 34–40 ms); open missed the 150 ms target (268–357 ms) and is recorded in the
       architecture table; RSS is unverified (154.7–156.5 MiB is the seeding process, not an opened
       mailbox).
-- [ ] Flags, move, archive, delete, spam, undo.
-- [ ] Tags/labels, local rules (move, tag, read, delete, forward), rule preview.
+- [x] Flags, move, archive, delete and undo; spam classification is out of scope for M3.
+- [x] Tags/labels; local rules (move, tag, read, delete, forward), rule preview remain P9c.
 - [ ] Attachment preview/save with path confinement.
-- [ ] Verify: thread fixtures, rule idempotency, no path escape. The search half of the 100k gate is
-      proven; the open/RSS half remains open.
+- [ ] Verify: thread fixtures, rule idempotency, no path escape. The search and account-wide thread
+      halves of the 100k gate are proven; the folder thread view and open/RSS halves remain open.
 
 ## M4 — live in the background
 
