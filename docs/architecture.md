@@ -1268,9 +1268,10 @@ parse and resolve the query now, so an unclosed quote, an unknown label or an un
 refused instead of stored; a label or folder deleted later leaves the row visible as `valid:false`
 with `error`, never a dead entry. Counts (`total`, `unread`) are computed by the same search path as
 `search`, cached by engine revision, and a pending FTS index reports invalid with “the search index
-is not ready”. Applying a saved search replaces the query, clears the label filter and keeps the
-current folder only when the saved query contains `folder:`; `Esc` restores the query, folder, filters
-and threaded mode. The last eight successful queries live in `meta.recent_searches:<account>` inside
+is not ready”. Applying a saved search replaces the query and clears the label filter; the query owns
+its scope, so a `folder:` clause filters it and a query without one is account-wide instead of
+inheriting the folder the user happened to be in. `Esc` restores the query, folder, filters and
+threaded mode. The last eight successful queries live in `meta.recent_searches:<account>` inside
 SQLCipher; the sidebar shows them as chips while the empty search field is focused and the palette
 has an explicit clear command. Rename, edit and delete are undoable; CRUD leaves the packaged store
 in the encrypted database.

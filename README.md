@@ -110,10 +110,11 @@ MCP      ─┘
   with one undo. `threads_list`, `thread_get` and `thread_flag` are the operation surface; `thread_get`
   follows aliases and the cache is rebuilt by `search_reindex`.
 - **Saved searches (P9b).** The sidebar's **RICERCHE** section (under ETICHETTE) saves up to 12 named
-  queries per account with unique names ignoring case. Applying one replaces the query, clears the
-  label filter and keeps the folder only when the query names one; `Esc` restores the previous query,
-  folder and filters. Counts are computed and cached until the mailbox changes; a query whose label or
-  folder was deleted is shown as invalid with the reason, not hidden. The last eight successful
+  queries per account with unique names ignoring case. Applying one replaces the query and clears the
+  label filter; the query's `folder:` clause owns the scope, and a query without one is account-wide.
+  `Esc` restores the previous query, folder, filters and view. Counts are computed and cached until
+  the mailbox changes; a query whose label or folder was deleted is shown as invalid with the reason,
+  not hidden. The last eight successful
   queries live in the encrypted `meta.recent_searches:<account>` table and appear as chips when the
   search field is focused and empty; “Cancella ricerche recenti” clears them. Rename, edit and delete
   are undoable, and `saved_searches_list` plus the four CRUD/recent operations expose the same surface

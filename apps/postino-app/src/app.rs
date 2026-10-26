@@ -1883,6 +1883,7 @@ impl PostinoApp {
             return;
         }
         let account = self.active_account.clone();
+        let previous = mode.as_deref().and_then(|id| self.saved_searches.iter().find(|saved| saved.id == id).cloned());
         let result = match mode {
             Some(id) => self.engine.call("saved_search_update", json!({ "id": id, "name": name, "query": query })),
             None => self.engine.call("saved_search_create", json!({ "account": account, "name": name, "query": query })),
@@ -1893,6 +1894,12 @@ impl PostinoApp {
                 self.refresh_saved_searches();
                 self.scroll_saved_into_view = true;
                 self.status = "Ricerca salvata".to_owned();
+                if let Some(previous) = previous {
+                    self.push_toast(
+                        "Ricerca aggiornata",
+                        UndoAction::SavedSearchUpdate { id: previous.id, name: previous.name, query: previous.query, sort: previous.sort },
+                    );
+                }
             }
             Err(postino_core::OpError::InvalidArgs(message)) => {
                 if let Some(editor) = self.saved_editor.as_mut() {
@@ -1951,6 +1958,11 @@ impl PostinoApp {
         self.clear_thread_selection();
         self.list_cache = None;
         self.list_signature.clear();
+        if saved.valid {
+            let account = self.active_account.clone();
+            let _ = self.engine.record_recent_search(account.as_deref(), &saved.query);
+            self.refresh_recent_searches();
+        }
         self.status = format!("Ricerca “{}”", saved.name);
     }
 
@@ -2123,18 +2135,6 @@ impl PostinoApp {
             self.thread_summary = Some(detail.thread);
             self.thread_total = detail.total;
         }
-    }
-
-    fn query_has_folder(query: &str) -> bool {
-        fn walk(expr: &postino_core::SearchExpr) -> bool {
-            match expr {
-                postino_core::SearchExpr::Folder(_) => true,
-                postino_core::SearchExpr::And(children) | postino_core::SearchExpr::Or(children) => children.iter().any(walk),
-                postino_core::SearchExpr::Not(child) => walk(child),
-                _ => false,
-            }
-        }
-        postino_core::parse_search(query).is_ok_and(|parsed| walk(&parsed.expr))
     }
 
     /// The search field names the active label, so the placeholder never claims a mailbox-wide
@@ -3021,6 +3021,13 @@ impl PostinoApp {
                     self.refresh_saved_searches();
                 }
             }
+            UndoAction::SavedSearchUpdate { id, name, query, sort } => {
+                if self.engine.call("saved_search_update", json!({ "id": id, "name": name, "query": query, "sort": sort })).is_err() {
+                    failed = true;
+                } else {
+                    self.refresh_saved_searches();
+                }
+            }
         }
         if failed {
             self.report_failure("Non è stato possibile annullare l'azione.", false);
@@ -3081,8 +3088,8 @@ impl PostinoApp {
         let label_scoped = self.label_filter.is_some();
         let list_folder = if label_scoped { self.label_folder.clone() } else { Some(self.folder.clone()) };
         let search_folder = if self.saved_folder_scope {
-            let keep = Self::query_has_folder(&self.search_committed);
-            if keep { Some(self.folder.clone()) } else { None }
+            // A saved search owns its scope: `folder:` inside the query is the only folder filter.
+            None
         } else if label_scoped {
             self.label_folder.clone()
         } else {
@@ -3315,9 +3322,8 @@ impl PostinoApp {
                 self.threads_view_before_search.get_or_insert(self.threads_view);
                 self.threads_view = false;
             }
-            if postino_core::parse_search(&self.search_committed).is_ok() {
-                let account = self.active_account.clone();
-                let _ = self.engine.record_recent_search(account.as_deref(), &self.search_committed);
+            if self.engine.validate_search_query(&self.search_committed, self.active_account.as_deref()).is_ok() {
+                let _ = self.engine.record_recent_search(self.active_account.as_deref(), &self.search_committed);
                 self.refresh_recent_searches();
             }
         }
@@ -8775,6 +8781,13 @@ enum UndoAction {
         sort: String,
         account: String,
     },
+    /// Restore the previous name/query/sort of a saved search after an edit.
+    SavedSearchUpdate {
+        id: String,
+        name: String,
+        query: String,
+        sort: String,
+    },
 }
 
 enum LabelEditorMode {
@@ -13507,6 +13520,15 @@ mod tests {
         assert!(!app.threads_view);
         app.cancel_search();
         assert!(app.threads_view, "Esc restores the folder view when the saved search started from it");
+
+        app.engine.call("saved_search_create", json!({ "name": "Inviati", "query": "folder:sent" })).expect("folder query");
+        app.refresh_saved_searches();
+        let folder_saved = app.saved_searches.iter().find(|saved| saved.name == "Inviati").cloned().expect("saved");
+        app.folder = "inbox".to_owned();
+        app.apply_saved_search(&folder_saved.id);
+        let (rows, _, _) = app.visible_messages();
+        assert!(!rows.is_empty(), "the saved folder query returned nothing");
+        assert!(rows.iter().all(|message| message.folder_id == "sent"), "the saved query's folder is the only folder filter");
     }
 
     #[test]
@@ -13520,6 +13542,22 @@ mod tests {
         app.undo_last();
         assert_eq!(app.saved_searches.len(), 1);
         assert_eq!(app.saved_searches[0].name, "Fatture");
+    }
+
+    #[test]
+    fn saved_search_rename_is_undoable() {
+        let (_ctx, mut app) = conversations_app();
+        app.engine.call("saved_search_create", json!({ "name": "Prima", "query": "is:unread" })).expect("save");
+        app.refresh_saved_searches();
+        let id = app.saved_searches[0].id.clone();
+        app.start_saved_search_rename(&id);
+        if let Some(editor) = app.saved_editor.as_mut() {
+            editor.name = "Dopo".to_owned();
+        }
+        app.commit_saved_search_editor();
+        assert_eq!(app.saved_searches[0].name, "Dopo");
+        app.undo_last();
+        assert_eq!(app.saved_searches[0].name, "Prima");
     }
 
     #[test]

@@ -306,8 +306,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// Claim the earliest `append_pending` row whose Sent append is due and unowned â€” either never
-    /// claimed, or claimed by a worker whose lease expired â€” in one transaction.
+    /// Claim the earliest `append_pending` row whose Sent append is due and unowned — either never
+    /// claimed, or claimed by a worker whose lease expired — in one transaction.
     ///
     /// The claim writes `lease_at` and increments `append_attempts`, the counter the append backoff
     /// uses. Two passes (the app and the CLI, or two app instances) can therefore never APPEND the
@@ -538,7 +538,7 @@ impl Store {
 /// The fixed sentence written when a crash leaves a `sending` row behind. It never contains an
 /// address, a subject, a server name or server text.
 pub const UNCERTAIN_AFTER_CRASH: &str =
-    "Postino si Ã¨ fermato durante l'invio; il messaggio potrebbe essere stato accettato. Controlla Inviati prima di riprovare.";
+    "Postino si è fermato durante l'invio; il messaggio potrebbe essere stato accettato. Controlla Inviati prima di riprovare.";
 
 // ---------------------------------------------------------------------------------------------
 // Folders
@@ -722,7 +722,7 @@ impl Store {
         }
         let tx = self.conn.unchecked_transaction()?;
         let mut touched = BTreeSet::new();
-        let mut thread_touches: Vec<(String, String)> = Vec::new();
+        let mut thread_touches: BTreeSet<(String, String)> = BTreeSet::new();
         let mut changed = 0usize;
         for id in ids {
             let row: Option<(String, String)> =
@@ -739,7 +739,7 @@ impl Store {
                 touched.insert(folder);
             }
             if update.unread.is_some() || update.starred.is_some() {
-                thread_touches.push((account, thread));
+                thread_touches.insert((account, thread));
             }
             changed += 1;
         }

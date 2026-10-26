@@ -268,8 +268,9 @@ per action, no hidden mutation.
   980×600 the pane is the existing full overlay (`Torna alla posta`, Esc).
 - **RICERCHE** sits under ETICHETTE: at most 12 named searches, with unread/total counts, a gold dot
   when valid and a danger dot plus “Ricerca non valida” when its label or folder disappeared. Clicking
-  applies it: the query replaces the field, the label filter clears, and the current folder is kept
-  only when the query contains `folder:`; Esc restores the previous query, folder, filters and view.
+  applies it: the query replaces the field, the label filter clears, and the query's own `folder:`
+  clause owns the scope (a query without one is account-wide, not pinned to the current folder); Esc
+  restores the previous query, folder, filters and view.
   `Salva ricerca` (field `+`, palette) opens the sidebar drawer with a name and the query; rename and
   edit reuse it; delete shows an undo toast. Applying or saving scrolls the section into view.
 - The last eight successful queries appear as chips when the search field is focused and empty;

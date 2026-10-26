@@ -104,8 +104,16 @@ fn threaded_fixture() -> (Fixture, Engine) {
     let fixture = Fixture::new();
     let store = fixture.open();
     seed(&store);
-    let root = message("msg_root", INBOX, "<root@example.com>", "Preventivo sito", T0);
-    insert(&store, &root, None, &[]);
+    let mut root = message("msg_root", INBOX, "<root@example.com>", "Preventivo sito", T0);
+    root.summary.starred = true;
+    let attachment = postino_store::Attachment {
+        id: "att_root".to_owned(),
+        filename: "preventivo.pdf".to_owned(),
+        mime: "application/pdf".to_owned(),
+        size: 1024,
+        blob_hash: None,
+    };
+    store.upsert_synced_message_with_refs(&root, std::slice::from_ref(&attachment), None, &[]).expect("root with attachment");
     let reply = message("msg_reply", INBOX, "<reply@example.com>", "Re: Preventivo sito", T0 + 3_600_000);
     insert(&store, &reply, Some("root@example.com"), &["<root@example.com>"]);
     let archived = message("msg_archived", ARCHIVE, "<archived@example.com>", "Re: Preventivo sito", T0 + 7_200_000);
@@ -199,6 +207,11 @@ fn thread_scope_filters_keep_mailbox_wide_counts() {
     assert_eq!(unread["total"], 0);
     let read = engine.call("threads_list", json!({ "folder": INBOX, "starred_only": false })).expect("read");
     assert_eq!(read["total"], 1);
+
+    let attachments = engine.call("threads_list", json!({ "folder": INBOX, "with_attachments": true })).expect("attachments");
+    assert_eq!(attachments["total"], 1, "the thread with the PDF is the only attachment thread");
+    let starred = engine.call("threads_list", json!({ "folder": INBOX, "starred_only": true })).expect("starred");
+    assert_eq!(starred["total"], 1, "one message in the thread is starred from the fixture");
 }
 
 #[test]

@@ -3203,4 +3203,97 @@ mod tests {
             assert!(!serde_json::to_string(&result.outbox).expect("JSON").contains(forbidden), "the JSON output kept server text");
         }
     }
+
+    struct CapturingLogger(Arc<Mutex<Vec<String>>>);
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if let Ok(mut captured) = self.0.lock() {
+                captured.push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn thread_and_saved_search_work_never_logs_subjects_addresses_or_queries() {
+        static CAPTURED: std::sync::OnceLock<Arc<Mutex<Vec<String>>>> = std::sync::OnceLock::new();
+        let captured = CAPTURED.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone();
+        let _ = log::set_boxed_logger(Box::new(CapturingLogger(captured.clone())));
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let subject = "Oggetto riservato P9b 7f3a";
+        let address = "riservato-p9b@example.com";
+        let query = "mittente-riservato-p9b";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mail.db");
+        let mut key_bytes = [0u8; 32];
+        getrandom::fill(&mut key_bytes).expect("OS random source");
+        let store = postino_store::Store::open(&path, &postino_store::StoreKey::from_bytes(key_bytes)).expect("store");
+        store
+            .upsert_account(&postino_store::Account {
+                id: "acc_log".to_owned(),
+                name: "Log".to_owned(),
+                email: address.to_owned(),
+                provider: "custom".to_owned(),
+                signature: String::new(),
+                created_at: 1,
+            })
+            .expect("account");
+        store
+            .upsert_folder(&postino_store::Folder {
+                id: "inbox".to_owned(),
+                account_id: "acc_log".to_owned(),
+                name: "INBOX".to_owned(),
+                kind: postino_store::FolderKind::Inbox,
+                unread: 0,
+                total: 0,
+                uid_validity: Some(1),
+                uid_next: Some(1),
+                last_sync_at: None,
+            })
+            .expect("folder");
+        let row = postino_store::Message {
+            summary: postino_store::MessageSummary {
+                id: "msg_log".to_owned(),
+                account_id: "acc_log".to_owned(),
+                folder_id: "inbox".to_owned(),
+                thread_id: "provisional".to_owned(),
+                from: postino_store::Address::new("Giulia", address),
+                to: vec![postino_store::Address::new("Me", "me@example.it")],
+                subject: subject.to_owned(),
+                snippet: "corpo riservato P9b".to_owned(),
+                date: 1_700_000_000_000,
+                unread: true,
+                starred: false,
+                has_attachments: false,
+                labels: Vec::new(),
+            },
+            uid: Some(1),
+            message_id: Some("<log-p9b@example.com>".to_owned()),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            body_text: "corpo riservato P9b".to_owned(),
+            body_html: None,
+            remote_images: 0,
+            size: Some(8),
+        };
+        store.upsert_synced_message_with_refs(&row, &[], None, &[]).expect("message");
+        let mut engine = Engine::open(store).expect("engine");
+        let threads = call(&mut engine, "threads_list", json!({ "account": "acc_log" })).expect("threads");
+        let id = threads["threads"][0]["id"].as_str().expect("thread id").to_owned();
+        call(&mut engine, "thread_get", json!({ "account": "acc_log", "id": id })).expect("thread");
+        call(&mut engine, "thread_flag", json!({ "account": "acc_log", "id": id, "unread": false })).expect("flag");
+        call(&mut engine, "saved_search_create", json!({ "account": "acc_log", "name": "Riservata P9b", "query": query })).expect("saved");
+        engine.record_recent_search(Some("acc_log"), "from:giulia is:unread").expect("recent");
+        let logged = captured.lock().map(|lines| lines.join("\n")).unwrap_or_default();
+        for forbidden in [subject, address, query, "corpo riservato"] {
+            assert!(!logged.contains(forbidden), "a log line contained private mail content: {logged}");
+        }
+    }
 }

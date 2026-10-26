@@ -995,6 +995,13 @@ impl Engine {
         Ok(self.recent_searches.get(&account.id).cloned().unwrap_or_default())
     }
 
+    /// Parse and resolve a query without running it. The UI uses this before recording a recent
+    /// query, so a typo or a deleted label does not enter the history.
+    pub fn validate_search_query(&self, query: &str, account: Option<&str>) -> Result<(), OpError> {
+        let account = self.requested_account(account, "search")?;
+        crate::ops::validate_search_query(self, query, Some(&account.id))
+    }
+
     fn saved_search_views(&self, account_id: &str) -> Result<Vec<SavedSearch>, OpError> {
         let selected = self.saved_searches.iter().filter(|saved| saved.account_id == account_id).cloned().collect::<Vec<_>>();
         if selected.is_empty() {
