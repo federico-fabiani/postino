@@ -151,8 +151,9 @@ interaction model before real mail makes them expensive to change. Full spec:
       and aliases, duplicate-Message-ID canonicalisation and the bounded subject fallback. Cached
       `threads` rows with mailbox-wide counts, `threads_list`/`thread_get`/`thread_flag`, the
       one-open-card conversation view with thread archive/delete in one undo, CLI/MCP parity and
-      20k/100k evidence. 100k account-wide list P50 82.1 ms / P95 91.6 ms; the folder view missed the
-      target (360–449 ms P95) and is recorded in the architecture table.
+      20k/100k evidence. 100k account-wide list P50 80.7 ms / P95 82.1 ms and
+      100 real 3-reference inserts in 307 ms (P50 2.7 ms, P95 6.0 ms); the folder view missed the
+      target (356-359 ms P95) and is recorded in the architecture table.
 - [x] Saved searches (P9b): RICERCHE under ETICHETTE, ≤12 named queries with computed stale-aware
       counts, apply/replace/Esc-restore, recent queries in encrypted `meta`, rename/edit/delete with
       undo, CLI and MCP CRUD.
@@ -166,8 +167,9 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] Flags, move, archive, delete and undo; spam classification is out of scope for M3.
 - [x] Tags/labels; local rules (move, tag, read, delete, forward), rule preview remain P9c.
 - [ ] Attachment preview/save with path confinement.
-- [ ] Verify: thread fixtures, rule idempotency, no path escape. The search and account-wide thread
-      halves of the 100k gate are proven; the folder thread view and open/RSS halves remain open.
+- [ ] Verify: thread fixtures, rule idempotency, no path escape. The search, real-ingest and
+      account-wide thread halves of the 100k gate are proven; the folder thread view and open/RSS
+      halves remain open.
 
 ## M4 — live in the background
 

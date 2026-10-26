@@ -1961,3 +1961,49 @@ fn the_outbox_list_pages_newest_first() {
     let last = engine.outbox_list(None, 2, 4).expect("last page");
     assert_eq!(last.entries.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(), vec!["ob_page_0"]);
 }
+
+#[test]
+fn a_real_send_leaves_one_sent_thread_and_no_draft_ghost() {
+    let harness = Harness::new();
+    let store = harness.open();
+    let vault = MemoryVault::new();
+    let capture = Arc::new(Mutex::new(SmtpCapture::default()));
+    let smtp_capture = capture.clone();
+    let smtp = RunningSmtp::start(1, move |_, conn| {
+        let capture = smtp_capture.clone();
+        async move { serve_smtp(conn, capture, Reply::Success).await }
+    });
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let imap = RunningAppendServer::start(1, records, true);
+    seed_account_with_smtp(
+        &store,
+        &vault,
+        ACCOUNT_ID,
+        imap.port(),
+        smtp.port(),
+        &[("drafts", "Drafts", FolderKind::Drafts), ("sent", "Sent", FolderKind::Sent)],
+    );
+    let mut engine = open_engine(&harness, &vault, &smtp, &imap);
+    let saved = engine
+        .save_draft(None, None, draft(vec![Address::new("Giulia", "giulia@example.com")], Vec::new(), Vec::new(), "Thread del invio", "Corpo"))
+        .expect("draft");
+    let draft_id = saved.summary.id.clone();
+    let draft_thread = saved.summary.thread_id.clone();
+    assert!(draft_thread.starts_with("thr_draft_"), "{draft_thread}");
+    let queued = engine.message_send(&draft_id).expect("queue");
+    let report = engine.process_outbox(queued.outbox.send_at).expect("send pass");
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.sent, 1, "{report:?}");
+    let sent_folder = engine
+        .message(&draft_id)
+        .and_then(|message| engine.folders().iter().find(|folder| folder.id == message.summary.folder_id).map(|folder| folder.kind));
+    assert_eq!(sent_folder, Some(postino_core::FolderKind::Sent));
+
+    let store = harness.open();
+    let threads = store
+        .list_threads(&postino_store::ThreadFilter { account_id: Some(ACCOUNT_ID.to_owned()), limit: 200, ..Default::default() })
+        .expect("threads");
+    assert_eq!(threads.threads.len(), 1, "one sent message must not leave a ghost conversation: {:?}", threads.threads);
+    assert!(!threads.threads.iter().any(|thread| thread.id.starts_with("thr_draft_")), "{:?}", threads.threads);
+    assert!(store.get_thread(ACCOUNT_ID, &draft_thread, 50, 0).expect("old thread").is_none());
+}

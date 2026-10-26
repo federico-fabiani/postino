@@ -272,6 +272,13 @@ fn the_subject_fallback_is_narrow_and_never_merges_two_threads() {
     insert(&store, &ambiguous, None, &[]);
     assert_eq!(thread_of(&store, "msg_ambiguous"), "ambiguous@example.com", "two matching threads drop the fallback");
 
+    // A re-fetch of the first fallback reply must not move it now that a second thread has the same
+    // subject: the row already had a thread and no references, so it keeps it.
+    insert(&store, &reply, None, &[]);
+    assert_eq!(thread_of(&store, "msg_project_reply"), "project@example.com", "a fallback attachment survives a re-fetch");
+    let project = thread_row(&store, "project@example.com").expect("project thread");
+    assert_eq!(project.message_count, 2);
+
     let old = message("msg_old", INBOX, Some("<old@example.com>"), "Vecchio", T0);
     insert(&store, &old, None, &[]);
     let late = message("msg_late", INBOX, Some("<late@example.com>"), "Re: Vecchio", T0 + 20 * 24 * 60 * 60 * 1000);
@@ -400,6 +407,60 @@ fn deleting_the_last_message_removes_the_thread_and_flags_refresh_its_counts() {
     assert_eq!(row.message_count, 1);
     store.delete_message("msg_root").expect("delete the last");
     assert!(thread_row(&store, "root@example.com").is_none(), "an empty thread row is removed");
+}
+
+#[test]
+fn thread_lookups_use_the_derived_indexes() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let store = fixture.open();
+    seed(&store);
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).expect("raw open");
+    let hex = fixture.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";")).expect("raw key");
+    let plans = connection
+        .prepare("EXPLAIN QUERY PLAN SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id IN (?2, ?3) ORDER BY id ASC LIMIT 1")
+        .expect("plan")
+        .query_map(["acc_thr", "a@example.com", "<a@example.com>"], |row| row.get::<_, String>(3))
+        .expect("rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("plan rows")
+        .join(" ");
+    assert!(plans.contains("messages_account_message_id"), "the reference lookup is not indexed: {plans}");
+    for index in ["messages_account_message_id", "messages_account_subject_norm_date", "thread_aliases_account_new"] {
+        let exists: bool = connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)", [index], |row| row.get(0))
+            .expect("index lookup");
+        assert!(exists, "the v7 index {index} is missing");
+    }
+}
+
+#[test]
+fn sending_a_draft_refreshes_the_old_draft_thread_and_leaves_no_ghost() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    let mut draft = message("draft_1", INBOX, None, "Bozza", T0);
+    draft.summary.thread_id = "thr_draft_1".to_owned();
+    draft.uid = None;
+    store.save_draft_message(&draft, &[]).expect("save draft");
+    assert!(thread_row(&store, "thr_draft_1").is_some());
+
+    let mut sent = draft.clone();
+    sent.summary.folder_id = ARCHIVE.to_owned();
+    sent.summary.thread_id = "sent-root@example.com".to_owned();
+    sent.uid = None;
+    sent.message_id = Some("<sent-root@example.com>".to_owned());
+    store.send_draft_message(&sent, None).expect("send");
+
+    assert!(thread_row(&store, "thr_draft_1").is_none(), "the old draft thread is a ghost");
+    let row = thread_row(&store, "sent-root@example.com").expect("sent thread");
+    assert_eq!(row.message_count, 1);
+    assert_eq!(row.latest_message_id.as_deref(), Some("draft_1"));
+    assert!(store.get_thread(ACCOUNT, "thr_draft_1", 50, 0).expect("old id").is_none());
+    let threads = store.list_threads(&ThreadFilter { account_id: Some(ACCOUNT.to_owned()), limit: 200, ..ThreadFilter::default() }).expect("threads");
+    assert_eq!(threads.threads.len(), 1, "one sent message must be one conversation: {:?}", threads.threads);
 }
 
 #[test]

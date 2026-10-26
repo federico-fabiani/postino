@@ -638,7 +638,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "b4235b58a626878db508caf90774b2a620a269e5948bfdbcddb3f47d6cffc29c"
+sha256 = "3f0bd908e9daf92b39e3eb2413754eef18f4af8fec33262e01c76769493d7478"
 usage = "Documentation screenshot of conversation rows, participants and mailbox-wide counts at the minimum window"
 
 [[asset]]
@@ -648,7 +648,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "6cd898e0c3b2902e331c2a4e77d16f7d19faa0fe40ce7f3e250b4cbdee4d40df"
+sha256 = "a8981550583a9204a2325685a42551b0e452affea95fffb1cfca1eb14e806944"
 usage = "Documentation screenshot of dark-theme conversation rows at the minimum window"
 
 [[asset]]
@@ -678,7 +678,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "0d538657458c7701ab6eb4cb2a3789ee5a4b5acb012f666679042ebdef516214"
+sha256 = "e417c7db224a229b9408709caf00c809dc7c66a64aeb25dda2164ccae2c29e7f"
 usage = "Documentation screenshot of the RICERCHE sidebar and an applied saved search at the minimum window"
 
 [[asset]]
@@ -688,7 +688,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "b47fc5b91fd774f6de27f29275894eb908b3c7603f079c9db0d5b0bfa5e27c0e"
+sha256 = "59a665cf61643ba4f25ee49f8fefb54e966d42335fbd3ac45694ac2c610cc7f6"
 usage = "Documentation screenshot of dark-theme saved searches and recent queries at the minimum window"
 
 [[dependency]]

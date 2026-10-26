@@ -103,10 +103,15 @@ closure: schema v7, the body-free read path, FTS5 query language, operations, UI
 The search first-page target is met (51 ms P50 at 100k); open misses its 150 ms target and RSS is
 unverified, both stated in the architecture table. P9b is done in two green commits: P9b1 is the
 reference-chain engine, thread cache, operations, CLI/MCP and 20k/100k evidence; P9b2 is the
-conversation view, saved searches, screenshots and docs. The account-wide `threads_list` target is met
-(82 ms P50 / 92 ms P95 at 100k); the folder-scoped list misses it (360–449 ms P95) and is reported in
-the architecture/threat-model tables. P9b adds an idempotent cache index on normal open but no schema
-version change; P9c still inherits the inert v7 rule tables and needs no migration.
+conversation view, saved searches, screenshots and docs. A blind review found a missing
+`messages(account_id,message_id)` index (1.29 s per reference at 100k) and a sent-draft ghost thread;
+the closure adds the derived indexes, refresh of the old draft thread, store-backed flag counts, live
+thread pages, subject-fallback stability, saved-search freshness/account cleanup, conversation Enter,
+thread paging and partial-batch undo. The account-wide `threads_list` target is met (80.7 ms P50 /
+82.1 ms P95 at 100k) and 100 real 3-reference inserts take 307 ms (P95 6.0 ms); the folder-scoped list
+misses it (356–359 ms P95) and is reported in the architecture/threat-model tables. P9b creates derived
+indexes idempotently on normal open but has no schema version change; P9c still inherits the inert v7
+rule tables and needs no migration.
 
 ## 5. Delighters backlog
 

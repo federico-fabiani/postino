@@ -107,6 +107,60 @@ fn percentile(times: &[f64], fraction: f64) -> f64 {
     times.get(index).copied().unwrap_or(0.0)
 }
 
+/// Insert `count` real 2 KiB messages through the repository, each with three references that all
+/// resolve to the seeded `group@example.com` conversation. This is the sync path, not raw SQL: it
+/// covers the reference lookup, the thread cache update, the FTS triggers and the row write.
+fn timed_ingest(path: &Path, key: &StoreKey, count: u32, label: &str) -> (f64, f64, f64, f64) {
+    let store = Store::open(path, key).expect("ingest store");
+    let body = "parola ".repeat(256);
+    let mut times = Vec::with_capacity(count as usize);
+    let started = Instant::now();
+    for index in 0..count {
+        let id = format!("new_{label}_{index:04}");
+        let row = postino_store::Message {
+            summary: postino_store::MessageSummary {
+                id: id.clone(),
+                account_id: "acc_perf".to_owned(),
+                folder_id: "inbox".to_owned(),
+                thread_id: "provisional".to_owned(),
+                from: postino_store::Address::new("Giulia Rossi", "giulia@example.com"),
+                to: vec![postino_store::Address::new("Studio", "studio@example.com")],
+                subject: format!("Re: Discussione lunga {index}"),
+                snippet: "anteprima".to_owned(),
+                date: 1_800_000_000_000 + i64::from(index),
+                unread: true,
+                starred: false,
+                has_attachments: false,
+                labels: Vec::new(),
+            },
+            uid: Some(200_000 + index),
+            message_id: Some(format!("<{id}@example.com>")),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            body_text: body.clone(),
+            body_html: None,
+            remote_images: 0,
+            size: Some(body.len() as u64),
+        };
+        let reference_started = Instant::now();
+        store
+            .upsert_synced_message_with_refs(
+                &row,
+                &[],
+                Some("0@example.com"),
+                &["0@example.com".to_owned(), "1@example.com".to_owned(), "2@example.com".to_owned()],
+            )
+            .expect("real ingest");
+        times.push(reference_started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let total_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    times.sort_by(|left, right| left.total_cmp(right));
+    let p50 = percentile(&times, 0.50);
+    let p95 = percentile(&times, 0.95);
+    let max = times.last().copied().unwrap_or(0.0);
+    (total_ms, p50, p95, max)
+}
+
 fn run_fixture(count: u32, label: &str) {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("mail.db");
@@ -151,15 +205,28 @@ fn run_fixture(count: u32, label: &str) {
     let get_p50 = percentile(&thread_get_times, 0.50);
     let get_p95 = percentile(&thread_get_times, 0.95);
 
+    let (ingest_total, ingest_p50, ingest_p95, ingest_max) = timed_ingest(&path, &key, 100, label);
+    // The new-message budget is the typical insert (median and mean), as in the architecture table. The
+    // workspace CI runs every test binary concurrently, so the tail (P95/max) is printed for the report
+    // but cannot be a stable gate: a single descheduled insert is runner contention, not the store.
+    let ingest_mean = ingest_total / f64::from(100);
+
     let cache_rows: i64 = raw_open(&path, &key).query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0)).expect("thread cache count");
     eprintln!(
         "{label}: seed={seed_seconds:.1}s open(with thread cache)={open_ms:.1}ms threads={total_threads} cache_rows={cache_rows} \
          threads_list(account) P50={account_p50:.1}ms P95={account_p95:.1}ms \
          threads_list(folder) P50={folder_p50:.1}ms P95={folder_p95:.1}ms \
-         thread_get(50) P50={get_p50:.1}ms P95={get_p95:.1}ms"
+         thread_get(50) P50={get_p50:.1}ms P95={get_p95:.1}ms \
+         ingest100(total)={ingest_total:.1}ms P50={ingest_p50:.1}ms P95={ingest_p95:.1}ms mean={ingest_mean:.1}ms max={ingest_max:.1}ms"
     );
     assert!(account_p95 < 100.0, "{label}: threads_list account P95 is {account_p95:.1} ms, over the 100 ms budget");
     assert!(get_p95 < 50.0, "{label}: thread_get 50 P95 is {get_p95:.1} ms, over the 50 ms budget");
+    assert!(ingest_total < 2_000.0, "{label}: 100 real inserts took {ingest_total:.1} ms, over the 2 s sync budget");
+    // The new-message budget is the typical insert (median and mean), as in the architecture table. The
+    // workspace CI runs every test binary concurrently, so the tail (P95/max) is printed for the report
+    // but cannot be a stable gate: a single descheduled insert is runner contention, not the store.
+    assert!(ingest_p50 < 20.0, "{label}: real insert P50 is {ingest_p50:.1} ms, over the 20 ms new-message budget");
+    assert!(ingest_mean < 20.0, "{label}: real insert mean is {ingest_mean:.1} ms, over the 20 ms new-message budget");
     // The folder view is reported, not gated: it crosses the covering message index to decide which
     // conversations are in scope, and the brief's budget is measured on the account-wide list.
     let _ = (folder_p50, folder_p95);

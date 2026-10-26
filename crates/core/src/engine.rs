@@ -318,6 +318,9 @@ pub struct Engine {
     /// Saved searches in name order. The store is authoritative; this is the hydrated copy the UI
     /// lists every frame, refreshed after every CRUD call.
     saved_searches: Vec<SavedSearch>,
+    /// Next demo saved-search number. A store-backed engine uses the store's monotonic meta counter
+    /// instead, so deleting the highest row never reuses its id.
+    next_saved_search_seq: u32,
     /// Computed saved-search counts, keyed by the engine revision. A count scan over the index is
     /// expensive at 100k, so the list reuses it until a write invalidates the revision.
     saved_counts: RefCell<Option<(u64, HashMap<String, SavedCount>)>>,
@@ -333,6 +336,7 @@ struct SavedCount {
     error: Option<String>,
     total: u32,
     unread: u32,
+    pending: bool,
 }
 
 pub(crate) const MAX_SAVED_SEARCHES: u32 = 12;
@@ -367,6 +371,7 @@ impl Engine {
             draft_snapshots: HashMap::new(),
             reply_links: HashMap::new(),
             saved_searches: Vec::new(),
+            next_saved_search_seq: 1,
             saved_counts: RefCell::new(None),
             recent_searches: HashMap::new(),
         }
@@ -472,13 +477,16 @@ impl Engine {
     fn open_inner(store: Store, vault: Option<Arc<dyn CredentialVault>>) -> Result<Self, OpError> {
         let accounts = store.list_accounts().map_err(store_map::read_error)?.into_iter().map(store_map::account).collect::<Vec<_>>();
         let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
-        repair_orphan_drafts(&store, &accounts, &folders)?;
+        if !store.is_read_only() {
+            repair_orphan_drafts(&store, &accounts, &folders)?;
+        }
         // One list-row query and one attachment-hash query. Bodies, HTML parts and attachment rows
         // wait for a message open; a 100k mailbox must fit in a summary vector.
         let messages = store.list_all_summaries().map_err(store_map::read_error)?.into_iter().map(store_map::summary).collect::<Vec<_>>();
         let blob_hashes = store.list_blob_hashes().map_err(store_map::read_error)?;
         let labels = store.list_labels(None).map_err(store_map::read_error)?.into_iter().map(store_map::label).collect::<Result<Vec<_>, _>>()?;
-        let label_seq = repair_label_seq(&store, &labels)?;
+        let label_seq =
+            if store.is_read_only() { labels.iter().filter_map(label_number).max().unwrap_or(0) } else { repair_label_seq(&store, &labels)? };
         // Draft metadata only: no body, headers or attachments. The revision map is the stale-draft
         // guard, independent of the body cache.
         let drafts = store.list_draft_metadata().map_err(store_map::read_error)?;
@@ -504,6 +512,13 @@ impl Engine {
         engine.reply_links = reply_links;
         engine.draft_snapshots = draft_snapshots;
         engine.saved_searches = saved_searches;
+        engine.next_saved_search_seq = engine
+            .saved_searches
+            .iter()
+            .filter_map(|saved| saved.id.strip_prefix("saved_").and_then(|rest| rest.parse::<u32>().ok()))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         engine.recent_searches = recent_searches;
         Ok(engine)
     }
@@ -559,6 +574,7 @@ impl Engine {
             draft_snapshots: HashMap::new(),
             reply_links: HashMap::new(),
             saved_searches: Vec::new(),
+            next_saved_search_seq: 1,
             saved_counts: RefCell::new(None),
             recent_searches: HashMap::new(),
         };
@@ -766,7 +782,8 @@ impl Engine {
         };
         let limit = request.limit.unwrap_or(50).clamp(1, 200);
         let offset = request.offset.unwrap_or(0).min(5_000);
-        if let Some(store) = &self.store {
+        if self.store.is_some() {
+            let store = self.require_thread_cache()?;
             let page = store
                 .list_threads(&postino_store::ThreadFilter {
                     account_id: Some(account.id.clone()),
@@ -794,7 +811,8 @@ impl Engine {
         let account = self.requested_account(account, "thread_get")?;
         let limit = limit.unwrap_or(50).clamp(1, 200);
         let offset = offset.unwrap_or(0).min(5_000);
-        if let Some(store) = &self.store {
+        if self.store.is_some() {
+            let store = self.require_thread_cache()?;
             let detail = store.get_thread(&account.id, id, limit, offset).map_err(store_map::read_error)?.ok_or_else(|| unknown_thread(id))?;
             let total = detail.total;
             return Ok(ThreadDetailResult {
@@ -859,6 +877,29 @@ impl Engine {
         if changed > 0 {
             if let Some(store) = &self.store {
                 store.set_flags(&ids, postino_store::FlagUpdate { unread, starred }).map_err(store_map::write_error)?;
+                let touched = ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+                for message in &mut self.messages {
+                    if !touched.contains(message.id.as_str()) {
+                        continue;
+                    }
+                    if let Some(wanted) = unread {
+                        message.unread = wanted;
+                    }
+                    if let Some(wanted) = starred {
+                        message.starred = wanted;
+                    }
+                }
+                for message in self.demo_messages.values_mut() {
+                    if !touched.contains(message.summary.id.as_str()) {
+                        continue;
+                    }
+                    if let Some(wanted) = unread {
+                        message.summary.unread = wanted;
+                    }
+                    if let Some(wanted) = starred {
+                        message.summary.starred = wanted;
+                    }
+                }
                 self.bump_revision();
                 self.recount();
             } else {
@@ -1002,6 +1043,41 @@ impl Engine {
         crate::ops::validate_search_query(self, query, Some(&account.id))
     }
 
+    /// Re-read one account's saved-search metadata and recent list from the store. Used by the
+    /// operation and the desktop before listing, so a second process's CRUD is visible without a
+    /// restart; the computed counts are invalidated only when the rows actually changed.
+    pub fn reload_saved_searches(&mut self, account: Option<&str>) -> Result<(), OpError> {
+        let account = self.requested_account(account, "saved_searches_list")?;
+        let Some(store) = &self.store else {
+            self.recent_searches.remove(&account.id);
+            return Ok(());
+        };
+        let rows = store.list_saved_searches(Some(&account.id)).map_err(store_map::read_error)?;
+        let mut next = rows.into_iter().map(store_map::saved_search).collect::<Vec<_>>();
+        next.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()).then(left.id.cmp(&right.id)));
+        let current = self.saved_searches.iter().filter(|saved| saved.account_id == account.id).cloned().collect::<Vec<_>>();
+        let changed = current.len() != next.len()
+            || current
+                .iter()
+                .zip(next.iter())
+                .any(|(left, right)| left.id != right.id || left.name != right.name || left.query != right.query || left.sort != right.sort);
+        if changed {
+            self.saved_searches.retain(|saved| saved.account_id != account.id);
+            self.saved_searches.extend(next);
+            self.saved_searches.sort_by(|left, right| {
+                left.account_id.cmp(&right.account_id).then(left.name.to_lowercase().cmp(&right.name.to_lowercase())).then(left.id.cmp(&right.id))
+            });
+            *self.saved_counts.borrow_mut() = None;
+        }
+        let recent = store.recent_searches(&account.id).map_err(store_map::read_error)?;
+        if recent.is_empty() {
+            self.recent_searches.remove(&account.id);
+        } else {
+            self.recent_searches.insert(account.id, recent);
+        }
+        Ok(())
+    }
+
     fn saved_search_views(&self, account_id: &str) -> Result<Vec<SavedSearch>, OpError> {
         let selected = self.saved_searches.iter().filter(|saved| saved.account_id == account_id).cloned().collect::<Vec<_>>();
         if selected.is_empty() {
@@ -1016,7 +1092,8 @@ impl Engine {
         let counts = cache.as_mut().map(|(_, counts)| counts).ok_or_else(|| OpError::Failed("the saved-search cache is unavailable".to_owned()))?;
         let mut views = Vec::with_capacity(selected.len());
         for mut saved in selected {
-            if !counts.contains_key(&saved.id) {
+            let needs_count = counts.get(&saved.id).is_none_or(|count| count.pending);
+            if needs_count {
                 let count = self.saved_search_count(&saved);
                 counts.insert(saved.id.clone(), count);
             }
@@ -1025,6 +1102,7 @@ impl Engine {
                 saved.error.clone_from(&count.error);
                 saved.total = count.total;
                 saved.unread = count.unread;
+                saved.index_pending = count.pending;
             }
             views.push(saved);
         }
@@ -1049,15 +1127,21 @@ impl Engine {
         };
         let total = match crate::ops::execute_search(self, args(false)) {
             Ok(result) if result.index.is_none() => result.total,
-            Ok(_) => return SavedCount { valid: false, error: Some("the search index is not ready".to_owned()), total: 0, unread: 0 },
-            Err(OpError::InvalidArgs(error)) => return SavedCount { valid: false, error: Some(error), total: 0, unread: 0 },
-            Err(error) => return SavedCount { valid: false, error: Some(error.to_string()), total: 0, unread: 0 },
+            Ok(_) => return SavedCount { valid: true, error: None, total: 0, unread: 0, pending: true },
+            Err(OpError::InvalidArgs(error)) => return SavedCount { valid: false, error: Some(error), total: 0, unread: 0, pending: false },
+            Err(error) => return SavedCount { valid: false, error: Some(error.to_string()), total: 0, unread: 0, pending: false },
         };
         let unread = match crate::ops::execute_search(self, args(true)) {
             Ok(result) => result.total,
             Err(_) => 0,
         };
-        SavedCount { valid: true, error: None, total: u32::try_from(total).unwrap_or(u32::MAX), unread: u32::try_from(unread).unwrap_or(u32::MAX) }
+        SavedCount {
+            valid: true,
+            error: None,
+            total: u32::try_from(total).unwrap_or(u32::MAX),
+            unread: u32::try_from(unread).unwrap_or(u32::MAX),
+            pending: false,
+        }
     }
 
     pub fn create_saved_search(&mut self, account: Option<&str>, name: &str, query: &str, sort: Option<&str>) -> Result<SavedSearch, OpError> {
@@ -1072,24 +1156,52 @@ impl Engine {
                 account.id
             )));
         }
+        if let Some(store) = &self.store {
+            let stored = store.count_saved_searches(&account.id).map_err(store_map::read_error)?;
+            if stored >= MAX_SAVED_SEARCHES {
+                return Err(OpError::InvalidArgs(format!(
+                    "account {:?} already has {MAX_SAVED_SEARCHES} saved searches; delete one before adding another",
+                    account.id
+                )));
+            }
+        }
         if self.saved_searches.iter().any(|saved| saved.account_id == account.id && saved.name.eq_ignore_ascii_case(&name)) {
             return Err(OpError::InvalidArgs(format!("a saved search named {name:?} already exists; names are unique ignoring case")));
         }
-        let id = self.next_saved_search_id();
+        let id = match &self.store {
+            Some(store) => store.allocate_saved_search_id().map_err(store_map::write_error)?,
+            None => format!("saved_{}", self.next_saved_search_seq),
+        };
         let now = Utc::now().timestamp_millis();
-        let saved = SavedSearch { id, account_id: account.id.clone(), name, query, sort, valid: true, error: None, total: 0, unread: 0 };
+        let saved = SavedSearch {
+            id,
+            account_id: account.id.clone(),
+            name,
+            query,
+            sort,
+            valid: true,
+            error: None,
+            total: 0,
+            unread: 0,
+            index_pending: false,
+        };
         if let Some(store) = &self.store {
             store
-                .create_saved_search(&postino_store::SavedSearch {
-                    id: saved.id.clone(),
-                    account_id: saved.account_id.clone(),
-                    name: saved.name.clone(),
-                    query: saved.query.clone(),
-                    sort: saved.sort.clone(),
-                    created_at: now,
-                    updated_at: now,
-                })
+                .create_saved_search_limited(
+                    &postino_store::SavedSearch {
+                        id: saved.id.clone(),
+                        account_id: saved.account_id.clone(),
+                        name: saved.name.clone(),
+                        query: saved.query.clone(),
+                        sort: saved.sort.clone(),
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    MAX_SAVED_SEARCHES,
+                )
                 .map_err(store_map::write_error)?;
+        } else {
+            self.next_saved_search_seq = self.next_saved_search_seq.saturating_add(1);
         }
         let id = saved.id.clone();
         self.saved_searches.push(saved);
@@ -1100,12 +1212,26 @@ impl Engine {
             .ok_or_else(|| OpError::Failed("the new saved search disappeared".to_owned()))
     }
 
-    pub fn update_saved_search(&mut self, id: &str, name: Option<&str>, query: Option<&str>, sort: Option<&str>) -> Result<SavedSearch, OpError> {
+    pub fn update_saved_search(
+        &mut self,
+        account: Option<&str>,
+        id: &str,
+        name: Option<&str>,
+        query: Option<&str>,
+        sort: Option<&str>,
+    ) -> Result<SavedSearch, OpError> {
         if name.is_none() && query.is_none() && sort.is_none() {
             return Err(OpError::InvalidArgs("provide name, query and/or sort".to_owned()));
         }
+        let account = self.requested_account(account, "saved_search_update")?;
+        if !self.saved_searches.iter().any(|saved| saved.id == id && saved.account_id == account.id) {
+            self.reload_saved_searches(Some(&account.id))?;
+        }
         let index = self.saved_searches.iter().position(|saved| saved.id == id).ok_or_else(|| unknown_saved_search(id))?;
-        let account_id = self.saved_searches.get(index).map(|saved| saved.account_id.clone()).ok_or_else(|| unknown_saved_search(id))?;
+        if self.saved_searches.get(index).is_none_or(|saved| saved.account_id != account.id) {
+            return Err(unknown_saved_search(id));
+        }
+        let account_id = account.id.clone();
         let current_name = self.saved_searches.get(index).map(|saved| saved.name.clone()).unwrap_or_default();
         let resolved_name = match name {
             Some(name) => validate_saved_name(name)?,
@@ -1135,8 +1261,13 @@ impl Engine {
         self.saved_search_views(&account_id)?.into_iter().find(|saved| saved.id == id).ok_or_else(|| unknown_saved_search(id))
     }
 
-    pub fn delete_saved_search(&mut self, id: &str) -> Result<SavedSearch, OpError> {
-        let index = self.saved_searches.iter().position(|saved| saved.id == id).ok_or_else(|| unknown_saved_search(id))?;
+    pub fn delete_saved_search(&mut self, account: Option<&str>, id: &str) -> Result<SavedSearch, OpError> {
+        let account = self.requested_account(account, "saved_search_delete")?;
+        if !self.saved_searches.iter().any(|saved| saved.id == id && saved.account_id == account.id) {
+            self.reload_saved_searches(Some(&account.id))?;
+        }
+        let index =
+            self.saved_searches.iter().position(|saved| saved.id == id && saved.account_id == account.id).ok_or_else(|| unknown_saved_search(id))?;
         if let Some(store) = &self.store {
             store.delete_saved_search(id).map_err(store_map::write_error)?;
         }
@@ -1172,16 +1303,6 @@ impl Engine {
             return Ok(had || stored);
         }
         Ok(had)
-    }
-
-    fn next_saved_search_id(&self) -> String {
-        let highest = self
-            .saved_searches
-            .iter()
-            .filter_map(|saved| saved.id.strip_prefix("saved_").and_then(|rest| rest.parse::<u64>().ok()))
-            .max()
-            .unwrap_or(0);
-        format!("saved_{}", highest.saturating_add(1))
     }
 
     /// Every configured account with its IMAP server and last sync status. The demo account has
@@ -1614,6 +1735,9 @@ impl Engine {
         self.accounts.retain(|candidate| candidate.id != account.id);
         self.folders.retain(|folder| folder.account_id != account.id);
         self.messages.retain(|message| !folder_ids.contains(&message.folder_id));
+        self.saved_searches.retain(|saved| saved.account_id != account.id);
+        self.recent_searches.remove(&account.id);
+        *self.saved_counts.borrow_mut() = None;
         self.rebuild_message_index();
         let live = self.messages.iter().map(|message| message.id.clone()).collect::<BTreeSet<_>>();
         self.demo_messages.retain(|id, _| live.contains(id));
@@ -1753,6 +1877,18 @@ impl Engine {
     /// to choose SQL over the in-memory fallback.
     pub(crate) fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// The store, or a readable explanation when a read-only store has never built the conversation
+    /// cache. The caller is a thread read; it must not silently show an empty mailbox.
+    fn require_thread_cache(&self) -> Result<&Store, OpError> {
+        let store = self.require_store("threads_list")?;
+        if store.is_read_only() && store.thread_cache_count().map_err(store_map::read_error)? == 0 {
+            return Err(OpError::Failed(
+                "the conversation cache is empty; open this store read-write once to build it (any mail write or search_reindex does)".to_owned(),
+            ));
+        }
+        Ok(store)
     }
 
     /// The store, or the same readable demo/empty explanation the write operations use.

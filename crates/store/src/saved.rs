@@ -68,6 +68,42 @@ impl Store {
         Ok(())
     }
 
+    /// Insert a saved search only when the account has fewer than `limit` rows. The count and the
+    /// insert share one `BEGIN IMMEDIATE` transaction, so a desktop and an MCP process cannot both
+    /// create the 13th search.
+    pub fn create_saved_search_limited(&self, saved: &SavedSearch, limit: u32) -> Result<(), StoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM saved_searches WHERE account_id = ?1", [&saved.account_id], |row| row.get(0))?;
+        if u32::try_from(count).unwrap_or(u32::MAX) >= limit {
+            return Err(StoreError::SavedSearchLimit { limit });
+        }
+        tx.execute(
+            &format!("INSERT INTO saved_searches({SAVED_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+            params![saved.id, saved.account_id, saved.name, saved.query, saved.sort, saved.created_at, saved.updated_at],
+        )
+        .map_err(|error| duplicate("saved search", &saved.name, error))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Allocate a store-wide monotonic saved-search id (`saved_<n>`). A meta high-water mark is
+    /// seeded once from existing rows, so a deleted id is never handed out again to a different row.
+    pub fn allocate_saved_search_id(&self) -> Result<String, StoreError> {
+        const KEY: &str = "saved_search_seq";
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let stored: Option<String> = tx.query_row("SELECT value FROM meta WHERE key = ?1", [KEY], |row| row.get(0)).optional()?;
+        let stored = stored.and_then(|raw| raw.parse::<i64>().ok()).unwrap_or(0);
+        let highest: Option<i64> =
+            tx.query_row("SELECT MAX(CAST(substr(id, 7) AS INTEGER)) FROM saved_searches WHERE id GLOB 'saved_[0-9]*'", [], |row| row.get(0))?;
+        let next = stored.max(highest.unwrap_or(0)).saturating_add(1);
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![KEY, next.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(format!("saved_{next}"))
+    }
+
     /// Change the editable fields. `None` keeps the current value; the id and account never change.
     pub fn update_saved_search(&self, id: &str, name: Option<&str>, query: Option<&str>, sort: Option<&str>) -> Result<SavedSearch, StoreError> {
         let Some(current) = self.get_saved_search(id)? else {

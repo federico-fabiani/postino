@@ -237,6 +237,7 @@ pub(crate) fn assign_thread_in_tx(
     date: i64,
     subject: &str,
     subject_norm: &str,
+    previous_thread: Option<&str>,
 ) -> Result<String, StoreError> {
     let own = own_message_id.and_then(normalise_thread_reference);
     let chain = normalise_chain(references, own.as_deref());
@@ -282,6 +283,11 @@ pub(crate) fn assign_thread_in_tx(
         first.clone()
     } else if let Some(parent) = &parent {
         parent.clone()
+    } else if let Some(previous) = previous_thread {
+        // A no-reference message that already had a thread keeps it across a re-fetch. The subject
+        // fallback is a heuristic and must not move the same row when a second same-subject thread
+        // appears later; a genuine merge still happens through references.
+        canonical_in_tx(tx, account_id, previous)?
     } else if let Some(candidate) = subject_candidate_in_tx(tx, account_id, local_id, date, subject, subject_norm)? {
         candidate
     } else if let Some(own) = own {
@@ -681,6 +687,9 @@ impl Store {
     /// Create the cache from existing messages once, for a store written by P9a. A populated cache
     /// is left alone: it is maintained incrementally and a rebuild is an explicit maintenance step.
     pub fn ensure_thread_cache(&self) -> Result<bool, StoreError> {
+        if self.read_only {
+            return Ok(false);
+        }
         let threads: i64 = self.conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
         if threads > 0 {
             return Ok(false);
@@ -691,5 +700,11 @@ impl Store {
         }
         self.refresh_all_threads()?;
         Ok(true)
+    }
+
+    /// Number of cache rows, for the read-only open check. A cheap count over the cache table.
+    pub fn thread_cache_count(&self) -> Result<u32, StoreError> {
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+        to_count(count)
     }
 }

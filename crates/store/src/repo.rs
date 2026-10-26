@@ -153,6 +153,8 @@ impl Store {
         tx.execute("DELETE FROM folders WHERE account_id = ?1", [account_id])?;
         let status_key = format!("{SYNC_STATUS_KEY_PREFIX}{account_id}");
         tx.execute("DELETE FROM meta WHERE key = ?1", [status_key])?;
+        let recent_key = format!("{}{account_id}", crate::RECENT_SEARCHES_KEY_PREFIX);
+        tx.execute("DELETE FROM meta WHERE key = ?1", [recent_key])?;
         tx.execute("DELETE FROM accounts WHERE id = ?1", [account_id])?;
         tx.commit()?;
         Ok(true)
@@ -867,6 +869,7 @@ impl Store {
             message.summary.date,
             &message.summary.subject,
             &subject_norm,
+            previous.as_deref(),
         )?;
         if let Some(previous) = previous
             && tx
@@ -1402,6 +1405,8 @@ impl Store {
     /// (the server copy already exists). The returned UID is `Some(uid)` when this happened.
     pub fn send_draft_message(&self, message: &Message, merge_duplicate: Option<&str>) -> Result<Option<u32>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
+        let old_thread: Option<String> =
+            tx.query_row("SELECT thread_id FROM messages WHERE id = ?1", [&message.summary.id], |row| row.get(0)).optional()?;
         let adopted_uid = match merge_duplicate {
             Some(duplicate) if duplicate != message.summary.id => {
                 tx.query_row("SELECT uid FROM messages WHERE id = ?1", [duplicate], |row| row.get::<_, Option<u32>>(0)).optional()?.flatten()
@@ -1409,6 +1414,9 @@ impl Store {
             _ => None,
         };
         let mut touched_threads = vec![message.summary.thread_id.clone()];
+        if let Some(old_thread) = old_thread {
+            touched_threads.push(old_thread);
+        }
         if let Some(duplicate) = merge_duplicate
             && duplicate != message.summary.id
             && let Some(thread) =

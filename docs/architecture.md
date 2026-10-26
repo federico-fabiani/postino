@@ -1136,7 +1136,8 @@ second builder can see a half-built index, so do not run it from the desktop and
 runs `VACUUM`, because FTS keys on `messages.rowid`.
 
 `threads`, `thread_aliases`, `saved_searches`, `rules`, `rule_runs` and `rule_actions` are created empty
-and inert in v7 so P9b/P9c need no second migration. P9a does not read or write them.
+and inert in v7 so P9b/P9c would need no second migration. P9a did not read or write them; P9b now
+owns `threads`, `thread_aliases` and `saved_searches`, while the P9c rule tables stay inert.
 
 **Query language.** `postino-core::search` is a hand-written recursive-descent parser with one AST and
 one canonical printer:
@@ -1223,81 +1224,106 @@ message moves, the old row is deleted and an `thread_aliases(old_id,new_id)` ent
 working; `thread_get` follows it and returns `resolved_id`. A message whose own `Message-ID` names a
 phantom thread adopts it, which is how a late parent joins the replies that were waiting for it.
 Unresolved sibling references are aliased to the chosen root, so a root that arrives later joins the
-same conversation. Ids change only on a merge.
+same conversation. Ids change only on a merge; a locally sent draft keeps the id its final row will
+have, so the send does not create a second conversation.
 
 The subject fallback is deliberately narrow: no `References` and no `In-Reply-To`, a `Re:`/`Fwd:`/`Fw:`
 prefix, a normalised subject of at least 8 bytes, and exactly one distinct thread with that subject
 inside a ±14-day window. It attaches this message to that thread; it never merges two threads, and two
-matching threads drop the fallback. A message re-fetch is idempotent, a reopen reads the stored ids,
-and a `UIDVALIDITY` reset re-derives the same ids from the same headers. A locally sent message takes
-its own `Message-ID` (or the parent thread, or the phantom parent) as the thread before its row is
-written, so a later Sent re-fetch derives the same id instead of moving it. Mail cached by P9a keeps its
-P9a placeholder ids until an explicit rebuild; P9b does not re-read every pre-P9 message at open (that
-would add a full mailbox derivation to the startup path). `search_reindex` rebuilds the cache rows,
-not the ids.
+matching threads drop the fallback. A no-reference message that already has a thread keeps it on a
+re-fetch, so a second same-subject thread appearing later cannot detach the first reply. A reopen reads
+the stored ids, and a `UIDVALIDITY` reset re-derives the same ids from the same headers. A locally sent
+message takes its own `Message-ID` (or the parent thread, or the phantom parent) as the thread before
+its row is written, and `send_draft_message` refreshes the old draft thread as well as the new one, so a
+later Sent re-fetch derives the same id and no ghost row survives. Mail cached by P9a keeps its P9a
+placeholder ids; P9b does not re-read every pre-P9 message at open (that would add a full mailbox
+derivation to the startup path). `search_reindex` rebuilds the cache rows, not the ids; **the pre-P9
+placeholder ids are permanent until a future full re-derivation operation**, which this package does not
+ship.
 
 `threads` is a cache. Counts are mailbox-wide, the subject is the earliest message's subject, and
 `latest_message_id` is the row a click opens. Ingest, flag changes, deletes, merges and draft sends
-refresh only the affected rows; `Store::refresh_all_threads` rebuilds the table from `messages` in one
-transaction, and `Engine::open` runs it once when a P9a store has messages but an empty cache. A folder
-or label view lists threads with at least one message in scope without narrowing the counts on the
-row. `Store::list_threads` reads a page from the cache and the latest snippet per row **after** the
-`LIMIT`, so a 100k cache never joins every message before the page. The cache gets an idempotent
-`threads(account_id,last_date DESC,id)` index on normal open: it is derived-cache maintenance, not a
-schema version (`user_version` stays 7), and a read-only open never creates it.
+refresh only the affected rows (a send refreshes both the old draft thread and the new thread);
+`Store::refresh_all_threads` rebuilds the table from `messages` in one transaction, and `Engine::open`
+runs it once when a P9a store has messages but an empty cache. A read-only open skips that write and a
+thread read answers with an actionable "open read-write once" error if the cache is empty. A folder or
+label view lists threads with at least one message in scope without narrowing the counts on the row.
+`Store::list_threads` reads a page from the cache and the latest snippet per row **after** the `LIMIT`,
+so a 100k cache never joins every message before the page. Normal open creates the derived indexes
+idempotently: `threads(account_id,last_date DESC,id)`, `messages(account_id,message_id)` for the
+reference lookup, `messages(account_id,subject_norm,date)` for the subject fallback and
+`thread_aliases(account_id,new_id)` for merge redirects. This is derived-cache maintenance, not a
+schema version (`user_version` stays 7); a read-only open never creates them. The reference lookup is
+the difference between a mailbox scan per reference and a point lookup on every synced message.
 
 **Operations.** `threads_list {account?,folder?,label?,unread_only?,starred_only?,with_attachments?,
 limit?,offset?}` returns `{threads,total,unread_threads,unread_messages}` with participants, subject,
 snippet, date, state, counts and labels. `thread_get {id,account?,limit?,offset?}` returns ascending
-message summaries (≤200), `total`, `truncated` and `resolved_id`; bodies stay behind `message_get`.
-`thread_flag {id,account?,unread?,starred?}` changes every message in the thread (≤500), is
-idempotent and reports the refreshed row plus the real transition count. Archive/delete stay
-`message_move` over the thread's ids, so one undo covers the batch. All three are local and offline;
-none is sensitive, and MCP marks `thread_flag` idempotent.
+message summaries (≤200), `total`, `truncated` and `resolved_id`; the desktop loads the newest page
+first and prepends earlier pages on request, and an account-wide list includes local drafts (folder
+views do not). `thread_flag {id,account?,unread?,starred?}` changes every message in the thread (≤500),
+is idempotent and reports the refreshed row plus the real transition count; the engine updates its
+summary vector and folder/label/star counts in the same call. Archive/delete stay `message_move` over
+the thread's ids, so one undo covers the batch, including the messages that moved when a later id in a
+partial batch failed. All three are local and offline; none is sensitive, and MCP marks `thread_flag`
+idempotent.
 
 **UI.** Folder views list one row per conversation by default: participants, subject, date, message
-and unread counts, mailbox-wide labels. A search starts flat and the **Conversazioni** command groups
-its hits instead. Opening a row shows the conversation banner at the top of the reading pane, one
-compact card per message and exactly one expanded message: `J`/`K` move the open card, `Enter` opens
-the latest unread, `R`/`A`/`F` reply/reply-all/forward it, `E`/`U`/`S` act on the whole thread, and
-`Esc` goes back to the list. At 980×600 the reading pane is the full overlay the P2b layout already
-uses. A thread with more than the 200-message page refuses a bulk move/flag with a sentence instead
-of acting on part of it.
+and unread counts, mailbox-wide labels. A search starts flat and the **Conversazioni o messaggi**
+command groups its hits instead; the grouped header says the counts describe the results. Opening a row
+shows the conversation banner at the top of the reading pane, one compact card per message and exactly
+one expanded message: `J`/`K` move the open card (pulling the previous page at its top edge), `Enter`
+opens the selected card, `R`/`A`/`F` reply/reply-all/forward it, `E`/`U`/`S` act on the whole thread,
+and `Esc` goes back to the list. The thread list loads 200 conversations at a time with “Carica altre
+conversazioni”; a thread over the page loads its newest 200 messages and prepends older pages. A thread
+over 500 messages refuses a bulk move/flag with a sentence instead of acting on part of it. At 980×600
+the reading pane is the full overlay the P2b layout already uses.
 
 **Saved searches.** `saved_searches` holds at most 12 names per account (unique ignoring case), 1–48
-characters, with the documented query language and `sort` `relevance`/`date`. Create and update
-parse and resolve the query now, so an unclosed quote, an unknown label or an unknown folder is
-refused instead of stored; a label or folder deleted later leaves the row visible as `valid:false`
-with `error`, never a dead entry. Counts (`total`, `unread`) are computed by the same search path as
-`search`, cached by engine revision, and a pending FTS index reports invalid with “the search index
-is not ready”. Applying a saved search replaces the query and clears the label filter; the query owns
-its scope, so a `folder:` clause filters it and a query without one is account-wide instead of
-inheriting the folder the user happened to be in. `Esc` restores the query, folder, filters and
-threaded mode. The last eight successful queries live in `meta.recent_searches:<account>` inside
-SQLCipher; the sidebar shows them as chips while the empty search field is focused and the palette
-has an explicit clear command. Rename, edit and delete are undoable; CRUD leaves the packaged store
-in the encrypted database.
+characters, with the documented query language and `sort` `relevance`/`date`; the cap is checked in the
+same immediate transaction as the insert, so a desktop and an MCP process cannot both create the 13th,
+and ids come from a monotonic store counter (never reused). Create, update and delete are account-scoped
+when the mailbox has several accounts. Create and update parse and resolve the query now, so an unclosed
+quote, an unknown label or an unknown folder is refused instead of stored; a label or folder deleted
+later leaves the row visible as `valid:false` with `error`, never a dead entry. Counts (`total`,
+`unread`) are computed by the same search path as `search`, cached by engine revision, and a pending FTS
+index is `valid:true,index_pending:true` with zero counts, not an invalid query; the desktop refreshes
+the row when the index completes. Applying a saved search replaces the query, clears the label filter
+and the unread/attachment chips, and the query owns its scope: a `folder:` clause filters it and a query
+without one is account-wide, titled “Tutte le mail” and with no folder highlight. `Esc` restores the
+query, folder, chips, filters and threaded mode. The last eight successful queries live in
+`meta.recent_searches:<account>` inside SQLCipher; only Enter, a chip and an applied search record one,
+so the 250 ms debounce cannot fill the history with prefixes. Deleting an account deletes that key and
+its saved-search rows, and the desktop clears both lists. Rename, edit and delete are undoable; CRUD
+leaves the packaged store in the encrypted database.
 
 **Evidence.** The P9b fixture has 100 000 messages, 2 KiB bodies and 50 messages in one grouped
-thread; 20 000 runs in CI and 100 000 behind `POSTINO_SLOW_TESTS=1`. On the Windows GNU host (debug,
-SQLCipher 4.19 / SQLite 3.53.4), five runs after the cache was built:
+thread; 20 000 runs in CI and 100 000 behind `POSTINO_SLOW_TESTS=1`. The ingest measurement seeds the
+mailbox with raw SQL and then writes 100 real 2 KiB messages through
+`upsert_synced_message_with_refs`, each with three references that resolve to the grouped thread. On
+the Windows GNU host (debug, SQLCipher 4.19 / SQLite 3.53.4), five runs after the cache was built:
 
 | Measure | 20k | 100k | P9b target |
 |---|---|---|---|
-| `threads_list` account-wide P50 | 11.8 ms | 82.1 ms | < 100 ms |
-| `threads_list` account-wide P95 | 12.5 ms | 91.6 ms | < 100 ms |
-| `threads_list` folder view P50 | 69.2 ms | 360.6 ms | reported |
-| `threads_list` folder view P95 | 69.2 ms | 448.7 ms | reported |
-| `thread_get` 50 P50 | 0.4 ms | 0.5 ms | < 50 ms |
-| `thread_get` 50 P95 | 1.1 ms | 1.2 ms | < 50 ms |
-| First open of a P9a store (thread cache build) | 478 ms | 1 952 ms | one-time, reported |
+| `threads_list` account-wide P50 | 12.0 ms | 80.7 ms | < 100 ms |
+| `threads_list` account-wide P95 | 14.2 ms | 82.1 ms | < 100 ms |
+| `threads_list` folder view P50 | 69.1 ms | 356.1 ms | reported |
+| `threads_list` folder view P95 | 69.9 ms | 358.6 ms | reported |
+| `thread_get` 50 P50 | 0.4 ms | 0.4 ms | < 50 ms || `thread_get` 50 P95 | 1.2 ms | 1.2 ms | < 50 ms |
+| 100 real inserts with 3 refs, total | 308 ms | 307 ms | < 2 s |
+| A real 2 KiB insert P50 / P95 | 2.7 / 4.5 ms | 2.7 / 6.0 ms | P50 < 20 ms |
+| First open of a P9a store (thread cache build) | 386 ms | 1 956 ms | one-time, reported |
 | Later open | unchanged from P9a | unchanged from P9a | not re-measured |
 
-The account-wide list meets its target. **The folder view misses it at 100k:** deciding which
-conversations have a message in a folder crosses the covering message index (100k entries) and then
-counts the matching thread cache; a denormalised folder scope in the cache is the next step. The P9a
-upgrade cost is a one-time cache build, not part of a steady-state open. No new dependency, no
-migration, and the FTS index is not consulted by thread listing.
+The account-wide list, `thread_get` and the real-ingest targets are met. **The folder view misses
+<100 ms at 100k:** deciding which conversations have a message in a folder crosses the covering
+message index (100k entries) and then counts the matching thread cache; a denormalised folder scope in
+the cache is the next step. The P9a upgrade cost is a one-time cache build, not part of a steady-state
+open. There is no new dependency and no schema version bump; normal open creates the derived indexes
+idempotently, and the FTS index is not consulted by thread listing. Two bounds are deliberate: the
+participant/label facts of a page are read from at most 2 000 message rows and 4 000 label rows, so a
+very large page may omit late participants, and rows written by P9a keep the old `subject_norm` without
+a stripped prefix, so the subject fallback can miss pre-P9 mail until a future backfill.
 
 ## 5. Synchronization
 
@@ -1407,3 +1433,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-26 | minor | P6d: schema v6 `messages.remote_images`, `ParsedMessage::remote_images_blocked` carried through sync and the store, `message_get` field and the Italian reading-pane line from stored truth; no HTML rendering and no remote fetch |
 | 2026-10-26 | major | P9a: body-free store read path (summaries + owned cached `message`), schema v7 search columns and contentless-delete FTS5, recursive-descent query language with canonical printer, typed bound execution with bm25 ranking, `search`/`search_status`/`search_reindex`, CLI/MCP/UI parity, 100k evidence |
 | 2026-10-26 | major | P9b: reference-chain conversation derivation with phantom joins, order-independent merges and aliases, bounded subject fallback, cached thread rows with mailbox-wide counts, thread operations, one-open-card conversation view at 980, saved searches with stale-aware computed counts, recent queries in encrypted meta, CLI/MCP parity, 20k/100k evidence |
+| 2026-10-26 | major | P9b closure: `messages(account_id,message_id)` and `subject_norm` indexes (1.29 s/ref → 2.7 ms/insert), sent-draft ghost removed, store-backed thread flag counts, live thread pages and paging, subject-fallback re-fetch stability, saved-search freshness/account cleanup/atomic cap/account scope, conversation Enter, partial-batch undo, read-only cache guard |

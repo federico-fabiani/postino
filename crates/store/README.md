@@ -96,6 +96,18 @@ mail.db.blobs/<first two hex chars>/<64 lowercase hex>.blob
 - The blob directory has no garbage collector yet: deleting a message leaves its blob, because
   another message may reference the same content.
 
+## Schema v7
+
+v7 is additive from v6: derived search columns on `messages` (`search_sender`, `search_to`,
+`search_cc`, `search_bcc`, `attachment_names`, `subject_norm`, `in_reply_to`, `references_json`,
+`ingested_at`, `rules_applied_at`), the contentless-delete `message_fts` index and rank table with
+their triggers, and the `threads`, `thread_aliases`, `saved_searches`, `rules`, `rule_runs` and
+`rule_actions` tables. P9b uses the conversation cache and saved searches; the P9c rule tables stay
+inert. Normal `Store::open` also creates the derived indexes idempotently
+(`threads(account_id,last_date DESC,id)`, `messages(account_id,message_id)`,
+`messages(account_id,subject_norm,date)`, `thread_aliases(account_id,new_id)`) so a P9a store gains
+them without a version bump; a read-only open never writes them.
+
 ## Schema v6
 
 v6 is additive from v5: `messages.remote_images INTEGER NOT NULL DEFAULT 0 CHECK(remote_images
@@ -115,7 +127,12 @@ IMAP and optional SMTP secrets live in the OS keyring.
 | `accounts` | id, name, email, provider, signature, created_at |
 | `account_servers` | IMAP endpoint, plus the nullable SMTP endpoint (P7) |
 | `folders` | account, name, kind, cached unread/total, `uid_validity`, `uid_next`, `last_sync_at` |
-| `messages` | envelope, JSON recipient lists, flags, body text/HTML, stored blocked-image count, size, optional IMAP uid |
+| `messages` | envelope, JSON recipient lists, flags, body text/HTML, stored blocked-image count, size, optional IMAP uid, derived search text and threading headers (P9a/P9b) |
+| `message_fts` | contentless-delete FTS5 index over the search columns, keyed by `messages.rowid` (P9a) |
+| `message_fts_rank` | rowid → date/id tie-break for a global bm25 page (P9a) |
+| `threads` | conversation cache: subject, last date, mailbox-wide counts, attachments, latest message (P9b) |
+| `thread_aliases` | old merged thread id → current id (P9b) |
+| `saved_searches` | account, name (unique NOCASE), query, sort and timestamps (P9b) |
 | `attachments` | metadata: filename, mime, size, optional blob hash; the bytes live in `blobs/` |
 | `labels` | account-scoped or mailbox-wide, name, semantic colour name |
 | `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |
@@ -123,9 +140,12 @@ IMAP and optional SMTP secrets live in the OS keyring.
 | `draft_seq` | message id → highest revision ever written; survives a send and a move back |
 | `outbox` | draft id, content-stable idempotency key, state, submission and append attempt counters, due time, lease epoch, fixed error, raw blob hash, envelope JSON (P7) |
 | `sync_state` | per-folder sync cursor: next UID to fetch, `highest_modseq`, `last_error` |
-| `meta` | key/value store from P3a; holds `label_seq`, `draft_id_seq`, `sync_status:<account>` and `outbox_halt:<account>` |
+| `meta` | key/value store from P3a; holds `label_seq`, `draft_id_seq`, `saved_search_seq`, `recent_searches:<account>`, `reply_to:<message>`, `search_index`, `search_updated_at`, `sync_status:<account>` and `outbox_halt:<account>` |
 
 Indexes cover the hot reads: `messages(folder_id, date DESC)`, `messages(account_id, date DESC)`,
+`messages(account_id, thread_id, date DESC)`, `messages(account_id, message_id)`,
+`messages(account_id, subject_norm, date)`, the covering `messages_list_cover`,
+`threads(account_id, last_date DESC, id)`, `thread_aliases(account_id, new_id)`,
 `message_labels(label_id)`, `attachments(message_id)`, `drafts(updated_at DESC)`,
 `folders(account_id)` and `outbox(state, send_at)`. `labels` has `UNIQUE(account_id, name)` plus a
 partial unique index on mailbox-wide names, because SQLite treats `NULL`s as distinct in a plain
@@ -226,8 +246,8 @@ cargo test -p postino-store
 
 ## Not here yet
 
-Desktop-app wiring (P6 onboarding), FTS5, body/raw-message blobs (P9), daemon (M4), key rotation and
-blob garbage collection. `sync_state` and the sync-status `meta` key have writers
+Desktop-app wiring (P6 onboarding), raw-message blobs, the rules engine (P9c), the daemon (M4), key
+rotation and blob garbage collection. `sync_state` and the sync-status `meta` key have writers
 now: `postino-sync` (P5b) is the client of this crate for received mail. Parsing MIME is not here:
 sync parses and hands over rows and blob hashes. The engine (P3c, P4b) is another client; this crate
 never depends on it.

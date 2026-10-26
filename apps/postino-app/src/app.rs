@@ -250,25 +250,39 @@ pub struct PostinoApp {
     threads_view_before_search: Option<bool>,
     /// The last `threads_list` read, keyed like `list_cache`.
     threads_cache: Option<(String, u64, Vec<ThreadSummary>, u32, u32, u32)>,
-    /// The conversation shown in the reading pane and its ascending message page.
+    /// How many conversation rows the threaded list has loaded; "Carica altre" grows it by 200.
+    thread_list_limit: u32,
+    /// The conversation shown in the reading pane and the newest page of its messages.
     selected_thread: Option<String>,
     thread_messages: Vec<MessageSummary>,
     thread_summary: Option<ThreadSummary>,
     thread_total: u32,
+    /// Offset of the first loaded message. Older pages are prepended; the newest page is loaded first.
+    thread_offset: u32,
     thread_open: Option<String>,
     /// Saved searches and the last eight queries, kept in the engine's account order.
     saved_searches: Vec<SavedSearch>,
     recent_searches: Vec<String>,
+    /// The engine revision the saved-search rows were last refreshed at, plus a 2 s poll for a
+    /// second process's CRUD.
+    saved_searches_revision: Option<u64>,
+    last_saved_refresh: f64,
     /// The saved search currently applied, for the sidebar's selected state.
     applied_saved: Option<String>,
     saved_editor: Option<SavedSearchEditor>,
     /// Snapshot restored by Esc after a saved search replaced the query and filters.
     saved_restore: Option<SavedRestore>,
-    /// A saved query that names `folder:` keeps the current folder scope; a plain saved query does
-    /// not inherit the folder the user happened to be in.
+    /// True while a saved search owns the scope; `saved_query_folder` says whether its query names a
+    /// folder. A query without `folder:` is account-wide and the folder is not highlighted.
     saved_folder_scope: bool,
+    saved_query_folder: bool,
     /// Why the applied saved search is stale, shown inline until the next search.
     saved_error: Option<String>,
+    /// True while a saved search is invalid only because the FTS index is still building.
+    saved_index_pending: bool,
+    /// Record the committed query in the recent list. Only Enter, apply and an explicit commit set
+    /// this; the 250 ms debounce must not fill the history with prefixes.
+    recording_recent: bool,
     /// Reveal the RICERCHE section on the next sidebar frame (after save or apply).
     scroll_saved_into_view: bool,
     /// The sidebar scroll offset computed from the last RICERCHE reveal, applied next frame.
@@ -432,6 +446,7 @@ impl PostinoApp {
         let send_worker = store.as_ref().map(|handle| SendWorker::start(Box::new(StoreSendBackend::new(handle.clone(), extra_roots.clone()))));
         let saved_searches = active_account.as_deref().and_then(|account| engine.saved_searches_list(Some(account)).ok()).unwrap_or_default();
         let recent_searches = active_account.as_deref().and_then(|account| engine.recent_searches(Some(account)).ok()).unwrap_or_default();
+        let saved_revision = engine.revision();
         Self {
             engine,
             folder,
@@ -477,18 +492,25 @@ impl PostinoApp {
             threads_view: true,
             threads_view_before_search: None,
             threads_cache: None,
+            thread_list_limit: 200,
             selected_thread: None,
             thread_messages: Vec::new(),
             thread_summary: None,
             thread_total: 0,
+            thread_offset: 0,
             thread_open: None,
             saved_searches,
             recent_searches,
+            saved_searches_revision: Some(saved_revision),
+            last_saved_refresh: 0.0,
             applied_saved: None,
             saved_editor: None,
             saved_restore: None,
             saved_folder_scope: false,
+            saved_query_folder: false,
             saved_error: None,
+            saved_index_pending: false,
+            recording_recent: false,
             scroll_saved_into_view: false,
             sidebar_scroll_target: None,
             search_focus: false,
@@ -1386,6 +1408,19 @@ impl PostinoApp {
             self.sync_account = None;
         }
         self.labels_cache = self.engine.label_summaries();
+        self.clear_thread_selection();
+        self.threads_cache = None;
+        self.thread_list_limit = 200;
+        self.saved_searches.clear();
+        self.recent_searches.clear();
+        self.applied_saved = None;
+        self.saved_editor = None;
+        self.saved_restore = None;
+        self.saved_searches_revision = None;
+        self.saved_index_pending = false;
+        self.saved_error = None;
+        self.saved_folder_scope = false;
+        self.saved_query_folder = false;
         if self.active_account.as_deref() == Some(removed) {
             self.active_account = self.engine.accounts().first().map(|account| account.id.clone());
         }
@@ -1407,6 +1442,7 @@ impl PostinoApp {
             self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
             self.clear_selection();
             self.close_reading();
+            self.refresh_saved_searches();
             self.sync_view = sync_view_for(&self.engine, self.active_account.as_deref());
             self.last_sync = last_sync_from(&self.sync_view);
             self.status = warning.unwrap_or_else(|| "Account rimosso".to_owned());
@@ -1448,7 +1484,21 @@ impl PostinoApp {
         self.labels_cache = self.engine.label_summaries();
         self.clear_selection();
         self.close_reading();
+        self.clear_thread_selection();
+        self.threads_cache = None;
+        self.thread_list_limit = 200;
+        self.saved_searches.clear();
+        self.recent_searches.clear();
+        self.applied_saved = None;
+        self.saved_editor = None;
+        self.saved_restore = None;
+        self.saved_searches_revision = None;
+        self.saved_index_pending = false;
+        self.saved_error = None;
+        self.saved_folder_scope = false;
+        self.saved_query_folder = false;
         self.clear_search();
+        self.refresh_saved_searches();
         self.unread_only = false;
         self.attachments_only = false;
         self.label_filter = None;
@@ -1804,6 +1854,9 @@ impl PostinoApp {
         self.clear_selection();
         self.reading_open = false;
         self.reading_full = false;
+        self.clear_thread_selection();
+        self.threads_cache = None;
+        self.thread_list_limit = 200;
         self.list_error_ack = false;
         self.mark_settings_dirty();
         self.persist_settings();
@@ -1830,8 +1883,42 @@ impl PostinoApp {
 
     fn refresh_saved_searches(&mut self) {
         let account = self.active_account.clone();
+        let _ = self.engine.reload_saved_searches(account.as_deref());
         self.saved_searches = account.as_deref().and_then(|account| self.engine.saved_searches_list(Some(account)).ok()).unwrap_or_default();
         self.recent_searches = account.as_deref().and_then(|account| self.engine.recent_searches(Some(account)).ok()).unwrap_or_default();
+        self.saved_searches_revision = Some(self.engine.revision());
+        self.last_saved_refresh = self.now;
+        if let Some(applied) = self.applied_saved.clone() {
+            match self.saved_searches.iter().find(|saved| saved.id == applied) {
+                Some(saved) => {
+                    self.saved_index_pending = saved.index_pending;
+                    if saved.index_pending {
+                        self.saved_error = None;
+                    } else if !saved.valid {
+                        self.saved_error = saved.error.clone().or_else(|| Some("query".to_owned()));
+                    } else {
+                        self.saved_error = None;
+                    }
+                }
+                None => {
+                    self.applied_saved = None;
+                    self.saved_error = None;
+                    self.saved_index_pending = false;
+                }
+            }
+        } else {
+            self.saved_index_pending = false;
+        }
+    }
+
+    /// Refresh saved-search counts after any engine write and at least every two seconds for a
+    /// second process's CRUD. The engine's own count cache makes the first form cheap.
+    fn refresh_saved_searches_if_stale(&mut self) {
+        let revision_changed = self.saved_searches_revision != Some(self.engine.revision());
+        let poll_due = self.now - self.last_saved_refresh >= 2.0;
+        if revision_changed || poll_due {
+            self.refresh_saved_searches();
+        }
     }
 
     fn refresh_recent_searches(&mut self) {
@@ -1853,15 +1940,27 @@ impl PostinoApp {
         if name.trim().is_empty() {
             name = "Nuova ricerca".to_owned();
         }
-        self.saved_editor =
-            Some(SavedSearchEditor { mode: SavedSearchEditorMode::Create, name, query: self.search_committed.clone(), error: None, focus: true });
+        self.saved_editor = Some(SavedSearchEditor {
+            mode: SavedSearchEditorMode::Create,
+            name,
+            query: self.search_committed.clone(),
+            sort: "relevance".to_owned(),
+            error: None,
+            focus: true,
+        });
     }
 
     fn start_saved_search_rename(&mut self, id: &str) {
         self.label_editor = None;
         let Some(saved) = self.saved_searches.iter().find(|saved| saved.id == id).cloned() else { return };
-        self.saved_editor =
-            Some(SavedSearchEditor { mode: SavedSearchEditorMode::Update(saved.id), name: saved.name, query: saved.query, error: None, focus: true });
+        self.saved_editor = Some(SavedSearchEditor {
+            mode: SavedSearchEditorMode::Update(saved.id),
+            name: saved.name,
+            query: saved.query,
+            sort: saved.sort,
+            error: None,
+            focus: true,
+        });
     }
 
     fn cancel_saved_search_editor(&mut self) {
@@ -1876,6 +1975,7 @@ impl PostinoApp {
         };
         let name = editor.name.trim().to_owned();
         let query = editor.query.trim().to_owned();
+        let sort = editor.sort.clone();
         if name.is_empty() || query.is_empty() {
             if let Some(editor) = self.saved_editor.as_mut() {
                 editor.error = Some("Servono un nome e una ricerca".to_owned());
@@ -1884,9 +1984,12 @@ impl PostinoApp {
         }
         let account = self.active_account.clone();
         let previous = mode.as_deref().and_then(|id| self.saved_searches.iter().find(|saved| saved.id == id).cloned());
+        let update_account = previous.as_ref().map(|saved| saved.account_id.clone()).or_else(|| account.clone());
         let result = match mode {
-            Some(id) => self.engine.call("saved_search_update", json!({ "id": id, "name": name, "query": query })),
-            None => self.engine.call("saved_search_create", json!({ "account": account, "name": name, "query": query })),
+            Some(id) => {
+                self.engine.call("saved_search_update", json!({ "id": id, "account": update_account, "name": name, "query": query, "sort": sort }))
+            }
+            None => self.engine.call("saved_search_create", json!({ "account": account, "name": name, "query": query, "sort": sort })),
         };
         match result {
             Ok(_) => {
@@ -1897,13 +2000,19 @@ impl PostinoApp {
                 if let Some(previous) = previous {
                     self.push_toast(
                         "Ricerca aggiornata",
-                        UndoAction::SavedSearchUpdate { id: previous.id, name: previous.name, query: previous.query, sort: previous.sort },
+                        UndoAction::SavedSearchUpdate {
+                            id: previous.id,
+                            account: previous.account_id,
+                            name: previous.name,
+                            query: previous.query,
+                            sort: previous.sort,
+                        },
                     );
                 }
             }
             Err(postino_core::OpError::InvalidArgs(message)) => {
                 if let Some(editor) = self.saved_editor.as_mut() {
-                    editor.error = Some(message);
+                    editor.error = Some(saved_editor_error(&message));
                 }
             }
             Err(_) => {
@@ -1914,7 +2023,7 @@ impl PostinoApp {
 
     fn delete_saved_search(&mut self, id: &str) {
         let Some(saved) = self.saved_searches.iter().find(|saved| saved.id == id).cloned() else { return };
-        match self.engine.call("saved_search_delete", json!({ "id": id })) {
+        match self.engine.call("saved_search_delete", json!({ "id": id, "account": saved.account_id })) {
             Ok(_) => {
                 self.refresh_saved_searches();
                 let message = format!("Ricerca “{}” eliminata", saved.name);
@@ -1937,17 +2046,24 @@ impl PostinoApp {
                 label_folder: self.label_folder.clone(),
                 query: self.query.clone(),
                 search_committed: self.search_committed.clone(),
+                unread_only: self.unread_only,
+                attachments_only: self.attachments_only,
                 threads_view: self.threads_view,
                 threads_view_before_search: self.threads_view_before_search,
                 saved_folder_scope: self.saved_folder_scope,
+                saved_query_folder: self.saved_query_folder,
             });
         }
         self.saved_folder_scope = true;
+        self.saved_query_folder = query_has_folder(&saved.query);
         self.applied_saved = Some(saved.id.clone());
         self.scroll_saved_into_view = true;
-        self.saved_error = if saved.valid { None } else { saved.error.clone() };
+        self.saved_index_pending = saved.index_pending;
+        self.saved_error = if saved.index_pending || saved.valid { None } else { saved.error.clone().or_else(|| Some("query".to_owned())) };
         self.label_filter = None;
         self.label_folder = None;
+        self.unread_only = false;
+        self.attachments_only = false;
         self.query = saved.query.clone();
         self.search_committed = saved.query.clone();
         self.search_debounce_until = None;
@@ -1958,7 +2074,7 @@ impl PostinoApp {
         self.clear_thread_selection();
         self.list_cache = None;
         self.list_signature.clear();
-        if saved.valid {
+        if saved.valid && !saved.index_pending {
             let account = self.active_account.clone();
             let _ = self.engine.record_recent_search(account.as_deref(), &saved.query);
             self.refresh_recent_searches();
@@ -1974,10 +2090,14 @@ impl PostinoApp {
         self.label_folder = restore.label_folder;
         self.query = restore.query;
         self.search_committed = restore.search_committed;
+        self.unread_only = restore.unread_only;
+        self.attachments_only = restore.attachments_only;
         self.threads_view = restore.threads_view;
         self.threads_view_before_search = restore.threads_view_before_search;
         self.saved_folder_scope = restore.saved_folder_scope;
+        self.saved_query_folder = restore.saved_query_folder;
         self.saved_error = None;
+        self.saved_index_pending = false;
         self.applied_saved = None;
         self.saved_editor = None;
         self.search_debounce_until = None;
@@ -2017,32 +2137,92 @@ impl PostinoApp {
     }
 
     fn select_thread(&mut self, id: String) {
+        self.load_thread_page(id, true, None);
+    }
+
+    /// Load one conversation. `open` chooses and expands the latest unread card; without it the
+    /// thread is only selected (J/K before Enter). `offset` loads a specific page; `None` loads the
+    /// newest page so the latest unread is visible even in a thread larger than the 200-message cap.
+    fn load_thread_page(&mut self, id: String, open: bool, offset: Option<u32>) {
         let account = self.active_account.clone();
-        let args = json!({ "id": id, "account": account, "limit": 200 });
-        match self.engine.call("thread_get", args) {
+        let summary = match self.engine.call("thread_get", json!({ "id": id, "account": account, "limit": 1, "offset": 0 })) {
+            Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
+                Ok(detail) => detail,
+                Err(_) => {
+                    self.report_failure("Non è stato possibile leggere la conversazione.", false);
+                    return;
+                }
+            },
+            Err(error) => {
+                self.report_failure(op_error_copy(&error), false);
+                return;
+            }
+        };
+        let total = summary.total;
+        let start = offset.unwrap_or_else(|| total.saturating_sub(200));
+        let page = match self.engine.call("thread_get", json!({ "id": summary.resolved_id, "account": account, "limit": 200, "offset": start })) {
+            Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
+                Ok(detail) => detail,
+                Err(_) => {
+                    self.report_failure("Non è stato possibile leggere la conversazione.", false);
+                    return;
+                }
+            },
+            Err(error) => {
+                self.report_failure(op_error_copy(&error), false);
+                return;
+            }
+        };
+        self.selected_thread = Some(page.resolved_id.clone());
+        self.thread_summary = Some(page.thread.clone());
+        self.thread_messages = page.messages;
+        self.thread_total = page.total;
+        self.thread_offset = start.min(page.total);
+        self.thread_open = None;
+        if open {
+            let open_id = self
+                .thread_messages
+                .iter()
+                .rev()
+                .find(|message| message.unread)
+                .or_else(|| self.thread_messages.last())
+                .map(|message| message.id.clone());
+            if let Some(open_id) = open_id {
+                self.thread_open = Some(open_id.clone());
+                self.open_message(open_id);
+            } else {
+                self.close_reading();
+            }
+        } else {
+            if let Some(latest) = self.thread_messages.last().map(|message| message.id.clone()) {
+                self.selected = Some(latest.clone());
+                self.select_only(latest);
+            }
+            self.close_reading();
+        }
+        self.threads_cache = None;
+    }
+
+    /// Prepend the page before the first loaded card. The open card and scroll position stay put.
+    fn load_older_thread_messages(&mut self) {
+        let Some(id) = self.selected_thread.clone() else { return };
+        if self.thread_offset == 0 {
+            return;
+        }
+        let account = self.active_account.clone();
+        let offset = self.thread_offset.saturating_sub(200);
+        match self.engine.call("thread_get", json!({ "id": id, "account": account, "limit": 200, "offset": offset })) {
             Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
                 Ok(detail) => {
-                    self.selected_thread = Some(detail.resolved_id.clone());
-                    self.thread_summary = Some(detail.thread);
-                    self.thread_messages = detail.messages;
+                    let known = self.thread_messages.iter().map(|message| message.id.clone()).collect::<BTreeSet<_>>();
+                    let mut older = detail.messages.into_iter().filter(|message| !known.contains(&message.id)).collect::<Vec<_>>();
+                    older.append(&mut self.thread_messages);
+                    self.thread_messages = older;
+                    self.thread_offset = offset.min(detail.total);
                     self.thread_total = detail.total;
-                    self.thread_open = None;
-                    let open = self
-                        .thread_messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.unread)
-                        .or_else(|| self.thread_messages.last())
-                        .map(|message| message.id.clone());
-                    if let Some(open) = open {
-                        self.thread_open = Some(open.clone());
-                        self.open_message(open);
-                    } else {
-                        self.close_reading();
-                    }
-                    self.threads_cache = None;
+                    self.thread_summary = Some(detail.thread);
                 }
-                Err(_) => self.report_failure("Non è stato possibile leggere la conversazione.", false),
+                Err(_) => self.report_failure("Non è stato possibile leggere i messaggi precedenti.", false),
             },
             Err(error) => self.report_failure(op_error_copy(&error), false),
         }
@@ -2053,10 +2233,15 @@ impl PostinoApp {
         self.open_message(id);
     }
 
-    /// J/K inside a conversation moves the open card, not the thread list.
+    /// J/K inside a conversation moves the open card, not the thread list. At the top of the loaded
+    /// page it pulls the previous page in first.
     fn step_thread_message(&mut self, delta: i32) {
         if self.thread_messages.is_empty() {
             return;
+        }
+        let current = self.selected.as_ref().and_then(|id| self.thread_messages.iter().position(|message| &message.id == id));
+        if delta < 0 && self.thread_offset > 0 && current.is_none_or(|index| index == 0) {
+            self.load_older_thread_messages();
         }
         let current = self.selected.as_ref().and_then(|id| self.thread_messages.iter().position(|message| &message.id == id));
         let next = match current {
@@ -2072,35 +2257,70 @@ impl PostinoApp {
         }
     }
 
-    /// Every id of the open conversation, when the loaded page covers the whole thread. A thread
-    /// over the 200-message page is refused by the caller instead of archiving only part of it.
-    fn thread_action_ids(&self) -> Option<Vec<String>> {
-        let _thread = self.active_thread()?;
-        if usize::try_from(self.thread_total).unwrap_or(usize::MAX) != self.thread_messages.len() {
-            return None;
+    /// Every message of the open conversation, paged from the store. Bulk actions cover the whole
+    /// thread, not the visible window; the 500-message mutation cap is enforced here too.
+    fn thread_all_messages(&mut self) -> Result<Vec<MessageSummary>, String> {
+        let Some(id) = self.active_thread().map(str::to_owned) else {
+            return Err("Nessuna conversazione selezionata".to_owned());
+        };
+        if self.thread_total > 500 {
+            return Err("La conversazione supera i 500 messaggi: usa i singoli messaggi".to_owned());
         }
-        Some(self.thread_messages.iter().map(|message| message.id.clone()).collect())
+        let account = self.active_account.clone();
+        let mut all = Vec::new();
+        let mut offset = 0u32;
+        while all.len() < usize::try_from(self.thread_total).unwrap_or(usize::MAX) {
+            let value = self
+                .engine
+                .call("thread_get", json!({ "id": id, "account": account, "limit": 200, "offset": offset }))
+                .map_err(|error| op_error_copy(&error))?;
+            let detail = serde_json::from_value::<ThreadGetResult>(value).map_err(|_| "Risposta della conversazione non valida".to_owned())?;
+            let received = detail.messages.len();
+            all.extend(detail.messages);
+            if received == 0 {
+                break;
+            }
+            offset = offset.saturating_add(u32::try_from(received).unwrap_or(u32::MAX));
+        }
+        Ok(all)
+    }
+
+    fn thread_all_ids(&mut self) -> Result<Vec<String>, String> {
+        Ok(self.thread_all_messages()?.into_iter().map(|message| message.id).collect())
     }
 
     fn set_thread_flag(&mut self, unread: Option<bool>, starred: Option<bool>) {
         let Some(id) = self.active_thread().map(str::to_owned) else { return };
-        if self.thread_action_ids().is_none() {
-            self.status = "La conversazione supera i 200 messaggi mostrati: usa i singoli messaggi".to_owned();
-            return;
-        }
-        let before = self.thread_messages.iter().map(|message| (message.id.clone(), message.unread, message.starred)).collect::<Vec<_>>();
+        let before = match self.thread_all_messages() {
+            Ok(messages) => messages.into_iter().map(|message| (message.id, message.unread, message.starred)).collect::<Vec<_>>(),
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
         match self.engine.call("thread_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
-            Ok(_) => {
+            Ok(value) => {
                 self.pending_read = None;
                 let mut unread_changes = Vec::new();
                 let mut starred_changes = Vec::new();
-                for (message_id, was_unread, was_starred) in before {
-                    if unread.is_some_and(|wanted| wanted != was_unread) {
-                        unread_changes.push((message_id.clone(), was_unread));
+                for (message_id, was_unread, was_starred) in &before {
+                    if unread.is_some_and(|wanted| wanted != *was_unread) {
+                        unread_changes.push((message_id.clone(), *was_unread));
                     }
-                    if starred.is_some_and(|wanted| wanted != was_starred) {
-                        starred_changes.push((message_id, was_starred));
+                    if starred.is_some_and(|wanted| wanted != *was_starred) {
+                        starred_changes.push((message_id.clone(), *was_starred));
                     }
+                }
+                for message in &mut self.thread_messages {
+                    if let Some(wanted) = unread {
+                        message.unread = wanted;
+                    }
+                    if let Some(wanted) = starred {
+                        message.starred = wanted;
+                    }
+                }
+                if let Ok(detail) = serde_json::from_value::<postino_core::ThreadFlagOutput>(value) {
+                    self.thread_summary = Some(detail.thread);
                 }
                 if !unread_changes.is_empty() {
                     let message = if unread == Some(true) { "Conversazione non letta" } else { "Conversazione letta" }.to_owned();
@@ -2116,24 +2336,9 @@ impl PostinoApp {
                 }
                 self.refresh_labels();
                 self.threads_cache = None;
-                if let Some(thread) = self.selected_thread.clone() {
-                    self.load_thread_summary(&thread);
-                }
+                self.list_cache = None;
             }
             Err(_) => self.report_failure("Non è stato possibile aggiornare la conversazione.", false),
-        }
-    }
-
-    fn load_thread_summary(&mut self, id: &str) {
-        if let Some(summary) = self.thread_summary.as_mut() {
-            summary.state = "read".to_owned();
-        }
-        let account = self.active_account.clone();
-        if let Ok(value) = self.engine.call("thread_get", json!({ "id": id, "account": account, "limit": 1 }))
-            && let Ok(detail) = serde_json::from_value::<ThreadGetResult>(value)
-        {
-            self.thread_summary = Some(detail.thread);
-            self.thread_total = detail.total;
         }
     }
 
@@ -2157,6 +2362,9 @@ impl PostinoApp {
         self.clear_selection();
         self.reading_open = false;
         self.reading_full = false;
+        self.clear_thread_selection();
+        self.threads_cache = None;
+        self.thread_list_limit = 200;
     }
 
     fn clear_label_filter(&mut self) {
@@ -2666,9 +2874,12 @@ impl PostinoApp {
 
     fn move_selected(&mut self, kind: FolderKind, confirmation: &str, plural: &str) {
         if self.active_thread().is_some() {
-            let Some(ids) = self.thread_action_ids() else {
-                self.status = "La conversazione supera i 200 messaggi mostrati: sposta i singoli messaggi".to_owned();
-                return;
+            let ids = match self.thread_all_ids() {
+                Ok(ids) => ids,
+                Err(message) => {
+                    self.status = message;
+                    return;
+                }
             };
             self.move_many_to_kind(&ids, kind, confirmation, plural);
             return;
@@ -2691,29 +2902,39 @@ impl PostinoApp {
 
     fn move_many(&mut self, ids: &[String], folder: &str, confirmation: &str, plural: &str) {
         let mut moved = Vec::new();
+        let mut failed = false;
         for id in ids {
             let Some(previous) = self.engine.message(id).map(|message| message.summary.folder_id.clone()) else {
-                continue;
+                failed = true;
+                break;
             };
             match self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
                 Ok(_) => moved.push((id.clone(), previous)),
                 Err(_) => {
-                    self.report_failure("Non è stato possibile spostare il messaggio.", false);
-                    return;
+                    failed = true;
+                    break;
                 }
             }
         }
-        if moved.is_empty() {
-            return;
+        if !moved.is_empty() {
+            let message = if moved.len() == 1 { confirmation.to_owned() } else { plural.to_owned() };
+            self.status = message.clone();
+            self.clear_selection();
+            self.clear_thread_selection();
+            self.threads_cache = None;
+            self.list_cache = None;
+            self.reading_open = false;
+            self.reading_full = false;
+            // A partial batch still gets its undo: the messages that moved are recoverable.
+            self.push_toast(message, UndoAction::Move(moved));
         }
-        let message = if moved.len() == 1 { confirmation.to_owned() } else { plural.to_owned() };
-        self.status = message.clone();
-        self.clear_selection();
-        self.clear_thread_selection();
-        self.threads_cache = None;
-        self.reading_open = false;
-        self.reading_full = false;
-        self.push_toast(message, UndoAction::Move(moved));
+        if failed {
+            self.failure = Some(Failure {
+                message: "Non è stato possibile spostare un messaggio; quelli già spostati sono annullabili.".to_owned(),
+                retry_list: false,
+            });
+            self.status.clear();
+        }
     }
 
     fn step_selection(&mut self, delta: i32, extend: bool) {
@@ -2769,11 +2990,7 @@ impl PostinoApp {
             None => 0,
         };
         let Some(thread) = threads.get(next) else { return };
-        self.selected_thread = Some(thread.id.clone());
-        self.thread_open = None;
-        if let Some(latest) = thread.latest_message_id.clone() {
-            self.select_only(latest);
-        }
+        self.load_thread_page(thread.id.clone(), false, None);
         self.scroll_to_selected = true;
     }
 
@@ -3021,8 +3238,12 @@ impl PostinoApp {
                     self.refresh_saved_searches();
                 }
             }
-            UndoAction::SavedSearchUpdate { id, name, query, sort } => {
-                if self.engine.call("saved_search_update", json!({ "id": id, "name": name, "query": query, "sort": sort })).is_err() {
+            UndoAction::SavedSearchUpdate { id, account, name, query, sort } => {
+                if self
+                    .engine
+                    .call("saved_search_update", json!({ "id": id, "account": account, "name": name, "query": query, "sort": sort }))
+                    .is_err()
+                {
                     failed = true;
                 } else {
                     self.refresh_saved_searches();
@@ -3215,14 +3436,15 @@ impl PostinoApp {
     /// search flat unless the user asks otherwise.
     fn visible_threads(&mut self) -> (Vec<ThreadSummary>, u32, u32, u32) {
         let signature = format!(
-            "{}|{}|{}|{}|{:?}|{:?}|{}|threads",
+            "{}|{}|{}|{}|{:?}|{:?}|{}|threads|{}",
             self.folder,
             self.search_committed,
             self.unread_only,
             self.attachments_only,
             self.label_filter,
             self.label_folder,
-            self.active_account.as_deref().unwrap_or_default()
+            self.active_account.as_deref().unwrap_or_default(),
+            self.thread_list_limit
         );
         if let Some((cached, revision, rows, total, unread_threads, unread_messages)) = &self.threads_cache
             && *cached == signature
@@ -3255,24 +3477,44 @@ impl PostinoApp {
             "with_attachments": self.attachments_only,
             "limit": 200
         });
-        match self.engine.call("threads_list", args) {
-            Ok(value) => match serde_json::from_value::<ThreadsListResult>(value) {
-                Ok(result) => {
-                    let rows = result.threads;
-                    self.threads_cache =
-                        Some((signature, self.engine.revision(), rows.clone(), result.total, result.unread_threads, result.unread_messages));
-                    (rows, result.total, result.unread_threads, result.unread_messages)
-                }
+        let wanted = self.thread_list_limit.max(200);
+        let mut rows = Vec::new();
+        let mut total = 0u32;
+        let mut unread_threads = 0u32;
+        let mut unread_messages = 0u32;
+        let mut offset = 0u32;
+        while u32::try_from(rows.len()).unwrap_or(u32::MAX) < wanted {
+            let mut page_args = args.clone();
+            page_args["offset"] = json!(offset);
+            match self.engine.call("threads_list", page_args) {
+                Ok(value) => match serde_json::from_value::<ThreadsListResult>(value) {
+                    Ok(result) => {
+                        total = result.total;
+                        unread_threads = result.unread_threads;
+                        unread_messages = result.unread_messages;
+                        let received = result.threads.len();
+                        rows.extend(result.threads);
+                        if received < 200 || u32::try_from(rows.len()).unwrap_or(u32::MAX) >= total {
+                            break;
+                        }
+                        offset = offset.saturating_add(u32::try_from(received).unwrap_or(u32::MAX));
+                    }
+                    Err(_) => {
+                        self.report_list_failure();
+                        return (Vec::new(), 0, 0, 0);
+                    }
+                },
                 Err(_) => {
                     self.report_list_failure();
-                    (Vec::new(), 0, 0, 0)
+                    return (Vec::new(), 0, 0, 0);
                 }
-            },
-            Err(_) => {
-                self.report_list_failure();
-                (Vec::new(), 0, 0, 0)
             }
         }
+        if total == 0 {
+            total = u32::try_from(rows.len()).unwrap_or(0);
+        }
+        self.threads_cache = Some((signature, self.engine.revision(), rows.clone(), total, unread_threads, unread_messages));
+        (rows, total, unread_threads, unread_messages)
     }
 
     /// Keep a pending FTS index moving without blocking the frame: one 500-row batch per tick while
@@ -3295,6 +3537,8 @@ impl PostinoApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
             if self.index_progress.as_ref().is_some_and(|status| status.ready) {
                 self.index_progress = None;
+                self.saved_searches_revision = None;
+                self.refresh_saved_searches();
             }
         }
     }
@@ -3302,6 +3546,8 @@ impl PostinoApp {
     /// Commit the typed search immediately (Enter). Empty text clears the search.
     fn commit_search(&mut self) {
         let was_empty = self.search_committed.trim().is_empty();
+        let record_recent = self.recording_recent;
+        self.recording_recent = false;
         let query = self.query.trim().to_owned();
         self.query = query.clone();
         self.search_committed = query;
@@ -3322,7 +3568,7 @@ impl PostinoApp {
                 self.threads_view_before_search.get_or_insert(self.threads_view);
                 self.threads_view = false;
             }
-            if self.engine.validate_search_query(&self.search_committed, self.active_account.as_deref()).is_ok() {
+            if record_recent && self.engine.validate_search_query(&self.search_committed, self.active_account.as_deref()).is_ok() {
                 let _ = self.engine.record_recent_search(self.active_account.as_deref(), &self.search_committed);
                 self.refresh_recent_searches();
             }
@@ -3568,10 +3814,14 @@ impl PostinoApp {
             self.toggle_selection(id);
         }
         if enter {
-            if self.threads_view
-                && let Some(thread) = self.selected_thread.clone()
-            {
-                self.select_thread(thread);
+            if self.threads_view {
+                if self.reading_open && self.selected_thread.is_some() && self.thread_summary.is_some() {
+                    if let Some(card) = self.thread_open.clone().or_else(|| self.selected.clone()) {
+                        self.open_thread_message(card);
+                    }
+                } else if let Some(thread) = self.selected_thread.clone() {
+                    self.select_thread(thread);
+                }
             } else if self.reading_open {
                 if !reading_overlay(ctx.content_rect().width()) {
                     self.reading_full = true;
@@ -4537,6 +4787,7 @@ impl PostinoApp {
                     }
                     if response.has_focus() {
                         if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                            self.recording_recent = true;
                             self.commit_search();
                         }
                         if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -4703,7 +4954,9 @@ impl PostinoApp {
                         };
                         let row = ListRow::folder(folder.name.as_str(), meta.as_str())
                             .icon(folder_icon(folder.kind))
-                            .selected(if self.label_filter.is_some() {
+                            .selected(if self.saved_folder_scope && !self.saved_query_folder {
+                                false
+                            } else if self.label_filter.is_some() {
                                 self.label_folder.as_deref() == Some(folder.id.as_str())
                             } else {
                                 self.folder == folder.id
@@ -4810,17 +5063,22 @@ impl PostinoApp {
                         } else {
                             saved.total.to_string()
                         };
-                        let detail = if saved.valid {
+                        let detail = if saved.index_pending {
+                            "Indice di ricerca in preparazione".to_owned()
+                        } else if saved.valid {
                             format!("{} · {} non letti", messages_text(saved.total as usize), unread_text(saved.unread as usize))
                         } else {
                             "Ricerca non valida: correggila o eliminala".to_owned()
                         };
                         let selected = self.applied_saved.as_deref() == Some(saved.id.as_str());
-                        let row = ListRow::folder(&saved.name, &meta)
-                            .subtitle(&detail)
-                            .dot(if saved.valid { t.gold_ink } else { t.danger })
-                            .selected(selected)
-                            .height(32.0);
+                        let dot = if saved.index_pending {
+                            t.text_faint
+                        } else if saved.valid {
+                            t.gold_ink
+                        } else {
+                            t.danger
+                        };
+                        let row = ListRow::folder(&saved.name, &meta).subtitle(&detail).dot(dot).selected(selected).height(32.0);
                         let id = saved.id.clone();
                         let response = row.show(ui);
                         #[cfg(test)]
@@ -4829,7 +5087,9 @@ impl PostinoApp {
                             saved_action = Some(SavedAction::Apply(id.clone()));
                         }
                         if response.hovered() || response.has_focus() {
-                            response.clone().on_hover_text(if saved.valid {
+                            response.clone().on_hover_text(if saved.index_pending {
+                                format!("{}\nIndice di ricerca in preparazione", saved.name)
+                            } else if saved.valid {
                                 format!("{}\n{}", saved.name, saved.query)
                             } else {
                                 format!("{}\nRicerca non valida: correggila o eliminala", saved.name)
@@ -4957,16 +5217,21 @@ impl PostinoApp {
         let (rows, total, unread) = self.visible_messages();
         self.prune_selection(&rows);
         let searching = !self.search_committed.trim().is_empty();
+        let saved_account_wide = self.saved_folder_scope && !self.saved_query_folder;
         let search_error = self.search_error.clone();
         let search_capped = self.search_capped;
         let index_progress = self.index_progress.clone();
         let multi = self.selection.len() > 1;
         let mut clear_filter = false;
         // The header always names the scope, so the label counts cannot read as folder-local.
-        let scope = label_filter.as_ref().map(|(_, _, _)| match &narrowed_folder_name {
-            Some(name) => format!("in {name}"),
-            None => "in tutte le cartelle".to_owned(),
-        });
+        let scope = if saved_account_wide {
+            Some("in tutte le mail".to_owned())
+        } else {
+            label_filter.as_ref().map(|(_, _, _)| match &narrowed_folder_name {
+                Some(name) => format!("in {name}"),
+                None => "in tutte le cartelle".to_owned(),
+            })
+        };
         let meta = if searching {
             search_meta(total, search_capped, scope.as_deref())
         } else {
@@ -4986,7 +5251,11 @@ impl PostinoApp {
                 // The action is reserved first so it can never be clipped; the title and the scope
                 // share the remaining width on two lines. At 1280 with the reading pane open the
                 // list is about 375 px wide and the scope would not fit beside the title.
-                let title = label_filter.as_ref().map_or(current_folder_name.clone(), |(_, name, _)| name.clone());
+                let title = if saved_account_wide {
+                    "Tutte le mail".to_owned()
+                } else {
+                    label_filter.as_ref().map_or(current_folder_name.clone(), |(_, name, _)| name.clone())
+                };
                 Sides::new().height(40.0).shrink_left().show(
                     ui,
                     |ui| {
@@ -5041,6 +5310,7 @@ impl PostinoApp {
                                 ui.label(typography::text(Role::Caption, chip, t.text_muted));
                             } else if Chip::new(chip.as_str()).show(ui).clicked() {
                                 self.query = chip;
+                                self.recording_recent = true;
                                 self.commit_search();
                             }
                         }
@@ -5055,6 +5325,17 @@ impl PostinoApp {
             if let Some((code, position)) = &search_error {
                 ui.add_space(space::XS);
                 ui.label(typography::text(Role::Meta, search_error_text(code, *position), t.danger));
+            }
+            if self.saved_index_pending {
+                ui.add_space(space::XS);
+                ui.label(typography::text(
+                    Role::Meta,
+                    "Indice di ricerca in preparazione: la ricerca salvata sarà disponibile tra poco.",
+                    t.text_muted,
+                ));
+            } else if self.saved_error.is_some() {
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Meta, "Ricerca salvata non valida: correggila o eliminala.", t.danger));
             }
             if let Some(index) = &index_progress {
                 ui.add_space(space::XS);
@@ -5472,15 +5753,21 @@ impl PostinoApp {
             .map(|label| (label.id.clone(), label.name.clone(), label_color(label.color, &t)));
         let (threads, total, unread_threads, unread_messages) = self.visible_threads();
         let searching = !self.search_committed.trim().is_empty();
+        let saved_account_wide = self.saved_folder_scope && !self.saved_query_folder;
         let search_error = self.search_error.clone();
         let saved_error = self.saved_error.clone();
+        let saved_pending = self.saved_index_pending;
         let index_progress = self.index_progress.clone();
         let mut clear_filter = false;
-        let title = label_filter.as_ref().map_or(current_folder_name.clone(), |(_, name, _)| name.clone());
-        let meta = if searching {
-            format!("{total} conversazioni · {unread_messages} messaggi non letti")
+        let title = if saved_account_wide {
+            "Tutte le mail".to_owned()
         } else {
-            format!("{unread_threads} non letti · {total} conversazioni")
+            label_filter.as_ref().map_or(current_folder_name.clone(), |(_, name, _)| name.clone())
+        };
+        let meta = if searching {
+            format!("{total} conversazioni nei risultati · {unread_messages} messaggi non letti nei risultati")
+        } else {
+            format!("{unread_threads} conversazioni con messaggi non letti · {total} conversazioni")
         };
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
             if matches!(self.sync_view, SyncView::Offline { .. }) {
@@ -5542,6 +5829,7 @@ impl PostinoApp {
                                 ui.label(typography::text(Role::Caption, chip, t.text_muted));
                             } else if Chip::new(chip.as_str()).show(ui).clicked() {
                                 self.query = chip;
+                                self.recording_recent = true;
                                 self.commit_search();
                             }
                         }
@@ -5552,7 +5840,14 @@ impl PostinoApp {
                 ui.add_space(space::XS);
                 ui.label(typography::text(Role::Meta, search_error_text(code, *position), t.danger));
             }
-            if let Some(_error) = &saved_error {
+            if saved_pending {
+                ui.add_space(space::XS);
+                ui.label(typography::text(
+                    Role::Meta,
+                    "Indice di ricerca in preparazione: la ricerca salvata sarà disponibile tra poco.",
+                    t.text_muted,
+                ));
+            } else if let Some(_error) = &saved_error {
                 ui.add_space(space::XS);
                 ui.label(typography::text(Role::Meta, "Ricerca salvata non valida: correggila o eliminala.", t.danger));
             }
@@ -5572,10 +5867,19 @@ impl PostinoApp {
                     for query in recent {
                         if Chip::new(query.as_str()).show(ui).clicked() {
                             self.query = query;
+                            self.recording_recent = true;
                             self.commit_search();
                         }
                     }
                 });
+            }
+            if !searching
+                && usize::try_from(total).unwrap_or(usize::MAX) > threads.len()
+                && Button::ghost("Carica altre conversazioni").size(ButtonSize::Sm).show(ui).clicked()
+            {
+                self.thread_list_limit = self.thread_list_limit.saturating_add(200).min(5_000);
+                self.threads_cache = None;
+                self.list_cache = None;
             }
             ui.add_space(space::MD);
             if threads.is_empty() {
@@ -5692,42 +5996,9 @@ impl PostinoApp {
                     }
                     ThreadRowAction::Flag(id, unread, starred) => {
                         if self.selected_thread.as_deref() != Some(id.as_str()) {
-                            self.select_thread(id.clone());
+                            self.load_thread_page(id, false, None);
                         }
-                        let ids = self.thread_action_ids().unwrap_or_default();
-                        if ids.is_empty() {
-                            self.status = "La conversazione supera i 200 messaggi mostrati: usa il pannello di lettura".to_owned();
-                        } else {
-                            let before =
-                                self.thread_messages.iter().map(|message| (message.id.clone(), message.unread, message.starred)).collect::<Vec<_>>();
-                            match self.engine.call("thread_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
-                                Ok(_) => {
-                                    if unread.is_some() {
-                                        self.pending_read = None;
-                                    }
-                                    let changes = before
-                                        .into_iter()
-                                        .filter(|(_, was_unread, was_starred)| {
-                                            unread.is_some_and(|wanted| wanted != *was_unread) || starred.is_some_and(|wanted| wanted != *was_starred)
-                                        })
-                                        .collect::<Vec<_>>();
-                                    let undo = if unread.is_some() {
-                                        UndoAction::Unread(changes.into_iter().map(|(id, unread, _)| (id, unread)).collect())
-                                    } else {
-                                        UndoAction::Starred(changes.into_iter().map(|(id, _, starred)| (id, starred)).collect())
-                                    };
-                                    let message = if unread.is_some() { "Conversazione aggiornata" } else { "Stella aggiornata" }.to_owned();
-                                    self.status = message.clone();
-                                    self.push_toast(message, undo);
-                                    self.refresh_labels();
-                                    self.threads_cache = None;
-                                    if let Some(thread_id) = self.selected_thread.clone() {
-                                        self.load_thread_summary(&thread_id);
-                                    }
-                                }
-                                Err(_) => self.report_failure("Non è stato possibile aggiornare la conversazione.", false),
-                            }
-                        }
+                        self.set_thread_flag(unread, starred);
                     }
                 }
             }
@@ -5855,6 +6126,10 @@ impl PostinoApp {
         let subject = thread_subject(&summary.subject);
         let messages = self.thread_messages.clone();
         let open_id = self.thread_open.clone().or_else(|| self.selected.clone());
+        if self.thread_offset > 0 && Button::ghost("Carica messaggi precedenti").size(ButtonSize::Sm).show(ui).clicked() {
+            self.load_older_thread_messages();
+            return;
+        }
         Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(typography::strong(Role::Caption, "CONVERSAZIONE", t.text_faint));
@@ -8007,20 +8282,26 @@ impl PostinoApp {
                 self.status.clear();
             }
             "open" => {
-                if self.threads_view
-                    && let Some(thread) = self.selected_thread.clone()
-                {
-                    self.select_thread(thread);
+                if self.threads_view {
+                    if self.reading_open && self.selected_thread.is_some() && self.thread_summary.is_some() {
+                        if let Some(card) = self.thread_open.clone().or_else(|| self.selected.clone()) {
+                            self.open_thread_message(card);
+                        }
+                    } else if let Some(thread) = self.selected_thread.clone() {
+                        self.select_thread(thread);
+                    }
                 } else if let Some(message) = self.selected.clone() {
                     self.open_message(message);
                 }
             }
             "expand" => {
-                if self.threads_view
-                    && let Some(thread) = self.selected_thread.clone()
-                {
-                    self.select_thread(thread);
-                    self.reading_full = true;
+                if self.threads_view {
+                    if self.reading_open && self.selected_thread.is_some() && self.thread_summary.is_some() {
+                        self.reading_full = true;
+                    } else if let Some(thread) = self.selected_thread.clone() {
+                        self.select_thread(thread);
+                        self.reading_full = true;
+                    }
                 } else if let Some(message) = self.selected.clone() {
                     self.open_message(message);
                     self.reading_full = true;
@@ -8101,6 +8382,20 @@ impl PostinoApp {
             "focus_search" => self.focus_search = true,
             "threads_toggle" => self.toggle_threads_view(),
             "saved_search_save" => self.start_saved_search_save(),
+            "saved_search_rename" => {
+                if let Some(id) = self.applied_saved.clone() {
+                    self.start_saved_search_rename(&id);
+                } else {
+                    self.status = "Seleziona prima una ricerca salvata".to_owned();
+                }
+            }
+            "saved_search_delete" => {
+                if let Some(id) = self.applied_saved.clone() {
+                    self.delete_saved_search(&id);
+                } else {
+                    self.status = "Seleziona prima una ricerca salvata".to_owned();
+                }
+            }
             "saved_search_clear_recent" => {
                 let account = self.active_account.clone();
                 match self.engine.clear_recent_searches(account.as_deref()) {
@@ -8217,6 +8512,7 @@ impl PostinoApp {
         self.capture_screenshot(ui.ctx());
         self.tick(ui.ctx());
         self.poll_search_index(ui.ctx());
+        self.refresh_saved_searches_if_stale();
         self.resize_handles(ui.ctx());
         self.handle_shortcuts(ui.ctx());
         if self.boot_failure.is_some() {
@@ -8784,6 +9080,7 @@ enum UndoAction {
     /// Restore the previous name/query/sort of a saved search after an edit.
     SavedSearchUpdate {
         id: String,
+        account: String,
         name: String,
         query: String,
         sort: String,
@@ -8805,6 +9102,7 @@ struct SavedSearchEditor {
     mode: SavedSearchEditorMode,
     name: String,
     query: String,
+    sort: String,
     error: Option<String>,
     /// Request focus on the next render.
     focus: bool,
@@ -8818,9 +9116,12 @@ struct SavedRestore {
     label_folder: Option<String>,
     query: String,
     search_committed: String,
+    unread_only: bool,
+    attachments_only: bool,
     threads_view: bool,
     threads_view_before_search: Option<bool>,
     saved_folder_scope: bool,
+    saved_query_folder: bool,
 }
 
 struct LabelEditor {
@@ -8976,7 +9277,7 @@ const COMMANDS: &[Command] = &[
     },
     Command { id: "clear_selection", label: "Deseleziona", icon: icons::X_CIRCLE, shortcut: "Esc", rule: CommandRule::Always, in_palette: true },
     Command { id: "focus_search", label: "Cerca nelle mail", icon: icons::SEARCH, shortcut: "/", rule: CommandRule::Always, in_palette: true },
-    Command { id: "threads_toggle", label: "Conversazioni", icon: icons::LIST, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "threads_toggle", label: "Conversazioni o messaggi", icon: icons::LIST, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command { id: "saved_search_save", label: "Salva ricerca", icon: icons::TAG, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
         id: "saved_search_rename",
@@ -9289,6 +9590,20 @@ fn search_chips(query: &str) -> Vec<String> {
 }
 
 /// The search header: an exact total, or the explicit 10 000 prefix when more rows match.
+/// True when a query contains a `folder:` clause. Used by a saved search to decide whether its
+/// scope owns a folder or is account-wide, and by the header's "Tutte le mail" label.
+fn query_has_folder(query: &str) -> bool {
+    fn walk(expr: &postino_core::SearchExpr) -> bool {
+        match expr {
+            postino_core::SearchExpr::Folder(_) => true,
+            postino_core::SearchExpr::And(children) | postino_core::SearchExpr::Or(children) => children.iter().any(walk),
+            postino_core::SearchExpr::Not(child) => walk(child),
+            _ => false,
+        }
+    }
+    postino_core::parse_search(query).is_ok_and(|parsed| walk(&parsed.expr))
+}
+
 /// Strip repeated reply/forward prefixes for a conversation title. The stored subject stays
 /// untouched; this is a display decision, and an empty result falls back to the original.
 fn thread_subject(subject: &str) -> String {
@@ -9581,6 +9896,22 @@ fn label_editor_widget(ui: &mut Ui, editor: &mut LabelEditor, t: &Tokens) -> Lab
     action
 }
 
+/// A saved-search editor error in Italian. The engine sentence stays in the API/CLI; the UI never
+/// echoes an English engine string back to a person.
+fn saved_editor_error(message: &str) -> String {
+    if message.contains("already exists") {
+        "Esiste già una ricerca con questo nome.".to_owned()
+    } else if message.contains("unknown label") || message.contains("unknown folder") {
+        "La ricerca cita un'etichetta o una cartella che non esiste.".to_owned()
+    } else if message.contains("search query") {
+        "La ricerca non è valida: controlla virgolette, parentesi e campi.".to_owned()
+    } else if message.contains("saved searches") {
+        "Hai già 12 ricerche salvate: eliminane una prima di aggiungerne un'altra.".to_owned()
+    } else {
+        "Non è stato possibile salvare la ricerca: correggi il nome o la query.".to_owned()
+    }
+}
+
 /// The saved-search drawer. It shares the sidebar drawer slot with the label editor and returns the
 /// same save/cancel action so the shell has one keyboard path.
 fn saved_search_editor_widget(ui: &mut Ui, editor: &mut Option<SavedSearchEditor>, t: &Tokens) -> LabelEditorAction {
@@ -9601,7 +9932,14 @@ fn saved_search_editor_widget(ui: &mut Ui, editor: &mut Option<SavedSearchEditor
         }
         name.show(ui);
         TextField::new(&mut editor.query, "Ricerca").width(ui.available_width()).show(ui);
-        ui.label(typography::text(Role::Caption, "La ricerca è quella del campo in alto", t.text_faint));
+        ui.horizontal(|ui| {
+            if Chip::new("Rilevanza").selected(editor.sort == "relevance").show(ui).clicked() {
+                editor.sort = "relevance".to_owned();
+            }
+            if Chip::new("Data").selected(editor.sort == "date").show(ui).clicked() {
+                editor.sort = "date".to_owned();
+            }
+        });
         ui.add_space(space::XS);
         ui.horizontal(|ui| {
             let save = Button::primary("Salva").size(ButtonSize::Sm).show(ui);
@@ -13622,6 +13960,172 @@ mod tests {
         frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
         assert!(!app.reading_open);
         assert_eq!(app.selected_thread.as_deref(), Some("thr_preventivo"), "Esc goes back to the list, not away from the thread");
+    }
+
+    #[test]
+    fn thread_actions_after_j_target_the_selected_conversation() {
+        let mut app = PostinoApp::demo(true);
+        app.threads_view = true;
+        app.select_thread("thr_preventivo".to_owned());
+        app.close_reading();
+        app.step_selection(1, false);
+        let target = app.selected_thread.clone().expect("a second thread");
+        assert_ne!(target, "thr_preventivo");
+        let target_ids = app.thread_messages.iter().map(|message| message.id.clone()).collect::<Vec<_>>();
+        assert!(!target_ids.is_empty());
+        app.move_selected(FolderKind::Archive, "Conversazione archiviata", "Conversazioni archiviate");
+        assert!(target_ids.iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.folder_id == "archive")));
+        assert!(
+            ["msg_001", "msg_002", "msg_003"].iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.folder_id != "archive"))
+        );
+        assert!(app.toast.as_ref().and_then(|toast| toast.undo.as_ref()).is_some());
+        app.undo_last();
+        assert!(target_ids.iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.folder_id != "archive")));
+    }
+
+    #[test]
+    fn thread_flag_after_j_updates_the_page_and_offers_undo_each_time() {
+        let mut app = PostinoApp::demo(true);
+        app.threads_view = true;
+        app.select_thread("thr_preventivo".to_owned());
+        app.close_reading();
+        app.mark_unread();
+        assert!(app.thread_messages.iter().all(|message| app.engine.message(&message.id).is_some_and(|message| message.summary.unread)));
+        app.toggle_read();
+        assert!(app.thread_messages.iter().all(|message| app.engine.message(&message.id).is_some_and(|message| !message.summary.unread)));
+        app.toggle_read();
+        assert!(app.thread_messages.iter().all(|message| app.engine.message(&message.id).is_some_and(|message| message.summary.unread)));
+        let undo_steps = app.toast.as_ref().and_then(|toast| toast.undo.as_ref()).is_some();
+        assert!(undo_steps, "the third flag must still offer undo");
+        app.set_starred(true);
+        assert!(app.thread_messages.iter().all(|message| app.engine.message(&message.id).is_some_and(|message| message.summary.starred)));
+    }
+
+    #[test]
+    fn enter_opens_the_selected_card_and_reply_targets_it() {
+        let (ctx, mut app) = conversations_app();
+        app.select_thread("thr_preventivo".to_owned());
+        app.step_thread_message(-1);
+        assert_eq!(app.selected.as_deref(), Some("msg_002"));
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.selected.as_deref(), Some("msg_002"), "Enter must not jump back to the latest unread");
+        assert_eq!(app.thread_open.as_deref(), Some("msg_002"));
+        frame(&ctx, &mut app, vec![key(Key::R, Modifiers::NONE)]);
+        assert!(app.composer.open, "R opens the reply composer");
+        assert!(app.composer.in_reply_to.as_deref().is_some_and(|parent| parent.contains("msg_002")), "{:?}", app.composer.in_reply_to);
+    }
+
+    #[test]
+    fn a_partial_batch_move_still_offers_undo_for_the_moved_messages() {
+        let mut app = PostinoApp::demo(true);
+        app.threads_view = false;
+        app.move_many(&["msg_001".to_owned(), "missing".to_owned()], "archive", "Messaggio archiviato", "Messaggi archiviati");
+        assert_eq!(app.engine.message("msg_001").map(|message| message.summary.folder_id), Some("archive".to_owned()));
+        assert!(app.failure.is_some(), "the missing row is reported");
+        assert!(app.toast.as_ref().and_then(|toast| toast.undo.as_ref()).is_some(), "the moved message is undoable");
+        app.undo_last();
+        assert_eq!(app.engine.message("msg_001").map(|message| message.summary.folder_id), Some("inbox".to_owned()));
+    }
+
+    #[test]
+    fn a_large_thread_opens_on_its_newest_page_and_loads_older_messages() {
+        let mut app = booted_app("p9b-large-thread", Vec::new(), |store| {
+            seed_account_rows(store, "acc_big", "big@example.com", None);
+            for index in 0..250u32 {
+                let id = format!("msg_big_{index:03}");
+                let mut row = store_message("fld_acc_big_inbox", "acc_big", &id, &format!("Discussione {index}"));
+                row.summary.thread_id = "big@example.com".to_owned();
+                row.summary.date = 1_700_000_000_000 + i64::from(index);
+                row.message_id = Some(format!("<big-{index}@example.com>"));
+                store.upsert_synced_message_with_refs(&row, &[], Some("big@example.com"), &["big@example.com".to_owned()]).expect("message");
+            }
+            store.recount_folder("fld_acc_big_inbox").expect("counts");
+        });
+        app.threads_view = true;
+        app.folder = "fld_acc_big_inbox".to_owned();
+        app.thread_list_limit = 200;
+        app.select_thread("big@example.com".to_owned());
+        assert_eq!(app.thread_total, 250);
+        assert_eq!(app.thread_messages.len(), 200);
+        assert_eq!(app.thread_offset, 50);
+        assert_eq!(app.selected.as_deref(), Some("msg_big_249"));
+        app.load_older_thread_messages();
+        assert_eq!(app.thread_messages.len(), 250);
+        assert_eq!(app.thread_offset, 0);
+    }
+
+    #[test]
+    fn a_large_thread_list_loads_the_next_page() {
+        let mut app = booted_app("p9b-large-list", Vec::new(), |store| {
+            seed_account_rows(store, "acc_list", "list@example.com", None);
+            for index in 0..200u32 {
+                let id = format!("msg_thread_{index:03}");
+                let mut row = store_message("fld_acc_list_inbox", "acc_list", &id, &format!("Filo {index}"));
+                row.summary.thread_id = format!("thread-{index}");
+                row.summary.date = 1_700_000_000_000 + i64::from(index);
+                store.upsert_message(&row).expect("message");
+            }
+            store.recount_folder("fld_acc_list_inbox").expect("counts");
+        });
+        app.threads_view = true;
+        app.folder = "fld_acc_list_inbox".to_owned();
+        app.thread_list_limit = 200;
+        let (rows, total, _, _) = app.visible_threads();
+        assert_eq!(total, 201);
+        assert_eq!(rows.len(), 200);
+        app.thread_list_limit = 400;
+        app.threads_cache = None;
+        let (rows, total, _, _) = app.visible_threads();
+        assert_eq!(total, 201);
+        assert_eq!(rows.len(), 201);
+    }
+
+    #[test]
+    fn deleting_a_label_used_by_a_saved_search_marks_it_invalid_on_the_next_refresh() {
+        let (_ctx, mut app) = conversations_app();
+        app.engine.call("saved_search_create", json!({ "name": "Fatture", "query": "label:Fatture" })).expect("save");
+        app.refresh_saved_searches();
+        assert!(app.saved_searches[0].valid);
+        app.engine.call("label_delete", json!({ "id": "lbl_3" })).expect("delete label");
+        app.refresh_saved_searches_if_stale();
+        assert!(!app.saved_searches[0].valid);
+        assert!(!app.saved_searches[0].index_pending);
+    }
+
+    #[test]
+    fn applying_an_account_wide_saved_search_clears_chips_and_names_the_scope() {
+        let (ctx, mut app) = conversations_app();
+        app.unread_only = true;
+        app.engine.call("saved_search_create", json!({ "name": "Da Giulia", "query": "from:giulia" })).expect("save");
+        app.refresh_saved_searches();
+        let saved = app.saved_searches[0].clone();
+        app.apply_saved_search(&saved.id);
+        assert!(!app.unread_only && !app.attachments_only, "the saved search replaces the chips too");
+        assert!(app.saved_folder_scope && !app.saved_query_folder);
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("Tutte le mail")), "the account-wide scope is not named: {text:?}");
+    }
+
+    #[test]
+    fn removing_an_account_prunes_its_saved_and_recent_ui_rows() {
+        let mut app = booted_app("p9b-remove-account", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+        });
+        app.active_account = Some("acc_a".to_owned());
+        app.engine.call("saved_search_create", json!({ "account": "acc_a", "name": "Segreta", "query": "is:unread" })).expect("save");
+        app.engine.record_recent_search(Some("acc_a"), "subject:segreto").expect("recent");
+        app.refresh_saved_searches();
+        assert_eq!(app.saved_searches.len(), 1);
+        assert_eq!(app.recent_searches.len(), 1);
+        app.selected_thread = Some("thr_x".to_owned());
+        app.engine.call("account_remove", json!({ "id": "acc_a", "confirm": true })).expect("remove");
+        app.after_account_removal("acc_a", None);
+        assert!(app.saved_searches.is_empty(), "the removed account's saved searches stay in the sidebar");
+        assert!(app.recent_searches.is_empty(), "the removed account's recent chips stay");
+        assert!(app.selected_thread.is_none());
+        assert_eq!(app.active_account.as_deref(), Some("acc_b"));
     }
 
     fn test_directory(name: &str) -> PathBuf {

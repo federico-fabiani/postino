@@ -383,6 +383,10 @@ pub struct SavedSearch {
     pub error: Option<String>,
     pub total: u32,
     pub unread: u32,
+    /// True while the full-text index is still building. Counts are zero and the row is not stale;
+    /// it becomes valid as soon as the index is ready.
+    #[serde(default)]
+    pub index_pending: bool,
 }
 
 /// The list-row shape. Bodies are fetched separately so a mailbox list stays cheap.

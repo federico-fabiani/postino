@@ -378,27 +378,40 @@ crash-dump entry above.
 - **Merge safety.** The cache update, the message moves, the alias and the row deletion are one
   transaction. A merge into the smallest id is deterministic for the same candidate set; a late
   reference that resolves to a deleted id follows the alias. An empty thread row is deleted rather
-  than left as a stale conversation. A message with more than 500 members refuses `thread_flag`
-  instead of changing part of it, and a UI bulk action over the 200-message page refuses with a
-  sentence.
+  than left as a stale conversation, and a submitted draft refreshes its old draft thread in the same
+  transaction, so a send cannot leave a ghost conversation. A message with more than 500 members
+  refuses `thread_flag` instead of changing part of it; the desktop pages a thread from the store for
+  bulk actions and refuses over 500 with a sentence. A partial `message_move` batch keeps its undo
+  toast for the rows that moved and reports the failure separately.
 - **Subject fallback.** Only a message with no references and no parent, a reply/forward prefix, a
   normalised subject of at least 8 bytes, and exactly one thread inside the 14-day window attaches.
   Two matches drop the fallback; subject text is never used to merge two existing threads, so a
-  generic “Re: update” cannot fuse unrelated conversations.
+  generic "Re: update" cannot fuse unrelated conversations. A no-reference message that already has a
+  thread keeps it on re-fetch, so a later second same-subject thread cannot detach it.
 - **Saved queries are local metadata.** Names and query text live in SQLCipher; at most 12 per account,
-  unique ignoring case, and the query is parsed and resolved before it is stored. A query whose label
-  or folder disappears is shown as invalid with a reason and no counts, never silently broadened. The
-  eight recent queries live in `meta.recent_searches:<account>` inside the encrypted database and are
-  cleared by an explicit command. No query, subject or address is logged; saved-search errors name the
-  stale label or folder to the caller but never reach a log.
+  unique ignoring case, and the query is parsed and resolved before it is stored. The cap and the
+  insert share one immediate transaction, so two processes cannot both create the 13th. Update and
+  delete validate the owning account in a multi-account mailbox. A query whose label or folder
+  disappears is shown as invalid with a reason and no counts, never silently broadened; a pending
+  index is a separate `index_pending` state, not an invalid query. The eight recent queries live in
+  `meta.recent_searches:<account>` inside the encrypted database, only explicit commits are recorded,
+  and an explicit clear command removes them. **Deleting an account deletes its recent-search meta
+  key**; the desktop clears its saved/recent rows before showing the remaining account. No query,
+  subject or address is logged; saved-search errors name the stale label or folder to the caller but
+  never reach a log.
 - **Counts are derived.** `total`/`unread` use the same bound search path as `search`, capped at
-  10 000, and are cached only by engine revision. A pending index reports the saved search as invalid
-  with “the search index is not ready” instead of a wrong number.
-- **Residual.** A conversation folder view at 100k crosses the covering message index (360–449 ms
-  P95 on the debug host) and misses the 100 ms budget; it is reported, not hidden. Mail cached by P9a
-  keeps its P9a placeholder thread ids until an explicit rebuild; no pre-P9 headers are re-read at
-  open. The one-time P9a cache build adds ~2 s to the first open of a 100k store and nothing to later
-  opens.
+  10 000, and are cached only by engine revision. A pending index yields zero counts with
+  `index_pending:true` instead of a wrong number or a false “delete it” instruction.
+- **Cache writes and indexes.** A read-only store is never repaired: `Engine::open` skips the orphan
+  draft and thread-cache builds, and a thread read on an empty read-only cache returns an actionable
+  “open read-write once” error. Normal open creates the derived indexes idempotently; `user_version`
+  stays 7.
+- **Residual.** A conversation folder view at 100k crosses the covering message index (356–359 ms P95
+  on the debug host) and misses the 100 ms budget; it is reported, not hidden. Mail cached by P9a
+  keeps its P9a placeholder thread ids permanently in this package (there is no full re-derivation
+  operation), and pre-P9 `subject_norm` values were not normalised with the prefix stripper. The
+  one-time P9a cache build adds ~2 s to the first open of a 100k store and nothing to later opens.
+  Thread-row participants/labels are bounded to 2 000 message rows and 4 000 label rows per page.
 
 
 

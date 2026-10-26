@@ -37,6 +37,9 @@ pub(crate) fn write_error(error: StoreError) -> OpError {
             "folder {folder_id:?} belongs to account {folder_account:?}, not {message_account:?}; use a folder from the message's own account"
         )),
         StoreError::Duplicate { entity, name } => OpError::InvalidArgs(format!("{entity} {name:?} already exists; choose another one")),
+        StoreError::SavedSearchLimit { limit } => {
+            OpError::InvalidArgs(format!("this account already has {limit} saved searches; delete one before adding another"))
+        }
         StoreError::DuplicateAttachment { id } => {
             OpError::InvalidArgs(format!("attachment id {id:?} is repeated in the draft; give every attachment a unique id"))
         }
@@ -174,6 +177,7 @@ pub(crate) fn saved_search(row: store::SavedSearch) -> SavedSearch {
         error: None,
         total: 0,
         unread: 0,
+        index_pending: false,
     }
 }
 

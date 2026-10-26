@@ -28,6 +28,8 @@ DROP TRIGGER IF EXISTS messages_fts_update;
 DROP TABLE IF EXISTS message_fts;
 DROP TABLE IF EXISTS message_fts_rank;
 DROP INDEX IF EXISTS messages_account_thread_date;
+DROP INDEX IF EXISTS messages_account_message_id;
+DROP INDEX IF EXISTS messages_account_subject_norm_date;
 DROP INDEX IF EXISTS messages_list_cover;
 DROP TABLE IF EXISTS thread_aliases;
 DROP TABLE IF EXISTS threads;

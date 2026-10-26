@@ -215,7 +215,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "thread_get",
             "Get a conversation",
-            "One conversation and an ascending page of its message summaries (at most 200; bodies are read with message_get). `resolved_id` is the current id after a merge: pass an old id and it still resolves through the alias table. `truncated` says whether more messages exist after the page. Read-only and offline.",
+            "One conversation and an ascending page of its message summaries (at most 200; bodies are read with message_get). `resolved_id` is the current id after a merge: pass an old id and it still resolves through the alias table. `truncated` says whether more messages exist after the page; the desktop loads the newest page first and prepends older pages. Read-only and offline.",
             ThreadGetArgs,
             true,
             false
@@ -231,7 +231,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "saved_searches_list",
             "List saved searches",
-            "Every saved search for one account, by name ignoring case, with computed `total`/`unread` counts and `valid`/`error`. A stored query whose label or folder no longer exists is `valid: false`, never a dead entry; its last counts are zero and the error says why. `recent` is the last eight successful queries, newest first. Counts are cached until the mailbox changes. Read-only and offline.",
+            "Every saved search for one account, by name ignoring case, with computed `total`/`unread` counts, `valid`/`error` and `index_pending`. A stored query whose label or folder no longer exists is `valid: false`, never a dead entry; a valid text query while the FTS index is still building is `valid: true, index_pending: true` with zero counts. `recent` is the last eight successful queries, newest first. Counts are cached until the mailbox changes. Read-only and offline.",
             SavedSearchesListArgs,
             true,
             false
@@ -239,7 +239,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "saved_search_create",
             "Save a search",
-            "Store a named search for one account. Names are 1-48 characters, unique ignoring case and capped at 12 per account. The query is the documented search language and is validated now: an unclosed quote, an unknown label or an unknown folder is refused. `sort` is `relevance` (default) or `date`. Returns the row with its computed counts. Saved searches are local metadata in the encrypted store.",
+            "Store a named search for one account. Names are 1-48 characters, unique ignoring case and capped at 12 per account; the cap and insert are one store transaction, so two processes cannot both create the 13th. The query is the documented search language and is validated now: an unclosed quote, an unknown label or an unknown folder is refused. `sort` is `relevance` (default) or `date`. Returns the row with its computed counts. Saved searches are local metadata in the encrypted store.",
             SavedSearchCreateArgs,
             false,
             false
@@ -247,7 +247,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "saved_search_update",
             "Update a saved search",
-            "Change the name, query and/or sort of one saved search. At least one field is required; the id and account never change. The query is validated like saved_search_create. Returns the row with recomputed counts.",
+            "Change the name, query and/or sort of one saved search. At least one field is required; the id and account never change. `account` is required when the mailbox has several accounts and the row must belong to it. The query is validated like saved_search_create. Returns the row with recomputed counts.",
             SavedSearchUpdateArgs,
             false,
             false
@@ -255,7 +255,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "saved_search_delete",
             "Delete a saved search",
-            "Delete one saved search row. This removes local metadata only, never a message. Returns the deleted row.",
+            "Delete one saved search row. `account` is required when the mailbox has several accounts and the row must belong to it. This removes local metadata only, never a message. Returns the deleted row.",
             SavedSearchDeleteArgs,
             false,
             true
@@ -684,6 +684,8 @@ pub struct SavedSearchCreateArgs {
 #[serde(deny_unknown_fields)]
 pub struct SavedSearchUpdateArgs {
     pub id: String,
+    /// Account that owns the search. Required when the mailbox has several accounts.
+    pub account: Option<String>,
     /// New name. Omit to keep the current one.
     pub name: Option<String>,
     /// New query. Omit to keep the current one.
@@ -696,6 +698,8 @@ pub struct SavedSearchUpdateArgs {
 #[serde(deny_unknown_fields)]
 pub struct SavedSearchDeleteArgs {
     pub id: String,
+    /// Account that owns the search. Required when the mailbox has several accounts.
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1243,6 +1247,7 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "saved_searches_list" => {
             let args: SavedSearchesListArgs = parse(args)?;
+            engine.reload_saved_searches(args.account.as_deref())?;
             let searches = engine.saved_searches_list(args.account.as_deref())?;
             let recent = engine.recent_searches(args.account.as_deref())?;
             value(SavedSearchesListResult { searches, recent })
@@ -1254,12 +1259,13 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "saved_search_update" => {
             let args: SavedSearchUpdateArgs = parse(args)?;
-            let search = engine.update_saved_search(&args.id, args.name.as_deref(), args.query.as_deref(), args.sort.as_deref())?;
+            let search =
+                engine.update_saved_search(args.account.as_deref(), &args.id, args.name.as_deref(), args.query.as_deref(), args.sort.as_deref())?;
             value(SavedSearchResult { search })
         }
         "saved_search_delete" => {
             let args: SavedSearchDeleteArgs = parse(args)?;
-            let search = engine.delete_saved_search(&args.id)?;
+            let search = engine.delete_saved_search(args.account.as_deref(), &args.id)?;
             value(SavedSearchDeleteResult { search })
         }
         "saved_search_recent_clear" => {

@@ -293,6 +293,10 @@ ALTER TABLE messages ADD COLUMN ingested_at INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE messages ADD COLUMN rules_applied_at INTEGER NULL;
 
 CREATE INDEX messages_account_thread_date ON messages(account_id, thread_id, date DESC);
+-- The thread reference lookup and the subject fallback are on the sync insert path; without these
+-- two indexes a single reference scans a 100k mailbox (measured 1.29 s before the index).
+CREATE INDEX messages_account_message_id ON messages(account_id, message_id);
+CREATE INDEX messages_account_subject_norm_date ON messages(account_id, subject_norm, date);
 -- A covering list index: the mailbox-open query reads summary columns only and never touches the
 -- 2 KiB body pages that sit in the table row. It is derived data, like the FTS index.
 CREATE INDEX messages_list_cover ON messages(
@@ -368,6 +372,7 @@ CREATE TABLE thread_aliases(
     new_id     TEXT NOT NULL,
     PRIMARY KEY(account_id, old_id)
 );
+CREATE INDEX thread_aliases_account_new ON thread_aliases(account_id, new_id);
 
 CREATE TABLE saved_searches(
     id         TEXT PRIMARY KEY,
@@ -495,6 +500,8 @@ pub enum StoreError {
     AccountMismatch { folder_id: String, message_account: String, folder_account: String },
     #[error("{entity} {name:?} already exists")]
     Duplicate { entity: &'static str, name: String },
+    #[error("this account already has {limit} saved searches; delete one before adding another")]
+    SavedSearchLimit { limit: u32 },
     #[error("attachment id {id:?} is repeated in the same draft; every attachment needs a unique id")]
     DuplicateAttachment { id: String },
     #[error("attachment id {id:?} belongs to message {owner:?}; omit the id so the engine assigns a new one")]
@@ -556,6 +563,9 @@ pub struct Store {
     /// The database file this connection owns, for a truthful size report. FTS5 shadow tables live
     /// in this file; there is no index sidecar.
     path: PathBuf,
+    /// True for [`Store::open_read_only`]. Read paths that would normally repair a derived cache must
+    /// not write; the caller gets an explicit error instead.
+    read_only: bool,
 }
 
 /// The blob directory that belongs to a database file: `mail.db` → `mail.db.blobs`.
@@ -604,17 +614,30 @@ impl Store {
         .map_err(translate)?;
         migrate(&mut conn)?;
         // The thread cache is derived data. Its page is ordered by `last_date` and scoped by account;
-        // without this index a 100k mailbox sorts the whole cache on every list. This is cache
-        // maintenance, not a schema migration: `user_version` stays 7 and an existing store gains
-        // the index on its next normal open. A read-only open never creates it.
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS threads_account_date ON threads(account_id, last_date DESC, id);").map_err(translate)?;
+        // without this index a 100k mailbox sorts the whole cache on every list. The reference and
+        // subject indexes make a synced insert a lookup instead of a mailbox scan. This is derived
+        // cache maintenance, not a schema version bump: `user_version` stays 7 and an existing store
+        // gains the indexes on its next normal open. A read-only open never creates them.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS threads_account_date ON threads(account_id, last_date DESC, id);
+             CREATE INDEX IF NOT EXISTS messages_account_message_id ON messages(account_id, message_id);
+             CREATE INDEX IF NOT EXISTS messages_account_subject_norm_date ON messages(account_id, subject_norm, date);
+             CREATE INDEX IF NOT EXISTS thread_aliases_account_new ON thread_aliases(account_id, new_id);",
+        )
+        .map_err(translate)?;
         let blobs = BlobStore::open(blob_root(path), key)?;
-        Ok(Self { conn, blobs, path: path.to_path_buf() })
+        Ok(Self { conn, blobs, path: path.to_path_buf(), read_only: false })
     }
 
     /// The encrypted attachment blob store that lives next to this database.
     pub fn blobs(&self) -> &BlobStore {
         &self.blobs
+    }
+
+    /// True for a connection opened with [`Store::open_read_only`]. Derived-cache repair must skip its
+    /// write and offer an explicit error instead of failing with SQLITE_READONLY.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Open an existing, already-migrated store **without** write access.
@@ -643,7 +666,7 @@ impl Store {
             return Err(StoreError::SchemaTooOld { found: version, supported: SCHEMA_VERSION });
         }
         let blobs = BlobStore::open(blob_root(path), key)?;
-        Ok(Self { conn, blobs, path: path.to_path_buf() })
+        Ok(Self { conn, blobs, path: path.to_path_buf(), read_only: true })
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {

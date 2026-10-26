@@ -262,18 +262,24 @@ per action, no hidden mutation.
   toggle.
 - **Reading a conversation.** The top of the reading pane is a `CONVERSAZIONE` banner: subject,
   `n messaggi · m non letti`, and one compact card per message (sender and time). Exactly one card is
-  expanded; J/K move it, Enter opens it, R/A/F reply/reply-all/forward it. E/U/S act on the whole
-  thread and one undo restores the batch; the same actions are in the row context menu. A thread over
-  the 200-message page refuses a bulk action with a sentence instead of acting on part of it. At
-  980×600 the pane is the existing full overlay (`Torna alla posta`, Esc).
+  expanded; J/K move it (the previous page is pulled in at the top edge), Enter opens the selected
+  card, R/A/F reply/reply-all/forward it. E/U/S act on the whole thread and one undo restores the
+  batch; a partial move keeps the undo for the rows that did move. The thread list loads 200 rows at a
+  time with **Carica altre conversazioni**; a thread over the page opens on its newest 200 messages
+  and prepends older ones with **Carica messaggi precedenti**. Over 500 messages a bulk action refuses
+  with a sentence. At 980×600 the pane is the existing full overlay (`Torna alla posta`, Esc).
 - **RICERCHE** sits under ETICHETTE: at most 12 named searches, with unread/total counts, a gold dot
   when valid and a danger dot plus “Ricerca non valida” when its label or folder disappeared. Clicking
-  applies it: the query replaces the field, the label filter clears, and the query's own `folder:`
-  clause owns the scope (a query without one is account-wide, not pinned to the current folder); Esc
-  restores the previous query, folder, filters and view.
+  applies it: the query replaces the field, the label filter and unread/attachment chips clear, and
+  the query's own `folder:` clause owns the scope (a query without one is account-wide, titled
+  "Tutte le mail", with no folder highlighted); Esc restores the query, folder, chips, filters and view.
   `Salva ricerca` (field `+`, palette) opens the sidebar drawer with a name and the query; rename and
   edit reuse it; delete shows an undo toast. Applying or saving scrolls the section into view.
+- A valid saved search whose FTS index is still building shows a muted dot and "Indice di ricerca in
+  preparazione", not a stale warning. Counts and validity refresh after every mailbox write and every
+  two seconds for another process's CRUD; deleting an account removes its rows and recent chips.
 - The last eight successful queries appear as chips when the search field is focused and empty;
+  only Enter, a chip or an applied saved search records one, so debounced prefixes never fill the list.
   **Cancella ricerche recenti** in the palette clears them. They live only in the encrypted store.
 - 980×600 light/dark screenshots: `docs/images/postino-p9b-threads-980.png`,
   `postino-p9b-threads-980-dark.png`, `postino-p9b-conversation-980.png`,

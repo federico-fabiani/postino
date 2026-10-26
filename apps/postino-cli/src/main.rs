@@ -175,6 +175,8 @@ enum SavedCommand {
     Update {
         id: String,
         #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         query: Option<String>,
@@ -182,7 +184,11 @@ enum SavedCommand {
         sort: Option<String>,
     },
     /// Delete a saved search.
-    Delete { id: String },
+    Delete {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Forget the eight recent queries of one account.
     RecentClear {
         #[arg(long)]
@@ -1346,17 +1352,20 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                     say(format!("{}  {}  {}\n", result.search.id, result.search.name, result.search.query))?;
                 }
             }
-            SavedCommand::Update { id, name, query, sort } => {
-                let result: SavedSearchResult =
-                    decode(call(engine, "saved_search_update", json!({ "id": id, "name": name, "query": query, "sort": sort }))?)?;
+            SavedCommand::Update { id, account, name, query, sort } => {
+                let result: SavedSearchResult = decode(call(
+                    engine,
+                    "saved_search_update",
+                    json!({ "id": id, "account": account, "name": name, "query": query, "sort": sort }),
+                )?)?;
                 if json_output {
                     print_json(&result)?;
                 } else {
                     say(format!("{}  {}  {}\n", result.search.id, result.search.name, result.search.query))?;
                 }
             }
-            SavedCommand::Delete { id } => {
-                let result: SavedSearchDeleteResult = decode(call(engine, "saved_search_delete", json!({ "id": id }))?)?;
+            SavedCommand::Delete { id, account } => {
+                let result: SavedSearchDeleteResult = decode(call(engine, "saved_search_delete", json!({ "id": id, "account": account }))?)?;
                 if json_output {
                     print_json(&result)?;
                 } else {

@@ -82,10 +82,10 @@ agent can read the message and recover.
 | `threads_list` | yes | Conversation rows with participants, subject, snippet, date, state, mailbox-wide counts and labels; folder/label/flag scope, pageable |
 | `thread_get` | yes | One conversation and an ascending page of ≤ 200 message summaries; old merged ids resolve through aliases |
 | `thread_flag` | no | Set read/starred on every message of a thread (≤ 500); idempotent, returns the refreshed row and the real transition count |
-| `saved_searches_list` | yes | Saved searches with computed total/unread counts, `valid`/`error` for a stale query, and the eight recent queries |
-| `saved_search_create` | no | Save a named query (≤ 12 per account, unique ignoring case; query validated now) |
-| `saved_search_update` | no | Change the name, query and/or sort of one saved search |
-| `saved_search_delete` | no | Delete one saved search; local metadata only, never a message |
+| `saved_searches_list` | yes | Saved searches with computed total/unread counts, `valid`/`error` for a stale query, `index_pending` while the FTS index builds, and the eight recent queries |
+| `saved_search_create` | no | Save a named query (≤ 12 per account, unique ignoring case, atomic cap; query validated now) |
+| `saved_search_update` | no | Change the name, query and/or sort of one saved search; `account` is required in a multi-account mailbox |
+| `saved_search_delete` | no | Delete one saved search; `account` is required in a multi-account mailbox, local metadata only |
 | `saved_search_recent_clear` | no | Forget one account's recent queries from the encrypted `meta` table |
 | `labels_list` | yes | Labels with mailbox-wide total and unread counts |
 | `label_create` | no | Create a local label with a semantic colour |
@@ -216,12 +216,14 @@ maintenance action: do not run it from the desktop and MCP at the same time.
 message_count, unread_count, starred_count, has_attachments, latest_message_id, labels, state}`.
 `folder`, `label`, `unread_only`, `starred_only` and `with_attachments` decide which conversations are
 listed; the counts on a row stay mailbox-wide. `total`, `unread_threads` and `unread_messages` describe
-the filtered scope. `thread_get` returns an ascending page of ≤ 200 message summaries; bodies are read
-with `message_get`. An id merged into another conversation still resolves, and `resolved_id` is the
-current one. `thread_flag` sets `unread` and/or `starred` on every message of one thread (≤ 500),
-returns the refreshed row and the number of real transitions, and a repeat returns `changed: 0`.
-Thread archive/delete is not a separate tool: call `message_move` for the ids returned by
-`thread_get`.
+the filtered scope. `thread_get` returns an ascending page of ≤ 200 message summaries; the desktop asks
+for the newest page first and prepends earlier pages, and `truncated` says whether more exist. Bodies
+are read with `message_get`. An id merged into another conversation still resolves, and `resolved_id`
+is the current one. `thread_flag` sets `unread` and/or `starred` on every message of one thread
+(≤ 500), updates the engine's folder/label/star counts, returns the refreshed row and the number of
+real transitions, and a repeat returns `changed: 0`. Thread archive/delete is not a separate tool: call
+`message_move` for the ids returned by `thread_get` (the desktop does this over the whole thread, with
+one undo; a partial batch still offers undo for the rows that moved).
 
 `threads_list`, `thread_get` and `saved_searches_list` are read-only. `thread_flag`,
 `saved_search_create`, `saved_search_update` and `saved_search_recent_clear` are local writes, and
@@ -229,11 +231,15 @@ Thread archive/delete is not a separate tool: call `message_move` for the ids re
 network connection. MCP marks `thread_flag` idempotent.
 
 `saved_searches_list` returns `{searches, recent}`. A search whose label or folder was deleted later
-is `valid: false` with `error` and zero counts; it is not hidden. `saved_search_create` takes
-`{account?, name, query, sort?}` and validates the query (parse plus label/folder resolution) before
-storing it; names are 1–48 characters, unique per account ignoring case, at most 12 per account.
-`sort` is `relevance` or `date`. `recent` holds the last eight successful queries in the encrypted
-`meta.recent_searches:<account>` value; `saved_search_recent_clear` forgets them.
+is `valid: false` with `error` and zero counts; it is not hidden. A valid text query while the FTS index
+is still building is `valid: true, index_pending: true` with zero counts, not a stale entry.
+`saved_search_create` takes `{account?, name, query, sort?}` and validates the query (parse plus
+label/folder resolution) before storing it; names are 1–48 characters, unique per account ignoring
+case, and the 12-row cap is checked in the same store transaction as the insert. `sort` is `relevance`
+or `date`. `saved_search_update` and `saved_search_delete` take `{id, account?, ...}`; `account` is
+required when the mailbox has several accounts and the row must belong to it. `recent` holds the last
+eight successful queries in the encrypted `meta.recent_searches:<account>` value; only an explicit
+commit records one, and `saved_search_recent_clear` forgets them. Deleting an account deletes that key.
 
 
 `draft_save` refuses CR/LF in addresses or the subject, validates every recipient, and returns the

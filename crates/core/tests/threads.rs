@@ -4,10 +4,35 @@
 //! cover the JSON shapes the CLI and MCP return, not only the repository.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use postino_core::{Engine, OpError};
+use postino_core::{CredentialVault, Engine, OpError, VaultError};
 use postino_store::{Account, Address, Folder, FolderKind, Message, MessageSummary, Store, StoreKey};
 use serde_json::json;
+use zeroize::Zeroizing;
+
+struct NoVault;
+
+impl CredentialVault for NoVault {
+    fn store_imap_password(&self, _account_id: &str, _password: &[u8]) -> Result<(), VaultError> {
+        Ok(())
+    }
+    fn load_imap_password(&self, _account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+        Ok(None)
+    }
+    fn delete_imap_password(&self, _account_id: &str) -> Result<(), VaultError> {
+        Ok(())
+    }
+    fn store_smtp_password(&self, _account_id: &str, _password: &[u8]) -> Result<(), VaultError> {
+        Ok(())
+    }
+    fn load_smtp_password(&self, _account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+        Ok(None)
+    }
+    fn delete_smtp_password(&self, _account_id: &str) -> Result<(), VaultError> {
+        Ok(())
+    }
+}
 
 const ACCOUNT: &str = "acc_p9b";
 const INBOX: &str = "fld_p9b_inbox";
@@ -118,6 +143,8 @@ fn threaded_fixture() -> (Fixture, Engine) {
     insert(&store, &reply, Some("root@example.com"), &["<root@example.com>"]);
     let archived = message("msg_archived", ARCHIVE, "<archived@example.com>", "Re: Preventivo sito", T0 + 7_200_000);
     insert(&store, &archived, Some("root@example.com"), &["<root@example.com>", "<reply@example.com>"]);
+    store.recount_folder(INBOX).expect("inbox counts");
+    store.recount_folder(ARCHIVE).expect("archive counts");
     drop(store);
     let engine = fixture.engine();
     (fixture, engine)
@@ -157,13 +184,27 @@ fn threads_list_and_thread_get_return_the_documented_shape() {
 #[test]
 fn thread_flag_changes_every_message_once_and_resolves_an_old_id() {
     let (_fixture, mut engine) = threaded_fixture();
+    let label = engine.create_label("Conversazione", postino_core::LabelColor::Gold).expect("label");
+    engine.set_label(&label.id, &["msg_root".to_owned(), "msg_reply".to_owned(), "msg_archived".to_owned()], true).expect("label all");
+    assert_eq!(engine.label_summary(&label.id).map(|label| label.unread_count), Some(3));
     let first = engine.call("thread_flag", json!({ "id": "root@example.com", "unread": false })).expect("flag");
     assert_eq!(first["changed"], 3);
     assert_eq!(first["thread"]["unread_count"], 0);
     assert_eq!(first["thread"]["state"], "read");
+    assert!(
+        ["msg_root", "msg_reply", "msg_archived"].iter().all(|id| engine
+            .messages()
+            .iter()
+            .find(|message| message.id == *id)
+            .is_some_and(|message| !message.unread))
+    );
+    let inbox = engine.folders().iter().find(|folder| folder.id == INBOX).expect("inbox");
+    assert_eq!(inbox.unread, 0, "the folder badge follows the thread flag");
+    assert_eq!(engine.label_summary(&label.id).map(|label| label.unread_count), Some(0), "the label badge follows it too");
     let again = engine.call("thread_flag", json!({ "id": "root@example.com", "unread": false })).expect("idempotent");
     assert_eq!(again["changed"], 0);
     engine.call("thread_flag", json!({ "id": "root@example.com", "starred": true })).expect("star");
+    assert!(engine.messages().iter().filter(|message| message.thread_id == "root@example.com").all(|message| message.starred));
     let listed = engine.call("threads_list", json!({ "folder": INBOX })).expect("threads");
     assert_eq!(listed["threads"][0]["starred_count"], 3);
     let named = engine.call("thread_flag", json!({ "id": "root@example.com" })).expect_err("a flag is required");
@@ -386,6 +427,139 @@ fn demo_threads_group_the_preventivo_messages_and_flag_the_whole_thread() {
     assert_eq!(flagged["changed"], 2);
     let again = engine.call("thread_flag", json!({ "id": "thr_preventivo", "unread": false })).expect("idempotent");
     assert_eq!(again["changed"], 0);
+}
+
+#[test]
+fn a_pending_index_is_not_a_stale_saved_search() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let store = fixture.open();
+    seed(&store);
+    for index in 0..501u32 {
+        let id = format!("msg_index_{index}");
+        let row = message(&id, INBOX, &format!("<index-{index}@example.com>"), &format!("Indice {index}"), T0 + i64::from(index));
+        store.upsert_message(&row).expect("message");
+    }
+    store.recount_folder(INBOX).expect("counts");
+    // Force a pending index whose first batch cannot finish: the next search sees "not ready" and
+    // must report the saved search as pending, not as invalid.
+    let raw = rusqlite::Connection::open(&path).expect("raw open");
+    let hex = fixture.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    raw.execute_batch(&format!(
+        "PRAGMA key = \"x'{hex}'\"; DELETE FROM message_fts; DELETE FROM message_fts_rank; DELETE FROM meta WHERE key = 'search_index';"
+    ))
+    .expect("damage the index");
+    drop(raw);
+    let mut engine = fixture.engine();
+    let created = engine.call("saved_search_create", json!({ "name": "Testo", "query": "indice" })).expect("save");
+    assert_eq!(created["search"]["valid"], true);
+    assert_eq!(created["search"]["index_pending"], true, "{created}");
+    assert_eq!(created["search"]["total"], 0);
+    engine.call("search_reindex", json!({})).expect("reindex");
+    let listed = engine.call("saved_searches_list", json!({})).expect("list");
+    assert_eq!(listed["searches"][0]["valid"], true);
+    assert_eq!(listed["searches"][0]["index_pending"], false);
+    assert_eq!(listed["searches"][0]["total"], 501);
+}
+
+#[test]
+fn a_read_only_store_never_writes_the_thread_cache_and_says_so() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let store = fixture.open();
+    seed(&store);
+    let root = message("msg_root", INBOX, "<root@example.com>", "Sola lettura", T0);
+    insert(&store, &root, None, &[]);
+    store.recount_folder(INBOX).expect("counts");
+    drop(store);
+    let raw = rusqlite::Connection::open(&path).expect("raw open");
+    let hex = fixture.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    raw.execute_batch(&format!("PRAGMA key = \"x'{hex}'\"; DELETE FROM threads; DELETE FROM thread_aliases;")).expect("empty cache");
+    drop(raw);
+    let read_only = Store::open_read_only(&path, &fixture.key).expect("read-only store");
+    let mut engine = Engine::open(read_only).expect("read-only engine");
+    assert_eq!(engine.messages().len(), 1);
+    let error = engine.call("threads_list", json!({})).expect_err("no cache on a read-only store");
+    assert!(matches!(error, OpError::Failed(ref detail) if detail.contains("read-write")), "{error}");
+    let searched = engine.call("search", json!({ "query": "is:unread" })).expect("search is read-only");
+    assert!(searched["total"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn the_saved_search_cap_is_atomic_across_connections_and_ids_are_not_reused() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    drop(store);
+    let mut engine = fixture.engine();
+    let external = fixture.open();
+    for index in 0..12 {
+        let saved = postino_store::SavedSearch {
+            id: format!("saved_{index}"),
+            account_id: ACCOUNT.to_owned(),
+            name: format!("Esterna {index}"),
+            query: "is:unread".to_owned(),
+            sort: "relevance".to_owned(),
+            created_at: T0,
+            updated_at: T0,
+        };
+        external.create_saved_search_limited(&saved, 12).expect("external save");
+    }
+    let error = engine.call("saved_search_create", json!({ "name": "Tredici", "query": "is:unread" })).expect_err("cross-process cap");
+    assert!(matches!(error, OpError::InvalidArgs(ref detail) if detail.contains("12")), "{error}");
+
+    let mut cleanup = fixture.engine();
+    let listed = cleanup.call("saved_searches_list", json!({})).expect("list");
+    let id = listed["searches"][0]["id"].as_str().expect("id").to_owned();
+    cleanup.call("saved_search_delete", json!({ "id": id })).expect("delete");
+    let created = cleanup.call("saved_search_create", json!({ "name": "Nuova", "query": "is:unread" })).expect("new");
+    let new_id = created["search"]["id"].as_str().expect("id");
+    assert_ne!(new_id, id, "a deleted saved-search id must not be reused");
+    assert_eq!(new_id, "saved_12", "the store high-water mark continues after the external rows");
+}
+
+#[test]
+fn saved_search_update_and_delete_are_account_scoped() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    store
+        .upsert_account(&Account {
+            id: "acc_other".to_owned(),
+            name: "Other".to_owned(),
+            email: "other@example.com".to_owned(),
+            provider: "custom".to_owned(),
+            signature: String::new(),
+            created_at: T0,
+        })
+        .expect("second account");
+    drop(store);
+    let mut engine = fixture.engine();
+    let created = engine.call("saved_search_create", json!({ "account": ACCOUNT, "name": "Mia", "query": "is:unread" })).expect("save");
+    let id = created["search"]["id"].as_str().expect("id");
+    let wrong = engine.call("saved_search_update", json!({ "account": "acc_other", "id": id, "name": "Rubata" })).expect_err("wrong account");
+    assert!(matches!(wrong, OpError::InvalidArgs(_)));
+    let wrong_delete = engine.call("saved_search_delete", json!({ "account": "acc_other", "id": id })).expect_err("wrong account delete");
+    assert!(matches!(wrong_delete, OpError::InvalidArgs(_)));
+    let updated = engine.call("saved_search_update", json!({ "account": ACCOUNT, "id": id, "name": "Mia 2" })).expect("owner update");
+    assert_eq!(updated["search"]["name"], "Mia 2");
+    engine.call("saved_search_delete", json!({ "account": ACCOUNT, "id": id })).expect("owner delete");
+}
+
+#[test]
+fn removing_an_account_removes_its_saved_searches_and_recent_queries() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    let engine = Engine::open_with_vault(store, Arc::new(NoVault)).expect("engine");
+    let mut engine = engine;
+    engine.call("saved_search_create", json!({ "name": "Segreta", "query": "is:unread" })).expect("save");
+    engine.record_recent_search(None, "subject:segreto").expect("recent");
+    engine.call("account_remove", json!({ "id": ACCOUNT, "confirm": true })).expect("remove");
+    drop(engine);
+    let store = fixture.open();
+    assert!(store.recent_searches(ACCOUNT).expect("recent").is_empty(), "the encrypted history must be deleted with the account");
+    assert!(store.list_saved_searches(Some(ACCOUNT)).expect("saved").is_empty());
 }
 
 #[test]
