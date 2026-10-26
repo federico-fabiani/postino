@@ -1229,7 +1229,9 @@ The subject fallback is deliberately narrow: no `References` and no `In-Reply-To
 prefix, a normalised subject of at least 8 bytes, and exactly one distinct thread with that subject
 inside a ±14-day window. It attaches this message to that thread; it never merges two threads, and two
 matching threads drop the fallback. A message re-fetch is idempotent, a reopen reads the stored ids,
-and a `UIDVALIDITY` reset re-derives the same ids from the same headers. Mail cached by P9a keeps its
+and a `UIDVALIDITY` reset re-derives the same ids from the same headers. A locally sent message takes
+its own `Message-ID` (or the parent thread, or the phantom parent) as the thread before its row is
+written, so a later Sent re-fetch derives the same id instead of moving it. Mail cached by P9a keeps its
 P9a placeholder ids until an explicit rebuild; P9b does not re-read every pre-P9 message at open (that
 would add a full mailbox derivation to the startup path). `search_reindex` rebuilds the cache rows,
 not the ids.

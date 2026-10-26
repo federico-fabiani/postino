@@ -199,6 +199,7 @@ fn two_resolved_threads_merge_into_the_smallest_id_and_keep_an_alias() {
     assert!(thread_row(&store, "zulu@example.com").is_none(), "the merged thread row is deleted");
     let alias = store.canonical_thread(ACCOUNT, "zulu@example.com").expect("alias");
     assert_eq!(alias, "alpha@example.com");
+    assert_eq!(store.thread_id_for_message_id(ACCOUNT, "zulu@example.com").expect("lookup").as_deref(), Some("alpha@example.com"));
     let detail = store.get_thread(ACCOUNT, "zulu@example.com", 50, 0).expect("read").expect("detail");
     assert_eq!(detail.thread.id, "alpha@example.com");
     assert_eq!(detail.thread.message_count, 3);

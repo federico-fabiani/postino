@@ -3075,6 +3075,20 @@ impl Engine {
 
         // The pass holds the connection outside `self`, so it is passed in explicitly.
         let store = persist.or(self.store.as_ref());
+        // A locally sent message must carry the thread a later sync would derive: its own
+        // Message-ID for a root, the parent thread (or phantom parent) for a reply. Otherwise a Sent
+        // re-fetch would move it to another id without a merge.
+        if let Some(message_id) = stored_message_id.as_deref() {
+            let parent = self.reply_links.get(id).cloned();
+            message.summary.thread_id = match (parent, store) {
+                (Some(parent), Some(store)) => store.thread_id_for_message_id(&account_id, &parent).ok().flatten().unwrap_or(parent),
+                (Some(parent), None) => parent,
+                (None, Some(store)) => {
+                    store.thread_id_for_message_id(&account_id, message_id).ok().flatten().unwrap_or_else(|| message_id.to_owned())
+                }
+                (None, None) => message_id.to_owned(),
+            };
+        }
         let mut merged_duplicate = None;
         let mut adopted_uid = None;
         if let Some(store) = store {

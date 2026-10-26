@@ -524,7 +524,8 @@ impl Store {
                 let mut stmt = self.conn.prepare(&format!(
                     "SELECT m.thread_id, ml.label_id FROM messages m INDEXED BY messages_account_thread_date
                      JOIN message_labels ml ON ml.message_id = m.id
-                     WHERE m.account_id = ?1 AND m.thread_id IN ({placeholders})"
+                     WHERE m.account_id = ?1 AND m.thread_id IN ({placeholders})
+                     LIMIT 4000"
                 ))?;
                 let rows =
                     stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
@@ -624,6 +625,32 @@ impl Store {
             }
         }
         Ok(canonical)
+    }
+
+    /// The thread a `Message-ID` belongs to, without writing anything. A locally sent message uses
+    /// this before its row is written so a later sync of the same root derives the same id.
+    pub fn thread_id_for_message_id(&self, account_id: &str, message_id: &str) -> Result<Option<String>, StoreError> {
+        let canonical = self.canonical_thread(account_id, message_id)?;
+        let bracketed = format!("<{canonical}>");
+        let thread: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT thread_id FROM messages WHERE account_id = ?1 AND message_id IN (?2, ?3) ORDER BY id ASC LIMIT 1",
+                params![account_id, canonical, bracketed],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(thread) = thread {
+            return self.canonical_thread(account_id, &thread).map(Some);
+        }
+        let exists: bool =
+            self.conn.query_row("SELECT EXISTS(SELECT 1 FROM threads WHERE account_id = ?1 AND id = ?2)", params![account_id, canonical], |row| {
+                row.get(0)
+            })?;
+        if exists {
+            return Ok(Some(canonical));
+        }
+        Ok(None)
     }
 
     /// Rebuild every thread cache row from the message rows, in one transaction.
