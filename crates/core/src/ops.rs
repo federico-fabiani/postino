@@ -183,7 +183,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search",
             "Search mail",
-            "Search the encrypted local index. Grammar: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:unread|read|starred|unstarred`, `has:attachment`, `before:`/`after:` (YYYY-MM-DD UTC), `larger:`/`smaller:` (k/m/g). Bare terms search all text, `*` marks a prefix, quoted values support `\\\"`, and AND/OR/NOT (uppercase) plus parentheses compose clauses. Hits are bm25-ranked with a stable date/id tie-break; `sort: \"date\"` orders newest first. `total` is exact up to 10 000 and `total_capped` says when it is not. At most 200 hits per page and offset 5000. Snippets are plain text, never HTML. Unknown folder or label names/ids are an error. A parse error is an invalid argument carrying the error code and position.",
+            "Search the encrypted local index. Grammar: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:unread|read|starred|unstarred`, `has:attachment`, `before:`/`after:` (YYYY-MM-DD UTC), `larger:`/`smaller:` (k/m/g). Bare terms search all text, `*` marks a prefix, quoted values support `\\\"`, and AND/OR/NOT (uppercase) plus parentheses compose clauses. Hits are bm25-ranked with an exact global date/id tie-break; `sort: \"date\"` orders newest first. `unread_only` and `with_attachments` filter the same scope as the page. `total` is exact up to 10 000 and `total_capped` says when it is not. At most 200 hits per page and offset 5000. Snippets are plain text, never HTML. Unknown folder or label names/ids are an error. A parse error is an invalid argument carrying the error code and position. While a pending index is building, the result has empty hits and an `index` object with state/counts/last_error.",
             SearchArgs,
             true,
             false
@@ -191,7 +191,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search_status",
             "Search index status",
-            "Report whether the local full-text index is ready, how many documents and message rows it covers, its size, the last error and when it was last updated. Read-only and offline. A `ready: false` index is repairable with search_reindex.",
+            "Report whether the local full-text index is ready, how many documents and message rows it covers, FTS/rank row-id drift, the database+WAL size, the last error and the last index update. Read-only and offline. A failed build is reported here and never blocks opening the mailbox; a `ready: false` index is repairable with search_reindex.",
             SearchStatusArgs,
             true,
             false
@@ -199,7 +199,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search_reindex",
             "Rebuild the search index",
-            "Delete and rebuild the encrypted full-text index from the stored message rows in resumable 500-row batches. Idempotent and safe to run while the mailbox is open; it never vacuums the database and never contacts a server. Returns the document count and duration. Thread rows are created by P9b and stay 0 here.",
+            "Delete and rebuild the encrypted full-text and rank indexes from the stored message rows in resumable 500-row batches. Idempotent; it never vacuums the database and never contacts a server. It is a single-process maintenance action: do not run it from the desktop and MCP at once. Returns the document count and duration. Thread rows are created by P9b and stay 0 here.",
             SearchReindexArgs,
             false,
             false
@@ -520,6 +520,12 @@ pub struct SearchArgs {
     pub limit: Option<u32>,
     /// Row offset, 0-5000.
     pub offset: Option<u32>,
+    /// Only unread messages, from the same SQL/FTS scope as the page.
+    #[serde(default)]
+    pub unread_only: bool,
+    /// Only messages with attachments, from the same scope.
+    #[serde(default)]
+    pub with_attachments: bool,
     /// relevance (default) or date.
     pub sort: Option<SearchSort>,
 }
@@ -777,6 +783,9 @@ pub struct SearchResult {
     /// Deprecated alias of `hits[].message`, kept for one milestone so existing clients do not break.
     pub messages: Vec<MessageSummary>,
     pub took_ms: u64,
+    /// Present while the index is not ready: state, counts and last error. `hits` is empty then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<SearchStatusResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -788,6 +797,20 @@ pub struct SearchStatusResult {
     pub size_bytes: u64,
     pub state: String,
     pub updated_at: i64,
+}
+
+impl SearchStatusResult {
+    pub fn from_store(status: postino_store::SearchIndexStatus) -> Self {
+        Self {
+            ready: status.ready,
+            indexed: status.indexed,
+            total: status.total,
+            last_error: status.last_error,
+            size_bytes: status.size_bytes,
+            state: status.state,
+            updated_at: status.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,6 +1192,14 @@ fn find_folder<'a>(engine: &'a Engine, id: &str) -> Result<&'a Folder, OpError> 
     engine.folders().iter().find(|folder| folder.id == id).ok_or_else(|| unknown_folder(id))
 }
 
+fn find_inbox<'a>(engine: &'a Engine, account: Option<&str>) -> Result<&'a Folder, OpError> {
+    engine
+        .folders()
+        .iter()
+        .find(|folder| folder.kind == FolderKind::Inbox && account.is_none_or(|account| folder.account_id == account))
+        .ok_or_else(|| unknown_folder("inbox"))
+}
+
 fn page_bounds(limit: Option<u32>, offset: Option<u32>) -> (usize, usize) {
     let limit = usize::try_from(limit.unwrap_or(50).clamp(1, 200)).unwrap_or(50);
     let offset = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
@@ -1185,7 +1216,7 @@ fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
         Some(id) => Some(find_folder(engine, id)?),
         // A label on its own is a mailbox-wide view; without either filter the list stays inbox-first.
         None if args.label.is_some() => None,
-        None => Some(find_folder(engine, "inbox")?),
+        None => Some(find_inbox(engine, args.account.as_deref())?),
     };
     if let (Some(account), Some(folder)) = (&args.account, folder)
         && folder.account_id != *account
@@ -1284,6 +1315,12 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
         filters.push(postino_store::SearchExpr::Label(label.id));
     }
     let expression = translate_search(&parsed.expr, engine, account.as_deref())?;
+    if args.unread_only {
+        filters.push(postino_store::SearchExpr::Unread(true));
+    }
+    if args.with_attachments {
+        filters.push(postino_store::SearchExpr::HasAttachments(true));
+    }
     filters.push(expression);
     let expression = match filters.len() {
         0 => None,
@@ -1297,6 +1334,26 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
         SearchSort::Date => postino_store::SearchSort::Date,
     };
     let started = std::time::Instant::now();
+    if let Some(store) = engine.store()
+        && expression_uses_fts(expression.as_ref())
+        && !store.search_index_ready().map_err(store_map::read_error)?
+    {
+        // One resumable batch per search. A pending v7 index must not block opening the mailbox or
+        // the first search for the whole rebuild; the UI shows the progress carried in `index`.
+        let _ = store.ensure_search_index_batch();
+        let status = store.search_status().map_err(store_map::read_error)?;
+        if !status.ready {
+            return value(SearchResult {
+                query: parsed.text,
+                total: 0,
+                total_capped: false,
+                hits: Vec::new(),
+                messages: Vec::new(),
+                took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                index: Some(SearchStatusResult::from_store(status)),
+            });
+        }
+    }
     let (hits, total, total_capped) = match engine.store() {
         Some(store) => {
             // With one account every row is in scope; omitting the account filter lets the fast
@@ -1326,21 +1383,25 @@ fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
     };
     let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let messages = hits.iter().map(|hit| hit.message.clone()).collect();
-    value(SearchResult { query: parsed.text, total, total_capped, hits, messages, took_ms })
+    value(SearchResult { query: parsed.text, total, total_capped, hits, messages, took_ms, index: None })
+}
+
+fn expression_uses_fts(expression: Option<&postino_store::SearchExpr>) -> bool {
+    fn walk(expr: &postino_store::SearchExpr) -> bool {
+        match expr {
+            postino_store::SearchExpr::Match(_) => true,
+            postino_store::SearchExpr::And(children) | postino_store::SearchExpr::Or(children) => children.iter().any(walk),
+            postino_store::SearchExpr::Not(child) => walk(child),
+            _ => false,
+        }
+    }
+    expression.is_some_and(walk)
 }
 
 fn search_status(engine: &Engine) -> Result<Value, OpError> {
     let store = engine.require_store_for_read("search_status")?;
     let status = store.search_status().map_err(store_map::read_error)?;
-    value(SearchStatusResult {
-        ready: status.ready,
-        indexed: status.indexed,
-        total: status.total,
-        last_error: status.last_error,
-        size_bytes: status.size_bytes,
-        state: status.state,
-        updated_at: status.updated_at,
-    })
+    value(SearchStatusResult::from_store(status))
 }
 
 fn search_reindex(engine: &Engine) -> Result<Value, OpError> {
@@ -1372,8 +1433,11 @@ fn resolve_folder(engine: &Engine, value: &str, account: Option<&str>) -> Result
     let folder = engine
         .folders()
         .iter()
-        .find(|folder| folder.id == value)
-        .or_else(|| engine.folders().iter().find(|folder| folder.name.eq_ignore_ascii_case(value)))
+        .find(|folder| folder.id == value && account.is_none_or(|account| folder.account_id == account))
+        .or_else(|| {
+            let wanted = value.to_lowercase();
+            engine.folders().iter().find(|folder| account.is_none_or(|account| folder.account_id == account) && folder.name.to_lowercase() == wanted)
+        })
         .ok_or_else(|| unknown_folder(value))?;
     if let Some(account) = account
         && folder.account_id != account
@@ -1395,11 +1459,12 @@ fn folder_expr(engine: &Engine, id: String) -> postino_store::SearchExpr {
 }
 
 fn resolve_label(engine: &Engine, value: &str) -> Result<Label, OpError> {
+    let wanted = value.to_lowercase();
     engine
         .labels()
         .iter()
         .find(|label| label.id == value)
-        .or_else(|| engine.labels().iter().find(|label| label.name.eq_ignore_ascii_case(value)))
+        .or_else(|| engine.labels().iter().find(|label| label.name.to_lowercase() == wanted))
         .cloned()
         .ok_or_else(|| unknown_label(value))
 }
@@ -1445,13 +1510,29 @@ fn translate_search(expr: &crate::search::Expr, engine: &Engine, account: Option
 
 fn matched_label(expr: &crate::search::Expr) -> String {
     use crate::search::Expr;
-    match expr {
-        Expr::Text { field: Some(field), .. } => field.as_str().to_owned(),
-        Expr::Text { field: None, .. } => "all".to_owned(),
-        Expr::And(children) | Expr::Or(children) => children.first().map_or_else(|| "all".to_owned(), matched_label),
-        Expr::Not(child) => matched_label(child),
-        _ => "filter".to_owned(),
+    fn collect(expr: &Expr, fields: &mut BTreeSet<&'static str>, bare: &mut bool, filters: &mut bool) {
+        match expr {
+            Expr::Text { field: Some(field), .. } => {
+                fields.insert(field.as_str());
+            }
+            Expr::Text { field: None, .. } => *bare = true,
+            Expr::And(children) | Expr::Or(children) => children.iter().for_each(|child| collect(child, fields, bare, filters)),
+            Expr::Not(child) => collect(child, fields, bare, filters),
+            _ => *filters = true,
+        }
     }
+    let mut fields = BTreeSet::new();
+    let mut bare = false;
+    let mut filters = false;
+    collect(expr, &mut fields, &mut bare, &mut filters);
+    let mut parts = fields.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if bare {
+        parts.push("all".to_owned());
+    }
+    if filters || parts.is_empty() {
+        parts.push("filter".to_owned());
+    }
+    parts.join(", ")
 }
 
 /// The demo mailbox has no FTS table: evaluate the AST over its full in-memory messages, then sort

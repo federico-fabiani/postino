@@ -341,24 +341,31 @@ crash-dump entry above.
 - **The index is in SQLCipher.** FTS5 and its shadow tables live in the encrypted database; there is
   no sidecar file and no plaintext copy. `VACUUM` is forbidden because FTS keys on `messages.rowid`.
 - **Contentless index.** The index stores terms, not content; snippets are computed in Rust from the
-  plain `body_text` row and are capped at 240 characters. `body_html` is never read by search, so a
-  sanitizer bug cannot be re-opened through a search result.
+  plain `body_text` row, are capped at 240 characters and strip bidi/format controls so a hostile
+  subject or body cannot spoof the row order. `body_html` is never read by search, so a sanitizer bug
+  cannot be re-opened through a search result.
 - **Bound, escaped MATCH.** Core quotes every value as an FTS5 phrase (doubling `"`) and the store binds
-  it as `MATCH ?`; label/folder names resolve to local ids in core. No caller text is concatenated into
-  SQL or a MATCH expression. A syntax error is an error result, not a crash or a query that runs.
-- **Bounded work.** Query 1024 B, 64 clauses, depth 8, 16 terms; 200 hits, offset 5 000; 64 KiB of body
-  per snippet; 1 MiB of body indexed per message. A hostile message cannot grow an index row without
-  bound or make one search allocate message-sized buffers.
+  it as `MATCH ?`; label/folder names resolve to local ids in core and folder names are resolved inside
+  the requested account. No caller text is concatenated into SQL or a MATCH expression. A syntax error
+  is an error result, not a crash or a query that runs.
+- **Bounded work.** Query 1024 B, 64 clauses, depth 8, 16 terms; 200 hits, offset 5 000; at most 16 384
+  characters of body per snippet (≤ 64 KiB of UTF-8); 1 MiB of body indexed per message. A hostile
+  message cannot grow an index row without bound or make one search allocate message-sized buffers.
 - **Privacy.** Query text, subjects, addresses and snippets never enter a log. The UI shows the user's
   own query and positional error; the CLI/MCP error names the error code and position, not the query.
   Search results are local; no request leaves the machine.
-- **Repairability.** The index is derived data (`meta.search_index` + 500-row batches). A damaged or
-  emptied index is reported by `search_status` and rebuilt by `search_reindex` from the encrypted rows;
-  a failed v7 migration rolls back to v6. The inert P9b/P9c tables hold no P9a data.
+- **Repairability.** The index is derived data (`meta.search_index` + 500-row batches, plus a rank
+  table maintained by the same triggers). `search_status` compares missing and extra rowids in both
+  the FTS and rank tables (same-count drift included), records a failed build's `last_error`, and the
+  database+WAL size; `search_reindex` rebuilds from the encrypted rows. Opening a pending index does
+  not block mail; the shell advances batches. `search_reindex` is a single-process maintenance action:
+  there is no cross-process advisory lock, so do not run it from the desktop and MCP at once. A failed
+  v7 migration rolls back to v6. The inert P9b/P9c tables hold no P9a data.
 - **Residual.** SQLite's row store keeps a 2 KiB body inline in `messages`; a covering summary index
-  keeps those pages out of the open scan, but 100k summaries still take ~293 ms to load and decode in
+  keeps those pages out of the open scan, but 100k summaries still take 268–357 ms to load and decode in
   the measured debug build. The app holds summaries and a small body cache, not a second index. The
-  measured open/RSS misses are documented in the architecture performance section.
+  open target is missed and reported; the RSS target is not established (the 154.7–156.5 MiB figure is the
+  seeding test process's high-water mark, not an opened mailbox).
 
 ## 5. Out of scope
 

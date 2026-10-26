@@ -268,10 +268,11 @@ behave exactly as before; `open(store)` hydrates the mailbox and keeps the conne
 write-through. The store crate does not depend on core: `crates/core/src/store_map.rs` is the only
 translation between domain types and store rows.
 
-**Load once.** `Engine::open` issues one query per table: accounts, folders, summaries, blob hashes,
-labels and drafts. There is no per-message read. Since P9a the list rows are `MessageSummary` values:
-bodies, HTML and attachment rows are read only by `Engine::message(id)`, which owns the result and
-keeps a revision-keyed cache (§4.11). Before hydrating, it repairs every `drafts` row that has no
+**Load once.** `Engine::open` issues one query per table: accounts, folders, summaries, attachment
+id/hash metadata, labels and draft metadata. There is no per-message read. Since P9a the list rows are
+`MessageSummary` values: bodies, HTML and full attachment rows are read only by `Engine::message(id)`,
+which owns the result and keeps a revision-keyed cache (§4.11). Before hydrating, it repairs every
+`drafts` row that has no
 message row into a real message row in the Drafts folder of its account, in one transaction, using the
 body and recipients from the revision row. If an account, folder or date cannot be repaired, the open
 fails with an actionable error instead of serving a ghost draft. The label sequence is read from
@@ -1034,10 +1035,10 @@ that table (so a valid lie such as `evil.exe` + `image/png` cannot change the em
 are never inspected). The engine writes the blob first, then one `save_draft_message_linked`
 transaction writes the message row, the attachment rows (with the new hash), the draft revision and
 the folder counts. A failed row write leaves an unreferenced deduplicated blob, never a row that
-claims bytes it does not have. Before either attachment write the engine checks the store message and
-draft revision/snapshot, including the hydrated reply link and attachment rows; a draft saved, sent or
-moved by another process is refused with “changed in another session; refresh the mailbox” instead of
-overwriting the newer body or resurrecting a Sent row. `draft_attachment_remove` deletes the row and
+claims bytes it does not have. Before either attachment write the engine compares the draft's stored
+revision with its metadata-only snapshot map (loaded at open and kept through cache eviction); a draft
+saved, sent or moved by another process is refused with “changed in another session; refresh the
+mailbox” instead of overwriting the newer body or resurrecting a Sent row. `draft_attachment_remove` deletes the row and
 leaves the blob for the future GC. The desktop picker/drop reads a path locally with the same 25 MiB bound and calls the
 engine method; CLI `draft attach` reads the path and calls the operation with base64; MCP receives
 base64 and never a path. The metadata-only `draft_save` path runs the same sanitizer and duplicate
@@ -1082,17 +1083,18 @@ The two changes ship together because the in-memory search that FTS replaces was
 `Engine::open` held bodies in the first place.
 
 **Read path.** A store-backed `Engine` holds `accounts`, `folders`, `labels` and a
-`Vec<MessageSummary>`; `Engine::open` issues one list-row query, one label query, one blob-hash query
-and one drafts query, and never selects `body_text`, `body_html` or an attachment row. `messages()`
-returns the summaries. `Engine::message(id)` is an owned read: it looks in an eight-entry cache keyed
-by the engine revision and otherwise calls `Store::get_message_with_attachments`. Every write and
-every reload bumps the revision, so a stale body cannot survive a flag, label, draft or sync change.
-Drafts are the one exception: their full messages are preloaded at open because the outbox snapshot
-check must compare the bytes this engine loaded, not a later read that hides another process's edit.
-`messages_list` uses `Store::list_messages` with folder, label, account, unread, starred and
-attachment filters, so the list is a bounded SQL page. `label_summaries` reads live counts from the
-store. ADR-0004 records the split. In memory, the demo engine keeps its full synthetic messages and
-answers through the same API.
+`Vec<MessageSummary>`; `Engine::open` issues one covering-index list query, one label query, one
+attachment id/hash query, one draft-metadata query (id, revision, updated_at, in_reply_to) and the
+orphan-draft repair query. It never selects `body_text`, `body_html` or full attachment rows.
+`messages()` returns the summaries. `Engine::message(id)` is an owned read: it looks in an eight-entry
+cache keyed by the engine revision and otherwise calls `Store::get_message_with_attachments`. Every
+write and reload bumps the revision, so a stale body cannot survive a flag, label, draft or sync
+change. Drafts are **not** preloaded: a dedicated `draft_snapshots` map (id → store revision) loaded
+from metadata is the stale-draft guard and is independent of body-cache eviction. Draft bodies are read
+only when a draft is opened or serialized. `messages_list` uses `Store::list_messages` with folder,
+label, account, unread, starred and attachment filters, so the list is a bounded SQL page.
+`label_summaries` reads live counts from the store. ADR-0004 records the split. In memory, the demo
+engine keeps its full synthetic messages and answers through the same API.
 
 **Schema v7** is additive after v6, in one transaction:
 
@@ -1106,19 +1108,27 @@ CREATE INDEX messages_list_cover ON messages(date DESC, id, folder_id, thread_id
 CREATE VIRTUAL TABLE message_fts USING fts5(
     subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names,
     content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2', prefix='2 3');
+CREATE TABLE message_fts_rank(rowid INTEGER PRIMARY KEY, date_key INTEGER NOT NULL, id_key TEXT NOT NULL);
 ```
 
 The repository derives sender/recipient text, the attachment-name list and `subject_norm`; the
 triggers copy those values and at most 262 144 characters of `body_text` (≤ 1 MiB of UTF-8) into the
-index. `AFTER INSERT`, `AFTER DELETE` and `AFTER UPDATE OF` the indexed columns maintain the FTS row;
-flag, folder and date updates name no indexed column and do not reindex. The pre-flight probe
+index. The same insert/delete/update triggers maintain `message_fts_rank`, so `bm25, date DESC,
+id ASC` is a global order inside SQLite before `LIMIT/OFFSET`; the page then joins only the selected
+rows to `messages`. An `AFTER UPDATE OF` includes the indexed columns, `date` and `id`, so a date
+change reorders the rank row; flag and folder updates do not reindex. The pre-flight probe
 (`crates/store/tests/fts_probe.rs`) proves the bundled SQLCipher 4.19 / SQLite 3.53.4 accepts
 `contentless_delete=1` and that delete+insert is the supported update form. FTS5 shadow tables live
 in the SQLCipher file; there is no sidecar and no content in the index, so snippets cannot leak HTML.
-`meta.search_index` holds `{state,last_rowid,indexed,total,updated_at,last_error}`. `Store::open`
-finishes a pending build in 500-row transactions (`ensure_search_index`); `search_reindex` deletes
-all and rebuilds; `search_status` reports readiness, counts, drift and the file size. Nothing runs
-`VACUUM`, because FTS keys on `messages.rowid`.
+`meta.search_index` holds `{state,last_rowid,indexed,total,updated_at,last_error}`; every FTS mutation
+also stamps `meta.search_updated_at`. `Store::open` **does not** force a build. `ensure_search_index`
+finishes a pending build in 500-row transactions, `ensure_search_index_batch` advances one batch for
+the shell/search path, and `search_reindex` deletes all and rebuilds. `search_status` reports state,
+counts, row-id drift (missing and extra rows, FTS and rank), `last_error`, the database+WAL size and the
+last index update. A failed batch records `state:error` and a readable `last_error`; the mailbox still
+opens. `search_reindex` is a single-process maintenance action: SQLite serialises the writes, but a
+second builder can see a half-built index, so do not run it from the desktop and MCP at once. Nothing
+runs `VACUUM`, because FTS keys on `messages.rowid`.
 
 `threads`, `thread_aliases`, `saved_searches`, `rules`, `rule_runs` and `rule_actions` are created empty
 and inert in v7 so P9b/P9c need no second migration. P9a does not read or write them.
@@ -1143,16 +1153,24 @@ fields, phrases, prefixes, Unicode, escapes, lowercase `or`, `Re:` and `http://`
 **Execution.** Core resolves `label:`/`folder:` names to ids and escapes every value as an FTS5
 phrase. The store receives a typed `SearchExpr`; SQL fragments are fixed and every value is bound, so
 no caller text reaches `MATCH` or a statement by interpolation. For a text query on one account, the
-store ranks inside FTS5 first, joins only a bounded candidate window to `messages`, applies the exact
-`bm25` order with `(date DESC, id ASC)` tie-break in Rust and returns the page; total is a separate
-FTS count, exact up to 10 000 and flagged with `total_capped`. A mixed query (text plus folder/label/
-flag/date/size) compiles to typed SQL predicates and per-leaf `MATCH` subqueries; a filter-only query
-never runs `MATCH`. Hits are capped at 200 and offset at 5 000. Snippets are built in Rust from the
-subject or the first 64 KiB of `body_text`, normalised to one line and at most 240 characters; the
-store never reads `body_html` for search. `Store::interrupt_handle` is exposed so the shell can cancel
-a superseded statement. The desktop app debounces 250 ms, commits on Enter, clears on Esc and caches
-results by `(signature, revision)`; it shows the parsed clauses as chips, the Italian parse position,
-plain snippets and a scope-aware empty state.
+store orders by `bm25, date_key DESC, id_key ASC` inside FTS5 (the rank table), then takes the page and
+joins only those rows to `messages`; total is a separate FTS+rank count, exact up to 10 000 and flagged
+with `total_capped`. A mixed query (text plus folder/label/flag/date/size) compiles to typed SQL
+predicates and per-leaf `MATCH` subqueries; a filter-only query never runs `MATCH`. The unread and
+attachment chips are filters in that same scope, not a post-filter of the page; a plain folder view
+passes `folder`, a label view passes the optional label folder. Hits are capped at 200 and offset at
+5 000. Snippets are built in Rust from the subject or the first 16 384 characters of `body_text`
+(at most 64 KiB of UTF-8), normalised to one line, stripped of bidi/format controls and at most 240
+characters; the store never reads `body_html` for search. The desktop app debounces 250 ms, commits on
+Enter, clears on Esc and caches results by `(signature, revision)`; it shows the parsed clauses as
+chips (at most four, two rows), the Italian parse position, plain snippets, `primi 10.000 risultati`
+when capped, and a scope-aware empty state. A pending index shows `Indice di ricerca in preparazione
+(x/y)` and the shell advances one 500-row batch per tick; an error shows the stored sentence.
+
+**Demo semantics.** The demo engine answers through the same operation shape but evaluates the AST in
+Rust over its synthetic messages: matching is case-insensitive substring rather than FTS tokens,
+`larger:`/`smaller:` match nothing because demo rows carry no RFC 822 size, and results are date-sorted
+regardless of `sort`. This is a demo-only divergence, stated here rather than hidden.
 
 **Performance.** Fixture: 100 000 messages, 2 KiB plain bodies, 20% attachment names, one account;
 20 000 in CI and 100 000 behind `POSTINO_SLOW_TESTS=1`. On the Windows GNU host (debug, opt-level 1,
@@ -1160,25 +1178,28 @@ SQLCipher 4.19 / SQLite 3.53.4), five runs after the index was built:
 
 | Measure | 20k | 100k | P9a target |
 |---|---|---|---|
-| First relevance page (P50) | 20.3 ms | 30.6 ms | < 100 ms |
-| First relevance page (P95) | 21.3 ms | 35.1 ms | < 100 ms |
-| `open` including summaries | 158 ms | 293 ms | < 150 ms |
-| `sort:"date"` first page | 51 ms | 282 ms | not gated, reported |
-| Seed + FTS build | 2.9 s | 16.6 s | backfill reported |
-| Full `search_reindex` | 2.4 s | 17.7 s | backfill reported |
-| Peak working set in the seeding test process | — | 156.5 MiB | < 120 MiB |
+| First relevance page, store P50 | 1.7–2.3 ms | 34.3–39.5 ms | < 100 ms |
+| First relevance page, store P95 | 6.0–7.7 ms | 35.8–54.9 ms | < 100 ms |
+| First relevance page, `search` op P50 | 3.1–3.3 ms | 51.0 ms | < 100 ms |
+| First relevance page, `search` op P95 | 10.2–11.3 ms | 53.3 ms | < 100 ms |
+| `open` including summaries | 59–77 ms | 268–357 ms | < 150 ms |
+| `sort:"date"` first page | 49–59 ms | 251–316 ms | not gated, reported |
+| Seed + FTS build | 3.1–3.3 s | 16.5–18.0 s | backfill reported |
+| Full `search_reindex` | 2.6 s | 17.6–20.7 s | backfill reported |
+| FTS+rank index bytes (`dbstat`) | 23.0 MB | 115.2 MB | reported |
+| 1 000 drafts, 4 KiB bodies, open | 18.6 ms | — | no body read |
+| Peak working set in the seeding test process | — | 154.7–156.5 MiB | < 120 MiB |
 
-Release `--release` measurements on the same host: open 262 ms, search P50 30.6 ms / P95 33.3 ms,
-reindex 17.3 s, peak 156.5 MiB. The debug build is the CI profile; release does not change the
-conclusion.
-
-The search target is met. **The open and RSS targets are missed and reported, not hidden:** a covering
-summary index keeps body pages out of the open scan (that alone took open from 1.4 s to 293 ms debug /
-262 ms release), but 100 000 summary rows still cost ~170–184 ms to decrypt and decode plus the engine's
-Vec, index and counts. The seeding test process's peak also includes the allocator high-water mark of
-100 000-message seed. A separate body table (or a compact summary table) is the next step if the open
-target must be met; P9a does not silently claim it. `sort:"date"` is slower than relevance because it
-must join every match to read the date; the default path is the fast one.
+The range is several debug runs on the same Windows GNU host; the CI profile is opt-level 1 with
+dependencies at 2. The relevance target is met, including the 2 000-identical-body oldest-first
+regression whose offsets 0/200/400 return disjoint newest-first pages. **The open target is missed**
+(268–357 ms vs 150): the covering index keeps body pages out of the scan, but decrypting and decoding
+100k summary rows and building the engine's Vec/index/counts remains ~200 ms plus engine work. A
+compact summary/body table is the next step; P9a reports the miss rather than claiming it. The
+`sort:"date"` path is slower because it joins every match to read the date. **RSS is unverified, not
+established as missed:** 154.7–156.5 MiB is the seeding test process's high-water mark, not an opened
+mailbox's working set. Index bytes are measured with `dbstat`; new-message latency and a 100-message
+incremental sync were not measured in P9a and are not claimed.
 
 
 

@@ -411,6 +411,11 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Expr, SearchError> {
         self.skip_space();
         let start = self.pos;
+        let checkpoint = self.pos;
+        if self.keyword("AND") || self.keyword("OR") {
+            self.pos = checkpoint;
+            return Err(SearchError::new("dangling_operator", start));
+        }
         match self.byte() {
             None => Err(SearchError::new("dangling_operator", start)),
             Some(b')') => Err(SearchError::new("unexpected_token", start)),
@@ -661,7 +666,7 @@ fn normalised_chars(text: &str, limit: usize) -> Vec<char> {
     let mut chars = Vec::with_capacity(limit.min(text.len()));
     let mut pending_space = false;
     for character in text.chars() {
-        if character.is_whitespace() || character.is_control() {
+        if character.is_whitespace() || character.is_control() || is_format_control(character) {
             pending_space = !chars.is_empty();
             continue;
         }
@@ -675,6 +680,10 @@ fn normalised_chars(text: &str, limit: usize) -> Vec<char> {
         chars.push(character);
     }
     chars
+}
+
+fn is_format_control(character: char) -> bool {
+    matches!(character, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
 }
 
 fn take(chars: &[char], start: usize, end: usize) -> String {
@@ -803,6 +812,9 @@ mod tests {
             ("", "empty"),
             ("from:", "dangling_field"),
             ("from:giulia AND", "dangling_operator"),
+            ("from:giulia OR AND b", "dangling_operator"),
+            ("from:giulia AND AND b", "dangling_operator"),
+            ("AND from:giulia", "dangling_operator"),
             ("NOT from:spam", "negative_only"),
             ("(from:giulia", "unclosed_paren"),
             ("subject:\"unclosed", "unclosed_quote"),
@@ -859,6 +871,14 @@ mod tests {
         assert_eq!(fts_phrase(None, "foo bar", false), "\"foo bar\"");
         assert_eq!(fts_phrase(Some("subject"), "a\"b", true), "subject : \"a\"\"b\"*");
         assert_eq!(fts_phrase(None, "AND OR * ( )", false), "\"AND OR * ( )\"");
+    }
+
+    #[test]
+    fn snippets_strip_format_controls() {
+        let snippet = make_snippet("Nota", "testo \u{202E}malevolo\u{202C} fine", &["testo".to_owned()]);
+        assert!(!snippet.text.contains('\u{202E}'));
+        assert!(!snippet.text.contains('\u{202C}'));
+        assert!(snippet.text.contains("malevolo"));
     }
 
     #[test]

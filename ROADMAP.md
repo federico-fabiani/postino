@@ -150,8 +150,10 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] FTS5 search with operators and ranking (P9a): encrypted contentless-delete index, schema v7,
       the documented grammar with a recursive-descent parser and canonical printer, typed bound SQL
       with bm25/date order, plain snippets, 200-hit/5k-offset caps, `search_status`/`search_reindex`,
-      CLI/MCP/UI parity and the body-free read path. 100k first-page P50 30.6 ms / P95 35.1 ms; open
-      and RSS missed the P9a targets and are recorded in the architecture performance table.
+      CLI/MCP/UI parity and the body-free read path. 100k first-page `search` op P50 51.0 ms / P95 53.3 ms
+      (store page 34–40 ms); open missed the 150 ms target (268–357 ms) and is recorded in the
+      architecture table; RSS is unverified (154.7–156.5 MiB is the seeding process, not an opened
+      mailbox).
 - [ ] Flags, move, archive, delete, spam, undo.
 - [ ] Tags/labels, local rules (move, tag, read, delete, forward), rule preview.
 - [ ] Attachment preview/save with path confinement.

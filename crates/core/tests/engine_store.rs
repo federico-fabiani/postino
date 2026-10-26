@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use postino_core::{Account, Address, Attachment, DraftContent, Engine, Folder, FolderKind, Message, OpError};
 use postino_store::{DraftUpdate, Store, StoreKey};
+use rusqlite::Connection;
 use serde_json::json;
 
 const NOW: &str = "2026-10-24T10:42:00Z";
@@ -31,6 +32,13 @@ impl Fixture {
 
     fn open(&self) -> Store {
         Store::open(&self.path(), &self.key).expect("open the store")
+    }
+
+    fn raw(&self) -> Connection {
+        let connection = Connection::open(self.path()).expect("raw open");
+        let hex = self.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";")).expect("raw key");
+        connection
     }
 
     /// Write everything the engine exposes into the store, as onboarding (P6) and the M1 import
@@ -543,6 +551,39 @@ fn a_repaired_draft_keeps_a_label_and_a_flag_across_a_reopen() {
         (drafts.total, drafts.unread),
         "the store folder counts disagree with the reopened engine"
     );
+}
+
+#[test]
+fn opening_a_draft_heavy_store_does_not_read_draft_bodies() {
+    let fixture = Fixture::new();
+    fixture.seed(&Engine::demo_at(now()));
+    let mut setup = Engine::open(fixture.open()).expect("setup engine");
+    let draft = setup
+        .save_draft(
+            None,
+            None,
+            postino_core::DraftContent {
+                to: vec![Address::new("Giulia", "giulia@example.com")],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Bozza persistente".to_owned(),
+                body_text: "corpo della bozza".to_owned(),
+                attachments: Vec::new(),
+                in_reply_to: None,
+            },
+        )
+        .expect("draft");
+    let draft_id = draft.summary.id.clone();
+    drop(setup);
+    // A body that cannot decode as UTF-8: any query that selects `drafts.body_text` during open would
+    // fail. Metadata-only open must still succeed, and the display message remains readable.
+    {
+        let connection = fixture.raw();
+        connection.execute("UPDATE drafts SET body_text = CAST(x'80' AS TEXT) WHERE id = ?1", [&draft_id]).expect("poison the draft body");
+    }
+    let engine = Engine::open(fixture.open()).expect("open reads draft metadata, not bodies");
+    assert!(engine.summary(&draft_id).is_some());
+    assert!(engine.message(&draft_id).is_some(), "the display message body is still available on demand");
 }
 
 #[test]

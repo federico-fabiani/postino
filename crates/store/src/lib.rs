@@ -52,8 +52,8 @@ mod search;
 
 pub use blob::BlobStore;
 pub use model::{
-    Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
-    LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
+    Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
+    Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
     SEARCH_TOTAL_CAP, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer, SyncState,
     UidEntry,
 };
@@ -311,22 +311,39 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
     prefix='2 3'
 );
 
+CREATE TABLE message_fts_rank(
+    rowid    INTEGER PRIMARY KEY,
+    date_key INTEGER NOT NULL,
+    id_key   TEXT NOT NULL
+);
+
 CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
     INSERT INTO message_fts(rowid, subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names)
     VALUES (new.rowid, new.subject, new.search_sender, new.search_to, new.search_cc, new.search_bcc,
             substr(new.body_text, 1, 262144), new.attachment_names);
+    INSERT INTO message_fts_rank(rowid, date_key, id_key) VALUES (new.rowid, new.date, new.id)
+    ON CONFLICT(rowid) DO UPDATE SET date_key = excluded.date_key, id_key = excluded.id_key;
+    INSERT INTO meta(key, value) VALUES('search_updated_at', CAST(strftime('%s','now') AS INTEGER) * 1000)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 END;
 
 CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM message_fts WHERE rowid = old.rowid;
+    DELETE FROM message_fts_rank WHERE rowid = old.rowid;
+    INSERT INTO meta(key, value) VALUES('search_updated_at', CAST(strftime('%s','now') AS INTEGER) * 1000)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 END;
 
 CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, search_sender, search_to, search_cc,
-    search_bcc, body_text, attachment_names ON messages BEGIN
+    search_bcc, body_text, attachment_names, date, id ON messages BEGIN
     DELETE FROM message_fts WHERE rowid = old.rowid;
     INSERT INTO message_fts(rowid, subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names)
     VALUES (new.rowid, new.subject, new.search_sender, new.search_to, new.search_cc, new.search_bcc,
             substr(new.body_text, 1, 262144), new.attachment_names);
+    INSERT INTO message_fts_rank(rowid, date_key, id_key) VALUES (new.rowid, new.date, new.id)
+    ON CONFLICT(rowid) DO UPDATE SET date_key = excluded.date_key, id_key = excluded.id_key;
+    INSERT INTO meta(key, value) VALUES('search_updated_at', CAST(strftime('%s','now') AS INTEGER) * 1000)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 END;
 
 CREATE TABLE threads(
@@ -584,11 +601,7 @@ impl Store {
         .map_err(translate)?;
         migrate(&mut conn)?;
         let blobs = BlobStore::open(blob_root(path), key)?;
-        let store = Self { conn, blobs, path: path.to_path_buf() };
-        // v7 writes a pending marker; finish or resume the index before the mailbox is served.
-        // A ready index whose counts agree is a no-op, so an ordinary open never reads a body.
-        store.ensure_search_index()?;
-        Ok(store)
+        Ok(Self { conn, blobs, path: path.to_path_buf() })
     }
 
     /// The encrypted attachment blob store that lives next to this database.

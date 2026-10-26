@@ -100,8 +100,8 @@ refresh, draft-id collisions and append backoff were all fixed before the squash
 after its blind review closure: real attachment bytes, per-account signatures, reply/reply-all/forward
 headers and the 20/25 MiB caps, with no schema change. M2 is complete. P9a lands the M3 search work on
 schema v7 after v6: the body-free read path, FTS5 query language, operations, UI and 100k evidence. The
-search first-page target is met; the open/RSS targets are reported as misses in the architecture table.
-P9b/P9c inherit the inert v7 tables and need no migration.
+search first-page target is met; open misses its target and RSS is unverified, both stated in the
+architecture table. P9b/P9c inherit the inert v7 tables and need no migration.
 
 ## 5. Delighters backlog
 

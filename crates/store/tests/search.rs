@@ -5,7 +5,7 @@ use std::path::Path;
 use postino_store::{
     Account, Address, Attachment, Folder, FolderKind, Message, MessageSummary, SearchExpr, SearchFilter, SearchSort, Store, StoreKey,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 fn random_key() -> StoreKey {
     let mut bytes = [0u8; 32];
@@ -272,6 +272,48 @@ fn label_filter_and_pagination_do_not_duplicate_a_row() {
 }
 
 #[test]
+fn relevance_pages_are_exact_when_thousands_of_documents_tie() {
+    let fixture = Fixture::new();
+    let store = fixture.seeded();
+    drop(store);
+    let mut connection = raw_open(&fixture.path(), &fixture.key);
+    let tx = connection.transaction().expect("raw transaction");
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT INTO messages(id, account_id, folder_id, thread_id, from_name, from_email, to_json, cc_json, bcc_json,
+                     subject, snippet, date, unread, starred, has_attachments, body_text)
+                 VALUES(?1, 'acc_1', 'inbox', ?1, 'a', 'a@example.com', '[]', '[]', '[]', 'same', '', ?2, 0, 0, 0, 'identical body')",
+            )
+            .expect("prepare");
+        for index in 0..2_000i64 {
+            insert.execute(params![format!("tie_{index:04}"), 1_000 + index]).expect("insert");
+        }
+    }
+    tx.commit().expect("commit");
+    drop(connection);
+    let store = fixture.open();
+
+    let mut pages = Vec::new();
+    for offset in [0u32, 200, 400] {
+        let page = store
+            .search(&SearchFilter { expr: Some(SearchExpr::Match("\"identical\"".to_owned())), limit: 200, offset, ..SearchFilter::default() })
+            .expect("search page");
+        assert_eq!(page.total, 2_000);
+        assert_eq!(page.hits.len(), 200);
+        pages.push(page.hits.iter().map(|hit| hit.message.id.clone()).collect::<Vec<_>>());
+    }
+    assert_eq!(pages[0].first().map(String::as_str), Some("tie_1999"), "the newest tied document must lead page 1");
+    assert_eq!(pages[0].last().map(String::as_str), Some("tie_1800"));
+    assert_eq!(pages[1].first().map(String::as_str), Some("tie_1799"));
+    assert_eq!(pages[2].first().map(String::as_str), Some("tie_1599"));
+    let mut union = pages.into_iter().flatten().collect::<Vec<_>>();
+    union.sort();
+    union.dedup();
+    assert_eq!(union.len(), 600, "pages 0/200/400 must not repeat a row");
+}
+
+#[test]
 fn the_total_is_exact_to_the_cap_and_then_flagged() {
     let fixture = Fixture::new();
     let store = fixture.seeded();
@@ -297,6 +339,82 @@ fn the_total_is_exact_to_the_cap_and_then_flagged() {
     assert_eq!(page.total, postino_store::SEARCH_TOTAL_CAP);
     assert!(page.total_capped, "10001 matches must report a capped total");
     assert_eq!(page.hits.len(), 50);
+}
+
+#[test]
+fn status_size_includes_the_wal_and_same_count_drift_is_not_ready() {
+    let fixture = Fixture::new();
+    let store = fixture.seeded();
+    insert(&store, &message("msg_1", "Verbale", "corpo", 1_000));
+    store.ensure_search_index().expect("ready");
+    let status = store.search_status().expect("status");
+    let mut expected = std::fs::metadata(fixture.path()).expect("main file").len();
+    for suffix in ["-wal", "-shm"] {
+        let mut name = fixture.path().into_os_string();
+        name.push(suffix);
+        expected += std::fs::metadata(std::path::Path::new(&name)).map(|metadata| metadata.len()).unwrap_or(0);
+    }
+    assert_eq!(status.size_bytes, expected, "size must include WAL and SHM while the store is open");
+    let updated = status.updated_at;
+    assert!(updated > 0, "a trigger must stamp the last index update");
+
+    // Same counts, different rowids: one lost document and one fake document.
+    {
+        let connection = raw_open(&fixture.path(), &fixture.key);
+        connection.execute("DELETE FROM message_fts WHERE rowid = (SELECT rowid FROM messages WHERE id = 'msg_1')", []).expect("delete");
+        connection
+            .execute(
+                "INSERT INTO message_fts(rowid, subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names)
+                 VALUES(999999, 'ghost', '', '', '', '', 'ghost', '')",
+                [],
+            )
+            .expect("fake");
+        connection.execute("DELETE FROM message_fts_rank WHERE rowid NOT IN (SELECT rowid FROM messages)", []).expect("rank clean");
+        connection.execute("INSERT INTO message_fts_rank(rowid, date_key, id_key) VALUES(999999, 1, 'ghost')", []).expect("fake rank");
+    }
+    let drift = store.search_status().expect("drift");
+    assert_eq!(drift.indexed, drift.total, "the counts are deliberately equal");
+    assert!(!drift.ready);
+    assert_eq!(drift.state, "drift");
+    let repaired = store.ensure_search_index().expect("repair");
+    assert_eq!(repaired.documents, 1);
+    let ready = store.search_status().expect("ready");
+    assert!(ready.ready, "{ready:?}");
+    assert_eq!(search(&store, SearchExpr::Match("\"verbale\"".to_owned())).total, 1);
+}
+
+#[test]
+fn a_failed_build_is_reported_by_status_without_blocking_open() {
+    let fixture = Fixture::new();
+    let store = fixture.seeded();
+    insert(&store, &message("msg_1", "Verbale", "corpo", 1_000));
+    store.ensure_search_index().expect("ready index");
+    {
+        let connection = raw_open(&fixture.path(), &fixture.key);
+        connection.execute("DELETE FROM message_fts WHERE rowid = (SELECT rowid FROM messages WHERE id = 'msg_1')", []).expect("drop doc");
+        connection.execute("DELETE FROM message_fts_rank WHERE rowid = (SELECT rowid FROM messages WHERE id = 'msg_1')", []).expect("drop rank");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_rank BEFORE INSERT ON message_fts_rank
+                 BEGIN SELECT RAISE(ABORT, 'rank write refused'); END;",
+            )
+            .expect("failure trigger");
+    }
+    let error = store.ensure_search_index().expect_err("the build must fail");
+    assert!(error.to_string().contains("rank write refused"), "{error}");
+    let status = store.search_status().expect("status after failure");
+    assert_eq!(status.state, "error");
+    assert!(status.last_error.is_some(), "{status:?}");
+    drop(store);
+    // Re-opening must still work: the derived index is not a prerequisite for the mailbox.
+    let reopened = fixture.open();
+    assert!(reopened.search_status().expect("status").last_error.is_some());
+    {
+        let connection = raw_open(&fixture.path(), &fixture.key);
+        connection.execute("DROP TRIGGER fail_rank", []).expect("drop trigger");
+    }
+    reopened.ensure_search_index().expect("recover");
+    assert!(reopened.search_status().expect("recovered").ready);
 }
 
 #[test]
@@ -394,7 +512,7 @@ fn the_shadow_tables_are_inside_the_encrypted_database_and_there_is_no_sidecar()
         .expect("query")
         .collect::<rusqlite::Result<_>>()
         .expect("rows");
-    assert_eq!(shadow, vec!["message_fts_config", "message_fts_data", "message_fts_docsize", "message_fts_idx"]);
+    assert_eq!(shadow, vec!["message_fts_config", "message_fts_data", "message_fts_docsize", "message_fts_idx", "message_fts_rank"]);
     drop(connection);
     let entries = std::fs::read_dir(fixture.dir.path())
         .expect("read dir")

@@ -226,19 +226,24 @@ per action, no hidden mutation.
 
 - `/` focuses the centred field. Typing debounces 250 ms, `Enter` searches immediately, `Esc` clears
   the query and the results. `Esc` in an unfocused list keeps its existing meaning.
-- Results are FTS5 hits, not a client-side filter: the header says `Risultati per “…”`, the parsed
-  clauses appear as chips (at most two rows, eight chips), and a caption names the syntax
+- Results are FTS5 hits, not a client-side filter: unread and attachment chips are passed to `search`
+  in the same scope, the current folder is passed as `folder`, a label view retains its optional
+  folder, and the header total is the filtered total. The header says `Risultati per “…”`, the parsed
+  clauses appear as chips (at most four, two rows), and a caption names the syntax
   (`from: · to: · subject: · label: · folder: · is: · has: · after: · larger:`, `AND/OR/NOT`,
-  `"frase"`, `prefisso*`). Clicking a chip replaces the query with that clause, so the chip is an
-  action, not decoration.
+  `"frase"`, `prefisso*`). A positive chip replaces the query with that clause; a `NOT` chip is shown
+  as a label rather than reversing the filter on click.
 - A parse error is inline, red and positional: `Ricerca non valida: una virgoletta non è chiusa
-  (posizione 8). Correggi il testo o premi Esc per cancellarla.` The field and the error never echo
-  message content; the position is the byte offset in the user's own query.
+  (posizione 8). Correggi il testo o premi Esc per cancellarla.` The invalid query does not also render
+  `Nessun risultato`; the field and the error never echo message content, and the position is the byte
+  offset in the user's own query.
 - The list shows the plain snippet from the matched sentence (≤240 characters). HTML never reaches
   the row. Empty results use the existing filter-aware empty state, primary action `Cancella ricerca`.
-- Loading, index building and error states reuse the shell: a search read failure uses the list
-  failure toast; `search_status` exposes readiness for a future partial index, and `search_reindex`
-  is available from the CLI. Saved searches and a recent-query row are P9b.
+  When `total_capped` is true the header says `primi 10.000 risultati`, never an exact 10 000.
+- A pending index shows `Indice di ricerca in preparazione (x/y)` in the list header; the shell advances
+  one 500-row batch per tick, so opening the mailbox never blocks on the rebuild. A failed build shows
+  the stored Italian reason from `search_status.last_error`; `search_reindex` remains available from
+  the CLI. Saved searches and a recent-query row are P9b.
 - 980×600 light/dark screenshots: `docs/images/postino-p9a-search.png`,
   `postino-p9a-search-dark.png`, `postino-p9a-search-error.png`,
   `postino-p9a-search-error-dark.png`. The headless render test asserts the results, syntax help and

@@ -11,20 +11,26 @@ of truth. P9a must search 100 000 messages in the encrypted store while keeping 
 
 ## Decision
 
-1. `Engine::open` loads `MessageSummary` rows (one query, plus labels, blob hashes and drafts). It does
-   not read `body_text`, `body_html`, attachment rows or blob bytes.
+1. `Engine::open` loads `MessageSummary` rows, labels, attachment id/hash metadata and draft metadata
+   (id, revision, updated_at, in_reply_to). It does not read `body_text`, `body_html`, attachment rows
+   beyond that id/hash query, or blob bytes. Orphan-draft repair reads a body only for a row that has
+   no display message.
 2. `Engine::message(id)` returns an owned `Message`. A store-backed engine reads
    `Store::get_message_with_attachments` and keeps an eight-entry cache keyed by an engine revision.
    Every write and reload bumps the revision, so a cached body cannot outlive a mutation.
 3. The demo engine keeps its full synthetic messages in memory and answers through the same API. The
    CLI, MCP and desktop app never branch on the source.
-4. Drafts are preloaded at open: the outbox compares the bytes this engine loaded, so re-reading at
-   send time would hide another process's edit. A draft is small and bounded; a mailbox is not.
+4. A dedicated draft-revision map, not the body cache, is the stale-draft guard. It is loaded from
+   metadata at open and updated on every save; an edited draft is refused even after the cache has
+   evicted or a write has cleared it. Bodies are read only when a draft is opened or serialized.
 5. Search is SQL over FTS5 in the same SQLCipher file. The store owns schema, triggers, ranking and
    pagination; core owns the query language and translates its AST into a typed filter tree. No caller
    text is interpolated into SQL or `MATCH`.
 6. The index is contentless-delete and repairable (`meta.search_index`, batched 500-row backfill,
-   `search_reindex`). Snippets are computed in Rust from the plain body, never `body_html`.
+   `search_reindex`). The date/id tie-break lives in a small auxiliary rank table maintained by the
+   same triggers, so the SQL order is exact before the page. Snippets are computed in Rust from the
+   plain body, never `body_html`. Opening a pending index does not block the mailbox; batches run from
+   the shell and from search.
 
 ## Consequences
 
@@ -34,9 +40,11 @@ of truth. P9a must search 100 000 messages in the encrypted store while keeping 
   must tolerate an owned message instead of borrowing from the gallery.
 - `Engine` is not `Sync` (the cache is a `RefCell`); it remains `Send`, so the CLI and workers can move
   one engine to their own thread.
-- SQLite stores a 2 KiB body inline in the `messages` table, so a summary scan still touches those
-  pages. The measured 100k open is above the 150 ms target; moving bodies to a separate table (or a
-  compact summary table) is the documented next step, not silently claimed.
+- A covering summary index keeps the 2 KiB body pages out of the open scan. The measured 100k open is
+  268–357 ms on the development host, above the 150 ms target: the remaining cost is decrypting and
+  decoding 100k summary rows and building the engine's Vec/index/counts, not reading bodies. A compact
+  summary table or body table is the next step if the target must be met; the miss is reported, not
+  hidden.
 - FTS5 shadow tables are encrypted with the database. There is no sidecar and `VACUUM` is forbidden
   because FTS keys on `messages.rowid`.
 

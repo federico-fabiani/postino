@@ -26,6 +26,7 @@ DROP TRIGGER IF EXISTS messages_fts_insert;
 DROP TRIGGER IF EXISTS messages_fts_delete;
 DROP TRIGGER IF EXISTS messages_fts_update;
 DROP TABLE IF EXISTS message_fts;
+DROP TABLE IF EXISTS message_fts_rank;
 DROP INDEX IF EXISTS messages_account_thread_date;
 DROP INDEX IF EXISTS messages_list_cover;
 DROP TABLE IF EXISTS thread_aliases;
@@ -45,6 +46,7 @@ ALTER TABLE messages DROP COLUMN references_json;
 ALTER TABLE messages DROP COLUMN ingested_at;
 ALTER TABLE messages DROP COLUMN rules_applied_at;
 DELETE FROM meta WHERE key = 'search_index';
+DELETE FROM meta WHERE key = 'search_updated_at';
 ";
 
 fn account(id: &str) -> Account {
@@ -425,6 +427,10 @@ fn upgrades_a_v6_database_to_v7_with_the_search_columns_and_index() {
 
     let store = Store::open(&path, &key).expect("upgrade v6 to v7");
     assert_eq!(store.schema_version().expect("version"), 7);
+    let pending = store.search_status().expect("pending status");
+    assert!(!pending.ready, "the migrated v7 index must start pending");
+    assert_eq!(pending.total, 1);
+    store.ensure_search_index().expect("build the pending v7 index");
     let status = store.search_status().expect("search status");
     assert!(status.ready, "the v7 index was not built on open: {status:?}");
     assert_eq!((status.indexed, status.total), (1, 1));
@@ -466,6 +472,10 @@ fn upgrades_a_v6_database_to_v7_with_the_search_columns_and_index() {
         .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'messages_list_cover'", [], |row| row.get(0))
         .expect("cover index");
     assert_eq!(cover, 1, "v7 did not create the covering list index");
+    let rank: u32 = connection
+        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'message_fts_rank'", [], |row| row.get(0))
+        .expect("rank table");
+    assert_eq!(rank, 1, "v7 did not create the FTS rank table");
 }
 
 #[test]

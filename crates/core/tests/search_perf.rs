@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use postino_core::Engine;
-use postino_store::{Account, Folder, FolderKind, SearchExpr, SearchFilter, Store, StoreKey};
+use postino_store::{Account, Address, Folder, FolderKind, Message, MessageSummary, SearchExpr, SearchFilter, Store, StoreKey};
 use rusqlite::{Connection, params};
 
 const BODY_BYTES: usize = 2 * 1024;
@@ -74,7 +74,7 @@ fn seed(path: &Path, key: &StoreKey, count: u32) {
         let filler = "parola ".repeat(BODY_BYTES / 8);
         for index in 0..count {
             let id = format!("msg_{index:06}");
-            let date = 1_800_000_000_000_i64.saturating_sub(i64::from(index) * 60_000);
+            let date = 1_700_000_000_000_i64.saturating_add(i64::from(index) * 60_000);
             let subject = if index % 10 == 0 { format!("Rapporto mensile {index}") } else { format!("Nota {index}") };
             let body = if index % 10 == 0 { format!("{filler} rapporto unico{index} fine") } else { format!("{filler} nota unica{index} fine") };
             let attachment = if index % 5 == 0 { format!("allegato-{index}.pdf") } else { String::new() };
@@ -139,11 +139,20 @@ fn run_fixture(count: u32, label: &str) {
     let seed_seconds = seed_started.elapsed().as_secs_f64();
 
     let open_started = Instant::now();
-    let engine = Engine::open(Store::open(&path, &key).expect("open")).expect("engine");
+    let mut engine = Engine::open(Store::open(&path, &key).expect("open")).expect("engine");
     let open_ms = open_started.elapsed().as_secs_f64() * 1_000.0;
     assert_eq!(engine.messages().len(), count as usize, "the fixture lost rows");
 
     let store = Store::open(&path, &key).expect("store");
+    let mut op_times = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        let _ = engine.call("search", serde_json::json!({ "query": "rapporto", "limit": 50 })).expect("search op");
+        op_times.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    op_times.sort_by(|left, right| left.total_cmp(right));
+    let op_p50 = percentile(&op_times, 0.50);
+    let op_p95 = percentile(&op_times, 0.95);
     let summaries_started = Instant::now();
     let summaries = store.list_all_summaries().expect("summaries");
     eprintln!("{label}: list_all_summaries={} rows {:?}", summaries.len(), summaries_started.elapsed());
@@ -162,12 +171,89 @@ fn run_fixture(count: u32, label: &str) {
     let reindex_started = Instant::now();
     let reindex = store.search_reindex().expect("reindex");
     let reindex_ms = reindex_started.elapsed().as_secs_f64() * 1_000.0;
+    let index_bytes: i64 = raw_open(&path, &key)
+        .query_row("SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name LIKE 'message_fts%'", [], |row| row.get(0))
+        .unwrap_or(-1);
     eprintln!(
-        "{label}: messages={count} seed={seed_seconds:.1}s open={open_ms:.1}ms search p50={p50:.1}ms p95={p95:.1}ms date-limit1={date_ms:.1}ms reindex={reindex_ms:.1}ms docs={} total={total} times={times:?}",
+        "{label}: messages={count} seed={seed_seconds:.1}s open={open_ms:.1}ms op p50={op_p50:.1}ms p95={op_p95:.1}ms store p50={p50:.1}ms p95={p95:.1}ms date-limit1={date_ms:.1}ms reindex={reindex_ms:.1}ms docs={} index_bytes={index_bytes} total={total} times={times:?}",
         reindex.documents
     );
-    assert!(p95 < 100.0, "{label}: first-page P95 is {p95:.1} ms, over the 100 ms budget");
+    assert!(p95 < 100.0, "{label}: store first-page P95 is {p95:.1} ms, over the 100 ms budget");
+    assert!(op_p95 < 100.0, "{label}: operation first-page P95 is {op_p95:.1} ms, over the 100 ms budget");
     assert_eq!(total, (count as usize).div_ceil(10), "the fixture's matching set changed");
+}
+
+#[test]
+fn one_thousand_drafts_open_from_metadata_only() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("mail.db");
+    let key = key();
+    let store = Store::open(&path, &key).expect("schema");
+    store
+        .upsert_account(&Account {
+            id: "acc_drafts".to_owned(),
+            name: "Drafts".to_owned(),
+            email: "drafts@example.com".to_owned(),
+            provider: "manual".to_owned(),
+            signature: String::new(),
+            created_at: 1_700_000_000_000,
+        })
+        .expect("account");
+    for (id, name, kind) in [("inbox", "INBOX", FolderKind::Inbox), ("drafts", "Bozze", FolderKind::Drafts)] {
+        store
+            .upsert_folder(&Folder {
+                id: id.to_owned(),
+                account_id: "acc_drafts".to_owned(),
+                name: name.to_owned(),
+                kind,
+                unread: 0,
+                total: 0,
+                uid_validity: Some(1),
+                uid_next: Some(2),
+                last_sync_at: None,
+            })
+            .expect("folder");
+    }
+    let body = "x".repeat(4 * 1024);
+    for index in 0..1_000u32 {
+        let id = format!("draft_{index}");
+        store
+            .save_draft_message(
+                &Message {
+                    summary: MessageSummary {
+                        id: id.clone(),
+                        account_id: "acc_drafts".to_owned(),
+                        folder_id: "drafts".to_owned(),
+                        thread_id: format!("thr_{id}"),
+                        from: Address::new("Me", "drafts@example.com"),
+                        to: vec![Address::new("Giulia", "giulia@example.com")],
+                        subject: format!("Bozza {index}"),
+                        snippet: "x".to_owned(),
+                        date: 1_700_000_000_000 + i64::from(index),
+                        unread: false,
+                        starred: false,
+                        has_attachments: false,
+                        labels: Vec::new(),
+                    },
+                    uid: None,
+                    message_id: None,
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    body_text: body.clone(),
+                    body_html: Some(format!("<p>{body}</p>")),
+                    remote_images: 0,
+                    size: Some(body.len() as u64),
+                },
+                &[],
+            )
+            .expect("draft");
+    }
+    drop(store);
+    let started = Instant::now();
+    let engine = Engine::open(Store::open(&path, &key).expect("open")).expect("engine");
+    let open_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    assert_eq!(engine.messages().len(), 1_000);
+    eprintln!("drafts: 1000 drafts open={open_ms:.1}ms (no body read)");
 }
 
 #[test]

@@ -93,7 +93,8 @@ is := unread|read|starred|unstarred; has := attachment
 - `bm25(message_fts, 4.0,3.0,2.0,1.0,0.5,1.0,2.0)` ascending, tie-break `date DESC, id ASC`;
   `sort:"date"`; `total` exact to 10k then capped; hits ≤200, offset ≤5k. Snippets in Rust from
   subject or 64 KiB of `body_text`, plain ≤240 chars, never `body_html`.
-- `InterruptHandle` cancels the old query; 50 snippets max.
+- `InterruptHandle` was considered but is not wired in P9a: the claim is removed, not left dead. 50
+  snippets max.
 
 ## 5. Threads (P9b)
 
@@ -201,8 +202,8 @@ alias of `hits[].message` for one milestone.
    cap, new-vs-old, manual cap.
 5. Ops/CLI/MCP/UI: schemas, messages alias, alias resolution, idempotent `thread_flag`, CLI/`--json`,
    MCP list/call, forward refusal before parsing, annotations; saved CRUD/counts/undo; screens at
-   980×600 light/dark, keyboard-only; no query/subject/address/body in logs; budgets; interrupt; no
-   body at boot.
+   980×600 light/dark, keyboard-only; no query/subject/address/body in logs; budgets; no interrupt in
+   P9a; no body at boot.
 
 ## Docs
 

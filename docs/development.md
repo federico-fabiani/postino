@@ -210,12 +210,17 @@ they have a reason to exist.
   wrong key, schema-too-new and a no-plaintext scan over the database, WAL and SHM; plus the
   one-query-per-table mailbox hydration used by `Engine::open`.
 - **Search:** migration v6→v7, an FTS5 capability probe (`contentless_delete=1`), insert/update/delete
-  reindexing without flag churn, attachment names and diacritics, bm25 and date order, filters,
-  pagination, hostile/metacharacter input, the 1 MiB body bound, drift and `search_reindex`, encrypted
-  shadow tables with no sidecar, the query grammar matrix and `parse(print(ast)) == ast`, op/CLI/MCP
-  parity, the headless search screens at 980×600 light/dark, and the 20k perf gate. The 100k fixture is
+  reindexing without flag churn, attachment names and diacritics, bm25/date order including 2 000
+  identical bodies inserted oldest-first (offset 0/200/400 disjoint and newest first), unread/
+  attachment filters in the same page scope, folder-name resolution inside the requested account,
+  hostile/metacharacter input, the 1 MiB body bound, same-count drift and `last_error`, WAL-inclusive
+  size, pending-index open plus resumable batches, encrypted shadow/rank tables with no sidecar, the
+  query grammar matrix and `parse(print(ast)) == ast`, draft metadata-only open with a poisoned draft
+  body, stale-draft refusal after cache eviction, op/CLI/MCP parity, the headless search screens at
+  980×600 light/dark, and the 20k perf gate. The 100k fixture is
   `POSTINO_SLOW_TESTS=1 cargo test -p postino-core --test search_perf -- --ignored one_hundred_thousand_messages`
-  and prints open/search/backfill numbers.
+  and prints open/search/backfill/index-byte numbers; `one_thousand_drafts_open_from_metadata_only`
+  prints the draft-heavy open.
 - **Blobs:** round trip and reopen, dedup, wrong key, tampered ciphertext/tag/nonce, a swapped file,
   an oversized declared length, traversal and non-hex hashes, temp cleanup, eight concurrent puts,
   compression only when it helps, header layout, remove/has and a no-plaintext scan over the

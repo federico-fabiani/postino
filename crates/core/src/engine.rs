@@ -257,6 +257,9 @@ pub struct Engine {
     /// keeps the in-memory half of the mapping (hydrated by [`Engine::open`], updated after a blob
     /// write) and the repository row stays the source of truth.
     blob_hashes: HashMap<String, String>,
+    /// Draft id → the store revision this engine loaded. The map is metadata-only and independent of
+    /// the eight-entry body cache: a stale queue must still be refused after eviction.
+    draft_snapshots: HashMap<String, u32>,
     /// Draft id → parent `Message-ID` for a reply, hydrated from `drafts.in_reply_to` on open.
     ///
     /// The display message deliberately has no reply field: a reply link belongs to the draft row,
@@ -290,6 +293,7 @@ impl Engine {
             #[cfg(debug_assertions)]
             test_clock: None,
             blob_hashes: HashMap::new(),
+            draft_snapshots: HashMap::new(),
             reply_links: HashMap::new(),
         }
     }
@@ -401,19 +405,19 @@ impl Engine {
         let blob_hashes = store.list_blob_hashes().map_err(store_map::read_error)?;
         let labels = store.list_labels(None).map_err(store_map::read_error)?.into_iter().map(store_map::label).collect::<Result<Vec<_>, _>>()?;
         let label_seq = repair_label_seq(&store, &labels)?;
-        let reply_links = store
-            .list_drafts(None)
-            .map_err(store_map::read_error)?
-            .into_iter()
-            .filter_map(|draft| draft.in_reply_to.map(|parent| (draft.id, parent)))
-            .collect::<HashMap<_, _>>();
+        // Draft metadata only: no body, headers or attachments. The revision map is the stale-draft
+        // guard, independent of the body cache.
+        let drafts = store.list_draft_metadata().map_err(store_map::read_error)?;
+        let reply_links =
+            drafts.iter().filter_map(|draft| draft.in_reply_to.clone().map(|parent| (draft.id.clone(), parent))).collect::<HashMap<_, _>>();
+        let draft_snapshots = drafts.into_iter().map(|draft| (draft.id, draft.revision)).collect::<HashMap<_, _>>();
 
         let mut engine = Self::from_summaries(accounts, folders, messages, labels, false, Some(store));
         engine.vault = vault;
         engine.next_label_seq = label_seq.saturating_add(1);
         engine.blob_hashes = blob_hashes;
         engine.reply_links = reply_links;
-        engine.preload_drafts();
+        engine.draft_snapshots = draft_snapshots;
         Ok(engine)
     }
 
@@ -465,6 +469,7 @@ impl Engine {
             #[cfg(debug_assertions)]
             test_clock: None,
             blob_hashes: HashMap::new(),
+            draft_snapshots: HashMap::new(),
             reply_links: HashMap::new(),
         };
         engine.rebuild_message_index();
@@ -472,6 +477,20 @@ impl Engine {
         engine
     }
 
+    /// The persisted search-index status. Read-only; a demo engine has no index.
+    pub fn search_index_status(&self) -> Result<Option<postino_store::SearchIndexStatus>, OpError> {
+        match &self.store {
+            Some(store) => store.search_status().map(Some).map_err(store_map::read_error),
+            None => Ok(None),
+        }
+    }
+
+    /// One resumable index batch. The desktop shell calls this while showing the progress banner.
+    pub fn advance_search_index(&self) -> Result<Option<postino_store::SearchIndexStatus>, OpError> {
+        let Some(store) = &self.store else { return Ok(None) };
+        let _ = store.ensure_search_index_batch();
+        store.search_progress().map(Some).map_err(store_map::read_error)
+    }
     /// True for the synthetic demo mailbox. Data written by a store-backed engine is real local
     /// data even while no server is connected.
     pub fn is_demo(&self) -> bool {
@@ -530,18 +549,6 @@ impl Engine {
         Ok(Some(message))
     }
 
-    /// Read the few full draft messages into the cache after an open or reload. A draft's snapshot is
-    /// the unit the outbox compares before sending, so a stale engine must keep its loaded copy:
-    /// re-reading it at send time would hide an edit made by another process.
-    fn preload_drafts(&self) {
-        for summary in &self.messages {
-            let drafts = self.folders.iter().any(|folder| folder.id == summary.folder_id && folder.kind == FolderKind::Drafts);
-            if drafts {
-                let _ = self.message_result(&summary.id);
-            }
-        }
-    }
-
     fn cache_message(&self, message: &Message) {
         let mut cache = self.body_cache.borrow_mut();
         if cache.front().is_none_or(|(revision, _)| *revision != self.revision) {
@@ -561,6 +568,10 @@ impl Engine {
     fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.body_cache.borrow_mut().clear();
+    }
+
+    fn remember_draft_revision(&mut self, id: &str, revision: u32) {
+        self.draft_snapshots.insert(id.to_owned(), revision);
     }
 
     pub fn labels(&self) -> &[Label] {
@@ -1077,6 +1088,7 @@ impl Engine {
         let live = self.messages.iter().map(|message| message.id.clone()).collect::<BTreeSet<_>>();
         self.demo_messages.retain(|id, _| live.contains(id));
         self.reply_links.retain(|draft_id, _| live.contains(draft_id));
+        self.draft_snapshots.retain(|draft_id, _| live.contains(draft_id));
         self.bump_revision();
         self.recount();
         match (imap_credential, smtp_credential) {
@@ -1232,12 +1244,10 @@ impl Engine {
         let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
         let messages = store.list_all_summaries().map_err(store_map::read_error)?.into_iter().map(store_map::summary).collect::<Vec<_>>();
         let blob_hashes = store.list_blob_hashes().map_err(store_map::read_error)?;
-        let reply_links = store
-            .list_drafts(None)
-            .map_err(store_map::read_error)?
-            .into_iter()
-            .filter_map(|draft| draft.in_reply_to.map(|parent| (draft.id, parent)))
-            .collect::<HashMap<_, _>>();
+        let drafts = store.list_draft_metadata().map_err(store_map::read_error)?;
+        let reply_links =
+            drafts.iter().filter_map(|draft| draft.in_reply_to.clone().map(|parent| (draft.id.clone(), parent))).collect::<HashMap<_, _>>();
+        self.draft_snapshots = drafts.into_iter().map(|draft| (draft.id, draft.revision)).collect::<HashMap<_, _>>();
         self.folders = folders;
         self.messages = messages;
         self.rebuild_message_index();
@@ -1245,7 +1255,6 @@ impl Engine {
         self.reply_links = reply_links;
         self.bump_revision();
         self.recount();
-        self.preload_drafts();
         Ok(())
     }
 
@@ -1436,6 +1445,7 @@ impl Engine {
             return Err(OpError::InvalidArgs(format!("folder {folder_id:?} is virtual and cannot receive messages")));
         }
         let target_id = target.id.clone();
+        let target_kind = target.kind;
         let current = self.messages.iter().find(|message| message.id == id).ok_or_else(|| unknown_message(id))?;
         let current_kind = self.folders.iter().find(|folder| folder.id == current.folder_id).map(|folder| folder.kind);
         if let Some(store) = &self.store {
@@ -1463,6 +1473,12 @@ impl Engine {
             full.summary.folder_id = target_id;
         }
         let summary = message.clone();
+        if target_kind == FolderKind::Drafts {
+            let revision = self.store.as_ref().map(|store| store.draft_revision(id)).transpose().map_err(store_map::read_error)?;
+            if let Some(Some(revision)) = revision {
+                self.remember_draft_revision(id, revision);
+            }
+        }
         self.bump_revision();
         self.recount();
         Ok(summary)
@@ -1627,11 +1643,13 @@ impl Engine {
             attachments,
         };
 
+        let mut saved_revision = None;
         let persisted = if let Some(store) = &self.store {
             let row = store_map::message_row(&saved, &account.id, None);
             let stored = store
                 .save_draft_message_linked(&row, &store_map::attachment_rows(&saved.attachments), requested_link.as_deref())
                 .map_err(store_map::write_error)?;
+            saved_revision = Some(stored.revision);
             // The repository keeps the stored hash *and size* of an attachment whose id survived the
             // replacement. Mirror those rows, or memory would cap a 2 MiB blob at a stale size of 0
             // and refuse to read it until the next restart.
@@ -1690,6 +1708,9 @@ impl Engine {
         self.bump_revision();
         self.cache_message(&saved);
         self.recount();
+        if let Some(revision) = saved_revision {
+            self.remember_draft_revision(&saved.summary.id, revision);
+        }
         Ok(saved)
     }
 
@@ -1749,7 +1770,21 @@ impl Engine {
 
     fn queue_send(&mut self, draft_id: &str, send_at: i64, now: i64) -> Result<SendQueued, OpError> {
         let store = self.require_store("message_send")?;
+        let draft_row = store.get_draft(draft_id).map_err(store_map::read_error)?;
+        let revision = draft_row.as_ref().map(|draft| draft.revision);
+        if let Some(revision) = revision
+            && self.draft_snapshots.get(draft_id).is_some_and(|snapshot| *snapshot != revision)
+        {
+            return Err(OpError::InvalidArgs(format!("draft {draft_id:?} changed in another session; refresh the mailbox before sending it")));
+        }
         let (serialized, account, _message) = self.submission_for_draft(draft_id)?;
+        // Re-check after the body read: another process may have saved between the snapshot check and
+        // serialization. The revision is store-owned and changes on every save.
+        if let Some(revision) = revision
+            && store.draft_revision(draft_id).map_err(store_map::read_error)? != Some(revision)
+        {
+            return Err(OpError::InvalidArgs(format!("draft {draft_id:?} changed in another session; refresh the mailbox before sending it")));
+        }
         let server = store
             .get_account_server(&account.id)
             .map_err(store_map::read_error)?
@@ -1759,22 +1794,6 @@ impl Engine {
                 "account {:?} has no SMTP endpoint, so it can read but not send. Remove it and add it again with an SMTP host, or edit the account configuration.",
                 account.id
             )));
-        }
-        // The draft revision is the submission snapshot: it changes on every save and never goes
-        // backwards, so "the revision is still this one" means "the draft has not been edited since
-        // it was serialized". It is also part of the idempotency key, which makes a deliberate
-        // resend of an edited, moved-back draft a new row instead of a collision with the sent row.
-        let draft_row = store.get_draft(draft_id).map_err(store_map::read_error)?;
-        let revision = draft_row.as_ref().map(|draft| draft.revision);
-        // The serialized bytes come from this engine's snapshot. If another process saved the draft
-        // after this engine loaded it, the revision would describe the other process's content while
-        // the bytes describe ours; refuse and let the caller reload. Compare the whole serialized
-        // snapshot (body, headers, Date and attachment set), not a timestamp: two saves can land in
-        // the same millisecond.
-        if let Some(draft) = &draft_row
-            && !self.draft_snapshot_matches(&_message, draft, store)?
-        {
-            return Err(OpError::InvalidArgs(format!("draft {draft_id:?} changed in another session; refresh the mailbox before sending it")));
         }
         // The newest row for this draft decides, and it is one indexed lookup, never a history scan.
         if let Some(existing) = store.active_outbox_for_draft(draft_id).map_err(store_map::read_error)? {
@@ -1855,6 +1874,9 @@ impl Engine {
         };
         match store.queue_outbox(&entry) {
             Ok(row) => {
+                if let Some(revision) = revision {
+                    self.remember_draft_revision(draft_id, revision);
+                }
                 let (view, _warning) = view(&row);
                 Ok(SendQueued { outbox: view, undo_until: Some(row.send_at) })
             }
@@ -2419,42 +2441,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether this engine's draft still serializes to the same bytes as the saved draft row.
-    ///
-    /// The `drafts` row carries the body, headers, revision and updated-at, but not the attachments;
-    /// the attachment rows carry the metadata and stored blob hashes. The `updated_at` check catches
-    /// any save by another engine (including an attachment-only one); the attachment rows are
-    /// compared too because two saves can land in the same millisecond. The reply linkage is compared
-    /// with the engine's hydrated map: a stored link this engine cannot serialize is stale, but a
-    /// link it did hydrate is part of the bytes and must match exactly.
-    fn draft_snapshot_matches(&self, message: &Message, draft: &postino_store::Draft, store: &Store) -> Result<bool, OpError> {
-        let expected_link = self.reply_links.get(&message.summary.id).map(String::as_str);
-        if draft.in_reply_to.as_deref() != expected_link
-            || !draft_matches_row(message, draft)
-            || message.summary.date.timestamp_millis() != draft.updated_at
-        {
-            return Ok(false);
-        }
-        let rows = store.attachments(&message.summary.id).map_err(store_map::read_error)?;
-        let mut stored = rows.into_iter().map(|row| (row.id, row.filename, row.mime, row.size, row.blob_hash)).collect::<Vec<_>>();
-        let mut memory = message
-            .attachments
-            .iter()
-            .map(|attachment| {
-                (
-                    attachment.id.clone(),
-                    attachment.filename.clone(),
-                    attachment.mime.clone(),
-                    attachment.size,
-                    self.blob_hashes.get(&attachment.id).cloned(),
-                )
-            })
-            .collect::<Vec<_>>();
-        stored.sort();
-        memory.sort();
-        Ok(stored == memory)
-    }
-
     /// Move a draft to Sent only after the submission was accepted. A draft that is gone or already
     /// moved is a no-op, so this is safe to repeat after a crash. `message_id` is the generated
     /// Message-ID, carried into the Sent row so a later sync reconciles instead of duplicating.
@@ -2481,11 +2467,8 @@ impl Engine {
             return Ok(FinalizeOutcome::NotADraft);
         }
         if let Some(expected) = expected_revision {
-            let Some(message) = self.message_result(draft_id)? else {
-                return Ok(FinalizeOutcome::NotADraft);
-            };
-            match store.get_draft(draft_id).map_err(store_map::read_error)? {
-                Some(draft) if draft.revision == expected && self.draft_snapshot_matches(&message, &draft, store)? => {}
+            match store.draft_revision(draft_id).map_err(store_map::read_error)? {
+                Some(revision) if revision == expected => {}
                 _ => return Ok(FinalizeOutcome::SnapshotChanged),
             }
         }
@@ -2510,8 +2493,16 @@ impl Engine {
     /// Move the draft to Sent. Returns the summary and, when a server copy with the same Message-ID
     /// was already cached, the UID it adopted (which means the server already has this message).
     fn finish_draft(&mut self, id: &str, message_id: Option<&str>, persist: Option<&Store>) -> Result<(MessageSummary, Option<u32>), OpError> {
-        let Some(current) = self.message_result(id)? else {
-            return Err(OpError::InvalidArgs(format!("unknown draft {id:?}")));
+        let current = if let Some(store) = persist {
+            // During an outbox pass the store is outside `self`; read the body with that explicit
+            // handle instead of the engine cache, which is empty for a reloaded process.
+            let (row, attachments) = store
+                .get_message_with_attachments(id)
+                .map_err(store_map::read_error)?
+                .ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}")))?;
+            store_map::message(row, attachments)?
+        } else {
+            self.message_result(id)?.ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}")))?
         };
         let folder = self
             .folders
@@ -2576,8 +2567,10 @@ impl Engine {
             let prefix = format!("att_{duplicate}_");
             self.blob_hashes.retain(|attachment_id, _| !attachment_id.starts_with(&prefix));
             self.reply_links.remove(duplicate);
+            self.draft_snapshots.remove(duplicate);
         }
         self.reply_links.remove(id);
+        self.draft_snapshots.remove(id);
 
         let Some(index) = self.messages.iter().position(|message| message.id == id) else {
             return Err(OpError::Failed(format!("unknown draft {id:?}")));
@@ -2677,17 +2670,14 @@ impl Engine {
     /// mailbox. The store has the `Message-ID`; `Reply-To` lives in the existing `meta` table because
     /// P8 may not migrate the message schema. The demo has deterministic ids and no Reply-To.
     pub fn reply_target(&self, message_id: &str) -> Result<ReplyTarget, OpError> {
-        if self.message(message_id).is_none() {
+        if self.summary(message_id).is_none() {
             return Err(unknown_message(message_id));
         }
         match &self.store {
             Some(store) => {
-                let row = store
-                    .get_message(message_id)
-                    .map_err(store_map::read_error)?
-                    .ok_or_else(|| OpError::InvalidArgs(format!("message {message_id:?} no longer exists; refresh the mailbox")))?;
+                let parent = store.message_header_id(message_id).map_err(store_map::read_error)?;
                 let reply_to = store.message_reply_to(message_id).map_err(store_map::read_error)?;
-                Ok(ReplyTarget { parent_message_id: row.message_id, reply_to: reply_to.iter().map(store_map::address).collect() })
+                Ok(ReplyTarget { parent_message_id: parent, reply_to: reply_to.iter().map(store_map::address).collect() })
             }
             None => Ok(ReplyTarget { parent_message_id: Some(format!("{message_id}@demo.postino.example")), reply_to: Vec::new() }),
         }
@@ -2750,7 +2740,7 @@ impl Engine {
         saved.summary.date = Utc::now();
         let link = self.reply_links.get(draft_id).cloned();
         let row = store_map::message_row(&saved, &self.draft_account_id(draft_id)?, None);
-        store.save_draft_message_linked(&row, &rows, link.as_deref()).map_err(store_map::write_error)?;
+        let saved_draft = store.save_draft_message_linked(&row, &rows, link.as_deref()).map_err(store_map::write_error)?;
         // Durable rows are written; only now does memory change.
         self.blob_hashes.insert(attachment_id, hash);
         if let Some(slot) = self.messages.get_mut(index) {
@@ -2759,6 +2749,7 @@ impl Engine {
         if self.in_memory {
             self.demo_messages.insert(saved.summary.id.clone(), saved.clone());
         }
+        self.remember_draft_revision(&saved.summary.id, saved_draft.revision);
         self.bump_revision();
         self.cache_message(&saved);
         self.recount();
@@ -2789,7 +2780,7 @@ impl Engine {
         let rows = self.attachment_rows(saved.attachments.iter().cloned(), None);
         let link = self.reply_links.get(draft_id).cloned();
         let row = store_map::message_row(&saved, &self.draft_account_id(draft_id)?, None);
-        store.save_draft_message_linked(&row, &rows, link.as_deref()).map_err(store_map::write_error)?;
+        let saved_draft = store.save_draft_message_linked(&row, &rows, link.as_deref()).map_err(store_map::write_error)?;
         self.blob_hashes.remove(&removed.id);
         if let Some(slot) = self.messages.get_mut(index) {
             *slot = saved.summary.clone();
@@ -2797,6 +2788,7 @@ impl Engine {
         if self.in_memory {
             self.demo_messages.insert(saved.summary.id.clone(), saved.clone());
         }
+        self.remember_draft_revision(&saved.summary.id, saved_draft.revision);
         self.bump_revision();
         self.cache_message(&saved);
         self.recount();
@@ -2885,8 +2877,8 @@ impl Engine {
         if row.summary.folder_id != current.summary.folder_id {
             return Err(draft_changed(&current.summary.id));
         }
-        let draft = store.get_draft(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(&changed)?;
-        if !self.draft_snapshot_matches(current, &draft, store)? {
+        let revision = store.draft_revision(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(&changed)?;
+        if self.draft_snapshots.get(&current.summary.id).is_some_and(|snapshot| *snapshot != revision) {
             return Err(draft_changed(&current.summary.id));
         }
         Ok(())
@@ -3182,19 +3174,6 @@ fn stale_submission_reason(store: &Store, envelope: &OutboxEnvelope) -> Result<O
         Some(draft) if draft.revision != expected => Ok(Some("la bozza è cambiata dopo l'accodamento; il messaggio non è stato inviato")),
         Some(_) => Ok(None),
     }
-}
-
-/// Whether this engine's draft snapshot still matches the saved draft row's content. `false` means
-/// another process saved the draft after this engine loaded it.
-fn draft_matches_row(message: &Message, draft: &postino_store::Draft) -> bool {
-    fn same_addresses(engine: &[Address], row: &[postino_store::Address]) -> bool {
-        engine.len() == row.len() && engine.iter().zip(row).all(|(left, right)| left.name == right.name && left.email == right.email)
-    }
-    message.body_text == draft.body_text
-        && message.summary.subject == draft.subject
-        && same_addresses(&message.summary.to, &draft.to)
-        && same_addresses(&message.cc, &draft.cc)
-        && same_addresses(&message.bcc, &draft.bcc)
 }
 
 /// A fixed sentence for an SMTP probe failure. Server-supplied text is never forwarded: a hostile

@@ -90,11 +90,15 @@ MCP      ─┘
 - **Encrypted search (P9a).** `search` runs on the FTS5 index inside SQLCipher, not over an in-memory
   body vector: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:`, `has:`,
   `before:`/`after:`, `larger:`/`smaller:`, quoted phrases, `*` prefixes and uppercase `AND`/`OR`/`NOT`
-  with parentheses. Hits are bm25-ranked with a stable date/id tie-break, snippets are plain text
-  (≤240 characters, never HTML), and the total is exact up to 10 000 (`total_capped`). The index is
-  contentless-delete, has no sidecar, rebuilds in resumable 500-row batches and is repairable with
-  `search_reindex`; `search_status` reports readiness and drift. `Engine::open` now loads list rows
-  only (no bodies) and `Engine::message(id)` is an owned, cached read.
+  with parentheses. Hits are bm25-ranked with an exact global date/id tie-break (an auxiliary rank table
+  keeps the order inside FTS before the page), snippets are plain text (≤240 characters, never HTML),
+  and the total is exact up to 10 000 (`total_capped`). The index is contentless-delete, has no
+  sidecar, rebuilds in resumable 500-row batches and is repairable with `search_reindex`;
+  `search_status` reports readiness, row-id drift, last error and the size of the database plus WAL.
+  `Engine::open` loads list rows, labels, attachment id/hash metadata and draft metadata only; bodies,
+  HTML and full attachment rows are read on demand through `Engine::message(id)` (owned and cached).
+  An index build never blocks open: the app builds batches in the background and shows the progress
+  banner.
 - Real accounts from the CLI: Aruba and Gmail are discovered offline (Gmail needs 2FA + an app
   password; OAuth is P12), `custom` takes host/port/TLS, a no-echo prompt or `--password-stdin` is the
   only way in, and MCP cannot add or remove an account. Passwords live in the OS keyring, never in

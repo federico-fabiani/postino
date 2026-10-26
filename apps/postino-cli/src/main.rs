@@ -327,6 +327,12 @@ enum Command {
         /// Restrict to one account when the mailbox has several.
         #[arg(long)]
         account: Option<String>,
+        /// Only unread messages, from the same search scope.
+        #[arg(long)]
+        unread: bool,
+        /// Only messages with attachments, from the same search scope.
+        #[arg(long)]
+        attachments: bool,
         /// relevance (default) or date.
         #[arg(long)]
         sort: Option<String>,
@@ -847,7 +853,7 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 }
             }
         }
-        Command::Search { query, limit, offset, folder, label, account, sort } => {
+        Command::Search { query, limit, offset, folder, label, account, unread, attachments, sort } => {
             if let Some(sort) = &sort
                 && !matches!(sort.as_str(), "relevance" | "date")
             {
@@ -856,8 +862,20 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             let result: SearchResult = decode(call(
                 engine,
                 "search",
-                json!({ "query": query, "limit": limit, "offset": offset, "folder": folder, "label": label, "account": account, "sort": sort }),
+                json!({ "query": query, "limit": limit, "offset": offset, "folder": folder, "label": label, "account": account, "unread_only": unread, "with_attachments": attachments, "sort": sort }),
             )?)?;
+            if let Some(index) = &result.index
+                && !index.ready
+            {
+                if json_output {
+                    print_json(&result)?;
+                } else if let Some(error) = &index.last_error {
+                    bail!("indice di ricerca non disponibile: {error}");
+                } else {
+                    say(format!("Indice di ricerca in preparazione ({}/{})", index.indexed, index.total))?;
+                }
+                return Ok(());
+            }
             if json_output {
                 print_json(&result)?;
             } else {
@@ -879,11 +897,23 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             if json_output {
                 print_json(&status)?;
             } else {
-                let state = if status.ready { "pronto".to_owned() } else { status.state.clone() };
+                let state = if status.ready {
+                    "pronto".to_owned()
+                } else {
+                    match status.state.as_str() {
+                        "drift" => "da ricostruire".to_owned(),
+                        "building" => "in preparazione".to_owned(),
+                        "pending" => "in attesa".to_owned(),
+                        "error" => "errore".to_owned(),
+                        other => other.to_owned(),
+                    }
+                };
                 let error = status.last_error.as_deref().map_or(String::new(), |error| format!("\n{error}"));
+                let updated = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(status.updated_at)
+                    .map_or_else(|| status.updated_at.to_string(), |date| date.format("%Y-%m-%d %H:%M:%S UTC").to_string());
                 say(format!(
-                    "indice: {state}\ndocumenti: {}\nmessaggi: {}\ndimensione: {} byte\naggiornato: {}{error}",
-                    status.indexed, status.total, status.size_bytes, status.updated_at
+                    "indice: {state}\ndocumenti: {}\nmessaggi: {}\ndimensione: {} byte\naggiornato: {updated}{error}",
+                    status.indexed, status.total, status.size_bytes
                 ))?;
             }
         }
@@ -2103,6 +2133,8 @@ mod tests {
                 folder: None,
                 label: Some("lbl_1".to_owned()),
                 account: None,
+                unread: false,
+                attachments: false,
                 sort: None,
             }),
             &mut engine,
@@ -2122,6 +2154,8 @@ mod tests {
                 folder: None,
                 label: Some("lbl_missing".to_owned()),
                 account: None,
+                unread: false,
+                attachments: false,
                 sort: None,
             }),
             &mut engine,

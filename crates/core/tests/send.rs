@@ -1805,6 +1805,41 @@ fn a_stale_engine_cannot_queue_a_draft_whose_attachments_changed() {
 }
 
 #[test]
+fn a_stale_draft_is_refused_after_the_body_cache_is_evicted() {
+    let harness = Harness::new();
+    let store = harness.open();
+    let vault = MemoryVault::new();
+    seed_account_with_smtp(&store, &vault, ACCOUNT_ID, 1, 1, &[("drafts", "Drafts", FolderKind::Drafts)]);
+    let mut setup = Engine::open_with_vault(harness.open(), vault.clone()).expect("setup engine");
+    let mut ids = Vec::new();
+    for index in 0..9 {
+        let saved = setup
+            .save_draft(None, None, draft(vec![Address::new("", "one@example.com")], Vec::new(), Vec::new(), &format!("Bozza {index}"), "corpo"))
+            .expect("draft");
+        ids.push(saved.summary.id.clone());
+    }
+    let stale_id = ids[0].clone();
+
+    // The stale engine loads only metadata for every draft. Its body cache is empty, so this guards
+    // the snapshot map, not a lucky cache entry.
+    let mut stale = Engine::open_with_vault(harness.open(), vault.clone()).expect("stale engine");
+    assert!(stale.message(&stale_id).is_some(), "the body is still available on demand");
+    let mut fresh = Engine::open_with_vault(harness.open(), vault).expect("fresh engine");
+    fresh
+        .save_draft(
+            None,
+            Some(&stale_id),
+            draft(vec![Address::new("", "one@example.com")], Vec::new(), Vec::new(), "EDITED BY THE OTHER PROCESS", "corpo"),
+        )
+        .expect("the other process edits the oldest draft");
+    // A write clears the eight-entry body cache; the draft snapshot must survive it.
+    stale.set_flags(&ids[1], Some(false), None).expect("flag a different message");
+    let error = stale.message_send(&stale_id).expect_err("an edited draft must never be queued by a stale engine");
+    assert!(error.to_string().contains("changed in another session"), "{error}");
+    assert!(harness.open().list_outbox(None, 50).expect("outbox").is_empty(), "the stale queue wrote a row");
+}
+
+#[test]
 fn a_reply_linkage_is_serialized_and_an_unhydrated_external_link_is_refused() {
     let harness = Harness::new();
     let store = harness.open();

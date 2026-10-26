@@ -463,18 +463,19 @@ pub const SEARCH_TOTAL_CAP: u32 = 10_000;
 /// The health of the FTS index, as persisted in `meta.search_index` and measured on read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchIndexStatus {
-    /// `pending`, `building`, `ready` or `error`.
+    /// `pending`, `building`, `ready`, `drift` or `error`.
     pub state: String,
     /// FTS documents present.
     pub indexed: u32,
     /// Message rows that should be indexed.
     pub total: u32,
-    /// True when the state is `ready` and the two counts agree.
+    /// True when the state is `ready`, no FTS/rank row is missing or extra, and the counts agree.
     pub ready: bool,
     pub last_error: Option<String>,
-    /// Size of the encrypted database file in bytes (index pages included; FTS5 has no sidecar).
+    /// Size of the encrypted database file plus WAL and SHM in bytes. FTS has no sidecar; use
+    /// `dbstat` when the index-only bytes are needed.
     pub size_bytes: u64,
-    /// Unix milliseconds of the last index update.
+    /// Unix milliseconds of the last index update (an FTS trigger or a build batch).
     pub updated_at: i64,
 }
 
@@ -529,6 +530,18 @@ pub struct LabelCount {
     pub label: Label,
     pub message_count: u32,
     pub unread_count: u32,
+}
+
+/// Metadata of a draft, without its body. The engine keeps one per draft so a stale queue can be
+/// refused even after the eight-entry body cache has evicted the draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftMeta {
+    pub id: String,
+    pub account_id: String,
+    pub revision: u32,
+    /// Unix milliseconds from the `drafts` row.
+    pub updated_at: i64,
+    pub in_reply_to: Option<String>,
 }
 
 /// A saved draft, including the store-owned revision.

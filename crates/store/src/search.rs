@@ -21,6 +21,9 @@ use crate::{Store, StoreError};
 
 /// `meta` key holding the resumable index state.
 pub const SEARCH_INDEX_KEY: &str = "search_index";
+/// `meta` key stamped by the FTS triggers on every index mutation, so status means "last index
+/// update", not "last full build".
+pub const SEARCH_UPDATED_KEY: &str = "search_updated_at";
 
 /// Rows indexed per resumable batch. A batch is one transaction, so a crash resumes after the last
 /// committed batch and never leaves a half-updated row.
@@ -52,6 +55,22 @@ struct IndexMeta {
 impl Default for IndexMeta {
     fn default() -> Self {
         Self { state: "pending".to_owned(), last_rowid: 0, indexed: 0, total: 0, updated_at: 0, last_error: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IndexHealth {
+    indexed: u32,
+    total: u32,
+    missing: u32,
+    extra: u32,
+    rank_missing: u32,
+    rank_extra: u32,
+}
+
+impl IndexHealth {
+    fn drift(self) -> bool {
+        self.missing > 0 || self.extra > 0 || self.rank_missing > 0 || self.rank_extra > 0
     }
 }
 
@@ -188,38 +207,36 @@ impl Store {
         Ok(SearchPage { hits, total, total_capped })
     }
 
-    /// Relevance over a single-account text query: rank and page inside FTS5, then join only the
-    /// candidate rowids to the encrypted message rows. A join of every match before sorting is the
-    /// difference between 2 ms and 26 ms at 20k messages.
+    /// Relevance over a single-account text query: rank and page inside FTS5, with the date/id
+    /// tie-break in an auxiliary rank table maintained by the same triggers. The SQL order is global
+    /// and exact; only the selected page is joined back to the encrypted message rows.
     fn search_fts_relevance(&self, fts: &str, limit: u32, offset: u32) -> Result<SearchPage, StoreError> {
-        let mut count_values = vec![Value::Text(fts.to_owned()), Value::Integer(i64::from(SEARCH_TOTAL_CAP) + 1)];
+        let count_values = [Value::Text(fts.to_owned()), Value::Integer(i64::from(SEARCH_TOTAL_CAP) + 1)];
         let counted: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM (SELECT rowid FROM message_fts WHERE message_fts MATCH ?1 LIMIT ?2)",
+            "SELECT COUNT(*) FROM (
+                 SELECT f.rowid FROM message_fts f
+                 JOIN message_fts_rank r ON r.rowid = f.rowid
+                 WHERE message_fts MATCH ?1 LIMIT ?2
+             )",
             params_from_iter(count_values.iter()),
             |row| row.get(0),
         )?;
         let total_capped = counted > i64::from(SEARCH_TOTAL_CAP);
         let total = u32::try_from(counted.min(i64::from(SEARCH_TOTAL_CAP))).unwrap_or(SEARCH_TOTAL_CAP);
-        count_values.clear();
 
-        let wanted = usize::try_from(offset.saturating_add(limit)).unwrap_or(usize::MAX);
-        // Rank inside FTS5 first, then join only a bounded candidate window to the encrypted rows.
-        // For an ordinary mailbox the window contains every match and the sort is exact; for a very
-        // broad query the window keeps the first page fast and the page boundaries stable. Total is
-        // still exact up to the documented cap.
-        let take = wanted.saturating_add(1_000).min(usize::try_from(MAX_OFFSET.saturating_add(MAX_HITS)).unwrap_or(5_200).saturating_add(1_000));
-        let candidates: Vec<(i64, f64)> = {
+        let selected: Vec<(i64, f64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT rowid, bm25(message_fts, 4.0, 3.0, 2.0, 1.0, 0.5, 1.0, 2.0)
-                 FROM message_fts
+                "SELECT f.rowid, bm25(message_fts, 4.0, 3.0, 2.0, 1.0, 0.5, 1.0, 2.0)
+                 FROM message_fts f
+                 JOIN message_fts_rank r ON r.rowid = f.rowid
                  WHERE message_fts MATCH ?1
-                 ORDER BY bm25(message_fts, 4.0, 3.0, 2.0, 1.0, 0.5, 1.0, 2.0) ASC, rowid ASC
-                 LIMIT ?2",
+                 ORDER BY bm25(message_fts, 4.0, 3.0, 2.0, 1.0, 0.5, 1.0, 2.0) ASC,
+                          r.date_key DESC, r.id_key ASC
+                 LIMIT ?2 OFFSET ?3",
             )?;
-            stmt.query_map(params![fts, i64::try_from(take).unwrap_or(i64::MAX)], |row| Ok((row.get(0)?, row.get(1)?)))?
+            stmt.query_map(params![fts, i64::from(limit), i64::from(offset)], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let selected = candidates.as_slice();
         if selected.is_empty() {
             return Ok(SearchPage { hits: Vec::new(), total, total_capped });
         }
@@ -245,15 +262,6 @@ impl Store {
                 Some(SearchHit { message, body_text, rank: *rank })
             })
             .collect::<Vec<_>>();
-        hits.sort_by(|left, right| {
-            left.rank
-                .total_cmp(&right.rank)
-                .then_with(|| right.message.date.cmp(&left.message.date))
-                .then_with(|| left.message.id.cmp(&right.message.id))
-        });
-        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-        let limit = usize::try_from(limit).unwrap_or(50);
-        let mut hits = hits.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
         self.attach_labels(&mut hits)?;
         Ok(SearchPage { hits, total, total_capped })
     }
@@ -269,78 +277,158 @@ impl Store {
         Ok(())
     }
 
-    /// A handle that can interrupt the next long statement from another thread. The desktop shell
-    /// uses it when a new query supersedes the previous one.
-    pub fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
-        self.conn.get_interrupt_handle()
+    /// Cheap readiness for the query path: the persisted state is ready and the counts agree. The
+    /// full row-id drift check belongs to `search_status`, which is allowed to be slower.
+    pub fn search_index_ready(&self) -> Result<bool, StoreError> {
+        let (meta, damaged) = self.index_meta();
+        if damaged.is_some() || meta.state == "error" {
+            return Ok(false);
+        }
+        Ok(self.fts_documents()? == self.message_count()?)
     }
 
-    /// Read the persisted index state and measure the live counts. A damaged value is reported as
-    /// `error` with a readable sentence rather than failing the status operation.
-    pub fn search_status(&self) -> Result<SearchIndexStatus, StoreError> {
+    /// Cheap progress for the shell: no full row-id drift scan. The full `search_status` remains the
+    /// operation and is allowed to be slower.
+    pub fn search_progress(&self) -> Result<SearchIndexStatus, StoreError> {
         let (meta, damaged) = self.index_meta();
         let indexed = self.fts_documents()?;
         let total = self.message_count()?;
-        let ready = damaged.is_none() && meta.state == "ready" && indexed == total;
-        let error_state = damaged.is_some();
-        let last_error = damaged.or_else(|| meta.last_error.clone());
+        let counts_complete = indexed == total;
+        let error_state = damaged.is_some() || meta.state == "error";
+        let ready = !error_state && counts_complete;
+        let state = if error_state {
+            "error"
+        } else if counts_complete {
+            "ready"
+        } else {
+            meta.state.as_str()
+        };
         Ok(SearchIndexStatus {
-            state: if error_state { "error".to_owned() } else { meta.state },
+            state: state.to_owned(),
             indexed,
             total,
             ready,
-            last_error,
+            last_error: damaged.or_else(|| meta.last_error.clone()),
             size_bytes: self.database_size_bytes().unwrap_or(0),
-            updated_at: meta.updated_at,
+            updated_at: self.search_updated_at()?.unwrap_or(meta.updated_at),
         })
     }
 
-    /// Finish or resume the index. Called by `Store::open` and by the search operations.
-    ///
-    /// The build is idempotent: a batch transaction records `last_rowid`, so a crash resumes after
-    /// the last committed 500-row batch. An already-ready index whose counts agree is a no-op.
+    /// Read the persisted index state and measure the live rows. A damaged value is reported as
+    /// `error` with a readable sentence rather than failing the status operation.
+    pub fn search_status(&self) -> Result<SearchIndexStatus, StoreError> {
+        let (meta, damaged) = self.index_meta();
+        let health = self.index_health()?;
+        let drift = health.drift();
+        let error_state = damaged.is_some();
+        let counts_complete = !drift && health.indexed == health.total;
+        let ready = !error_state && counts_complete && meta.state != "error";
+        let state = if error_state {
+            "error"
+        } else if drift && meta.state == "ready" {
+            "drift"
+        } else if counts_complete && meta.state != "error" {
+            "ready"
+        } else {
+            meta.state.as_str()
+        };
+        let last_error = damaged.or_else(|| meta.last_error.clone());
+        let updated_at = self.search_updated_at()?.unwrap_or(meta.updated_at);
+        Ok(SearchIndexStatus {
+            state: state.to_owned(),
+            indexed: health.indexed,
+            total: health.total,
+            ready,
+            last_error,
+            size_bytes: self.database_size_bytes().unwrap_or(0),
+            updated_at,
+        })
+    }
+
+    /// Finish or resume the whole index. The builder is idempotent: a batch transaction records
+    /// `last_rowid`, so a crash resumes after the last committed 500-row batch. A ready index with no
+    /// row-id drift is a no-op. This is the explicit maintenance path; `Store::open` never calls it.
     pub fn ensure_search_index(&self) -> Result<SearchReindexOutcome, StoreError> {
-        self.ensure_search_index_inner(false)
+        self.ensure_search_index_inner(false, None)
     }
 
-    /// Delete every FTS document and rebuild from the message rows. The one path that intentionally
-    /// removes the whole index; it never runs `VACUUM`, because FTS keys on `messages.rowid` and a
-    /// VACUUM would renumber rows.
+    /// Build at most one 500-row batch and return. The search operation calls this when the index is
+    /// pending or building, so the UI can show progress instead of blocking open for a whole rebuild.
+    pub fn ensure_search_index_batch(&self) -> Result<SearchReindexOutcome, StoreError> {
+        self.ensure_search_index_inner(false, Some(1))
+    }
+
+    /// Delete every FTS/rank document and rebuild from the message rows. The one path that
+    /// intentionally removes the whole index; it never runs `VACUUM`, because FTS keys on
+    /// `messages.rowid` and a `VACUUM` would renumber rows.
     pub fn search_reindex(&self) -> Result<SearchReindexOutcome, StoreError> {
-        self.ensure_search_index_inner(true)
+        self.ensure_search_index_inner(true, None)
     }
 
-    fn ensure_search_index_inner(&self, force: bool) -> Result<SearchReindexOutcome, StoreError> {
+    fn ensure_search_index_inner(&self, force: bool, max_batches: Option<u32>) -> Result<SearchReindexOutcome, StoreError> {
         let started = Instant::now();
-        let (mut meta, _damaged) = self.index_meta();
-        if force {
-            self.conn.execute_batch("DELETE FROM message_fts;")?;
+        let (mut meta, damaged) = self.index_meta();
+        if force || damaged.is_some() {
+            self.conn.execute_batch("DELETE FROM message_fts; DELETE FROM message_fts_rank;")?;
+            meta = IndexMeta { state: "pending".to_owned(), last_rowid: 0, ..IndexMeta::default() };
+            self.write_index_meta(&meta)?;
+        } else if meta.state == "ready" {
+            let health = self.index_health()?;
+            if !health.drift() {
+                return Ok(SearchReindexOutcome { documents: 0, took_ms: elapsed_ms(started) });
+            }
+            // Same-count drift or a missing/extra row: contentless FTS cannot repair individual rows
+            // safely, so rebuild. `search_status` reports the drift before this runs.
+            self.conn.execute_batch("DELETE FROM message_fts; DELETE FROM message_fts_rank;")?;
             meta = IndexMeta { state: "pending".to_owned(), last_rowid: 0, ..IndexMeta::default() };
             self.write_index_meta(&meta)?;
         }
-        let indexed = self.fts_documents()?;
-        let total = self.message_count()?;
-        if !force && meta.state == "ready" && indexed == total {
-            return Ok(SearchReindexOutcome { documents: 0, took_ms: elapsed_ms(started) });
+        if meta.state != "building" && meta.state != "pending" {
+            meta.state = "pending".to_owned();
         }
-        if !force && meta.state == "ready" && indexed != total {
-            // Drift: an emptied or partially lost FTS table cannot be repaired row by row without
-            // content, so rebuild it. `search_status` reports the drift before this runs.
-            self.conn.execute_batch("DELETE FROM message_fts;")?;
-            meta = IndexMeta { state: "pending".to_owned(), last_rowid: 0, ..IndexMeta::default() };
-            self.write_index_meta(&meta)?;
+        meta.last_error = None;
+        meta.updated_at = crate::now_ms();
+        self.write_index_meta(&meta)?;
+
+        let result = self.build_index_batches(&mut meta, max_batches);
+        match result {
+            Ok(true) => {
+                meta.state = "ready".to_owned();
+                meta.indexed = self.fts_documents()?;
+                meta.total = self.message_count()?;
+                meta.updated_at = crate::now_ms();
+                self.write_index_meta(&meta)?;
+                Ok(SearchReindexOutcome { documents: meta.indexed, took_ms: elapsed_ms(started) })
+            }
+            Ok(false) => {
+                meta.state = "building".to_owned();
+                meta.indexed = self.fts_documents()?;
+                meta.total = self.message_count()?;
+                meta.updated_at = crate::now_ms();
+                self.write_index_meta(&meta)?;
+                Ok(SearchReindexOutcome { documents: meta.indexed, took_ms: elapsed_ms(started) })
+            }
+            Err(error) => {
+                meta.state = "error".to_owned();
+                meta.last_error = Some(error.to_string());
+                let _ = self.write_index_meta(&meta);
+                Err(error)
+            }
         }
-        if meta.last_error.is_some() {
-            meta.last_error = None;
-        }
+    }
+
+    /// One or more committed batches. Returns `true` when there is nothing left to index.
+    fn build_index_batches(&self, meta: &mut IndexMeta, max_batches: Option<u32>) -> Result<bool, StoreError> {
+        let mut batches = 0u32;
         loop {
             let tx = self.conn.unchecked_transaction()?;
             let mut stmt = tx.prepare(&format!(
-                "SELECT rowid, subject, search_sender, search_to, search_cc, search_bcc,
-                        substr(body_text, 1, {BODY_INDEX_CHARS}), attachment_names
+                "SELECT m.rowid, m.subject, m.search_sender, m.search_to, m.search_cc, m.search_bcc,
+                        substr(m.body_text, 1, {BODY_INDEX_CHARS}), m.attachment_names, m.date, m.id
                  FROM messages m
                  WHERE m.rowid > ?1
-                   AND NOT EXISTS(SELECT 1 FROM message_fts f WHERE f.rowid = m.rowid)
+                   AND (NOT EXISTS(SELECT 1 FROM message_fts f WHERE f.rowid = m.rowid)
+                        OR NOT EXISTS(SELECT 1 FROM message_fts_rank r WHERE r.rowid = m.rowid))
                  ORDER BY m.rowid
                  LIMIT {SEARCH_BATCH}"
             ))?;
@@ -355,20 +443,20 @@ impl Store {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(stmt);
             if rows.is_empty() {
-                let indexed = self.fts_documents()?;
-                let total = self.message_count()?;
                 meta.state = "ready".to_owned();
-                meta.indexed = indexed;
-                meta.total = total;
+                meta.indexed = self.fts_documents()?;
+                meta.total = self.message_count()?;
                 meta.updated_at = crate::now_ms();
-                self.write_index_meta(&meta)?;
+                self.write_index_meta(meta)?;
                 tx.commit()?;
-                break;
+                return Ok(true);
             }
             for row in &rows {
                 tx.execute(
@@ -376,16 +464,66 @@ impl Store {
                      VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7],
                 )?;
+                tx.execute(
+                    "INSERT INTO message_fts_rank(rowid, date_key, id_key) VALUES(?1, ?2, ?3)
+                     ON CONFLICT(rowid) DO UPDATE SET date_key = excluded.date_key, id_key = excluded.id_key",
+                    params![row.0, row.8, row.9],
+                )?;
             }
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES('search_updated_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [crate::now_ms().to_string()],
+            )?;
             meta.last_rowid = rows.last().map_or(meta.last_rowid, |row| row.0);
             meta.state = "building".to_owned();
             meta.indexed = self.fts_documents()?;
             meta.total = self.message_count()?;
             meta.updated_at = crate::now_ms();
-            self.write_index_meta(&meta)?;
+            self.write_index_meta(meta)?;
             tx.commit()?;
+            batches = batches.saturating_add(1);
+            if max_batches.is_some_and(|max| batches >= max) {
+                return Ok(false);
+            }
         }
-        Ok(SearchReindexOutcome { documents: meta.indexed, took_ms: elapsed_ms(started) })
+    }
+
+    fn index_health(&self) -> Result<IndexHealth, StoreError> {
+        let indexed = self.fts_documents()?;
+        let total = self.message_count()?;
+        let missing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages m WHERE NOT EXISTS(SELECT 1 FROM message_fts f WHERE f.rowid = m.rowid)",
+            [],
+            |row| row.get(0),
+        )?;
+        let extra: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM message_fts f WHERE NOT EXISTS(SELECT 1 FROM messages m WHERE m.rowid = f.rowid)",
+            [],
+            |row| row.get(0),
+        )?;
+        let rank_missing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages m WHERE NOT EXISTS(SELECT 1 FROM message_fts_rank r WHERE r.rowid = m.rowid)",
+            [],
+            |row| row.get(0),
+        )?;
+        let rank_extra: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM message_fts_rank r WHERE NOT EXISTS(SELECT 1 FROM message_fts f WHERE f.rowid = r.rowid)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(IndexHealth {
+            indexed,
+            total,
+            missing: u32::try_from(missing).unwrap_or(u32::MAX),
+            extra: u32::try_from(extra).unwrap_or(u32::MAX),
+            rank_missing: u32::try_from(rank_missing).unwrap_or(u32::MAX),
+            rank_extra: u32::try_from(rank_extra).unwrap_or(u32::MAX),
+        })
+    }
+
+    fn search_updated_at(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self.get_meta(SEARCH_UPDATED_KEY)?.and_then(|value| value.parse::<i64>().ok()))
     }
 
     fn write_index_meta(&self, meta: &IndexMeta) -> Result<(), StoreError> {
@@ -418,7 +556,13 @@ impl Store {
     }
 
     fn database_size_bytes(&self) -> Result<u64, StoreError> {
-        Ok(std::fs::metadata(&self.path).map(|metadata| metadata.len()).unwrap_or(0))
+        let mut total = std::fs::metadata(&self.path).map(|metadata| metadata.len()).unwrap_or(0);
+        for suffix in ["-wal", "-shm"] {
+            let mut name = self.path.as_os_str().to_os_string();
+            name.push(suffix);
+            total = total.saturating_add(std::fs::metadata(std::path::Path::new(&name)).map(|metadata| metadata.len()).unwrap_or(0));
+        }
+        Ok(total)
     }
 }
 
@@ -452,6 +596,9 @@ fn expr_sql(expr: &SearchExpr, values: &mut Vec<Value>, depth: &mut u8) -> Resul
         }
         SearchExpr::Not(child) => format!("NOT ({})", expr_sql(child, values, depth)?),
         SearchExpr::Match(expression) => {
+            if expression.trim().is_empty() {
+                return Err(StoreError::Corrupt { table: "search", detail: "an empty MATCH expression is not valid".to_owned() });
+            }
             values.push(Value::Text(expression.clone()));
             "m.rowid IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)".to_owned()
         }
@@ -500,12 +647,19 @@ fn expr_sql(expr: &SearchExpr, values: &mut Vec<Value>, depth: &mut u8) -> Resul
 /// or a negation (FTS5 has no unary NOT), in which case the general typed path runs.
 fn pure_fts_expression(expr: &SearchExpr) -> Option<String> {
     match expr {
-        SearchExpr::Match(value) => Some(value.clone()),
+        SearchExpr::Match(value) if !value.trim().is_empty() => Some(value.clone()),
+        SearchExpr::Match(_) => None,
         SearchExpr::And(children) => {
+            if children.is_empty() {
+                return None;
+            }
             let parts = children.iter().map(pure_fts_expression).collect::<Option<Vec<_>>>()?;
             Some(format!("({})", parts.join(" AND ")))
         }
         SearchExpr::Or(children) => {
+            if children.is_empty() {
+                return None;
+            }
             let parts = children.iter().map(pure_fts_expression).collect::<Option<Vec<_>>>()?;
             Some(format!("({})", parts.join(" OR ")))
         }

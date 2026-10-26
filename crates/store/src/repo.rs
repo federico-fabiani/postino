@@ -10,8 +10,8 @@ use rusqlite::types::{Type, Value};
 use rusqlite::{ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter};
 
 use crate::model::{
-    Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
-    LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
+    Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
+    Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
     SyncState, UidEntry,
 };
 use crate::{REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError};
@@ -830,6 +830,11 @@ impl Store {
             .map_err(|error| corrupt_on_decode("messages", error))
     }
 
+    /// The RFC 5322 `Message-ID` of one row, without reading its body or attachments.
+    pub fn message_header_id(&self, id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.conn.query_row("SELECT message_id FROM messages WHERE id = ?1", [id], |row| row.get(0)).optional()?)
+    }
+
     /// The id of a locally written Sent/Archive row in this account that carries `message_id` and no
     /// UID yet.
     ///
@@ -1370,6 +1375,22 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(format!("draft_{next}"))
+    }
+
+    /// Draft metadata only: id, account, revision, update time and reply link. No body, headers or
+    /// attachments. `Engine::open` uses this to keep a stale-draft snapshot without reading a draft
+    /// body; the body is read only when a draft is opened or serialized.
+    pub fn list_draft_metadata(&self) -> Result<Vec<DraftMeta>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id, account_id, revision, updated_at, in_reply_to FROM drafts ORDER BY updated_at DESC, id ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DraftMeta { id: row.get(0)?, account_id: row.get(1)?, revision: get_u32(row, 2)?, updated_at: row.get(3)?, in_reply_to: row.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The current revision of one draft, if it still exists.
+    pub fn draft_revision(&self, id: &str) -> Result<Option<u32>, StoreError> {
+        self.conn.query_row("SELECT revision FROM drafts WHERE id = ?1", [id], |row| get_u32(row, 0)).optional().map_err(StoreError::from)
     }
 
     /// Drafts for one account (or every draft), newest update first.

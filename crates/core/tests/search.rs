@@ -25,6 +25,12 @@ impl Fixture {
     fn open(&self) -> Store {
         Store::open(&self.path(), &self.key).expect("store")
     }
+    fn raw(&self) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(self.path()).expect("raw open");
+        let hex = self.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";")).expect("raw key");
+        connection
+    }
 }
 
 fn message(id: &str, folder: &str, subject: &str, body: &str, date: i64, unread: bool) -> Message {
@@ -175,7 +181,112 @@ fn unknown_ids_and_parse_errors_are_actionable() {
 }
 
 #[test]
-fn status_and_reindex_are_operations_and_account_is_required_when_ambiguous() {
+fn a_pending_index_opens_and_searches_in_resumable_batches() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    store
+        .upsert_account(&Account {
+            id: "acc_1".to_owned(),
+            name: "Studio".to_owned(),
+            email: "studio@example.com".to_owned(),
+            provider: "manual".to_owned(),
+            signature: String::new(),
+            created_at: 1_700_000_000_000,
+        })
+        .expect("account");
+    store
+        .upsert_folder(&Folder {
+            id: "inbox".to_owned(),
+            account_id: "acc_1".to_owned(),
+            name: "INBOX".to_owned(),
+            kind: FolderKind::Inbox,
+            unread: 0,
+            total: 0,
+            uid_validity: Some(1),
+            uid_next: Some(601),
+            last_sync_at: None,
+        })
+        .expect("folder");
+    for index in 0..600 {
+        let mut row = message(&format!("msg_{index:03}"), "inbox", "Verbale", "corpo", index, false);
+        row.summary.account_id = "acc_1".to_owned();
+        store.upsert_synced_message(&row, &[]).expect("message");
+    }
+    drop(store);
+    {
+        let connection = fixture.raw();
+        connection.execute_batch("DELETE FROM message_fts; DELETE FROM message_fts_rank;").expect("empty index");
+        connection
+            .execute(
+                "INSERT INTO meta(key,value)
+                 VALUES('search_index','{\"state\":\"pending\",\"last_rowid\":0,\"indexed\":0,\"total\":600,\"updated_at\":0,\"last_error\":null}')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .expect("pending meta");
+    }
+    let mut engine = Engine::open(fixture.open()).expect("open must not block on the index");
+    let first = engine.call("search", json!({ "query": "verbale", "limit": 10 })).expect("first search");
+    assert_eq!(first["hits"], json!([]));
+    let index = first["index"].as_object().expect("index progress");
+    assert_eq!(index["ready"], false);
+    assert_eq!(index["indexed"], 500);
+    assert_eq!(index["total"], 600);
+    let second = engine.call("search", json!({ "query": "verbale", "limit": 10 })).expect("second search");
+    assert_eq!(second["index"], serde_json::Value::Null);
+    assert_eq!(second["total"], 600);
+    assert_eq!(second["hits"].as_array().expect("hits").len(), 10);
+}
+
+#[test]
+fn folder_names_resolve_inside_the_requested_account() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    for (id, email, folder, name) in [("acc_a", "a@example.com", "inbox_a", "A"), ("acc_b", "b@example.com", "inbox_b", "B")] {
+        store
+            .upsert_account(&Account {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                email: email.to_owned(),
+                provider: "manual".to_owned(),
+                signature: String::new(),
+                created_at: 1_700_000_000_000,
+            })
+            .expect("account");
+        store
+            .upsert_folder(&Folder {
+                id: folder.to_owned(),
+                account_id: id.to_owned(),
+                name: "INBOX".to_owned(),
+                kind: FolderKind::Inbox,
+                unread: 0,
+                total: 0,
+                uid_validity: Some(1),
+                uid_next: Some(2),
+                last_sync_at: None,
+            })
+            .expect("folder");
+    }
+    let mut a = message("msg_a", "inbox_a", "Solo A", "corpo a", 1, true);
+    a.summary.account_id = "acc_a".to_owned();
+    store.upsert_synced_message(&a, &[]).expect("message a");
+    let mut b = message("msg_b", "inbox_b", "Solo B", "corpo b", 2, true);
+    b.summary.account_id = "acc_b".to_owned();
+    store.upsert_synced_message(&b, &[]).expect("message b");
+    drop(store);
+    let mut engine = Engine::open(fixture.open()).expect("engine");
+    let result = engine.call("search", json!({ "query": "solo", "account": "acc_b", "folder": "INBOX" })).expect("account-scoped folder name");
+    assert_eq!(result["total"], 1, "{result}");
+    assert_eq!(result["hits"][0]["message"]["id"], "msg_b");
+    let listed = engine.call("messages_list", json!({ "account": "acc_b", "limit": 10 })).expect("default inbox");
+    assert_eq!(listed["folder"], "inbox_b");
+    assert_eq!(listed["total"], 1);
+    let ambiguous = engine.call("search", json!({ "query": "solo" })).expect_err("two accounts require an explicit account");
+    assert!(matches!(ambiguous, OpError::InvalidArgs(ref detail) if detail.contains("accounts")), "{ambiguous}");
+}
+
+#[test]
+fn status_and_reindex_are_operations() {
     let (_fixture, mut engine) = seeded();
     let status = engine.call("search_status", json!({})).expect("status");
     assert_eq!(status["ready"], true);

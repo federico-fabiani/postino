@@ -224,9 +224,17 @@ pub struct PostinoApp {
     search_debounce_until: Option<f64>,
     /// The last parse error, with the byte position the pencil points at.
     search_error: Option<(String, usize)>,
+    /// The last index status seen while a search was waiting for the FTS build. `None` means ready.
+    index_progress: Option<postino_core::SearchStatusResult>,
+    /// The boot status check ran once.
+    index_checked: bool,
+    /// The last search total was capped at 10 000.
+    search_capped: bool,
+    /// Page size the search list requests; `Mostra altri` grows it by 200 up to 5 000.
+    search_limit: u32,
     /// The last list/search read, keyed by its full signature and the engine revision. A frame that
     /// changes nothing reuses it instead of querying SQL again.
-    list_cache: Option<(String, u64, Vec<MessageSummary>, usize, usize)>,
+    list_cache: Option<(String, u64, Vec<MessageSummary>, usize, usize, bool)>,
     unread_only: bool,
     attachments_only: bool,
     dark: bool,
@@ -424,6 +432,10 @@ impl PostinoApp {
             search_debounce_until: None,
             search_error: None,
             list_cache: None,
+            index_progress: None,
+            index_checked: false,
+            search_capped: false,
+            search_limit: 200,
             unread_only: false,
             attachments_only: false,
             dark: false,
@@ -2566,17 +2578,18 @@ impl PostinoApp {
             self.list_error_ack = false;
             self.list_cache = None;
         }
-        if let Some((cached_signature, revision, rows, total, unread)) = &self.list_cache
+        if let Some((cached_signature, revision, rows, total, unread, capped)) = &self.list_cache
             && *cached_signature == signature
             && *revision == self.engine.revision()
         {
+            self.search_capped = *capped;
             return (rows.clone(), *total, *unread);
         }
         let searching = !self.search_committed.trim().is_empty();
         // A label view spans every folder until the user narrows it. A plain view is one folder.
         let label_scoped = self.label_filter.is_some();
         let list_folder = if label_scoped { self.label_folder.clone() } else { Some(self.folder.clone()) };
-        let search_folder = if label_scoped { self.label_folder.clone() } else { None };
+        let search_folder = if label_scoped { self.label_folder.clone() } else { Some(self.folder.clone()) };
         let account = self.active_account.clone();
         if account.is_none() || (list_folder.as_deref().is_none_or(str::is_empty) && self.label_filter.is_none()) {
             return (Vec::new(), 0, 0);
@@ -2584,7 +2597,15 @@ impl PostinoApp {
         let (name, args) = if searching {
             (
                 "search",
-                json!({ "query": self.search_committed, "account": account, "label": self.label_filter, "folder": search_folder, "limit": 200 }),
+                json!({
+                    "query": self.search_committed,
+                    "account": account,
+                    "label": self.label_filter,
+                    "folder": search_folder,
+                    "unread_only": self.unread_only,
+                    "with_attachments": self.attachments_only,
+                    "limit": self.search_limit
+                }),
             )
         } else {
             (
@@ -2602,14 +2623,26 @@ impl PostinoApp {
         let active_folders = self.active_folder_ids();
         if searching && let Err(error) = postino_core::parse_search(&self.search_committed) {
             self.search_error = Some((error.code.to_owned(), error.position));
+            self.search_capped = false;
             let empty = (Vec::new(), 0, 0);
-            self.list_cache = Some((signature, self.engine.revision(), Vec::new(), 0, 0));
+            self.list_cache = Some((signature, self.engine.revision(), Vec::new(), 0, 0, false));
             return empty;
         }
         let result = match self.engine.call(name, args) {
             Ok(value) if searching => match serde_json::from_value::<SearchResult>(value) {
                 Ok(result) => {
                     self.search_error = None;
+                    if let Some(index) = result.index {
+                        let ready = index.ready;
+                        self.index_progress = Some(index);
+                        if !ready {
+                            self.list_cache = None;
+                            self.search_capped = false;
+                            return (Vec::new(), 0, 0);
+                        }
+                    } else {
+                        self.index_progress = None;
+                    }
                     let mut rows = result
                         .hits
                         .into_iter()
@@ -2622,19 +2655,14 @@ impl PostinoApp {
                         })
                         .collect::<Vec<_>>();
                     rows.retain(|message| active_folders.contains(&message.folder_id));
-                    if self.unread_only {
-                        rows.retain(|message| message.unread);
-                    }
-                    if self.attachments_only {
-                        rows.retain(|message| message.has_attachments);
-                    }
                     let unread = rows.iter().filter(|message| message.unread).count();
                     let total = result.total;
-                    Some((rows, total, unread))
+                    self.search_capped = result.total_capped;
+                    Some((rows, total, unread, result.total_capped))
                 }
                 Err(_) => {
                     self.report_list_failure();
-                    Some((Vec::new(), 0, 0))
+                    Some((Vec::new(), 0, 0, false))
                 }
             },
             Ok(value) => match serde_json::from_value::<MessagesList>(value) {
@@ -2645,11 +2673,13 @@ impl PostinoApp {
                         result.total = usize::try_from(total).unwrap_or(usize::MAX);
                         result.unread = usize::try_from(unread).unwrap_or(usize::MAX);
                     }
-                    Some((result.messages, result.total, result.unread))
+                    self.index_progress = None;
+                    self.search_capped = false;
+                    Some((result.messages, result.total, result.unread, false))
                 }
                 Err(_) => {
                     self.report_list_failure();
-                    Some((Vec::new(), 0, 0))
+                    Some((Vec::new(), 0, 0, false))
                 }
             },
             Err(error) => {
@@ -2666,12 +2696,37 @@ impl PostinoApp {
                 } else {
                     self.report_list_failure();
                 }
-                Some((Vec::new(), 0, 0))
+                self.search_capped = false;
+                Some((Vec::new(), 0, 0, false))
             }
         };
-        let (rows, total, unread) = result.unwrap_or_default();
-        self.list_cache = Some((signature, self.engine.revision(), rows.clone(), total, unread));
+        let (rows, total, unread, capped) = result.unwrap_or_default();
+        self.list_cache = Some((signature, self.engine.revision(), rows.clone(), total, unread, capped));
         (rows, total, unread)
+    }
+
+    /// Keep a pending FTS index moving without blocking the frame: one 500-row batch per tick while
+    /// the banner is visible. A demo or an error state stops; the next boot/search retries.
+    fn poll_search_index(&mut self, ctx: &egui::Context) {
+        if !self.engine.is_persistent() {
+            return;
+        }
+        if !self.index_checked {
+            self.index_checked = true;
+            if let Ok(Some(status)) = self.engine.search_index_status()
+                && !status.ready
+            {
+                self.index_progress = Some(postino_core::SearchStatusResult::from_store(status));
+            }
+        }
+        let should_build = self.index_progress.as_ref().is_some_and(|status| !status.ready && status.state != "error");
+        if should_build && let Ok(Some(status)) = self.engine.advance_search_index() {
+            self.index_progress = Some(postino_core::SearchStatusResult::from_store(status));
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            if self.index_progress.as_ref().is_some_and(|status| status.ready) {
+                self.index_progress = None;
+            }
+        }
     }
 
     /// Commit the typed search immediately (Enter). Empty text clears the search.
@@ -2679,9 +2734,11 @@ impl PostinoApp {
         let query = self.query.trim().to_owned();
         self.query = query.clone();
         self.search_committed = query;
+        self.search_limit = 200;
         self.search_debounce_until = None;
         self.list_cache = None;
         self.search_error = None;
+        self.index_progress = None;
         if self.search_committed.is_empty() {
             self.list_signature.clear();
         }
@@ -2690,10 +2747,13 @@ impl PostinoApp {
     fn clear_search(&mut self) {
         self.query.clear();
         self.search_committed.clear();
+        self.search_limit = 200;
         self.search_debounce_until = None;
         self.search_error = None;
         self.list_cache = None;
         self.list_signature.clear();
+        self.index_progress = None;
+        self.search_capped = false;
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -4168,6 +4228,8 @@ impl PostinoApp {
         self.prune_selection(&rows);
         let searching = !self.search_committed.trim().is_empty();
         let search_error = self.search_error.clone();
+        let search_capped = self.search_capped;
+        let index_progress = self.index_progress.clone();
         let multi = self.selection.len() > 1;
         let mut clear_filter = false;
         // The header always names the scope, so the label counts cannot read as folder-local.
@@ -4175,9 +4237,13 @@ impl PostinoApp {
             Some(name) => format!("in {name}"),
             None => "in tutte le cartelle".to_owned(),
         });
-        let meta = match &scope {
-            Some(scope) => format!("{} · {} · {scope}", unread_text(unread), messages_text(total)),
-            None => format!("{} · {}", unread_text(unread), messages_text(total)),
+        let meta = if searching {
+            search_meta(total, search_capped, scope.as_deref())
+        } else {
+            match &scope {
+                Some(scope) => format!("{} · {} · {scope}", unread_text(unread), messages_text(total)),
+                None => format!("{} · {}", unread_text(unread), messages_text(total)),
+            }
         };
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
             if matches!(self.sync_view, SyncView::Offline { .. }) {
@@ -4240,8 +4306,10 @@ impl PostinoApp {
                 let chips = search_chips(&self.search_committed);
                 if !chips.is_empty() {
                     ui.horizontal_wrapped(|ui| {
-                        for chip in chips.into_iter().take(8) {
-                            if Chip::new(chip.as_str()).show(ui).clicked() {
+                        for chip in chips.into_iter().take(4) {
+                            if chip.starts_with("NOT ") {
+                                ui.label(typography::text(Role::Caption, chip, t.text_muted));
+                            } else if Chip::new(chip.as_str()).show(ui).clicked() {
                                 self.query = chip;
                                 self.commit_search();
                             }
@@ -4258,8 +4326,24 @@ impl PostinoApp {
                 ui.add_space(space::XS);
                 ui.label(typography::text(Role::Meta, search_error_text(code, *position), t.danger));
             }
+            if let Some(index) = &index_progress {
+                ui.add_space(space::XS);
+                let line = index.last_error.as_deref().map_or_else(
+                    || format!("Indice di ricerca in preparazione ({}/{})", index.indexed, index.total),
+                    |error| format!("Indice di ricerca non disponibile: {error}"),
+                );
+                ui.label(typography::text(Role::Meta, line, if index.last_error.is_some() { t.danger } else { t.text_muted }));
+            }
+            if searching
+                && rows.len() as u32 >= self.search_limit
+                && total > rows.len()
+                && Button::ghost("Mostra altri").size(ButtonSize::Sm).show(ui).clicked()
+            {
+                self.search_limit = self.search_limit.saturating_add(200).min(5_000);
+                self.list_cache = None;
+            }
             ui.add_space(space::MD);
-            if rows.is_empty() {
+            if rows.is_empty() && search_error.is_none() && index_progress.is_none() {
                 let mut menu_action = None;
                 let background = ui.interact(ui.available_rect_before_wrap(), ui.id().with("empty-list-menu"), Sense::click());
                 let has_label_filter = label_filter.is_some();
@@ -7060,6 +7144,7 @@ impl PostinoApp {
         let composer_was_open = self.composer.open;
         self.capture_screenshot(ui.ctx());
         self.tick(ui.ctx());
+        self.poll_search_index(ui.ctx());
         self.resize_handles(ui.ctx());
         self.handle_shortcuts(ui.ctx());
         if self.boot_failure.is_some() {
@@ -7129,6 +7214,9 @@ impl PostinoApp {
             ui.ctx().memory_mut(|memory| memory.request_focus(id));
         }
         self.toast_overlay(ui.ctx());
+        if self.index_progress.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
     }
 }
 
@@ -8035,7 +8123,11 @@ fn search_chips(query: &str) -> Vec<String> {
                     }
                 }
             }
-            postino_core::SearchExpr::Not(child) => collect(child, out),
+            postino_core::SearchExpr::Not(child) => {
+                if out.len() < 8 {
+                    out.push(format!("NOT ({})", child.canonical()));
+                }
+            }
             leaf => {
                 if out.len() < 8 {
                     out.push(leaf.canonical());
@@ -8046,6 +8138,15 @@ fn search_chips(query: &str) -> Vec<String> {
     let mut chips = Vec::new();
     collect(&parsed.expr, &mut chips);
     chips
+}
+
+/// The search header: an exact total, or the explicit 10 000 prefix when more rows match.
+fn search_meta(total: usize, capped: bool, scope: Option<&str>) -> String {
+    let total_text = if capped { "primi 10.000 risultati".to_owned() } else { messages_text(total) };
+    match scope {
+        Some(scope) => format!("{total_text} · {scope}"),
+        None => total_text,
+    }
 }
 
 /// The Italian sentence for a search parse error. The code is stable English; the position is the
@@ -11352,6 +11453,94 @@ mod tests {
     }
 
     #[test]
+    fn search_unread_and_attachment_filters_apply_before_the_page() {
+        let mut app = booted_app("p9a-search-filters", Vec::new(), |store| {
+            seed_account_rows(store, "acc_f", "f@example.com", None);
+            for index in 0..250u32 {
+                let id = format!("msg_f_{index:03}");
+                let mut row = store_message("fld_acc_f_inbox", "acc_f", &id, "Comune");
+                row.summary.date = 1_700_000_000_000 + i64::from(index);
+                row.summary.unread = index < 10;
+                row.summary.has_attachments = index < 5;
+                row.body_text = "comune nel corpo".to_owned();
+                store.upsert_message(&row).expect("message");
+                if index < 5 {
+                    seed_attachment(store, &id, &format!("att_{index}"), "nota.txt");
+                }
+            }
+        });
+        app.query = "comune".to_owned();
+        app.unread_only = true;
+        app.commit_search();
+        let (rows, total, _) = app.visible_messages();
+        assert_eq!(total, 10, "the unread filter must be part of the search page, not a post-filter");
+        assert_eq!(rows.len(), 10);
+        assert!(rows.iter().all(|message| message.unread));
+
+        app.unread_only = false;
+        app.attachments_only = true;
+        app.commit_search();
+        let (rows, total, _) = app.visible_messages();
+        assert_eq!(total, 5);
+        assert!(rows.iter().all(|message| message.has_attachments));
+    }
+
+    #[test]
+    fn search_is_scoped_to_the_current_folder() {
+        let mut app = booted_app("p9a-search-folder", Vec::new(), |store| {
+            seed_account_rows(store, "acc_s", "s@example.com", None);
+            for (folder, prefix) in [("fld_acc_s_inbox", "inbox"), ("fld_acc_s_sent", "sent")] {
+                for index in 0..3u32 {
+                    let id = format!("msg_{prefix}_{index}");
+                    let mut row = store_message(folder, "acc_s", &id, "Comune");
+                    row.summary.date = 1_700_000_000_000 + i64::from(index);
+                    row.body_text = "comune nel corpo".to_owned();
+                    store.upsert_message(&row).expect("message");
+                }
+            }
+        });
+        app.folder = "fld_acc_s_sent".to_owned();
+        app.query = "comune".to_owned();
+        app.commit_search();
+        let (rows, total, _) = app.visible_messages();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|message| message.folder_id == "fld_acc_s_sent"), "search escaped the current folder");
+    }
+
+    #[test]
+    fn search_meta_shows_the_cap_and_index_progress_has_a_banner() {
+        assert_eq!(search_meta(10_000, true, None), "primi 10.000 risultati");
+        assert_eq!(search_meta(3, false, Some("in Lavoro")), "3 messaggi · in Lavoro");
+        let (ctx, mut app) = ready_app();
+        app.query = "preventivo".to_owned();
+        app.commit_search();
+        let _ = app.visible_messages();
+        app.index_progress = Some(postino_core::SearchStatusResult {
+            ready: false,
+            indexed: 500,
+            total: 1_000,
+            last_error: None,
+            size_bytes: 4096,
+            state: "building".to_owned(),
+            updated_at: 1,
+        });
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("Indice di ricerca in preparazione (500/1000)")), "{text:?}");
+    }
+
+    #[test]
+    fn a_parse_error_does_not_also_render_the_empty_state() {
+        let (ctx, mut app) = ready_app();
+        app.query = "subject:\"unclosed".to_owned();
+        app.commit_search();
+        let _ = app.visible_messages();
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("Ricerca non valida")), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains("Nessun risultato")), "the invalid query showed an empty state: {text:?}");
+    }
+
+    #[test]
     fn search_debounces_commits_on_enter_and_explains_parse_errors() {
         let mut app = PostinoApp::demo(true);
         app.now = 10.0;
@@ -11379,6 +11568,8 @@ mod tests {
         assert!(app.query.is_empty() && app.search_committed.is_empty() && app.search_error.is_none());
         assert!(search_chips("from:giulia is:unread label:Lavoro").len() == 3);
         assert_eq!(search_chips("from:giulia AND subject:\"fattura\""), vec!["from:\"giulia\"".to_owned(), "subject:\"fattura\"".to_owned()]);
+        let chips = search_chips("from:giulia NOT from:spam");
+        assert!(chips.iter().any(|chip| chip.starts_with("NOT (")), "{chips:?}");
     }
 
     #[test]
@@ -13366,6 +13557,15 @@ mod tests {
         let submitted = smtp.submitted();
         smtp.finish();
         assert_eq!(submitted.len(), 1, "the externally queued row was not submitted");
+        // The worker can report completion a frame before the app has consumed the sent row.
+        for _ in 0..200 {
+            app.poll_outbox();
+            app.handle_send_events();
+            if app.engine.message(&draft_id).is_some_and(|message| message.summary.folder_id == "fld_acc_smtp_sent") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.clone()), Some("fld_acc_smtp_sent".to_owned()));
     }
 

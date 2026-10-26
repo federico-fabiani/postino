@@ -598,7 +598,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "9bbc0382f3803afa49d75f4514bd3d5454bb263a29a489b59fbcb945b0cf685b"
+sha256 = "00007136078ccc08575302e3772ae21868550b494ab1f9d354e18848811e2556"
 usage = "Documentation screenshot of query chips, syntax help and bm25-ranked results at the minimum window"
 
 [[asset]]
@@ -608,7 +608,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "74e1e6a4314e9e579d53f25c44a6884f9e73918800fab3aa82712e4eae141c4b"
+sha256 = "a13cdda6b46451114512016cc5b2339c1817176192eebec755a993961dc0b7b5"
 usage = "Documentation screenshot of dark-theme search at the minimum window"
 
 [[asset]]
@@ -618,7 +618,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "174fb635a11385b0a83502525773bb4bce13f2af7145d336d20c6fe8d700cfc5"
+sha256 = "81666376d6239168ca943e571e0d5d7585b4ce56feb3b7e731192997ed327c79"
 usage = "Documentation screenshot of the positional Italian parse error and its way out"
 
 [[asset]]
@@ -628,7 +628,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f0367ba6bcb5aea1144201795a1562198e6b10aa4fbf7a8ce60acd2b51615a71"
+sha256 = "f02edaebabea771a1fbeb00c8640d0744f7b1c684ef63d1f09a7f76a7189ee75"
 usage = "Documentation screenshot of the dark-theme search parse error"
 
 [[dependency]]

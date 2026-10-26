@@ -219,7 +219,9 @@ Append one line when significant time is lost to an issue likely to recur. Forma
   subset of columns (`cannot UPDATE a subset of columns`). fix/avoid: the update trigger does
   delete+insert; never write a partial `UPDATE message_fts`.
 - [SQLite/FTS5] joining every FTS match to `messages` before `ORDER BY bm25` pays one encrypted-row
-  lookup per match (26 ms at 20k, 125 ms at 100k). fix/avoid: rank and page inside FTS first, then
-  join only the candidate window; keep the exact date/id tie-break in Rust.
-- [Windows/Rust] `PRAGMA page_count` through `pragma_query_value` returned 0 on this SQLCipher build.
-  fix/avoid: report the database file size with `std::fs::metadata` (FTS lives in the same file).
+  lookup per match (26 ms at 20k, 125 ms at 100k). fix/avoid: rank and page with FTS plus a small
+  trigger-maintained `message_fts_rank(rowid,date_key,id_key)` table; do **not** apply a global
+  date/id tie-break to a truncated Rust candidate window — that repeats pages when bm25 ties exceed it.
+- [SQLite/WAL] the main database file alone under-reports size: committed FTS pages can still be in
+  `mail.db-wal` (4 KiB vs 241 KiB in the review probe). fix/avoid: sum main+wal+shm for status and
+  measure the index with `dbstat`, not the file size alone.
