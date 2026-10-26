@@ -540,6 +540,46 @@ license_file = "LICENSE-MIT"
 sha256 = "266bede8d29695592be4fa48b69a8b33c105b3bffca87849b32f6eaad279ad4b"
 usage = "Documentation screenshot of the settings dialog at the minimum window in the dark theme"
 
+[[asset]]
+path = "docs/images/postino-p8-compose-980.png"
+title = "Postino composer with attachments at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "a52dfc400b31c67d73588baba3b539138d6d642bb136d904d530b72bfdf327a9"
+usage = "Documentation screenshot of the composer at the minimum window with two attachments, their total, the picker button and Invia"
+
+[[asset]]
+path = "docs/images/postino-p8-compose-980-dark.png"
+title = "Postino composer with attachments at 980x600 in the dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "4ab1a7a33a2cf6efdcdf5d52638a6ef0a71e54e8e95ee673668454b248de48f7"
+usage = "Documentation screenshot of the composer with attachments at the minimum window in the dark theme"
+
+[[asset]]
+path = "docs/images/postino-p8-signature-980.png"
+title = "Postino signature editor at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "59ea8d9ba83c3f79b5e7193d58f7d6bb0722a3c0ad4e052c0bbfb67a71f684e4"
+usage = "Documentation screenshot of the per-account plain-text signature editor in Settings at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p8-signature-980-dark.png"
+title = "Postino signature editor at 980x600 in the dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "834971e26be6d4e8840d84c6d97fbcabe58cef56ee142f58a4933d87ef4c4778"
+usage = "Documentation screenshot of the signature editor in Settings at the minimum window in the dark theme"
+
 # Cargo dependencies that carry licensed assets (an icon font, not a vendored file).
 [[dependency]]
 name = "egui-phosphor"

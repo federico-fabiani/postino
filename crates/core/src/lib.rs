@@ -17,19 +17,24 @@ pub mod engine;
 pub mod model;
 pub mod ops;
 pub mod outbox;
+mod reply;
 mod store_map;
 pub mod vault;
 
-pub use engine::{AccountRequest, AccountSetup, AccountUpdateRequest, Engine, OpError, SmtpSetup};
+pub use engine::{
+    AccountRequest, AccountSetup, AccountUpdateRequest, Engine, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS,
+    MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup,
+};
 pub use model::{
     Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
     Provider, ServerSettings, SmtpSettings,
 };
 pub use ops::{
-    AccountAdd, AccountRemove, AccountTest, AccountUpdate, AccountsList, AppInfo, DraftSave, DryRunResult, FoldersList, LabelApply, LabelCreate,
-    LabelDelete, LabelUpdate, LabelsList, MessageFlag, MessageGet, MessagesList, OpDef, OutboxAction, OutboxListResult, SearchResult, SendQueued,
-    SyncNow, SyncReport, SyncStatusReport, SyncStatusView, op_defs,
+    AccountAdd, AccountRemove, AccountSignature, AccountTest, AccountUpdate, AccountsList, AppInfo, DraftAttachmentResult, DraftSave, DryRunResult,
+    FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageFlag, MessageGet, MessagesList, OpDef, OutboxAction,
+    OutboxListResult, SearchResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView, op_defs,
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
 pub use postino_sync::{SyncPhase, SyncStatus};
+pub use reply::{ReplyMode, ReplyPrefill, compose_reply, forward_subject, new_message_body, quote_body, reply_subject, signature_block};
 pub use vault::{CredentialVault, VaultError};

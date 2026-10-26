@@ -65,7 +65,10 @@ agent can read the message and recover.
 | `message_get` | yes | One message with body and attachments |
 | `message_flag` | no | Set read/unread and/or starred |
 | `message_move` | no | Move a message to a regular folder |
-| `draft_save` | no | Create a draft or patch one in place |
+| `draft_save` | no | Create a draft or patch one in place; metadata only, including the optional `in_reply_to` |
+| `draft_attachment_add` | no | Store one file's exact bytes (bounded base64) in the encrypted blob store; 20 files, 25 MiB each, 25 MiB total |
+| `draft_attachment_remove` | no | Remove one attachment row by id or exact filename; the blob waits for a later GC |
+| `account_signature_set` | no | Set an account's plain-text signature (≤ 4 KiB, newline/tab only) |
 | `message_send` | no | Queue a draft for SMTP submission with a 5 s undo window; disabled unless `--allow-send` |
 | `send_schedule` | no | Queue a draft at an RFC 3339 `send_at`; disabled unless `--allow-send` |
 | `outbox_list` | yes | Journal rows newest-first with state, attempts, a fixed error, recipient count and subject; `limit`/`offset` page the history; offline |
@@ -104,6 +107,30 @@ not drain either.
 `message_send` is **not** marked destructive: sending is the product's purpose, and the annotation
 would mislead an agent that treats destructive as "deletes data". The guardrail is the server flag,
 the recipient/message caps, the outbox row and the explicit confirmation on retry/mark-sent.
+
+## Attachments and signatures over MCP
+
+`draft_attachment_add` accepts `data_base64`, never a filesystem path: an MCP client chooses the bytes
+it sends and the server never reads the user's disk. The server reads each JSON-RPC request line with a
+hard ceiling of about 37 MB (enough for a 25 MiB payload plus base64 and JSON framing); an oversized
+line is drained and answered with a readable JSON-RPC error instead of being allocated in full. The
+base64 string is bounded before it is decoded, an invalid alphabet is refused, and the decoded size is
+checked again against the per-file and total caps. The operation is not sensitive — the bytes are not
+a credential — but its description states that the payload leaves the caller and is stored only in
+the encrypted local blob store. A duplicate filename is renamed, a hostile filename is sanitized, and
+an invalid declared MIME falls back to the extension (unknown → `application/octet-stream`). The
+engine accepts a declared type only when it matches the extension table, so a valid lie such as
+`evil.exe` + `image/png` is stored as `application/octet-stream`. The
+result is the updated draft; read the attachment list from `draft_save`/`message_get` afterwards.
+
+`draft_attachment_remove` takes the draft and an attachment id (or exact filename) and returns the
+updated draft. It deletes the row, not the deduplicated blob; there is no GC yet.
+
+`account_signature_set` sets one account's plain-text signature. HTML, images and tracking are not
+supported. The change applies to new messages; an existing draft keeps the text it saved.
+
+`draft_save` remains metadata-only for compatibility. Passing attachment metadata without stored bytes
+is accepted for the row but `message_send` refuses it with the filename before writing a queue row.
 
 ## Sensitive operations
 
@@ -145,13 +172,17 @@ before the row limit, so a match outside the first 200 rows is still returned. `
 validates every message id before changing anything, caps a call at 500 ids and returns how many
 messages actually changed, so an agent can retry safely.
 
-`draft_save` refuses CR/LF in addresses or the subject, validates every recipient, caps recipients
-and attachments, and returns the draft with a stable id. **It is a patch on update:** every content
-field (`to`, `cc`, `bcc`, `subject`, `body_text`, `attachments`) is optional; omitting a field keeps
-its current value and sending it — even as an empty list or empty string — replaces it. On create,
-omitted fields are empty, and `account` chooses the account; it is required when more than one
-account exists. The app sends the full content on every autosave, which is equivalent to replacing
-every field.
+`draft_save` refuses CR/LF in addresses or the subject, validates every recipient, and returns the
+draft with a stable id. **It is a patch on update:** every content field (`to`, `cc`, `bcc`,
+`subject`, `body_text`, `attachments`, `in_reply_to`) is optional; omitting a field keeps its current
+value and sending it — even as an empty list or empty string — replaces it, with one exception:
+`in_reply_to` cannot be cleared in P8. Omitting it keeps the stored parent; an empty string is
+rejected because there is no explicit clear field yet (P9 adds the full thread model). On create,
+omitted fields are empty, and `account` chooses the account; it is required when more than one account
+exists. `attachments` is metadata only: the bytes come from `draft_attachment_add`, and a row without
+a stored blob is refused at send time with the filename. `in_reply_to` is a parent `Message-ID`,
+normalised without brackets and emitted as `In-Reply-To`/`References`. The app sends the full content
+on every autosave, which is equivalent to replacing every field.
 
 `message_send` requires at least one recipient and a configured SMTP endpoint; it serializes the
 draft, stores the exact bytes, inserts an outbox row and returns the row with its 5-second undo

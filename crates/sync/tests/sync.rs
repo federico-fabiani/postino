@@ -30,6 +30,27 @@ fn one_inbox(uid_validity: u32, messages: Vec<TestMessage>) -> Vec<TestFolder> {
 }
 
 #[test]
+fn a_synced_reply_to_is_persisted_for_the_reply_composer() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let mut synthetic = synthetic_message(1);
+    let raw = String::from_utf8_lossy(&synthetic.raw).replacen(
+        "From: Synthetic Sender <synthetic1@example.test>",
+        "From: Synthetic Sender <synthetic1@example.test>\r\nReply-To: Segreteria <segreteria@example.test>",
+        1,
+    );
+    synthetic.raw = raw.into_bytes();
+    let server = RunningServer::start(one_inbox(10, vec![TestMessage::synthetic(synthetic)]));
+    sync(&store, &server).expect("sync with Reply-To");
+    server.finish();
+    let row = message_by_header(&store, "synthetic-1@example.test");
+    assert_eq!(
+        store.message_reply_to(&row.summary.id).expect("reply-to"),
+        vec![postino_store::Address::new("Segreteria", "segreteria@example.test")]
+    );
+}
+
+#[test]
 fn status_is_absent_before_the_first_run() {
     let harness = Harness::new();
     let store = seeded(&harness);

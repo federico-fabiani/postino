@@ -24,6 +24,7 @@ pub use postino_mime::{
     Envelope as SubmissionEnvelope, Mailbox as SubmissionMailbox, MimeError, OutgoingAttachment as SubmissionAttachment,
     OutgoingMessage as Submission, Serialized as SerializedSubmission,
 };
+pub use postino_mime::{mime_for_filename, normalize_mime_type, sanitize_filename};
 
 use crate::SyncError;
 

@@ -65,7 +65,7 @@ pub mod size {
     pub const COMPOSER_ACCOUNT_ROW: f32 = 20.0;
     pub const COMPOSER_FOOTER_BLOCK: f32 = 50.0;
     pub const COMPOSER_BODY_MIN: f32 = 96.0;
-    pub const ATTACHMENT_LIST_MAX: f32 = 36.0;
+    pub const ATTACHMENT_LIST_MAX: f32 = 72.0;
     /// The inline label editor is a drawer above the sidebar footer, tall enough for the field, its
     /// error line, the colour row, the hint and Save/Cancel at 980×600.
     pub const LABEL_EDITOR_DRAWER: f32 = 208.0;

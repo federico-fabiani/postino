@@ -24,6 +24,7 @@ zeroize.workspace = true
 getrandom.workspace = true
 postino-testkit.workspace = true
 rusqlite.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

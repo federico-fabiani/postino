@@ -45,6 +45,10 @@ pub(crate) fn unknown_message(id: &str) -> OpError {
     OpError::InvalidArgs(format!("unknown message {id:?}; use an id returned by messages_list"))
 }
 
+fn draft_changed(id: &str) -> OpError {
+    OpError::InvalidArgs(format!("draft {id:?} changed in another session; refresh the mailbox before editing its attachments"))
+}
+
 /// The one sentence for a draft held by its own journal row. It names the state and the two ways
 /// out, and it never suggests cancelling a row that cannot be cancelled.
 fn outbox_lock_message(what: &str, id: &str, state: OutboxState, action: &str) -> String {
@@ -63,8 +67,12 @@ pub(crate) fn unknown_label(id: &str) -> OpError {
 const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RECIPIENTS_PER_FIELD: usize = 100;
-const MAX_ATTACHMENTS: usize = 50;
-const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+/// The composer caps from P8: at most 20 files, 25 MiB each and 25 MiB in total.
+pub const MAX_DRAFT_ATTACHMENTS: usize = 20;
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
+/// A signature is plain text and small: 4 KiB is already a long signature.
+pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 const MAX_LABEL_NAME_CHARS: usize = 48;
 const MAX_LABEL_MESSAGES: usize = 500;
 
@@ -136,6 +144,15 @@ pub struct SmtpSetup {
     pub username: String,
     /// `None` means the IMAP credential is used for SMTP too.
     pub password: Option<Zeroizing<String>>,
+}
+
+/// The parent identity a composer needs to start a reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyTarget {
+    /// The parent `Message-ID`, without angle brackets, when the message has one.
+    pub parent_message_id: Option<String>,
+    /// The parent's `Reply-To` list. Empty means "use From".
+    pub reply_to: Vec<Address>,
 }
 
 /// Everything `account_add` needs **except** the password.
@@ -224,6 +241,12 @@ pub struct Engine {
     /// keeps the in-memory half of the mapping (hydrated by [`Engine::open`], updated after a blob
     /// write) and the repository row stays the source of truth.
     blob_hashes: HashMap<String, String>,
+    /// Draft id → parent `Message-ID` for a reply, hydrated from `drafts.in_reply_to` on open.
+    ///
+    /// The display message deliberately has no reply field: a reply link belongs to the draft row,
+    /// not to a message summary or to a body. The engine owns this small map and the serializer reads
+    /// it; `save_draft` keeps the stored link when a patch omits it.
+    reply_links: HashMap<String, String>,
 }
 
 impl Engine {
@@ -246,6 +269,7 @@ impl Engine {
             #[cfg(debug_assertions)]
             test_clock: None,
             blob_hashes: HashMap::new(),
+            reply_links: HashMap::new(),
         }
     }
 
@@ -368,11 +392,18 @@ impl Engine {
             .collect::<Result<Vec<_>, _>>()?;
         let labels = store.list_labels(None).map_err(store_map::read_error)?.into_iter().map(store_map::label).collect::<Result<Vec<_>, _>>()?;
         let label_seq = repair_label_seq(&store, &labels)?;
+        let reply_links = store
+            .list_drafts(None)
+            .map_err(store_map::read_error)?
+            .into_iter()
+            .filter_map(|draft| draft.in_reply_to.map(|parent| (draft.id, parent)))
+            .collect::<HashMap<_, _>>();
 
         let mut engine = Self::from_parts(accounts, folders, messages, labels, false, Some(store));
         engine.vault = vault;
         engine.next_label_seq = label_seq.saturating_add(1);
         engine.blob_hashes = blob_hashes;
+        engine.reply_links = reply_links;
         Ok(engine)
     }
 
@@ -402,6 +433,7 @@ impl Engine {
             #[cfg(debug_assertions)]
             test_clock: None,
             blob_hashes: HashMap::new(),
+            reply_links: HashMap::new(),
         };
         engine.recount();
         engine
@@ -436,6 +468,14 @@ impl Engine {
 
     pub fn labels(&self) -> &[Label] {
         &self.labels
+    }
+
+    /// The parent `Message-ID` of a reply draft, without angle brackets.
+    ///
+    /// The link lives on the draft row, not on the message summary; the composer reads it when it
+    /// reopens a draft so the next save cannot silently drop the linkage.
+    pub fn draft_reply_link(&self, draft_id: &str) -> Option<&str> {
+        self.reply_links.get(draft_id).map(String::as_str)
     }
 
     pub fn label(&self, id: &str) -> Option<&Label> {
@@ -906,6 +946,8 @@ impl Engine {
         self.accounts.retain(|candidate| candidate.id != account.id);
         self.folders.retain(|folder| folder.account_id != account.id);
         self.messages.retain(|message| !folder_ids.contains(&message.summary.folder_id));
+        let live = self.messages.iter().map(|message| message.summary.id.clone()).collect::<BTreeSet<_>>();
+        self.reply_links.retain(|draft_id, _| live.contains(draft_id));
         self.recount();
         match (imap_credential, smtp_credential) {
             (Ok(()), Ok(())) => Ok(view),
@@ -1063,9 +1105,16 @@ impl Engine {
                 store_map::message(row, rows)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let reply_links = store
+            .list_drafts(None)
+            .map_err(store_map::read_error)?
+            .into_iter()
+            .filter_map(|draft| draft.in_reply_to.map(|parent| (draft.id, parent)))
+            .collect::<HashMap<_, _>>();
         self.folders = folders;
         self.messages = messages;
         self.blob_hashes = blob_hashes;
+        self.reply_links = reply_links;
         self.recount();
         Ok(())
     }
@@ -1269,7 +1318,14 @@ impl Engine {
     /// With a store the message, attachments, revision and folder counts are one transaction. A
     /// failure returns before memory changes and leaves the previous rows exactly as they were.
     pub fn save_draft(&mut self, account: Option<&str>, id: Option<&str>, draft: DraftContent) -> Result<Message, OpError> {
+        let draft = normalize_draft_attachment_names(draft);
         validate_draft(&draft)?;
+        // Validate the reply linkage before any write. `None` means "keep what the row has"; the
+        // store's COALESCE enforces that, and this map is updated from the row it returns.
+        let requested_link = match draft.in_reply_to.as_deref() {
+            Some(raw) => Some(normalize_reply_parent(raw)?),
+            None => None,
+        };
         let index = match id {
             Some(id) => {
                 if id.trim().is_empty() {
@@ -1399,29 +1455,46 @@ impl Engine {
 
         let persisted = if let Some(store) = &self.store {
             let row = store_map::message_row(&saved, &account.id, None);
-            store.save_draft_message(&row, &store_map::attachment_rows(&saved.attachments)).map_err(store_map::write_error)?;
+            let stored = store
+                .save_draft_message_linked(&row, &store_map::attachment_rows(&saved.attachments), requested_link.as_deref())
+                .map_err(store_map::write_error)?;
             // The repository keeps the stored hash *and size* of an attachment whose id survived the
             // replacement. Mirror those rows, or memory would cap a 2 MiB blob at a stale size of 0
             // and refuse to read it until the next restart.
-            Some(store.attachments(&saved.summary.id).map_err(store_map::read_error)?)
+            Some((store.attachments(&saved.summary.id).map_err(store_map::read_error)?, stored.in_reply_to))
         } else {
             None
         };
-        if let Some(rows) = persisted {
-            for id in &replaced_ids {
-                self.blob_hashes.remove(id);
-            }
-            for row in &rows {
-                if let Some(hash) = &row.blob_hash {
-                    self.blob_hashes.insert(row.id.clone(), hash.clone());
-                }
-            }
-            saved.attachments = rows.into_iter().map(store_map::attachment).collect();
-        } else {
-            for id in &replaced_ids {
-                if !saved.attachments.iter().any(|attachment| attachment.id == *id) {
+        let persisted_link = match &persisted {
+            Some((rows, link)) => {
+                for id in &replaced_ids {
                     self.blob_hashes.remove(id);
                 }
+                for row in rows {
+                    if let Some(hash) = &row.blob_hash {
+                        self.blob_hashes.insert(row.id.clone(), hash.clone());
+                    }
+                }
+                saved.attachments = rows.iter().cloned().map(store_map::attachment).collect();
+                link.clone()
+            }
+            None => {
+                for id in &replaced_ids {
+                    if !saved.attachments.iter().any(|attachment| attachment.id == *id) {
+                        self.blob_hashes.remove(id);
+                    }
+                }
+                // Demo: no store means no COALESCE, so the request itself is the new value and an
+                // omitted link keeps the in-memory one.
+                requested_link.or_else(|| self.reply_links.get(&saved.summary.id).cloned())
+            }
+        };
+        match &persisted_link {
+            Some(link) => {
+                self.reply_links.insert(saved.summary.id.clone(), link.clone());
+            }
+            None => {
+                self.reply_links.remove(&saved.summary.id);
             }
         }
 
@@ -1672,8 +1745,11 @@ impl Engine {
             text: current.body_text.clone(),
             html: current.body_html.clone(),
             attachments,
-            in_reply_to: None,
-            references: Vec::new(),
+            in_reply_to: self.reply_links.get(draft_id).cloned(),
+            // P8 has the parent Message-ID but not the parent's own References list. The parent id
+            // alone is a valid single-entry chain and is what P9 will replace with the full list
+            // persisted from the incoming message.
+            references: self.reply_links.get(draft_id).cloned().into_iter().collect(),
             message_id: None,
         };
         let serialized = postino_sync::serialize_submission(&submission)
@@ -2166,12 +2242,15 @@ impl Engine {
     /// The `drafts` row carries the body, headers, revision and updated-at, but not the attachments;
     /// the attachment rows carry the metadata and stored blob hashes. The `updated_at` check catches
     /// any save by another engine (including an attachment-only one); the attachment rows are
-    /// compared too because two saves can land in the same millisecond. `in_reply_to` is compared by
-    /// refusing a stored linkage: this milestone's composer has no reply field and
-    /// `submission_for_draft` never serializes one, so sending such a row would silently drop the
-    /// linkage. Refusing is the honest result until the composer owns the field.
+    /// compared too because two saves can land in the same millisecond. The reply linkage is compared
+    /// with the engine's hydrated map: a stored link this engine cannot serialize is stale, but a
+    /// link it did hydrate is part of the bytes and must match exactly.
     fn draft_snapshot_matches(&self, message: &Message, draft: &postino_store::Draft, store: &Store) -> Result<bool, OpError> {
-        if draft.in_reply_to.is_some() || !draft_matches_row(message, draft) || message.summary.date.timestamp_millis() != draft.updated_at {
+        let expected_link = self.reply_links.get(&message.summary.id).map(String::as_str);
+        if draft.in_reply_to.as_deref() != expected_link
+            || !draft_matches_row(message, draft)
+            || message.summary.date.timestamp_millis() != draft.updated_at
+        {
             return Ok(false);
         }
         let rows = store.attachments(&message.summary.id).map_err(store_map::read_error)?;
@@ -2312,7 +2391,9 @@ impl Engine {
             self.messages.retain(|message| message.summary.id != *duplicate);
             let prefix = format!("att_{duplicate}_");
             self.blob_hashes.retain(|attachment_id, _| !attachment_id.starts_with(&prefix));
+            self.reply_links.remove(duplicate);
         }
+        self.reply_links.remove(id);
 
         let Some(slot) = self.messages.iter_mut().find(|message| message.summary.id == id) else {
             return Err(OpError::Failed(format!("unknown draft {id:?}")));
@@ -2397,6 +2478,234 @@ impl Engine {
     /// half of the in-memory mapping. It is not an operation and has no JSON schema.
     pub fn attachment_hash(&self, attachment_id: &str) -> Option<&str> {
         self.blob_hashes.get(attachment_id).map(String::as_str)
+    }
+
+    /// The parent identity for a reply: its `Message-ID` and `Reply-To` list.
+    ///
+    /// A reply is only useful if the composer can thread it and honour the sender's requested
+    /// mailbox. The store has the `Message-ID`; `Reply-To` lives in the existing `meta` table because
+    /// P8 may not migrate the message schema. The demo has deterministic ids and no Reply-To.
+    pub fn reply_target(&self, message_id: &str) -> Result<ReplyTarget, OpError> {
+        if self.message(message_id).is_none() {
+            return Err(unknown_message(message_id));
+        }
+        match &self.store {
+            Some(store) => {
+                let row = store
+                    .get_message(message_id)
+                    .map_err(store_map::read_error)?
+                    .ok_or_else(|| OpError::InvalidArgs(format!("message {message_id:?} no longer exists; refresh the mailbox")))?;
+                let reply_to = store.message_reply_to(message_id).map_err(store_map::read_error)?;
+                Ok(ReplyTarget { parent_message_id: row.message_id, reply_to: reply_to.iter().map(store_map::address).collect() })
+            }
+            None => Ok(ReplyTarget { parent_message_id: Some(format!("{message_id}@demo.postino.example")), reply_to: Vec::new() }),
+        }
+    }
+
+    /// Add one attachment with its exact bytes to a draft.
+    ///
+    /// The filename is sanitized with the same rule as the serializer, a duplicate is renamed
+    /// (`name (2).ext`), the declared MIME is validated and falls back to a conservative extension
+    /// table, and the caps are checked before the blob is written. The blob is written first and the
+    /// draft row, the attachment rows and the revision are one store transaction; a failed row write
+    /// leaves an unreferenced blob, never a row that claims bytes it does not have.
+    pub fn add_draft_attachment(&mut self, draft_id: &str, filename: &str, mime: Option<&str>, data: &[u8]) -> Result<Message, OpError> {
+        let store = self.require_store("draft_attachment_add")?;
+        let index = self.draft_index(draft_id, "allegato")?;
+        let current = self.messages.get(index).cloned().ok_or_else(|| unknown_message(draft_id))?;
+        self.ensure_draft_current(&current)?;
+        if filename.chars().any(|character| matches!(character, '\r' | '\n' | '\0')) {
+            return Err(OpError::InvalidArgs(format!("attachment file name {filename:?} contains a line break or NUL; header injection is refused")));
+        }
+        let sanitized = postino_sync::sanitize_filename(filename);
+        if sanitized.is_empty() {
+            return Err(OpError::InvalidArgs(format!(
+                "attachment file name {filename:?} is empty after sanitization; it must not be a path, a dot name or only controls"
+            )));
+        }
+        let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        if size > MAX_ATTACHMENT_BYTES {
+            return Err(OpError::InvalidArgs(format!(
+                "attachment {sanitized:?} is {size} bytes; this build accepts at most {MAX_ATTACHMENT_BYTES} bytes per file"
+            )));
+        }
+        if current.attachments.len() >= MAX_DRAFT_ATTACHMENTS {
+            return Err(OpError::InvalidArgs(format!(
+                "a draft can carry at most {MAX_DRAFT_ATTACHMENTS} attachments; remove one before adding {sanitized:?}"
+            )));
+        }
+        let total = current.attachments.iter().map(|attachment| attachment.size).sum::<u64>();
+        if total.saturating_add(size) > MAX_ATTACHMENT_TOTAL_BYTES {
+            return Err(OpError::InvalidArgs(format!(
+                "attachments would total {} bytes; this build accepts at most {MAX_ATTACHMENT_TOTAL_BYTES} bytes per message (adding {sanitized:?})",
+                total.saturating_add(size)
+            )));
+        }
+        let filename = unique_attachment_name(&sanitized, &current.attachments);
+        let derived = postino_sync::mime_for_filename(&filename);
+        // The declared type is a hint, never a promise: accept it only when it agrees with the
+        // extension table, otherwise the extension wins. A caller cannot turn `evil.exe` into
+        // `image/png` or `text/html`.
+        let mime = mime.and_then(postino_sync::normalize_mime_type).filter(|declared| declared == derived).unwrap_or_else(|| derived.to_owned());
+        let attachment_id = next_attachment_id(draft_id, &current.attachments);
+        let hash = store.blobs().put(data).map_err(store_map::blob_write_error)?;
+        let rows = self.attachment_rows(
+            current.attachments.iter().cloned().chain(std::iter::once(Attachment { id: attachment_id.clone(), filename, mime, size })),
+            Some((&attachment_id, &hash)),
+        );
+        let mut saved = current.clone();
+        saved.attachments = rows.iter().cloned().map(store_map::attachment).collect();
+        saved.summary.has_attachments = true;
+        saved.summary.date = Utc::now();
+        let link = self.reply_links.get(draft_id).cloned();
+        let row = store_map::message_row(&saved, &self.draft_account_id(draft_id)?, None);
+        store.save_draft_message_linked(&row, &rows, link.as_deref()).map_err(store_map::write_error)?;
+        // Durable rows are written; only now does memory change.
+        self.blob_hashes.insert(attachment_id, hash);
+        if let Some(slot) = self.messages.get_mut(index) {
+            *slot = saved.clone();
+        }
+        self.recount();
+        Ok(saved)
+    }
+
+    /// Remove one attachment row from a draft. The deduplicated blob stays until a later GC.
+    pub fn remove_draft_attachment(&mut self, draft_id: &str, attachment: &str) -> Result<Message, OpError> {
+        let store = self.require_store("draft_attachment_remove")?;
+        let index = self.draft_index(draft_id, "allegato")?;
+        let current = self.messages.get(index).cloned().ok_or_else(|| unknown_message(draft_id))?;
+        self.ensure_draft_current(&current)?;
+        let position = current
+            .attachments
+            .iter()
+            .position(|candidate| candidate.id == attachment)
+            .or_else(|| current.attachments.iter().position(|candidate| candidate.filename == attachment))
+            .ok_or_else(|| {
+                OpError::InvalidArgs(format!(
+                    "attachment {attachment:?} is not on draft {draft_id:?}; use an id or a filename returned by message_get"
+                ))
+            })?;
+        let removed = current.attachments.get(position).cloned().ok_or_else(|| OpError::Failed("the attachment disappeared".to_owned()))?;
+        let mut saved = current.clone();
+        saved.attachments.remove(position);
+        saved.summary.has_attachments = !saved.attachments.is_empty();
+        saved.summary.date = Utc::now();
+        let rows = self.attachment_rows(saved.attachments.iter().cloned(), None);
+        let link = self.reply_links.get(draft_id).cloned();
+        let row = store_map::message_row(&saved, &self.draft_account_id(draft_id)?, None);
+        store.save_draft_message_linked(&row, &rows, link.as_deref()).map_err(store_map::write_error)?;
+        self.blob_hashes.remove(&removed.id);
+        if let Some(slot) = self.messages.get_mut(index) {
+            *slot = saved.clone();
+        }
+        self.recount();
+        Ok(saved)
+    }
+
+    /// Copy one attachment from a message to a draft, reusing the encrypted blob.
+    ///
+    /// Forwarding never re-encodes the bytes in a JSON payload: the engine reads the source through
+    /// the same capped blob path as the reading pane and writes the new row. A missing or corrupt
+    /// source blob is refused with the source filename, never silently dropped.
+    pub fn copy_attachment_to_draft(&mut self, draft_id: &str, source_attachment: &str) -> Result<Message, OpError> {
+        let source = self.find_attachment(source_attachment)?.clone();
+        let data = self.attachment_bytes(source_attachment).map_err(|error| {
+            OpError::Failed(format!("attachment {:?} cannot be copied ({error}); the draft keeps its other attachments", source.filename))
+        })?;
+        self.add_draft_attachment(draft_id, &source.filename, Some(&source.mime), &data)
+    }
+
+    /// Set the plain-text signature of one account.
+    ///
+    /// The signature is body text, not a header and not an attachment: up to 4 KiB, newline and tab
+    /// only (no CR), and it is applied to new messages only because an existing draft already owns
+    /// the text it saved.
+    pub fn set_account_signature(&mut self, account_id: &str, signature: &str) -> Result<AccountView, OpError> {
+        let index = self.accounts.iter().position(|account| account.id == account_id).ok_or_else(|| unknown_account(account_id))?;
+        validate_signature(signature)?;
+        if let Some(store) = &self.store
+            && !store.set_account_signature(account_id, signature).map_err(store_map::write_error)?
+        {
+            return Err(unknown_account(account_id));
+        }
+        let account = self.accounts.get_mut(index).ok_or_else(|| unknown_account(account_id))?;
+        account.signature = signature.to_owned();
+        let account = account.clone();
+        self.account_view(&account)
+    }
+
+    /// The store rows for a draft's attachments, with the known blob hashes (and one new hash).
+    fn attachment_rows(&self, attachments: impl IntoIterator<Item = Attachment>, added: Option<(&str, &str)>) -> Vec<postino_store::Attachment> {
+        attachments
+            .into_iter()
+            .map(|attachment| postino_store::Attachment {
+                blob_hash: match added {
+                    Some((id, hash)) if id == attachment.id => Some(hash.to_owned()),
+                    _ => self.blob_hashes.get(&attachment.id).cloned(),
+                },
+                id: attachment.id,
+                filename: attachment.filename,
+                mime: attachment.mime,
+                size: attachment.size,
+            })
+            .collect()
+    }
+
+    /// One draft's index in memory, with the same folder and outbox checks every edit uses.
+    fn draft_index(&self, draft_id: &str, action: &str) -> Result<usize, OpError> {
+        let index = self
+            .messages
+            .iter()
+            .position(|message| message.summary.id == draft_id)
+            .ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {draft_id:?}; omit id to create a draft")))?;
+        let kind = self
+            .messages
+            .get(index)
+            .and_then(|message| self.folders.iter().find(|folder| folder.id == message.summary.folder_id))
+            .map(|folder| folder.kind);
+        if kind != Some(FolderKind::Drafts) {
+            return Err(OpError::InvalidArgs(format!("message {draft_id:?} is not a draft")));
+        }
+        if let Some(state) = self.outbox_lock_for(draft_id, Some(FolderKind::Drafts))? {
+            return Err(OpError::InvalidArgs(outbox_lock_message("draft", draft_id, state, action)));
+        }
+        Ok(index)
+    }
+
+    /// Refuse an attachment edit when the store moved on since this engine loaded the draft.
+    ///
+    /// The store is the authority: another process may have saved a newer body, replaced the
+    /// attachment set, sent the draft or moved it. Writing this engine's stale snapshot would
+    /// overwrite that work or resurrect a Sent row in Drafts. The same snapshot comparison used by
+    /// `message_send` makes the answer precise.
+    fn ensure_draft_current(&self, current: &Message) -> Result<(), OpError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let changed = || draft_changed(&current.summary.id);
+        let row = store.get_message(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(&changed)?;
+        if row.summary.folder_id != current.summary.folder_id {
+            return Err(draft_changed(&current.summary.id));
+        }
+        let draft = store.get_draft(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(&changed)?;
+        if !self.draft_snapshot_matches(current, &draft, store)? {
+            return Err(draft_changed(&current.summary.id));
+        }
+        Ok(())
+    }
+
+    fn draft_account_id(&self, draft_id: &str) -> Result<String, OpError> {
+        let folder_id = self
+            .messages
+            .iter()
+            .find(|message| message.summary.id == draft_id)
+            .map(|message| message.summary.folder_id.clone())
+            .ok_or_else(|| unknown_message(draft_id))?;
+        self.folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .map(|folder| folder.account_id.clone())
+            .ok_or_else(|| OpError::Failed(format!("draft {draft_id:?} lives in an unknown folder")))
     }
 
     /// The store, or a readable reason why this engine cannot touch attachment bytes.
@@ -2933,6 +3242,98 @@ fn validate_header(field: &str, value: &str, max_bytes: usize) -> Result<(), OpE
     Ok(())
 }
 
+/// Normalise a parent `Message-ID` for `drafts.in_reply_to`: one pair of angle brackets is accepted
+/// and removed, the value is bounded, ASCII and free of controls and whitespace, so the serializer
+/// can emit it without a second decision.
+fn normalize_reply_parent(raw: &str) -> Result<String, OpError> {
+    let trimmed = raw.trim();
+    let inner = trimmed.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')).unwrap_or(trimmed);
+    if inner.is_empty() {
+        return Err(OpError::InvalidArgs("in_reply_to must name the parent Message-ID".to_owned()));
+    }
+    if inner.len() > 900 {
+        return Err(OpError::InvalidArgs("in_reply_to is longer than 900 bytes".to_owned()));
+    }
+    if !inner.is_ascii() || inner.chars().any(|character| character.is_control() || character.is_whitespace() || character == '<' || character == '>')
+    {
+        return Err(OpError::InvalidArgs(
+            "in_reply_to must be one Message-ID without whitespace, controls, non-ASCII text or a second bracket pair".to_owned(),
+        ));
+    }
+    Ok(inner.to_owned())
+}
+
+/// A signature is body text: bounded, no CR and no other control character. Newline and tab are the
+/// only allowed controls, because the editor is plain text and a tab can be a deliberate indent.
+fn validate_signature(signature: &str) -> Result<(), OpError> {
+    if signature.len() > MAX_SIGNATURE_BYTES {
+        return Err(OpError::InvalidArgs(format!("signature is {} bytes; this build accepts at most {MAX_SIGNATURE_BYTES}", signature.len())));
+    }
+    if let Some(character) = signature.chars().find(|character| character.is_control() && !matches!(character, '\n' | '\t')) {
+        return Err(OpError::InvalidArgs(format!(
+            "signature must not contain control characters except newline and tab (found U+{:04X})",
+            u32::from(character)
+        )));
+    }
+    Ok(())
+}
+
+/// Apply the import naming rule to metadata supplied through `draft_save`: sanitize every name and
+/// rename duplicates. Bytes still come only from `draft_attachment_add`; this keeps a metadata-only
+/// row from carrying a device name, a tab or a duplicate that the import path would have repaired.
+fn normalize_draft_attachment_names(mut draft: DraftContent) -> DraftContent {
+    let mut normalized: Vec<Attachment> = Vec::with_capacity(draft.attachments.len());
+    for mut attachment in draft.attachments.drain(..) {
+        // CR/LF/NUL are a hard error on the import path and in the serializer; keep that rule for
+        // metadata too (validate_draft rejects the untouched name below).
+        let sanitized = if attachment.filename.chars().any(|character| matches!(character, '\r' | '\n' | '\0')) {
+            attachment.filename.clone()
+        } else {
+            postino_sync::sanitize_filename(&attachment.filename)
+        };
+        attachment.filename = unique_attachment_name(&sanitized, &normalized);
+        let derived = postino_sync::mime_for_filename(&attachment.filename);
+        if postino_sync::normalize_mime_type(&attachment.mime).as_deref() != Some(derived) {
+            attachment.mime = derived.to_owned();
+        }
+        normalized.push(attachment);
+    }
+    draft.attachments = normalized;
+    draft
+}
+
+/// Rename a duplicate to `name (2).ext`, keeping the extension and the 255-byte bound.
+fn unique_attachment_name(name: &str, existing: &[Attachment]) -> String {
+    if !existing.iter().any(|attachment| attachment.filename.eq_ignore_ascii_case(name)) {
+        return name.to_owned();
+    }
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => (stem, format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    for counter in 2..=10_000u32 {
+        let candidate = format!("{stem} ({counter}){extension}");
+        let candidate = postino_sync::sanitize_filename(&candidate);
+        if !candidate.is_empty() && !existing.iter().any(|attachment| attachment.filename.eq_ignore_ascii_case(&candidate)) {
+            return candidate;
+        }
+    }
+    // A draft has at most 20 attachments, so this is only reachable with a damaged row set.
+    format!("{stem}-{}{extension}", existing.len().saturating_add(1))
+}
+
+/// A draft-scoped attachment id that is free on this draft. The prefix is the draft id, so an id can
+/// never collide with another message's attachment.
+fn next_attachment_id(draft_id: &str, existing: &[Attachment]) -> String {
+    for counter in 0..10_000usize {
+        let candidate = format!("{draft_id}_att_{counter}");
+        if !existing.iter().any(|attachment| attachment.id == candidate) {
+            return candidate;
+        }
+    }
+    format!("{draft_id}_att_overflow")
+}
+
 fn validate_unique_attachment_ids(attachments: &[Attachment]) -> Result<(), OpError> {
     let mut seen = BTreeSet::new();
     for attachment in attachments {
@@ -2947,9 +3348,10 @@ fn validate_unique_attachment_ids(attachments: &[Attachment]) -> Result<(), OpEr
 }
 
 fn validate_attachments(attachments: &[Attachment]) -> Result<(), OpError> {
-    if attachments.len() > MAX_ATTACHMENTS {
-        return Err(OpError::InvalidArgs(format!("a draft can carry at most {MAX_ATTACHMENTS} attachments")));
+    if attachments.len() > MAX_DRAFT_ATTACHMENTS {
+        return Err(OpError::InvalidArgs(format!("a draft can carry at most {MAX_DRAFT_ATTACHMENTS} attachments")));
     }
+    let mut total = 0u64;
     for attachment in attachments {
         validate_header("attachment id", &attachment.id, 128)?;
         validate_header("attachment filename", &attachment.filename, 255)?;
@@ -2957,9 +3359,21 @@ fn validate_attachments(attachments: &[Attachment]) -> Result<(), OpError> {
         if attachment.filename.trim().is_empty() || attachment.filename.contains(['/', '\\', ':']) {
             return Err(OpError::InvalidArgs("attachment filenames must be a plain file name".to_owned()));
         }
-        if attachment.size > MAX_ATTACHMENT_BYTES {
-            return Err(OpError::InvalidArgs(format!("attachment {:?} is larger than {MAX_ATTACHMENT_BYTES} bytes", attachment.filename)));
+        if attachment.filename.chars().any(is_bidi_or_format_control) {
+            return Err(OpError::InvalidArgs("attachment filenames must not contain bidi or format control characters".to_owned()));
         }
+        if attachment.size > MAX_ATTACHMENT_BYTES {
+            return Err(OpError::InvalidArgs(format!(
+                "attachment {:?} is {} bytes; this build accepts at most {MAX_ATTACHMENT_BYTES} bytes per file",
+                attachment.filename, attachment.size
+            )));
+        }
+        total = total.saturating_add(attachment.size);
+    }
+    if total > MAX_ATTACHMENT_TOTAL_BYTES {
+        return Err(OpError::InvalidArgs(format!(
+            "the attachments total {total} bytes; this build accepts at most {MAX_ATTACHMENT_TOTAL_BYTES} bytes per message"
+        )));
     }
     Ok(())
 }
@@ -3030,6 +3444,7 @@ mod tests {
             subject: subject.to_owned(),
             body_text: body.to_owned(),
             attachments: Vec::new(),
+            in_reply_to: None,
         }
     }
 

@@ -80,7 +80,11 @@ fn hex_digit(value: u8) -> char {
 
 /// Base64 with 76-character lines separated by CRLF. No trailing CRLF is added.
 pub(crate) fn base64_lines(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().saturating_div(3).saturating_add(1).saturating_mul(78));
+    // Reserve the exact encoded size plus the CRLFs between lines. The old `len/3 * 78`
+    // over-reserved by ~31x and made a 25 MiB attachment ask for hundreds of MiB.
+    let encoded_len = data.len().saturating_add(2).saturating_div(3).saturating_mul(4);
+    let line_breaks = encoded_len.saturating_sub(1).saturating_div(76);
+    let mut out = String::with_capacity(encoded_len.saturating_add(line_breaks.saturating_mul(2)));
     let mut line_len = 0usize;
     for chunk in data.chunks(3) {
         let a = chunk.first().copied().unwrap_or(0);
@@ -220,6 +224,18 @@ mod tests {
         assert_eq!(lines[0].len(), 76);
         assert_eq!(lines[2].len(), 8);
         assert_eq!(base64_word(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn base64_reserves_the_encoded_size_not_31_times_the_input() {
+        let data = vec![0x5Au8; 1024 * 1024];
+        let encoded = base64_lines(&data);
+        let encoded_len = data.len().div_ceil(3) * 4;
+        let breaks = encoded_len.saturating_sub(1) / 76;
+        let expected = encoded_len + breaks * 2;
+        assert!(encoded.len() <= expected + 4, "{} > {expected}", encoded.len());
+        assert!(encoded.capacity() <= expected + 4096, "capacity {} for {expected} bytes", encoded.capacity());
+        assert!(!encoded.contains("\r\n\r\n"));
     }
 
     #[test]

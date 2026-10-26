@@ -259,7 +259,7 @@ pub(crate) fn draft_message(draft: &store::Draft, account: &Account, folder_id: 
     })
 }
 
-fn address(row: &store::Address) -> Address {
+pub(crate) fn address(row: &store::Address) -> Address {
     Address::new(row.name.clone(), row.email.clone())
 }
 

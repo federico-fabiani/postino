@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use base64::Engine as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -16,6 +17,11 @@ use crate::engine::{AccountSetup, Engine, OpError, unknown_account, unknown_fold
 use crate::model::{
     AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary, Provider,
 };
+
+/// The largest standard-base64 string that can decode to [`crate::MAX_ATTACHMENT_BYTES`]. Checked
+/// before allocating the decoded buffer: a hostile caller cannot make the engine allocate 25 MiB
+/// from a one-line "payload" that claims to be enormous.
+const MAX_ATTACHMENT_BASE64_CHARS: usize = ((crate::engine::MAX_ATTACHMENT_BYTES as usize).saturating_add(2) / 3).saturating_mul(4);
 
 /// One operation as the CLI and MCP see it.
 #[derive(Debug, Clone, Serialize)]
@@ -96,8 +102,24 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "draft_save",
             "Save a draft",
-            "Create or patch a draft in Drafts. Omit `id` to create one: absent content fields are empty. With `id`, an absent field keeps its current value and a present field replaces it, including an empty list or empty string. `account` chooses the account on create; it is required when several accounts exist.",
+            "Create or patch a draft in Drafts. Omit `id` to create one: absent content fields are empty. With `id`, an absent field keeps its current value and a present field replaces it, including an empty list or empty string. `account` chooses the account on create; it is required when several accounts exist. `attachments` carries metadata only; use draft_attachment_add for the bytes. `in_reply_to` stores the parent Message-ID for a reply and is serialized as In-Reply-To/References.",
             DraftSaveArgs,
+            false,
+            false
+        ),
+        def!(
+            "draft_attachment_add",
+            "Attach bytes to a draft",
+            "Add one file to a draft and store its exact bytes in the encrypted local blob store. `data_base64` is bounded to 25 MiB decoded and is rejected on an invalid alphabet; the bytes leave the caller and are stored only in the encrypted store. At most 20 files, 25 MiB per file and 25 MiB total; a duplicate filename is renamed (`name (2).ext`) and the filename is sanitized. The MIME type comes from the extension table; a declared type is accepted only when it agrees with that table, so an unknown extension is application/octet-stream. MCP callers send bytes, never a filesystem path. Returns the updated draft.",
+            DraftAttachmentAddArgs,
+            false,
+            false
+        ),
+        def!(
+            "draft_attachment_remove",
+            "Remove an attachment from a draft",
+            "Remove one attachment row from a draft by attachment id or exact filename. The encrypted blob stays in the content-addressed store until a later garbage collector, so this frees the row, not necessarily the disk file. Returns the updated draft.",
+            DraftAttachmentRemoveArgs,
             false,
             false
         ),
@@ -224,6 +246,14 @@ pub fn op_defs() -> Vec<OpDef> {
             true
         ),
         def!(
+            "account_signature_set",
+            "Set an account signature",
+            "Set the plain-text signature of one account, up to 4 KiB. Newlines and tabs are the only control characters accepted; HTML, images and tracking are not supported. The signature belongs to the account and is inserted in new, reply and forward messages for that identity; a draft already saved keeps the text it owns. Returns the account view.",
+            AccountSignatureArgs,
+            false,
+            false
+        ),
+        def!(
             "account_test",
             "Test an account",
             "Log in with the account's stored credential and list its folders. Read-only: nothing is written, no mailbox is selected and no message is fetched. Returns the selectable folder count and the server capabilities. A rejected credential is an auth error naming the provider and the likely cause; the cached mail is unchanged.",
@@ -347,6 +377,10 @@ pub struct DraftSaveArgs {
     /// Attachment metadata. Omit to keep the current attachments on update; an empty list clears
     /// them. The bytes are stored through the encrypted attachment seam; sending requires them.
     pub attachments: Option<Vec<DraftAttachment>>,
+    /// Parent `Message-ID` for a reply, with or without angle brackets. Omit on update to keep the
+    /// stored linkage; a new draft starts with none. It is serialized as `In-Reply-To` and the
+    /// parent id alone is written to `References` until P9 carries the full chain.
+    pub in_reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -358,6 +392,38 @@ pub struct DraftAttachment {
     pub mime: String,
     /// Declared size. The exact stored size is read back from the encrypted blob after a write.
     pub size: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DraftAttachmentAddArgs {
+    /// Draft id returned by draft_save.
+    pub draft: String,
+    /// File name. It is sanitized; CR, LF and NUL are refused and a duplicate is renamed.
+    pub filename: String,
+    /// Declared `type/subtype`. It is only a hint: the extension table wins unless the declaration
+    /// agrees with it, and unknown extensions become application/octet-stream.
+    pub mime: Option<String>,
+    /// Standard base64 of the exact bytes, at most 25 MiB decoded.
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DraftAttachmentRemoveArgs {
+    /// Draft id returned by draft_save.
+    pub draft: String,
+    /// Attachment id returned by draft_save or message_get, or its exact filename.
+    pub attachment: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountSignatureArgs {
+    /// Account id returned by accounts_list.
+    pub account: String,
+    /// Plain text, at most 4 KiB, with newline and tab as the only control characters.
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -620,6 +686,11 @@ pub struct DraftSave {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftAttachmentResult {
+    pub draft: Message,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendQueued {
     #[serde(flatten)]
     pub queued: crate::outbox::SendQueued,
@@ -684,6 +755,11 @@ pub struct AccountAdd {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountUpdate {
+    pub account: AccountView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountSignature {
     pub account: AccountView,
 }
 
@@ -786,6 +862,27 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let content = draft_content(engine, args)?;
             value(DraftSave { draft: content })
         }
+        "draft_attachment_add" => {
+            let args: DraftAttachmentAddArgs = parse(args)?;
+            if args.data_base64.len() > MAX_ATTACHMENT_BASE64_CHARS {
+                return Err(OpError::InvalidArgs(format!(
+                    "data_base64 is {} characters; the decoded payload must be at most {} bytes ({} base64 characters)",
+                    args.data_base64.len(),
+                    crate::engine::MAX_ATTACHMENT_BYTES,
+                    MAX_ATTACHMENT_BASE64_CHARS
+                )));
+            }
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(args.data_base64.as_bytes())
+                .map_err(|_| OpError::InvalidArgs("data_base64 is not valid standard base64".to_owned()))?;
+            let draft = engine.add_draft_attachment(&args.draft, &args.filename, args.mime.as_deref(), &data)?;
+            value(DraftAttachmentResult { draft })
+        }
+        "draft_attachment_remove" => {
+            let args: DraftAttachmentRemoveArgs = parse(args)?;
+            let draft = engine.remove_draft_attachment(&args.draft, &args.attachment)?;
+            value(DraftAttachmentResult { draft })
+        }
         "message_send" => {
             let args: MessageSendArgs = parse(args)?;
             value(SendQueued { queued: engine.message_send(&args.draft)? })
@@ -882,6 +979,10 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             };
             value(AccountUpdate { account: engine.update_account(request)? })
         }
+        "account_signature_set" => {
+            let args: AccountSignatureArgs = parse(args)?;
+            value(AccountSignature { account: engine.set_account_signature(&args.account, &args.signature)? })
+        }
         "account_test" => {
             let args: AccountTestArgs = parse(args)?;
             value(engine.test_account(&args.id)?)
@@ -905,7 +1006,7 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
 /// Merge a `draft_save` request into full draft content. On create absent fields are empty; on
 /// update absent fields keep the current value and present fields (including empty ones) replace it.
 fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, OpError> {
-    let DraftSaveArgs { id, account, to, cc, bcc, subject, body_text, attachments } = args;
+    let DraftSaveArgs { id, account, to, cc, bcc, subject, body_text, attachments, in_reply_to } = args;
     let content = match &id {
         Some(id) => {
             let current = engine.message(id).ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}; omit id to create a draft")))?;
@@ -919,6 +1020,7 @@ fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, Op
                     Some(attachments) => draft_attachments(attachments),
                     None => current.attachments.clone(),
                 },
+                in_reply_to: in_reply_to.or_else(|| engine.draft_reply_link(id).map(str::to_owned)),
             }
         }
         None => DraftContent {
@@ -928,6 +1030,7 @@ fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, Op
             subject: subject.unwrap_or_default(),
             body_text: body_text.unwrap_or_default(),
             attachments: attachments.map(draft_attachments).unwrap_or_default(),
+            in_reply_to,
         },
     };
     engine.save_draft(account.as_deref(), id.as_deref(), content)
@@ -1180,6 +1283,30 @@ mod tests {
         let dry = find("send_dry_run");
         assert!(dry.description.contains("without writing a queue row"), "{}", dry.description);
         assert!(!defs.iter().any(|def| def.name == "draft_send"), "the local-only draft_send operation must be gone");
+    }
+
+    #[test]
+    fn compose_depth_operations_have_the_documented_surface() {
+        let defs = super::op_defs();
+        let find = |name: &str| defs.iter().find(|def| def.name == name).unwrap_or_else(|| panic!("{name} is missing"));
+        for name in ["draft_attachment_add", "draft_attachment_remove", "account_signature_set"] {
+            let def = find(name);
+            assert!(!def.read_only, "{name} is a write");
+            assert!(!def.destructive, "{name} must not claim to be destructive");
+            assert!(!def.sensitive, "{name} takes no credential");
+            assert!(def.input_schema.is_object(), "{name} has no object schema");
+        }
+        let add = find("draft_attachment_add");
+        let properties = add.input_schema["properties"].as_object().expect("properties");
+        assert!(properties.contains_key("data_base64"), "{properties:?}");
+        assert!(!properties.contains_key("path"), "the operation must never accept a filesystem path");
+        assert!(add.description.contains("encrypted"), "{}", add.description);
+        assert!(add.description.contains("25 MiB"), "{}", add.description);
+        let signature = find("account_signature_set");
+        assert!(signature.description.contains("4 KiB"), "{}", signature.description);
+        let save = find("draft_save");
+        assert!(save.input_schema["properties"]["in_reply_to"].is_object(), "draft_save has no in_reply_to field");
+        assert!(save.description.contains("metadata only"), "{}", save.description);
     }
 
     #[test]

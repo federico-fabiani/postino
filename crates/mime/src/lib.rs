@@ -40,4 +40,6 @@ pub use limits::Limits;
 pub use model::{Attachment, Disposition, Mailbox, ParsedMessage, Warning};
 pub use parse::parse;
 pub use sanitize::{Sanitized, sanitize_html};
-pub use serialize::{Envelope, OutgoingAttachment, OutgoingMessage, Serialized, serialize};
+pub use serialize::{
+    Envelope, OutgoingAttachment, OutgoingMessage, Serialized, mime_for_filename, normalize_mime_type, sanitize_filename, serialize,
+};

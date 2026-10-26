@@ -499,19 +499,97 @@ fn clean_outgoing_filename(raw: &str) -> Result<String, MimeError> {
     Ok(cleaned)
 }
 
-/// Sanitize a file name for use as one path component: no separators, no control characters,
-/// no trailing dots or spaces, at most 255 bytes.
-pub(crate) fn sanitize_filename(raw: &str) -> String {
+/// Sanitize a file name for use as one path component: no separators, no control characters, no
+/// bidi/format controls, no Windows reserved device name, no trailing dots or spaces, at most 255
+/// bytes.
+///
+/// This is the one sanitizer for an attachment name that arrives from the composer, the CLI, MCP or
+/// a received message. It is deliberately lossy: a hostile name is repaired, never allowed to fail
+/// the whole message or to reach a header.
+pub fn sanitize_filename(raw: &str) -> String {
     let mut cleaned = String::with_capacity(raw.len());
     for character in raw.chars() {
-        if character.is_control() || matches!(character, '/' | '\\' | ':') {
+        if character.is_control() || is_bidi_or_format_control(character) || matches!(character, '/' | '\\' | ':') {
             continue;
         }
         cleaned.push(character);
     }
     let cleaned = truncate_chars(&cleaned, 255);
     let cleaned = cleaned.trim_matches(|character: char| character == ' ' || character == '\t' || character == '.');
-    if cleaned.is_empty() || cleaned == "." || cleaned == ".." { String::new() } else { cleaned.to_owned() }
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return String::new();
+    }
+    // A Windows device name cannot be created as a file, and some clients refuse it in a
+    // Content-Disposition. Rename it instead of dropping the attachment.
+    let stem = cleaned.split('.').next().unwrap_or(cleaned).trim_end();
+    if is_windows_reserved(stem) {
+        let prefixed = format!("_{cleaned}");
+        return truncate_chars(&prefixed, 255).trim_end_matches([' ', '.']).to_owned();
+    }
+    cleaned.to_owned()
+}
+
+/// Bidi and zero-width format controls: their only job in a filename is to disguise the extension
+/// or the real name. The engine rejects them in labels and the attachment path strips them.
+fn is_bidi_or_format_control(character: char) -> bool {
+    matches!(character, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+}
+
+/// A Windows reserved device name, matched on the stem ignoring case and trailing spaces.
+fn is_windows_reserved(stem: &str) -> bool {
+    let uppercase = stem.trim_end().to_ascii_uppercase();
+    matches!(uppercase.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || (uppercase.len() == 4
+            && (uppercase.starts_with("COM") || uppercase.starts_with("LPT"))
+            && uppercase.as_bytes().get(3).is_some_and(|digit| matches!(digit, b'1'..=b'9')))
+}
+
+/// Normalise a declared `type/subtype` when it is syntactically valid. Parameters, whitespace
+/// inside a token and an unknown type are refused: the caller falls back to
+/// `application/octet-stream` instead of trusting a label.
+pub fn normalize_mime_type(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let (ctype, subtype) = trimmed.split_once('/')?;
+    if ctype.is_empty()
+        || subtype.is_empty()
+        || subtype.contains('/')
+        || !ctype.chars().all(crate::util::is_token_char)
+        || !subtype.chars().all(crate::util::is_token_char)
+    {
+        return None;
+    }
+    Some(format!("{}/{}", ctype.to_ascii_lowercase(), subtype.to_ascii_lowercase()))
+}
+
+/// The conservative MIME type for a file name. It never inspects the bytes: the extension is a
+/// label, not a promise, and an unknown extension is `application/octet-stream`.
+pub fn mime_for_filename(filename: &str) -> &'static str {
+    let extension = filename.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase()).unwrap_or_default();
+    match extension.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "eml" => "message/rfc822",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Sanitize an attachment name received in a message. Unlike the serializer this is lossy: a
@@ -643,6 +721,33 @@ mod tests {
         assert_eq!(sanitize_filename("  ..  "), "");
         assert_eq!(sanitize_filename("ok.pdf"), "ok.pdf");
         assert!(sanitize_filename(&"è".repeat(200)).len() <= 255);
+    }
+
+    #[test]
+    fn strips_bidi_controls_and_renames_windows_device_names() {
+        assert_eq!(sanitize_filename("fat\u{202e}tura.pdf"), "fattura.pdf");
+        assert_eq!(sanitize_filename("zero\u{200b}width.txt"), "zerowidth.txt");
+        assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename("lpt9.log"), "_lpt9.log");
+        assert_eq!(sanitize_filename("console.txt"), "console.txt", "only the exact device stem is reserved");
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("nome.txt "), "nome.txt");
+        assert!(sanitize_filename(&"a".repeat(300)).len() <= 255);
+        let reserved_edge = format!("CON.{}", "a".repeat(251));
+        let cleaned = sanitize_filename(&reserved_edge);
+        assert_eq!(cleaned.len(), 255, "the underscore must fit inside the 255-byte cap");
+        assert!(cleaned.starts_with("_CON."));
+    }
+
+    #[test]
+    fn normalizes_declared_mime_and_falls_back_to_octet_stream() {
+        assert_eq!(normalize_mime_type("Application/PDF").as_deref(), Some("application/pdf"));
+        assert_eq!(normalize_mime_type("text/plain; charset=utf-8"), None);
+        assert_eq!(normalize_mime_type("not-a-type"), None);
+        assert_eq!(normalize_mime_type("text/plain/extra"), None);
+        assert_eq!(mime_for_filename("REPORT.PDF"), "application/pdf");
+        assert_eq!(mime_for_filename("no-extension"), "application/octet-stream");
+        assert_eq!(mime_for_filename("script.js"), "application/octet-stream", "an executable is not advertised by extension");
     }
 
     #[test]

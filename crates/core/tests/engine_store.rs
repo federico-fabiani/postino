@@ -173,6 +173,7 @@ fn draft(subject: &str, body: &str) -> DraftContent {
         subject: subject.to_owned(),
         body_text: body.to_owned(),
         attachments: Vec::new(),
+        in_reply_to: None,
     }
 }
 
@@ -664,7 +665,7 @@ fn a_subject_only_patch_keeps_the_html_body_and_the_reply_link() {
                 cc: draft_row.cc,
                 bcc: draft_row.bcc,
                 subject: draft_row.subject,
-                in_reply_to: Some("<msg_001@example.com>".to_owned()),
+                in_reply_to: Some("msg_001@example.com".to_owned()),
             })
             .expect("link the reply");
     }
@@ -683,7 +684,7 @@ fn a_subject_only_patch_keeps_the_html_body_and_the_reply_link() {
     assert_eq!(message.body_html.as_deref(), Some(HTML), "the subject-only patch cleared body_html in the store");
     assert_eq!(message.body_text, "Corpo originale");
     let stored = fixture.open().get_draft(&id).expect("draft row").expect("revision row");
-    assert_eq!(stored.in_reply_to.as_deref(), Some("<msg_001@example.com>"), "the subject-only patch cleared in_reply_to");
+    assert_eq!(stored.in_reply_to.as_deref(), Some("msg_001@example.com"), "the subject-only patch cleared in_reply_to");
     assert_eq!(stored.revision, 3);
 }
 

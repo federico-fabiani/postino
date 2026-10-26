@@ -1,8 +1,9 @@
 # Development
 
 > **Status:** M0 + U0.5 labels + P3c engine on the encrypted store + P4a MIME crate + P4b encrypted
-> attachment blobs + P5a IMAP client + P5b sync into the store + P2b states/accessibility ·
-> **Last updated:** 2026-10-25
+> attachment blobs + P5a IMAP client + P5b sync into the store + P2b states/accessibility + P6/P7
+> app, SMTP and outbox + P8 compose attachments, signatures and reply headers ·
+> **Last updated:** 2026-10-26
 
 ## 1. Toolchain
 
@@ -114,11 +115,12 @@ What is still demo or missing:
   an APPEND that follows a long submission, still owns a full window. There is no daemon, pipe or
   cross-process lock yet (M4): do not copy or move the database while a command runs, and do not treat
   two clients as two independent mailboxes.
-- IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission and the outbox exist
-  (P5-P7). Still missing: FTS5 search and threading (P9), the daemon and a scheduled send that runs
-  with the app closed (M4), HTML rendering (M5), compose attachments/signatures (P8) and Gmail OAuth
-  (P12). `message_send` queues real mail; the desktop send worker (which polls the store every two
-  seconds) and `postino send` process the outbox, so a future `--at` row waits until one of them runs.
+- IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox and compose depth
+  (attachment bytes, per-account signatures, reply/forward headers) exist (P5-P8). Still missing: FTS5
+  search and threading (P9), the daemon and a scheduled send that runs with the app closed (M4), HTML
+  rendering (M5), server-side signatures and Gmail OAuth (P12). `message_send` queues real mail; the
+  desktop send worker (which polls the store every two seconds) and `postino send` process the outbox,
+  so a future `--at` row waits until one of them runs.
   A plain `postino send` (no `--at`) waits the 5-second undo window and submits in the same command.
   MCP only queues.
 - Sync writes `uid`, `Message-ID` and the RFC 822 size; a local draft keeps them empty until the
@@ -227,6 +229,19 @@ they have a reason to exist.
   corruption surfaces as `OpError::Failed` without poisoning the message; the demo engine, an unknown
   attachment and an attachment without bytes are readable errors; a 4 MiB blob exercises the bounded
   path without a timing assertion.
+- **Compose depth (P8):** exact bytes through base64 → encrypted blob → draft → reopen → P7 outbox →
+  MIME (SHA-256 equal), duplicate/traversal/reserved/bidi filenames, the 20-file/25 MiB-per-file/
+  25 MiB-total caps, a 0-byte file and exactly 25 MiB, invalid/oversized base64, missing and corrupt
+  blob refusals naming the file, forward bytes and a missing forward blob, per-account signature
+  persistence and 4 KiB/control limits, the reply-all/Reply-To/Bcc/dedupe/subject/quote matrices,
+  header round trip and the stale external-link refusal, a synced `Reply-To` in `meta`, CLI
+  `draft attach/detach` and `account signature`, the MCP schema with `data_base64` and no `path`, and
+  headless picker/drop/keyboard/980×600 light/dark UI tests. The review closure adds the pristine-reply
+  Send/Save/Esc test, type→attach/remove→send/close body preservation, failed-forward blocking and
+  recovery, stale two-engine attachment edits, valid MIME lies, a 25 MiB base64 capacity regression,
+  GUI filename refusal, strip-drop dedupe, signature false-positive/byte-count/focus/close, demo
+  local remove, large-parent save copy, metadata naming parity, bounded MCP lines and bounded CLI
+  signature stdin. No test opens a native dialog or browser.
 - **Platform:** keyring load-or-create against `keyring_core::mock` only; the native vault is a
   manual, tagged smoke test and never part of the default suite.
 - **UI:** headless render with `Context::run_ui` and `PostinoApp::show`, including the gallery,
@@ -243,7 +258,7 @@ they have a reason to exist.
 - **Test infrastructure:** the fake IMAP/SMTP servers and TLS fixture live in `postino-testkit` and
   run in CI. Property tests for the network parsers and fuzzing for MIME remain future work.
 
-### Desktop OS seams (P6c)
+### Desktop OS seams (P6c, P8)
 
 The desktop shell is the only place that leaves Rust for a user action. Each exit is a trait in
 `apps/postino-app/src/seams.rs`; production installs the real adapter, tests and screenshots install
@@ -261,8 +276,18 @@ an unavailable or recording one:
   `CancellingFileSaver` is the default in the demo/screenshot constructor so a stray click cannot
   open a dialog; a real `--demo` launch also disables Save because the synthetic attachment has no
   bytes.
+- `FilePicker` — `rfd`'s multi-file picker in production; `RecordingFilePicker` in tests and an
+  unavailable picker in the demo/screenshot constructors. It returns paths only: the app bounds each
+  file (metadata and bytes read, 25 MiB), reads it locally and hands the bytes to the engine, so the
+  engine and MCP still accept bytes and never a path. A cancelled picker returns an empty list and
+  writes nothing. `egui::DroppedFile` uses the same reader; the composer component itself never opens
+  a file.
 - `FolderOpener` — the platform file manager in production; `RecordingFolderOpener` in tests and an
   unavailable adapter elsewhere. It only receives the blob directory derived from the store path.
+
+The CLI's `draft attach` error names the path the caller explicitly supplied; that is local command
+output, not a log line. The desktop app names only the file in its toast. Neither path is included in
+any `log::` call.
 
 Keeping the seam at the action boundary, not inside the engine, is deliberate: the scanner, filename
 rules and warnings stay pure and testable, and no native dialog, browser or shell runs in CI. The
@@ -319,11 +344,16 @@ cargo run -p postino-app -- --screenshot settings --out docs/images/postino-p6c-
 cargo run -p postino-app -- --screenshot settings --dark --out docs/images/postino-p6c-settings-dark.png
 cargo run -p postino-app -- --screenshot settings --size 980x600 --out docs/images/postino-p6c-settings-980.png
 cargo run -p postino-app -- --screenshot settings --size 980x600 --dark --out docs/images/postino-p6c-settings-980-dark.png
+cargo run -p postino-app -- --screenshot compose --size 980x600 --out docs/images/postino-p8-compose-980.png
+cargo run -p postino-app -- --screenshot compose --size 980x600 --dark --out docs/images/postino-p8-compose-980-dark.png
+cargo run -p postino-app -- --screenshot settings_signature --size 980x600 --out docs/images/postino-p8-signature-980.png
+cargo run -p postino-app -- --screenshot settings_signature --size 980x600 --dark --out docs/images/postino-p8-signature-980-dark.png
 ```
 
 The states are `shell` (demo inbox, no selection), `reading` (first inbox message open),
 `reading_full` (the same message with the pane expanded), `compose` (the composer prefilled with
-the docs fixture), `palette` (command palette open), `labels` (Lavoro filter active, list visible),
+the docs fixture and two attachments with the P8 total), `palette` (command palette open), `labels`
+(Lavoro filter active, list visible),
 `label_menu` (a labelled message open with the modal label menu above its captured target),
 `label_editor` (the inline create editor open under the ETICHETTE header with a name typed),
 `empty_unread` (the inbox with every message read and the unread filter on), `empty_attachments`
@@ -333,13 +363,14 @@ the docs fixture), `palette` (command palette open), `labels` (Lavoro filter act
 with a seeded updated-at state), `offline` (a cached message open under the offline banner),
 `reading_attachments` (a deterministic sanitized message with one stored blocked remote image, a safe
 link and one PDF attachment in the pinned strip), `link_confirm` (the same message under the
-full-destination sheet, which shows the host/recipient line as well as the exact URL) and `settings`
-(the full settings dialog). The onboarding, mailbox, P6c and P6d scenes are deterministic fixtures;
-they do not read a store or touch the network, and the P6c scenes install the unavailable/cancelling
-seams so no native dialog or browser can open. The `reading_attachments` message is **stored truth**:
-its HTML is already sanitized (no remote `src`, no tracker) and `remote_images = 1` is the count sync
-would have written from the parser, so the capture neither parses nor fetches anything live.
-`--dark` applies the dark theme.
+full-destination sheet, which shows the host/recipient line as well as the exact URL), `settings`
+(the full settings dialog) and `settings_signature` (the same dialog with the per-account Firma editor
+open and a seeded signature). The onboarding, mailbox, P6c, P6d and P8 scenes are deterministic
+fixtures; they do not read a store or touch the network, and the P6c/P8 scenes install the
+unavailable/cancelling seams so no native dialog or browser can open. The `reading_attachments`
+message is **stored truth**: its HTML is already sanitized (no remote `src`, no tracker) and
+`remote_images = 1` is the count sync would have written from the parser, so the capture neither
+parses nor fetches anything live. `--dark` applies the dark theme.
 `--gallery` is a separate component review window, not a screenshot state, and cannot be combined
 with `--screenshot`.
 

@@ -16,7 +16,7 @@ use postino_store::{Account, AccountServer, AccountTls, Store};
 use postino_testkit::{FakeServer, TestFolder, USER, serve_mailbox};
 use zeroize::Zeroizing;
 
-use crate::seams::{FileSaver, FolderOpener, LinkOpener};
+use crate::seams::{FilePicker, FileSaver, FolderOpener, LinkOpener};
 
 #[derive(Default)]
 pub struct MemoryVault {
@@ -393,6 +393,54 @@ impl LinkOpener for RecordingLinkOpener {
             opened.push(url.to_owned());
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct RecordingFilePicker {
+    paths: Mutex<Option<Vec<PathBuf>>>,
+    calls: AtomicUsize,
+    fail: Mutex<Option<String>>,
+}
+
+impl RecordingFilePicker {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The next dialog returns these paths. `None` models a cancelled dialog (an empty list).
+    pub fn set_paths(&self, paths: Vec<PathBuf>) {
+        if let Ok(mut slot) = self.paths.lock() {
+            *slot = Some(paths);
+        }
+    }
+
+    pub fn cancel(&self) {
+        if let Ok(mut slot) = self.paths.lock() {
+            *slot = Some(Vec::new());
+        }
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    pub fn fail_with(&self, error: &str) {
+        if let Ok(mut fail) = self.fail.lock() {
+            *fail = Some(error.to_owned());
+        }
+    }
+}
+
+impl FilePicker for RecordingFilePicker {
+    fn choose_files(&self) -> Result<Vec<PathBuf>, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Ok(fail) = self.fail.lock()
+            && let Some(error) = fail.as_ref()
+        {
+            return Err(error.clone());
+        }
+        Ok(self.paths.lock().ok().and_then(|paths| paths.clone()).unwrap_or_default())
     }
 }
 

@@ -68,6 +68,14 @@ const SCHEMA_VERSION: u32 = 6;
 /// label id is never handed out again.
 pub const LABEL_SEQ_KEY: &str = "label_seq";
 
+/// Prefix of the `meta` key that keeps a received message's `Reply-To` list.
+///
+/// P8 needs the header for reply/reply-all, but the shipped message schema has no `reply_to`
+/// column and this package must not migrate. The value is the same JSON address list the message
+/// tables already use, keyed by local message id; P9 widens the schema and can move it into a
+/// column. The key is removed with its message.
+pub const REPLY_TO_KEY_PREFIX: &str = "reply_to:";
+
 /// Prefix of the `meta` key that holds one account's persisted sync status. The account id follows.
 /// `postino-sync` writes the JSON value; `Store::delete_account` removes it with the account.
 pub const SYNC_STATUS_KEY_PREFIX: &str = "sync_status:";

@@ -15,6 +15,7 @@ postino-core.workspace = true
 postino-platform.workspace = true
 postino-store.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 env_logger.workspace = true

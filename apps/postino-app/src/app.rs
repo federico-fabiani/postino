@@ -10,7 +10,7 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
-    RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
+    RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
     Account, Address, Attachment, DraftSave, Engine, FolderKind, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate,
@@ -23,8 +23,8 @@ use crate::boot::{self, BootFailure, Launch, StoreHandle};
 use crate::onboarding::{self, ConnectionError, ErrorKind, FocusField, FolderPreview, FolderRole, FoldersPreview, Onboarding, ProviderChoice, Stage};
 use crate::reading::{self, DangerousKind, ExtractedLink};
 use crate::seams::{
-    CancellingFileSaver, FileSaver, FolderOpener, LinkOpener, RfdFileSaver, SystemFolderOpener, SystemLinkOpener, UnavailableFolderOpener,
-    UnavailableLinkOpener,
+    CancellingFileSaver, FilePicker, FileSaver, FolderOpener, LinkOpener, RfdFilePicker, RfdFileSaver, SystemFolderOpener, SystemLinkOpener,
+    UnavailableFilePicker, UnavailableFolderOpener, UnavailableLinkOpener,
 };
 use crate::send_worker::{SendEvent, SendWorker, StoreSendBackend};
 use crate::settings::Settings;
@@ -38,7 +38,7 @@ use crate::ui::typography::{self, Role};
 use crate::ui::widgets::ComposerFocus;
 use crate::ui::widgets::{
     AUTOSAVE_DELAY, Badge, BadgeKind, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize,
-    ListRow, Menu, MenuItem, SearchField, SectionHeader, TextField, Toast, ToastKind, ToastResult, compose_body, quote_body, signature_body,
+    ListRow, Menu, MenuItem, SearchField, SectionHeader, TextField, Toast, ToastKind, ToastResult,
 };
 
 /// The shell scenes `--screenshot` can render. Add a label here and a branch in
@@ -67,6 +67,7 @@ pub enum ScreenshotState {
     ReadingAttachments,
     LinkConfirm,
     Settings,
+    SettingsSignature,
     Outbox,
 }
 
@@ -95,11 +96,12 @@ impl ScreenshotState {
             "reading_attachments" => Ok(Self::ReadingAttachments),
             "link_confirm" => Ok(Self::LinkConfirm),
             "settings" => Ok(Self::Settings),
+            "settings_signature" => Ok(Self::SettingsSignature),
             "outbox" => Ok(Self::Outbox),
             other => Err(format!(
                 "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
                  empty_unread, empty_attachments, empty_label_unread, onboarding_welcome, onboarding_provider, onboarding_form, onboarding_error, \
-                 onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, link_confirm, settings, outbox"
+                 onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, link_confirm, settings, settings_signature, outbox"
             )),
         }
     }
@@ -267,6 +269,7 @@ pub struct PostinoApp {
     /// installs the browser, rfd and file-manager adapters.
     link_opener: Arc<dyn LinkOpener>,
     file_saver: Arc<dyn FileSaver>,
+    file_picker: Arc<dyn FilePicker>,
     folder_opener: Arc<dyn FolderOpener>,
     /// A link waiting for the confirmation sheet. The URL has already passed the allowlist.
     pending_link: Option<PendingLink>,
@@ -283,6 +286,10 @@ pub struct PostinoApp {
     /// The widget to restore when the settings dialog closes.
     settings_return_focus: Option<Id>,
     settings_focus_pending: bool,
+    /// Per-account plain-text signature editor in Settings → Account. `None` while collapsed.
+    signature_editor: Option<SignatureEditor>,
+    /// The account whose signature button should get focus after Escape cancelled the editor.
+    signature_focus_account: Option<String>,
     /// Request focus on the sidebar account row on the next frame. Used after closing settings.
     focus_account_switcher: bool,
     /// The attribution document is a nested dialog, not a browser or a shell.
@@ -314,6 +321,9 @@ impl PostinoApp {
         app.settings_path = settings_path;
         app.link_opener = Arc::new(SystemLinkOpener);
         app.file_saver = Arc::new(RfdFileSaver);
+        if !app.demo {
+            app.file_picker = Arc::new(RfdFilePicker);
+        }
         app.folder_opener = Arc::new(SystemFolderOpener);
         if app.system_theme
             && let Some(theme) = cc.egui_ctx.system_theme()
@@ -432,6 +442,7 @@ impl PostinoApp {
             screenshot: None,
             link_opener: Arc::new(UnavailableLinkOpener),
             file_saver: Arc::new(CancellingFileSaver),
+            file_picker: Arc::new(UnavailableFilePicker),
             folder_opener: Arc::new(UnavailableFolderOpener),
             pending_link: None,
             attachment_warning: None,
@@ -441,6 +452,8 @@ impl PostinoApp {
             account_switcher_id: None,
             settings_return_focus: None,
             settings_focus_pending: false,
+            signature_editor: None,
+            signature_focus_account: None,
             focus_account_switcher: false,
             show_licences: false,
             licences_return_focus: None,
@@ -554,17 +567,22 @@ impl PostinoApp {
             ScreenshotState::Compose => {
                 let mut composer = ComposerState::new(ComposeMode::New);
                 composer.to = "Giulia Ferri <giulia.ferri@example.com>".to_owned();
-                composer.cc = "Marco Bianchi <marco.bianchi@example.com>".to_owned();
-                composer.show_cc = true;
                 composer.subject = "Preventivo sito web — bozza finale".to_owned();
-                composer.body = "Ciao Giulia,\n\nti confermo il preventivo per il sito: 2.400 € + IVA, consegna in tre settimane.\nResto a disposizione per la call di lunedì.\n\n-- \nFederico\nfederico@example.it"
-                    .to_owned();
-                composer.attachments = vec![Attachment {
-                    id: "att_screenshot".to_owned(),
-                    filename: "preventivo-postino.pdf".to_owned(),
-                    mime: "application/pdf".to_owned(),
-                    size: 248_320,
-                }];
+                composer.body = "Ciao Giulia,\n\nti confermo il preventivo per il sito: 2.400 € + IVA.".to_owned();
+                composer.attachments = vec![
+                    Attachment {
+                        id: "att_screenshot".to_owned(),
+                        filename: "preventivo-postino.pdf".to_owned(),
+                        mime: "application/pdf".to_owned(),
+                        size: 248_320,
+                    },
+                    Attachment {
+                        id: "att_screenshot_2".to_owned(),
+                        filename: "planimetria-ufficio.png".to_owned(),
+                        mime: "image/png".to_owned(),
+                        size: 1_048_576,
+                    },
+                ];
                 composer.saved_at = Some(format_time(self.now_utc));
                 self.start_composer(composer);
             }
@@ -709,6 +727,22 @@ impl PostinoApp {
                 self.store_path = Some(PathBuf::from("C:/Users/demo/AppData/Local/Postino/mail.db"));
                 self.show_accounts_dialog = true;
                 self.settings_focus_pending = false;
+                self.status.clear();
+            }
+            ScreenshotState::SettingsSignature => {
+                self.clear_selection();
+                self.close_reading();
+                self.demo = false;
+                self.show_accounts_dialog = true;
+                self.settings_focus_pending = false;
+                if let Some(account) = self.engine.accounts().first().cloned() {
+                    self.signature_editor = Some(SignatureEditor {
+                        account: account.id,
+                        text: "Federico\nStudio Postino · example.it\n+39 000 000 0000".to_owned(),
+                        focus: false,
+                        error: None,
+                    });
+                }
                 self.status.clear();
             }
             ScreenshotState::Outbox => {
@@ -2824,7 +2858,7 @@ impl PostinoApp {
             return;
         };
         let mut state = ComposerState::new(ComposeMode::New);
-        state.body = signature_body(&account.signature);
+        state.body = postino_core::new_message_body(&account.signature);
         self.start_composer(state);
     }
 
@@ -2837,26 +2871,28 @@ impl PostinoApp {
             self.status = "Nessun account configurato".to_owned();
             return;
         };
-        let own = account.email.trim().to_ascii_lowercase();
-        let (to, cc) =
-            if mode == ComposeMode::Forward { (Vec::new(), Vec::new()) } else { reply_recipients(&message, &own, mode == ComposeMode::ReplyAll) };
-        let subject = match mode {
-            ComposeMode::Forward => forward_subject(&message.summary.subject),
-            _ => reply_subject(&message.summary.subject),
+        let target = self.engine.reply_target(id).unwrap_or(postino_core::ReplyTarget { parent_message_id: None, reply_to: Vec::new() });
+        let reply_mode = match mode {
+            ComposeMode::Forward => postino_core::ReplyMode::Forward,
+            ComposeMode::ReplyAll => postino_core::ReplyMode::ReplyAll,
+            _ => postino_core::ReplyMode::Reply,
         };
-        let quoted = match mode {
-            ComposeMode::Forward => Some(forward_block(&message)),
-            ComposeMode::Reply | ComposeMode::ReplyAll => Some(reply_block(&message)),
-            ComposeMode::New | ComposeMode::Draft => None,
-        };
+        let prefill = postino_core::compose_reply(&account, &message, target.parent_message_id.as_deref(), &target.reply_to, reply_mode);
         let mut state = ComposerState::new(mode);
-        state.to = Address::format_list(&to);
-        state.cc = Address::format_list(&cc);
-        state.show_cc = !cc.is_empty();
+        state.to = Address::format_list(&prefill.to);
+        state.cc = Address::format_list(&prefill.cc);
+        state.show_cc = !prefill.cc.is_empty();
         state.show_bcc = false;
-        state.subject = subject;
-        state.body = compose_body(&account.signature, quoted);
-        state.attachments = if mode == ComposeMode::Forward { message.attachments.clone() } else { Vec::new() };
+        state.subject = prefill.subject;
+        state.body = prefill.body;
+        state.in_reply_to = prefill.in_reply_to;
+        state.forward_sources =
+            if mode == ComposeMode::Forward { prefill.attachments.iter().map(|attachment| attachment.id.clone()).collect() } else { Vec::new() };
+        state.attachments = prefill.attachments;
+        // A prefill is content: Send, Salva bozza and Esc must create the draft even if the person
+        // has not typed anything yet. The old guard treated it as pristine and silently discarded it.
+        state.dirty = true;
+        state.last_edit = self.now;
         self.start_composer(state);
     }
 
@@ -2885,6 +2921,7 @@ impl PostinoApp {
         state.subject = message.summary.subject.clone();
         state.body = message.body_text.clone();
         state.attachments = message.attachments.clone();
+        state.in_reply_to = self.engine.draft_reply_link(&message.summary.id).map(str::to_owned);
         state.saved_at = Some(format_time(message.summary.date));
         self.start_composer(state);
     }
@@ -2894,10 +2931,19 @@ impl PostinoApp {
             return false;
         }
         if !self.composer.dirty && self.composer.draft_id.is_none() {
-            if notify {
-                self.status = "Nessuna modifica da salvare".to_owned();
+            let has_content = !self.composer.to.trim().is_empty()
+                || !self.composer.cc.trim().is_empty()
+                || !self.composer.bcc.trim().is_empty()
+                || !self.composer.subject.trim().is_empty()
+                || !self.composer.body.trim().is_empty()
+                || !self.composer.attachments.is_empty()
+                || self.composer.in_reply_to.is_some();
+            if !has_content {
+                if notify {
+                    self.status = "Nessuna modifica da salvare".to_owned();
+                }
+                return true;
             }
-            return true;
         }
         if !self.composer.dirty && self.composer.draft_id.is_some() {
             if notify {
@@ -2915,14 +2961,25 @@ impl PostinoApp {
                 return false;
             }
         };
+        let pending_forward = if self.composer.draft_id.is_none() && !self.composer.forward_sources.is_empty() {
+            self.composer.forward_sources.clone()
+        } else {
+            Vec::new()
+        };
+        let attachments_for_save = if pending_forward.is_empty() { self.composer.attachments.clone() } else { Vec::new() };
         let mut args = json!({
             "to": to,
             "cc": cc,
             "bcc": bcc,
             "subject": self.composer.subject,
             "body_text": self.composer.body,
-            "attachments": self.composer.attachments,
+            "attachments": attachments_for_save,
         });
+        if let Some(link) = &self.composer.in_reply_to
+            && let Some(object) = args.as_object_mut()
+        {
+            object.insert("in_reply_to".to_owned(), json!(link));
+        }
         if let Some(id) = &self.composer.draft_id
             && let Some(object) = args.as_object_mut()
         {
@@ -2937,27 +2994,106 @@ impl PostinoApp {
             Ok(value) => match serde_json::from_value::<DraftSave>(value) {
                 Ok(saved) => {
                     let id = saved.draft.summary.id.clone();
-                    self.composer.draft_id = Some(id);
+                    self.composer.draft_id = Some(id.clone());
+                    let forward_metadata = self.composer.attachments.clone();
                     self.composer.attachments = saved.draft.attachments;
-                    self.composer.mark_saved(format_time(self.now_utc));
+                    let copy = if pending_forward.is_empty() {
+                        ForwardCopy::default()
+                    } else {
+                        self.copy_forward_attachments(&id, &pending_forward, &forward_metadata)
+                    };
+                    if let Some(notice) = copy.notice {
+                        // The body is saved, but the attachment set is incomplete. Keep the composer
+                        // dirty so the state does not claim a complete save, and block Send until the
+                        // named rows are removed.
+                        self.composer.attachment_failure = Some(notice.clone());
+                        self.composer.failed_attachment_ids = copy.failed_ids;
+                        self.composer.dirty = true;
+                        self.composer.last_edit = self.now;
+                        self.composer.notice = Some(notice);
+                    } else if self.composer.failed_attachment_ids.is_empty() {
+                        self.composer.mark_saved(format_time(self.now_utc));
+                        self.composer.attachment_failure = None;
+                    } else {
+                        // A previous failed forward row is still present; the body save is fine but
+                        // the draft is not complete. Keep the blocking sentence and the dirty state.
+                        self.composer.dirty = true;
+                        self.composer.last_edit = self.now;
+                    }
                     if notify {
-                        self.status = "Bozza salvata".to_owned();
+                        self.status = if self.composer.attachment_failure.is_some() {
+                            "Bozza salvata, ma un allegato non è stato copiato".to_owned()
+                        } else {
+                            "Bozza salvata".to_owned()
+                        };
                     }
                     true
                 }
                 Err(_) => {
-                    self.composer.mark_failed("Non è stato possibile salvare la bozza.", self.now);
+                    let message = draft_save_error_message(&self.composer.attachment_failure, "Non è stato possibile salvare la bozza.");
+                    self.composer.mark_failed(message, self.now);
                     false
                 }
             },
-            Err(_) => {
-                self.composer.mark_failed("Non è stato possibile salvare la bozza.", self.now);
+            Err(error) => {
+                let message = draft_save_error_message(&self.composer.attachment_failure, &error.to_string());
+                self.composer.mark_failed(message, self.now);
                 if notify {
                     self.status = "La bozza non è stata salvata".to_owned();
                 }
                 false
             }
         }
+    }
+
+    /// Copy a forwarded message's attachment bytes into the new draft.
+    ///
+    /// The first save deliberately writes no metadata rows for them: a row without bytes would be
+    /// visible before the copy. Every successful copy replaces the composer's list with the stored
+    /// rows; a failed source becomes a metadata-only row with a fresh id, which is reported and makes
+    /// the next send refuse instead of silently dropping it.
+    fn copy_forward_attachments(&mut self, draft_id: &str, sources: &[String], sources_metadata: &[Attachment]) -> ForwardCopy {
+        let mut copied = Vec::new();
+        let mut failures = Vec::new();
+        for source in sources {
+            match self.engine.copy_attachment_to_draft(draft_id, source) {
+                Ok(draft) => copied = draft.attachments,
+                Err(error) => {
+                    let metadata = sources_metadata.iter().find(|attachment| attachment.id == *source).cloned().unwrap_or(Attachment {
+                        id: String::new(),
+                        filename: "allegato".to_owned(),
+                        mime: "application/octet-stream".to_owned(),
+                        size: 0,
+                    });
+                    failures.push((metadata, error.to_string()));
+                }
+            }
+        }
+        let mut attachments = copied;
+        let mut failed_ids = Vec::new();
+        for (index, (metadata, _)) in failures.iter().enumerate() {
+            let mut metadata = metadata.clone();
+            // A real id makes the row removable before it is persisted. It is also valid for the
+            // next draft_save, which turns the metadata-only row into a visible blocker.
+            metadata.id = format!("{draft_id}_local_att_{index}");
+            failed_ids.push(metadata.id.clone());
+            attachments.push(metadata);
+        }
+        self.composer.attachments = attachments;
+        self.composer.forward_sources.clear();
+        if failures.is_empty() {
+            return ForwardCopy::default();
+        }
+        let first = failures.first().map(|(attachment, error)| format!("{} ({error})", attachment.filename)).unwrap_or_default();
+        let more = failures.len().saturating_sub(1);
+        let suffix = if more == 0 {
+            ""
+        } else if more == 1 {
+            " e un altro file"
+        } else {
+            " e altri file"
+        };
+        ForwardCopy { notice: Some(format!("Allegato non copiato: {first}{suffix}. Rimuovilo per poter inviare.")), failed_ids }
     }
 
     fn send_composer(&mut self) {
@@ -2971,6 +3107,10 @@ impl PostinoApp {
             return;
         }
         if !self.save_composer(true) {
+            return;
+        }
+        if let Some(failure) = self.composer.attachment_failure.clone() {
+            self.composer.mark_failed(failure, self.now);
             return;
         }
         let Some(id) = self.composer.draft_id.clone() else {
@@ -3160,6 +3300,138 @@ impl PostinoApp {
         }
         self.composer = ComposerState::closed();
         self.status = "Bozza scartata".to_owned();
+    }
+
+    /// Open the injected picker and attach every chosen file. A cancellation is a no-op; a demo or
+    /// store-less session refuses before the picker (and therefore before any filesystem read).
+    fn pick_composer_files(&mut self) {
+        if !self.composer.open {
+            return;
+        }
+        if self.demo || self.store.is_none() {
+            self.push_info_toast("La modalità demo non allega file: serve un account su un archivio locale cifrato.", ToastKind::Error);
+            return;
+        }
+        match self.file_picker.choose_files() {
+            Ok(paths) if paths.is_empty() => {}
+            Ok(paths) => self.attach_composer_files(paths),
+            Err(_) => self.push_info_toast("Non è stato possibile aprire la scelta dei file.", ToastKind::Error),
+        }
+    }
+
+    /// Read, bound and attach a batch of files through the same engine path the CLI and MCP use.
+    ///
+    /// Every file is checked by metadata and then by the number of bytes actually read, so a file
+    /// that grows between the two checks is refused before decoding. Failures are collected into one
+    /// toast; the draft keeps the attachments that did succeed.
+    fn attach_composer_files(&mut self, mut paths: Vec<PathBuf>) {
+        if !self.composer.open || paths.is_empty() {
+            return;
+        }
+        // A drop can be reported by more than one rectangle; a picker can return the same path
+        // twice. Canonicalize for the key (or keep the literal path when it cannot be resolved) so
+        // one file is attached once.
+        let mut seen = BTreeSet::new();
+        paths.retain(|path| seen.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.clone())));
+        if paths.is_empty() {
+            return;
+        }
+        if self.demo || self.store.is_none() {
+            self.push_info_toast("La modalità demo non allega file: serve un account su un archivio locale cifrato.", ToastKind::Error);
+            return;
+        }
+        let mut was_dirty = self.composer.dirty;
+        if self.composer.draft_id.is_none() {
+            // A first attachment needs a draft id. Save the metadata-only draft first; the composer
+            // is already open and its content is what the person sees.
+            self.composer.dirty = true;
+            self.composer.last_edit = self.now;
+            if !self.save_composer(false) {
+                self.push_info_toast("Non è stato possibile preparare la bozza per gli allegati.", ToastKind::Error);
+                return;
+            }
+            // The initial save persisted the body; only an attachment-only change remains.
+            was_dirty = false;
+        }
+        let Some(draft_id) = self.composer.draft_id.clone() else {
+            return;
+        };
+        let mut failures = Vec::new();
+        let mut added = 0usize;
+        for path in paths {
+            let filename = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            match read_attachment_file(&path) {
+                Ok(bytes) => match self.engine.add_draft_attachment(&draft_id, &filename, None, &bytes) {
+                    Ok(draft) => {
+                        self.composer.attachments = draft.attachments;
+                        added = added.saturating_add(1);
+                    }
+                    Err(error) => failures.push(format!("{filename}: {error}")),
+                },
+                Err(error) => failures.push(format!("{filename}: {error}")),
+            }
+        }
+        if added > 0 {
+            if was_dirty {
+                // The attachment operation persisted the old body snapshot; the text the person just
+                // typed is still unsaved. Keep the composer dirty so Send/Close/autosave save it.
+                self.composer.dirty = true;
+                self.composer.last_edit = self.now;
+            } else {
+                self.composer.mark_saved(format_time(self.now_utc));
+            }
+            self.status = if added == 1 { "Allegato aggiunto".to_owned() } else { format!("{added} allegati aggiunti") };
+        }
+        if !failures.is_empty() {
+            let first = failures.first().cloned().unwrap_or_default();
+            let more = failures.len().saturating_sub(1);
+            let suffix = if more == 0 { String::new() } else { format!(" (e altri {more})") };
+            self.push_info_toast(format!("File non allegato: {first}{suffix}"), ToastKind::Error);
+        }
+    }
+
+    /// Remove one attachment row. A demo or unsaved row is removed from the composer list only;
+    /// with a store the operation deletes the row and the composer adopts the returned draft.
+    fn remove_composer_attachment(&mut self, attachment: &str) {
+        let pending_forward = self.composer.forward_sources.iter().any(|source| source == attachment);
+        if pending_forward {
+            self.composer.attachments.retain(|candidate| candidate.id != attachment);
+            self.composer.forward_sources.retain(|source| source != attachment);
+            self.composer.touch(self.now);
+            return;
+        }
+        let failed = self.composer.failed_attachment_ids.iter().any(|id| id == attachment) || attachment.is_empty();
+        let local_only = failed || self.demo || self.store.is_none() || self.composer.draft_id.is_none();
+        if local_only {
+            self.composer.attachments.retain(|candidate| candidate.id != attachment);
+            self.composer.failed_attachment_ids.retain(|id| id != attachment);
+            if self.composer.failed_attachment_ids.is_empty() {
+                self.composer.attachment_failure = None;
+            }
+            self.composer.touch(self.now);
+            self.status = "Allegato rimosso".to_owned();
+            return;
+        }
+        let was_dirty = self.composer.dirty;
+        let Some(draft_id) = self.composer.draft_id.clone() else {
+            return;
+        };
+        match self.engine.remove_draft_attachment(&draft_id, attachment) {
+            Ok(draft) => {
+                self.composer.attachments = draft.attachments;
+                if self.composer.failed_attachment_ids.is_empty() {
+                    self.composer.attachment_failure = None;
+                }
+                if was_dirty {
+                    self.composer.dirty = true;
+                    self.composer.last_edit = self.now;
+                } else {
+                    self.composer.mark_saved(format_time(self.now_utc));
+                }
+                self.status = "Allegato rimosso".to_owned();
+            }
+            Err(_) => self.push_info_toast("Non è stato possibile rimuovere l'allegato.", ToastKind::Error),
+        }
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
@@ -4994,6 +5266,9 @@ impl PostinoApp {
     fn close_settings(&mut self, ctx: &egui::Context) {
         self.show_accounts_dialog = false;
         self.show_licences = false;
+        // Closing Settings discards an unsaved signature editor; reopening must not show stale text.
+        self.signature_editor = None;
+        self.signature_focus_account = None;
         self.focus_account_switcher = true;
         if let Some(id) = self.settings_return_focus.take() {
             ctx.memory_mut(|memory| memory.request_focus(id));
@@ -5334,9 +5609,102 @@ impl PostinoApp {
         }
     }
 
+    fn signature_editor_ui(&mut self, ui: &mut Ui, t: &Tokens, account: &Account, save_out: &mut Option<String>, cancel_out: &mut bool) {
+        let Some(editor) = self.signature_editor.as_mut() else {
+            return;
+        };
+        Frame::new()
+            .fill(t.panel_alt)
+            .stroke(Stroke::new(1.0, t.border))
+            .corner_radius(radius::CONTROL)
+            .inner_margin(Margin::symmetric(inset::LG, inset::SM))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(typography::strong(Role::BodySmall, "Firma", t.text));
+                    ui.label(typography::text(Role::Caption, "Testo semplice, solo per i nuovi messaggi", t.text_faint));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(typography::mono(
+                            format!("{}/{} byte", editor.text.len(), postino_core::MAX_SIGNATURE_BYTES),
+                            9.5,
+                            if editor.text.len() > postino_core::MAX_SIGNATURE_BYTES { t.danger } else { t.text_faint },
+                        ));
+                    });
+                });
+                ui.add_space(space::XS);
+                let edit = TextEdit::multiline(&mut editor.text)
+                    .id_salt(("signature-editor", account.id.as_str()))
+                    .hint_text("Federico\nfederico@example.it")
+                    .font(FontId::new(type_size::BODY_SMALL, FontFamily::Proportional))
+                    .text_color(t.text)
+                    .frame(
+                        Frame::new()
+                            .fill(t.field)
+                            .stroke(Stroke::new(1.0, t.border))
+                            .corner_radius(radius::CONTROL)
+                            .inner_margin(Margin::symmetric(inset::SM, inset::XS)),
+                    )
+                    .desired_width(f32::INFINITY)
+                    .min_size(Vec2::new(0.0, 72.0));
+                let response = edit.show(ui);
+                if editor.focus {
+                    response.response.request_focus();
+                    editor.focus = false;
+                }
+                #[cfg(test)]
+                probe::signature_editor(ui, &account.id, response.response.rect);
+                let invalid_control = editor.text.chars().any(|character| character.is_control() && !matches!(character, '\n' | '\t'));
+                let too_large = editor.text.len() > postino_core::MAX_SIGNATURE_BYTES;
+                let problem = if too_large {
+                    Some("La firma supera 4 KiB: accorciala prima di salvare.".to_owned())
+                } else if invalid_control {
+                    Some("La firma contiene un carattere di controllo: sono ammessi solo nuova riga e tabulazione.".to_owned())
+                } else {
+                    editor.error.clone()
+                };
+                if let Some(problem) = &problem {
+                    ui.label(typography::text(Role::Caption, problem.as_str(), t.danger));
+                }
+                ui.horizontal(|ui| {
+                    let save = Button::primary("Salva firma")
+                        .icon(icons::SAVE)
+                        .size(ButtonSize::Sm)
+                        .enabled(problem.is_none())
+                        .disabled_reason("Correggi la firma prima di salvarla")
+                        .show(ui);
+                    #[cfg(test)]
+                    probe::signature_save(ui, &account.id, save.rect);
+                    if save.clicked() {
+                        *save_out = Some(account.id.clone());
+                    }
+                    let cancel = Button::ghost("Annulla").size(ButtonSize::Sm).show(ui);
+                    #[cfg(test)]
+                    probe::signature_cancel(ui, &account.id, cancel.rect);
+                    if cancel.clicked() {
+                        *cancel_out = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(typography::text(
+                            Role::Caption,
+                            "La modifica vale per i nuovi messaggi, non per le bozze già salvate.",
+                            t.text_faint,
+                        ));
+                    });
+                });
+            });
+    }
+
     fn accounts_dialog(&mut self, ui: &mut Ui) {
         if !self.show_accounts_dialog {
             return;
+        }
+        // Escape closes the signature editor first; only a second Escape leaves Settings. Consuming
+        // the key here keeps the modal's own close rule from seeing it.
+        if self.signature_editor.is_some()
+            && ui.ctx().input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+            && let Some(editor) = self.signature_editor.take()
+        {
+            self.signature_focus_account = Some(editor.account);
         }
         let t = theme::tokens(self.dark);
         let accounts = self.engine.accounts().to_vec();
@@ -5350,6 +5718,9 @@ impl PostinoApp {
         let mut open_folder = false;
         let mut licences = false;
         let mut shortcuts = false;
+        let mut signature_open: Option<String> = None;
+        let mut signature_save: Option<String> = None;
+        let mut signature_cancel = false;
         let focus_close = self.settings_focus_pending;
         self.settings_focus_pending = false;
         let window = ui.ctx().content_rect();
@@ -5398,23 +5769,57 @@ impl PostinoApp {
                                 .corner_radius(radius::CONTROL)
                                 .inner_margin(Margin::symmetric(inset::LG, inset::XS))
                                 .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(icons::icon(icons::MAIL, 16.0, if active { t.gold_ink } else { t.text_faint }));
-                                        ui.add_space(space::SM);
-                                        ui.vertical(|ui| {
-                                            ui.spacing_mut().item_spacing.y = 1.0;
+                                    Sides::new().show(
+                                        ui,
+                                        |ui| {
                                             ui.horizontal(|ui| {
-                                                ui.label(typography::text(Role::BodySmall, account.name.as_str(), t.text));
-                                                if active {
-                                                    let badge = Badge::new("Attivo").kind(BadgeKind::Accent).show(ui);
-                                                    badge.on_hover_text("L'account che stai leggendo");
-                                                }
+                                                ui.label(icons::icon(icons::MAIL, 16.0, if active { t.gold_ink } else { t.text_faint }));
+                                                ui.add_space(space::SM);
+                                                ui.vertical(|ui| {
+                                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(typography::text(Role::BodySmall, account.name.as_str(), t.text));
+                                                        if active {
+                                                            let badge = Badge::new("Attivo").kind(BadgeKind::Accent).show(ui);
+                                                            badge.on_hover_text("L'account che stai leggendo");
+                                                        }
+                                                    });
+                                                    let sync_line = format!("{} · {}", account.email, sync);
+                                                    ui.add(
+                                                        egui::Label::new(typography::text(Role::Caption, sync_line.as_str(), t.text_faint))
+                                                            .truncate(),
+                                                    )
+                                                    .on_hover_text(sync_line.as_str());
+                                                });
                                             });
-                                            let sync_line = format!("{} · {}", account.email, sync);
-                                            ui.add(egui::Label::new(typography::text(Role::Caption, sync_line.as_str(), t.text_faint)).truncate())
-                                                .on_hover_text(sync_line.as_str());
-                                        });
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        },
+                                        |ui| {
+                                            let signature_button = Button::ghost("Firma").size(ButtonSize::Sm).show(ui);
+                                            #[cfg(test)]
+                                            probe::signature_open_button(ui, &account.id, signature_button.rect);
+                                            #[cfg(test)]
+                                            probe::signature_open_button_id(ui, &account.id, signature_button.id);
+                                            #[cfg(test)]
+                                            crate::app::probe::signature_open_clicked(ui, signature_button.clicked());
+                                            #[cfg(test)]
+                                            crate::app::probe::signature_open_hover(
+                                                ui,
+                                                &account.id,
+                                                signature_button.hovered(),
+                                                ui.ctx().pointer_interact_pos(),
+                                            );
+                                            if self.signature_focus_account.as_deref() == Some(account.id.as_str()) {
+                                                signature_button.request_focus();
+                                                self.signature_focus_account = None;
+                                            } else if signature_button.clicked() {
+                                                if let Some(editor) = self.signature_editor.as_mut().filter(|editor| editor.account == account.id) {
+                                                    // Clicking Firma while its editor is open focuses the text
+                                                    // instead of being a dead button.
+                                                    editor.focus = true;
+                                                } else {
+                                                    signature_open = Some(account.id.clone());
+                                                }
+                                            }
                                             let remove_button = Button::danger("Rimuovi")
                                                 .size(ButtonSize::Sm)
                                                 .enabled(self.can_add_account())
@@ -5431,9 +5836,12 @@ impl PostinoApp {
                                                     focus_cancel: true,
                                                 });
                                             }
-                                        });
-                                    });
+                                        },
+                                    );
                                 });
+                            if self.signature_editor.as_ref().is_some_and(|editor| editor.account == account.id) {
+                                self.signature_editor_ui(ui, &t, account, &mut signature_save, &mut signature_cancel);
+                            }
                             ui.add_space(space::XS);
                         }
                         if Button::new("Aggiungi account")
@@ -5583,6 +5991,30 @@ impl PostinoApp {
             self.mark_settings_dirty();
             self.persist_settings();
             self.status = "Larghezza lettura reimpostata".to_owned();
+        }
+        if let Some(account_id) = signature_open {
+            let text =
+                self.engine.accounts().iter().find(|account| account.id == account_id).map(|account| account.signature.clone()).unwrap_or_default();
+            self.signature_editor = Some(SignatureEditor { account: account_id, text, focus: true, error: None });
+        }
+        if signature_cancel && let Some(editor) = self.signature_editor.take() {
+            self.signature_focus_account = Some(editor.account);
+        }
+        if let Some(account_id) = signature_save {
+            let text = self.signature_editor.as_ref().map(|editor| editor.text.clone()).unwrap_or_default();
+            let result = self.engine.call("account_signature_set", json!({ "account": account_id, "signature": text }));
+            match result {
+                Ok(_) => {
+                    self.signature_editor = None;
+                    self.signature_focus_account = Some(account_id);
+                    self.status = "Firma salvata".to_owned();
+                }
+                Err(error) => {
+                    if let Some(editor) = self.signature_editor.as_mut() {
+                        editor.error = Some(signature_error_message(&error.to_string()));
+                    }
+                }
+            }
         }
         if open_folder {
             self.open_data_folder();
@@ -5837,19 +6269,37 @@ impl PostinoApp {
         let id = Id::new("postino-composer");
         let area = egui::Modal::default_area(id).anchor(Align2::LEFT_TOP, card.min - window.min).constrain(false);
         let smtp_available = self.smtp_available_for(&account.id);
+        let attachments_available = !self.demo && self.store.is_some();
         let response = egui::Modal::new(id).area(area).backdrop_color(theme::scrim(self.dark)).frame(frame).show(ui.ctx(), |ui| {
             ui.set_min_size(inner.size());
             ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
-                Composer::new(&mut self.composer, &account).send_available(smtp_available).demo(self.demo).show(ui)
+                Composer::new(&mut self.composer, &account)
+                    .send_available(smtp_available)
+                    .demo(self.demo)
+                    .attachments_available(attachments_available)
+                    .show(ui)
             })
             .inner
         });
         let action = response.inner;
         if action.discard {
             self.discard_composer();
-        } else if action.close {
+            return;
+        }
+        if action.close {
             self.close_composer();
-        } else if action.send {
+            return;
+        }
+        if let Some(attachment) = action.remove_attachment.clone() {
+            self.remove_composer_attachment(&attachment);
+        }
+        if action.pick_files {
+            self.pick_composer_files();
+        }
+        if !action.dropped_files.is_empty() {
+            self.attach_composer_files(action.dropped_files);
+        }
+        if action.send {
             self.send_composer();
         } else if action.save {
             let _ = self.save_composer(true);
@@ -6807,6 +7257,24 @@ struct AccountRemoveState {
     focus_cancel: bool,
 }
 
+/// A failed forward copy. `notice` is the user-facing sentence and `failed_ids` names the
+/// composer-local metadata rows so Remove can find them before a store save assigns ids.
+#[derive(Default)]
+struct ForwardCopy {
+    notice: Option<String>,
+    failed_ids: Vec<String>,
+}
+
+/// The per-account signature being edited in Settings. `None` in the app means collapsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SignatureEditor {
+    account: String,
+    text: String,
+    /// Request focus on the multiline field on the first frame only.
+    focus: bool,
+    error: Option<String>,
+}
+
 /// The one current failure: the sentence the toast shows and whether reloading the list is a
 /// meaningful retry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7362,66 +7830,6 @@ fn row_context_menu(message: &MessageSummary, is_draft: bool) -> (Vec<MenuItem<'
     (items, actions)
 }
 
-fn reply_recipients(message: &Message, own_email: &str, all: bool) -> (Vec<Address>, Vec<Address>) {
-    let mut to = Vec::new();
-    if !message.summary.from.email.trim().eq_ignore_ascii_case(own_email) {
-        to.push(message.summary.from.clone());
-    }
-    if to.is_empty() {
-        to.extend(message.summary.to.iter().filter(|address| !address.email.trim().eq_ignore_ascii_case(own_email)).cloned());
-    }
-    let mut cc = if all { message.summary.to.iter().chain(message.cc.iter()).cloned().collect::<Vec<_>>() } else { Vec::new() };
-    let to = dedupe_recipients(to, own_email);
-    let excluded = to.iter().map(|address| address.email.trim().to_ascii_lowercase()).collect::<BTreeSet<_>>();
-    cc.retain(|address| !excluded.contains(&address.email.trim().to_ascii_lowercase()));
-    let cc = dedupe_recipients(cc, own_email);
-    (to, cc)
-}
-
-fn dedupe_recipients(addresses: Vec<Address>, own_email: &str) -> Vec<Address> {
-    let mut seen = BTreeSet::new();
-    let mut unique = Vec::new();
-    for address in addresses {
-        let email = address.email.trim().to_ascii_lowercase();
-        if email.is_empty() || email == own_email || !seen.insert(email) {
-            continue;
-        }
-        unique.push(address);
-    }
-    unique
-}
-
-fn reply_subject(subject: &str) -> String {
-    let subject = subject.trim();
-    if subject.to_ascii_lowercase().starts_with("re:") { subject.to_owned() } else { format!("Re: {subject}") }
-}
-
-fn forward_subject(subject: &str) -> String {
-    let subject = subject.trim();
-    if subject.to_ascii_lowercase().starts_with("fwd:") { subject.to_owned() } else { format!("Fwd: {subject}") }
-}
-
-fn reply_block(message: &Message) -> String {
-    let date = message.summary.date.with_timezone(&Local).format("%d/%m/%Y %H:%M");
-    format!("Il giorno {date}, {} ha scritto:\n{}", message.summary.from.display(), quote_body(&message.body_text))
-}
-
-fn forward_block(message: &Message) -> String {
-    let to = message.summary.to.iter().map(Address::display).collect::<Vec<_>>().join(", ");
-    let date = message.summary.date.with_timezone(&Local).format("%d/%m/%Y %H:%M");
-    let mut block = format!(
-        "---------- Messaggio inoltrato ----------\nDa: {}\nData: {date}\nA: {to}\nOggetto: {}\n",
-        message.summary.from.display(),
-        message.summary.subject
-    );
-    if !message.cc.is_empty() {
-        block.push_str(&format!("Cc: {}\n", message.cc.iter().map(Address::display).collect::<Vec<_>>().join(", ")));
-    }
-    block.push('\n');
-    block.push_str(&message.body_text);
-    block
-}
-
 fn folder_icon(kind: FolderKind) -> &'static str {
     match kind {
         FolderKind::Inbox => icons::INBOX,
@@ -7458,6 +7866,49 @@ fn remote_images_text(count: u32) -> Option<String> {
     }
 }
 
+fn signature_error_message(raw: &str) -> String {
+    if raw.contains("at most 4096") || raw.contains("4096") {
+        return "La firma supera 4 KiB: accorciala prima di salvare.".to_owned();
+    }
+    if raw.contains("control") {
+        return "La firma contiene un carattere di controllo: sono ammessi solo nuova riga e tabulazione.".to_owned();
+    }
+    if raw.contains("unknown account") {
+        return "L'account non esiste più: riapri le impostazioni.".to_owned();
+    }
+    "Non è stato possibile salvare la firma.".to_owned()
+}
+
+/// Translate a save failure without losing the actionable limit. A failed forward copy already has a
+/// precise sentence and must not be replaced by the generic save line.
+fn draft_save_error_message(attachment_failure: &Option<String>, raw: &str) -> String {
+    if let Some(failure) = attachment_failure {
+        return failure.clone();
+    }
+    let raw = raw.strip_prefix("invalid arguments: ").unwrap_or(raw);
+    if raw.contains("subject is longer") {
+        return "L'oggetto è troppo lungo (massimo 998 byte): accorcialo prima di salvare.".to_owned();
+    }
+    if raw.contains("body_text is larger") {
+        return "Il corpo è troppo lungo (massimo 1 MiB): accorcia il testo o la citazione prima di salvare.".to_owned();
+    }
+    if raw.contains("attachments") && raw.contains("at most") {
+        return "Gli allegati superano un limite (20 file, 25 MiB per file, 25 MiB totali).".to_owned();
+    }
+    if raw.contains("in_reply_to") {
+        return "Il collegamento alla conversazione non è valido: riapri la risposta dal messaggio originale.".to_owned();
+    }
+    "Non è stato possibile salvare la bozza. Controlla oggetto, destinatari e allegati.".to_owned()
+}
+
+/// Pull the attachment filename out of the engine's send refusal. The filename is already
+/// sanitized; a quoted name is shown with its quotes escaped rather than dropped.
+fn missing_attachment_name(raw: &str) -> Option<String> {
+    let rest = raw.split("attachment \"").nth(1)?;
+    let end = rest.find("\" has no stored bytes")?;
+    rest.get(..end).map(|name| name.replace("\\\"", "\""))
+}
+
 /// Translate an engine send failure into Italian copy. The raw sentence never reaches the shell.
 fn send_error_message(raw: &str, demo: bool) -> String {
     if demo || raw.contains("demo mailbox") {
@@ -7467,7 +7918,10 @@ fn send_error_message(raw: &str, demo: bool) -> String {
         return "Questo account non ha un server di invio (SMTP): rimuovilo e aggiungilo con i dati SMTP.".to_owned();
     }
     if raw.contains("no stored bytes") || raw.contains("attachments without content") {
-        return "Un allegato non ha contenuto salvato: rimuovilo e riprova ad allegare il file.".to_owned();
+        return match missing_attachment_name(raw) {
+            Some(name) => format!("Allegato \"{name}\" mancante o illeggibile: rimuovilo o riattaccalo prima di inviare."),
+            None => "Un allegato è mancante o illeggibile: rimuovilo o riattaccalo prima di inviare.".to_owned(),
+        };
     }
     if raw.contains("at least one recipient") {
         return "Aggiungi almeno un destinatario prima di inviare.".to_owned();
@@ -7820,6 +8274,29 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Read one attachment with the P8 cap enforced before and during the read. The error never includes
+/// the full path: a toast names the file, not the folder the person happens to keep it in.
+fn read_attachment_file(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path).map_err(|_| "il file non è leggibile".to_owned())?;
+    if !metadata.is_file() {
+        return Err("non è un file".to_owned());
+    }
+    if metadata.len() > postino_core::MAX_ATTACHMENT_BYTES {
+        return Err(format!("supera {}", format_size(postino_core::MAX_ATTACHMENT_BYTES)));
+    }
+    let file = std::fs::File::open(path).map_err(|_| "il file non è leggibile".to_owned())?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(postino_core::MAX_ATTACHMENT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| "la lettura del file è fallita".to_owned())?;
+    if bytes.len() as u64 > postino_core::MAX_ATTACHMENT_BYTES {
+        return Err(format!("supera {}", format_size(postino_core::MAX_ATTACHMENT_BYTES)));
+    }
+    Ok(bytes)
+}
+
 /// The warning class of the file the person actually chose, using the same sanitizer and
 /// classifier as the suggested name.
 fn attachment_destination_kind(path: &Path) -> Option<DangerousKind> {
@@ -7868,7 +8345,7 @@ pub(crate) mod probe {
     //! they were and which actions the reading toolbar offered. Nothing is recorded in a shipped
     //! build; the call sites are `#[cfg(test)]` statements.
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use eframe::egui::{Context, Id, Rect, Ui, Vec2};
 
@@ -8041,6 +8518,148 @@ pub(crate) mod probe {
 
     pub fn composer_cancel_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("composer-cancel")))
+    }
+
+    pub fn composer_attach(ui: &Ui, rect: Rect, enabled: bool) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("composer-attach"), rect);
+            data.insert_temp(id("composer-attach-enabled"), enabled);
+        });
+    }
+
+    pub fn composer_attach_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-attach")))
+    }
+
+    pub fn composer_attach_id(ui: &Ui, widget: Id) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-attach-id"), widget));
+    }
+
+    pub fn composer_attach_widget_id(ctx: &Context) -> Option<Id> {
+        ctx.data(|data| data.get_temp(id("composer-attach-id")))
+    }
+
+    pub fn composer_attach_enabled(ctx: &Context) -> Option<bool> {
+        ctx.data(|data| data.get_temp(id("composer-attach-enabled")))
+    }
+
+    pub fn composer_attach_clicked(ui: &Ui, clicked: bool) {
+        if clicked {
+            let previous = ui.ctx().data(|data| data.get_temp::<u32>(id("composer-attach-clicked")).unwrap_or(0));
+            ui.ctx().data_mut(|data| data.insert_temp(id("composer-attach-clicked"), previous.saturating_add(1)));
+        }
+    }
+
+    pub fn composer_attach_click_count(ctx: &Context) -> u32 {
+        ctx.data(|data| data.get_temp(id("composer-attach-clicked"))).unwrap_or(0)
+    }
+
+    pub fn composer_attachment_remove(ui: &Ui, attachment_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("composer-attachment-removes")).insert(attachment_id.to_owned(), rect);
+        });
+    }
+
+    pub fn composer_attachment_remove_rect(ctx: &Context, attachment_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("composer-attachment-removes"))).and_then(|rows| rows.get(attachment_id).copied())
+    }
+
+    pub fn composer_attachment_remove_id(ui: &Ui, attachment_id: &str, widget: Id) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Id>>(id("composer-attachment-remove-ids")).insert(attachment_id.to_owned(), widget);
+        });
+    }
+
+    pub fn composer_attachment_remove_widget_id(ctx: &Context, attachment_id: &str) -> Option<Id> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Id>>(id("composer-attachment-remove-ids"))).and_then(|rows| rows.get(attachment_id).copied())
+    }
+
+    pub fn composer_attachment_remove_clicked(ui: &Ui, attachment_id: &str, clicked: bool) {
+        if clicked {
+            ui.ctx().data_mut(|data| {
+                data.get_temp_mut_or_default::<BTreeSet<String>>(id("composer-attachment-remove-clicks")).insert(attachment_id.to_owned());
+            });
+        }
+    }
+
+    pub fn composer_attachment_remove_was_clicked(ctx: &Context, attachment_id: &str) -> bool {
+        ctx.data(|data| data.get_temp::<BTreeSet<String>>(id("composer-attachment-remove-clicks"))).is_some_and(|rows| rows.contains(attachment_id))
+    }
+
+    pub fn signature_open_button(ui: &Ui, account_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("signature-open-buttons")).insert(account_id.to_owned(), rect);
+        });
+    }
+
+    pub fn signature_open_button_id(ui: &Ui, account_id: &str, widget: Id) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Id>>(id("signature-open-button-ids")).insert(account_id.to_owned(), widget);
+        });
+    }
+
+    pub fn signature_open_button_widget_id(ctx: &Context, account_id: &str) -> Option<Id> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Id>>(id("signature-open-button-ids"))).and_then(|rows| rows.get(account_id).copied())
+    }
+
+    pub fn signature_open_button_rect(ctx: &Context, account_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("signature-open-buttons"))).and_then(|rows| rows.get(account_id).copied())
+    }
+
+    pub fn signature_open_clicked(ui: &Ui, clicked: bool) {
+        if clicked {
+            let previous = ui.ctx().data(|data| data.get_temp::<u32>(id("signature-open-clicks")).unwrap_or(0));
+            ui.ctx().data_mut(|data| data.insert_temp(id("signature-open-clicks"), previous.saturating_add(1)));
+        }
+    }
+
+    pub fn signature_open_click_count(ctx: &Context) -> u32 {
+        ctx.data(|data| data.get_temp(id("signature-open-clicks"))).unwrap_or(0)
+    }
+
+    pub fn signature_open_hover(ui: &Ui, account_id: &str, hovered: bool, pointer: Option<eframe::egui::Pos2>) {
+        let layer = pointer.and_then(|pos| ui.ctx().layer_id_at(pos));
+        let layer = layer.map_or_else(|| "none".to_owned(), |layer| format!("{layer:?}"));
+        let clip = ui.clip_rect();
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, (bool, Option<eframe::egui::Pos2>, Rect, String)>>(id("signature-open-hover"))
+                .insert(account_id.to_owned(), (hovered, pointer, clip, layer));
+        });
+    }
+
+    pub fn signature_open_hover_state(ctx: &Context, account_id: &str) -> Option<(bool, Option<eframe::egui::Pos2>, Rect, String)> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, (bool, Option<eframe::egui::Pos2>, Rect, String)>>(id("signature-open-hover")))
+            .and_then(|rows| rows.get(account_id).cloned())
+    }
+
+    pub fn signature_editor(ui: &Ui, account_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("signature-editors")).insert(account_id.to_owned(), rect);
+        });
+    }
+
+    pub fn signature_editor_rect(ctx: &Context, account_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("signature-editors"))).and_then(|rows| rows.get(account_id).copied())
+    }
+
+    pub fn signature_save(ui: &Ui, account_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("signature-save-buttons")).insert(account_id.to_owned(), rect);
+        });
+    }
+
+    pub fn signature_save_rect(ctx: &Context, account_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("signature-save-buttons"))).and_then(|rows| rows.get(account_id).copied())
+    }
+
+    pub fn signature_cancel(ui: &Ui, account_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("signature-cancel-buttons")).insert(account_id.to_owned(), rect);
+        });
+    }
+
+    pub fn signature_cancel_rect(ctx: &Context, account_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("signature-cancel-buttons"))).and_then(|rows| rows.get(account_id).copied())
     }
 
     pub fn composer_scroll(ui: &Ui, offset: f32, viewport: Rect, content: Vec2) {
@@ -8495,6 +9114,32 @@ mod tests {
         egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
     }
 
+    /// A dropped file for a headless frame. The bytes are never read by the composer; the screen
+    /// opens the path itself through the same bounded reader as the picker.
+    #[derive(Debug)]
+    struct TestDroppedFile(PathBuf);
+
+    impl egui::DroppedFile for TestDroppedFile {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|error| error.to_string())
+        }
+    }
+
+    fn frame_with_drop(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, pos: egui::Pos2, paths: Vec<PathBuf>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events: vec![egui::Event::PointerMoved(pos)],
+            dropped_files: paths.into_iter().map(|path| Arc::new(TestDroppedFile(path)) as egui::DroppedFileHandle).collect(),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+    }
+
     fn ready_app() -> (egui::Context, PostinoApp) {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
@@ -8517,6 +9162,15 @@ mod tests {
 
     fn click(ctx: &egui::Context, app: &mut PostinoApp, pos: egui::Pos2) {
         click_at(ctx, app, pos, Vec2::new(1200.0, 800.0));
+    }
+
+    /// A click on a modal that has just appeared: move, press and release arrive on separate frames,
+    /// so egui resolves the hover before the button sees the press.
+    fn click_settled(ctx: &egui::Context, app: &mut PostinoApp, pos: egui::Pos2, size: Vec2) {
+        frame_at(ctx, app, size, vec![egui::Event::PointerMoved(pos)]);
+        frame_at(ctx, app, size, vec![pointer(pos, true)]);
+        frame_at(ctx, app, size, vec![pointer(pos, false)]);
+        frame_at(ctx, app, size, vec![]);
     }
 
     /// A click whose release-frame platform output is returned, for clipboard assertions.
@@ -8765,6 +9419,628 @@ mod tests {
         assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| !message.summary.unread)));
         app.undo_last();
         assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| message.summary.unread)), "one undo restores every flag change");
+    }
+
+    #[test]
+    fn the_demo_composer_disables_attaching_with_a_reason_and_never_opens_a_picker() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        app.compose_new();
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(probe::composer_attach_enabled(&ctx), Some(false), "the demo must not pretend it can attach");
+        let picker = crate::test_support::RecordingFilePicker::new();
+        app.file_picker = picker.clone();
+        let rect = probe::composer_attach_rect(&ctx).expect("the Allega file button");
+        click(&ctx, &mut app, rect.center());
+        assert_eq!(picker.calls(), 0, "a disabled Allega button must not open a dialog");
+        assert!(app.composer.attachments.is_empty());
+    }
+
+    fn picker_app(name: &str) -> PostinoApp {
+        booted_app(name, Vec::new(), |store| seed_account_rows(store, "acc_a", "a@example.com", None))
+    }
+
+    #[test]
+    fn the_picker_attaches_exact_bytes_lists_the_total_and_removes_the_row() {
+        let mut app = picker_app("p8-picker");
+        let directory = test_directory("p8-picker-files");
+        let path = directory.join("contratto.pdf");
+        let bytes = b"%PDF-1.7 esatto";
+        std::fs::write(&path, bytes).expect("fixture file");
+        let picker = crate::test_support::RecordingFilePicker::new();
+        picker.set_paths(vec![path]);
+        app.file_picker = picker.clone();
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia@example.com>".to_owned();
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let attach = probe::composer_attach_rect(&ctx).expect("the Allega file button");
+        let card = probe::composer_card_rect(&ctx).expect("the composer card");
+        assert_eq!(probe::composer_attach_enabled(&ctx), Some(true), "a store-backed composer must allow attaching");
+        assert!(card.contains_rect(attach), "the attach button is outside the card: {attach:?} in {card:?}");
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        click_settled(&ctx, &mut app, attach.center(), Vec2::new(980.0, 600.0));
+        assert!(probe::composer_attach_click_count(&ctx) > 0, "the click never reached the attach button");
+
+        assert_eq!(picker.calls(), 1, "attach rect {attach:?} in card {card:?}");
+        let draft = app.composer.draft_id.clone().expect("the picker must create the draft");
+        assert_eq!(app.composer.attachments.len(), 1);
+        assert_eq!(app.composer.attachments[0].filename, "contratto.pdf");
+        assert_eq!(app.engine.attachment_bytes(&app.composer.attachments[0].id).expect("stored bytes"), bytes);
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("1 allegato")), "the total is missing: {text:?}");
+
+        let remove = probe::composer_attachment_remove_rect(&ctx, &app.composer.attachments[0].id).expect("the remove button");
+        click_settled(&ctx, &mut app, remove.center(), Vec2::new(980.0, 600.0));
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        assert!(app.composer.attachments.is_empty(), "the row was not removed");
+        assert!(app.engine.message(&draft).expect("draft").attachments.is_empty());
+
+        let before = app.composer.attachments.len();
+        picker.cancel();
+        app.pick_composer_files();
+        assert_eq!(app.composer.attachments.len(), before, "a cancelled picker adds nothing");
+        assert_eq!(picker.calls(), 2, "the picker was not asked a second time");
+    }
+
+    #[test]
+    fn a_failed_or_missing_pick_is_one_readable_toast_and_writes_no_row() {
+        let mut app = picker_app("p8-picker-fail");
+        let directory = test_directory("p8-picker-missing");
+        let missing = directory.join("non-esiste.pdf");
+        let picker = crate::test_support::RecordingFilePicker::new();
+        picker.set_paths(vec![missing]);
+        app.file_picker = picker;
+        app.compose_new();
+        app.composer.to = "Giulia <giulia@example.com>".to_owned();
+        let before = app.composer.attachments.len();
+        app.pick_composer_files();
+        assert_eq!(app.composer.attachments.len(), before);
+        let toast = app.toast.as_ref().map(|toast| toast.message.clone()).expect("one toast");
+        assert!(toast.contains("non-esiste.pdf"), "the toast must name the file: {toast}");
+        assert!(!toast.contains("p8-picker-missing"), "the toast must not leak the path: {toast}");
+    }
+
+    #[test]
+    fn dropping_files_on_the_composer_uses_the_same_bounded_path() {
+        let mut app = picker_app("p8-drop");
+        let directory = test_directory("p8-drop-files");
+        let path = directory.join("nota.txt");
+        std::fs::write(&path, b"drop bytes").expect("fixture file");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia@example.com>".to_owned();
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        let card = probe::composer_card_rect(&ctx).expect("the composer card");
+        frame_with_drop(&ctx, &mut app, size, card.center(), vec![path]);
+        frame_at(&ctx, &mut app, size, vec![]);
+        assert_eq!(app.composer.attachments.len(), 1, "the dropped file was not attached");
+        assert_eq!(app.composer.attachments[0].filename, "nota.txt");
+        assert_eq!(app.engine.attachment_bytes(&app.composer.attachments[0].id).expect("bytes"), b"drop bytes");
+    }
+
+    #[test]
+    fn forwarding_copies_attachment_bytes_and_a_missing_blob_is_reported_and_blocks_send() {
+        let mut app = booted_app("p8-forward", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            store
+                .replace_attachments(
+                    "msg_acc_a_1",
+                    &[postino_store::Attachment {
+                        id: "att_parent".to_owned(),
+                        filename: "preventivo.pdf".to_owned(),
+                        mime: "application/pdf".to_owned(),
+                        size: 0,
+                        blob_hash: None,
+                    }],
+                )
+                .expect("attachment row");
+        });
+        app.engine.store_attachment_bytes("msg_acc_a_1", "att_parent", b"byte del forward").expect("source bytes");
+        app.reply_to("msg_acc_a_1", ComposeMode::Forward);
+        app.composer.touch(0.0);
+        assert!(app.save_composer(false), "the forward draft must save");
+        let draft = app.composer.draft_id.clone().expect("forward draft");
+        let attachments = app.engine.message(&draft).expect("draft").attachments.clone();
+        assert_eq!(attachments.len(), 1, "the forwarded attachment was dropped");
+        assert_eq!(app.engine.attachment_bytes(&attachments[0].id).expect("copied bytes"), b"byte del forward");
+        assert_eq!(attachments[0].filename, "preventivo.pdf");
+
+        let second = booted_app("p8-forward-missing", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            store
+                .replace_attachments(
+                    "msg_acc_a_1",
+                    &[postino_store::Attachment {
+                        id: "att_parent".to_owned(),
+                        filename: "manca.pdf".to_owned(),
+                        mime: "application/pdf".to_owned(),
+                        size: 4,
+                        blob_hash: None,
+                    }],
+                )
+                .expect("attachment row");
+        });
+        let mut second = second;
+        second.reply_to("msg_acc_a_1", ComposeMode::Forward);
+        second.composer.touch(0.0);
+        assert!(second.save_composer(false));
+        let draft = second.composer.draft_id.clone().expect("forward draft");
+        let notice = second.composer.notice.clone().expect("the failed copy is reported");
+        assert!(notice.contains("manca.pdf"), "{notice}");
+        // The row is in the composer; the next save (what Send does first) persists it and keeps
+        // the send blocked on the missing bytes.
+        second.composer.to = "Giulia <giulia@example.com>".to_owned();
+        second.composer.touch(0.0);
+        assert!(second.save_composer(false));
+        assert_eq!(second.engine.message(&draft).expect("draft").attachments.len(), 1, "the failed row stays visible");
+        let error = second.engine.call("message_send", json!({ "draft": draft })).expect_err("send must refuse");
+        assert!(error.to_string().contains("manca.pdf"), "{error}");
+    }
+
+    #[test]
+    fn a_pristine_reply_sends_from_a_real_click_and_saves_before_close() {
+        let ca = postino_testkit::TlsFixture::generate().ca();
+        let mut app = smtp_app("p8-pristine-reply", 1, ca);
+        let source = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Origine".to_owned(),
+                    body_text: "Corpo originale".to_owned(),
+                    attachments: Vec::new(),
+                    in_reply_to: None,
+                },
+            )
+            .expect("source draft");
+        app.reply_to(&source.summary.id, ComposeMode::Reply);
+        assert!(app.composer.dirty, "a prefill must be content even before the first keystroke");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        let send = probe::composer_send_rect(&ctx).expect("the Send button");
+        click_settled(&ctx, &mut app, send.center(), size);
+        assert!(!app.composer.open, "Send did not close the composer: {:?}", app.composer.save_error);
+        let queued = app.engine.outbox_list(None, 500, 0).expect("outbox");
+        assert_eq!(queued.entries.len(), 1, "an unedited reply did not create an outbox row");
+
+        let second = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Seconda origine".to_owned(),
+                    body_text: "Corpo".to_owned(),
+                    attachments: Vec::new(),
+                    in_reply_to: None,
+                },
+            )
+            .expect("second source");
+        app.reply_to(&second.summary.id, ComposeMode::Reply);
+        assert!(app.save_composer(true), "Salva bozza must create the pristine reply");
+        assert!(app.composer.draft_id.is_some());
+        assert!(app.engine.messages().iter().any(|message| message.summary.subject == "Re: Seconda origine"));
+
+        let third = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Terza origine".to_owned(),
+                    body_text: "Corpo".to_owned(),
+                    attachments: Vec::new(),
+                    in_reply_to: None,
+                },
+            )
+            .expect("third source");
+        app.reply_to(&third.summary.id, ComposeMode::Reply);
+        frame_at(&ctx, &mut app, size, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!app.composer.open, "Esc did not close the reply");
+        assert!(app.engine.messages().iter().any(|message| message.summary.subject == "Re: Terza origine"), "Esc discarded the reply");
+    }
+
+    #[test]
+    fn typing_then_attaching_or_removing_does_not_lose_the_body() {
+        let ca = postino_testkit::TlsFixture::generate().ca();
+        let mut app = smtp_app("p8-dirty-attach", 1, ca);
+        let source = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Bozza da conservare".to_owned(),
+                    body_text: "corpo vecchio".to_owned(),
+                    attachments: Vec::new(),
+                    in_reply_to: None,
+                },
+            )
+            .expect("source draft");
+        app.edit_draft(&source.summary.id);
+        app.composer.body = "NUOVO TESTO".to_owned();
+        app.composer.touch(1.0);
+        let directory = test_directory("p8-dirty-attach-files");
+        let path = directory.join("nota.txt");
+        std::fs::write(&path, b"allegato").expect("fixture");
+        app.attach_composer_files(vec![path]);
+        assert!(app.composer.dirty, "attaching must not claim the unsaved body is saved");
+        let attachment = app.composer.attachments[0].id.clone();
+        app.remove_composer_attachment(&attachment);
+        assert!(app.composer.dirty, "removing must not claim the unsaved body is saved");
+        app.send_composer();
+        assert!(!app.composer.open, "send failed: {:?}", app.composer.save_error);
+        assert_eq!(app.engine.message(&source.summary.id).expect("draft").body_text, "NUOVO TESTO");
+        assert_eq!(app.engine.outbox_list(None, 500, 0).expect("outbox").entries.len(), 1);
+
+        let second = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Bozza chiusa".to_owned(),
+                    body_text: "corpo vecchio".to_owned(),
+                    attachments: Vec::new(),
+                    in_reply_to: None,
+                },
+            )
+            .expect("second draft");
+        app.edit_draft(&second.summary.id);
+        app.composer.body = "TESTO PRIMA DELLA CHIUSURA".to_owned();
+        app.composer.touch(2.0);
+        let path = directory.join("seconda.txt");
+        std::fs::write(&path, b"secondo").expect("fixture");
+        app.attach_composer_files(vec![path]);
+        app.close_composer();
+        assert_eq!(app.engine.message(&second.summary.id).expect("closed draft").body_text, "TESTO PRIMA DELLA CHIUSURA");
+    }
+
+    #[test]
+    fn a_failed_forward_copy_blocks_send_until_the_row_is_removed() {
+        let ca = postino_testkit::TlsFixture::generate().ca();
+        let mut app = smtp_app("p8-forward-block", 1, ca);
+        let source = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Con allegato mancante".to_owned(),
+                    body_text: "Corpo".to_owned(),
+                    attachments: vec![postino_core::Attachment {
+                        id: "source_missing".to_owned(),
+                        filename: "manca.pdf".to_owned(),
+                        mime: "application/pdf".to_owned(),
+                        size: 4,
+                    }],
+                    in_reply_to: None,
+                },
+            )
+            .expect("source draft");
+        app.reply_to(&source.summary.id, ComposeMode::Forward);
+        app.composer.to = "Giulia <giulia@example.com>".to_owned();
+        app.send_composer();
+        assert!(app.composer.open, "a failed forward copy must keep the composer open");
+        let failure = app.composer.attachment_failure.clone().expect("a blocking failure sentence");
+        assert!(failure.contains("manca.pdf"), "{failure}");
+        assert!(app.engine.outbox_list(None, 500, 0).expect("outbox").entries.is_empty(), "the failed attachment was silently dropped");
+        assert_eq!(app.composer.failed_attachment_ids.len(), 1);
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        let failed_id = app.composer.failed_attachment_ids[0].clone();
+        let remove = probe::composer_attachment_remove_rect(&ctx, &failed_id).expect("the failed row remove button");
+        let remove_id = probe::composer_attachment_remove_widget_id(&ctx, &failed_id).expect("the remove widget id");
+        let card = probe::composer_card_rect(&ctx).expect("card");
+        assert!(card.contains_rect(remove), "failed remove outside card: {remove:?} in {card:?}");
+        ctx.memory_mut(|memory| memory.request_focus(remove_id));
+        frame_at(&ctx, &mut app, size, vec![]);
+        assert!(ctx.memory(|memory| memory.has_focus(remove_id)), "the failed row remove button cannot take keyboard focus");
+        frame_at(&ctx, &mut app, size, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(probe::composer_attachment_remove_was_clicked(&ctx, &failed_id), "Enter on the remove button did not reach it");
+        assert!(app.composer.attachment_failure.is_none(), "removing the failed row did not unblock send (rect {remove:?})");
+        app.composer.to = "Giulia <giulia@example.com>".to_owned();
+        app.send_composer();
+        assert!(!app.composer.open, "send after removal failed: {:?}", app.composer.save_error);
+        assert_eq!(app.engine.outbox_list(None, 500, 0).expect("outbox").entries.len(), 1);
+    }
+
+    #[test]
+    fn a_missing_attachment_send_error_names_the_file_and_the_good_one_stays() {
+        let ca = postino_testkit::TlsFixture::generate().ca();
+        let mut app = smtp_app("p8-send-name", 1, ca);
+        let source = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Due allegati".to_owned(),
+                    body_text: "Corpo".to_owned(),
+                    attachments: vec![postino_core::Attachment {
+                        id: "missing".to_owned(),
+                        filename: "manca.pdf".to_owned(),
+                        mime: "application/pdf".to_owned(),
+                        size: 4,
+                    }],
+                    in_reply_to: None,
+                },
+            )
+            .expect("draft with a missing row");
+        app.engine.add_draft_attachment(&source.summary.id, "buono.txt", None, b"ok").expect("good blob");
+        app.edit_draft(&source.summary.id);
+        app.send_composer();
+        let error = app.composer.save_error.clone().expect("a readable send refusal");
+        assert!(error.contains("manca.pdf"), "the filename is missing from the refusal: {error}");
+        assert!(error.contains("mancante o illeggibile"), "{error}");
+        assert_eq!(app.engine.message(&source.summary.id).expect("draft").attachments.len(), 2, "the good attachment was dropped");
+        assert!(app.engine.outbox_list(None, 500, 0).expect("outbox").entries.is_empty());
+    }
+
+    #[test]
+    fn a_drop_on_the_attachment_strip_is_added_once() {
+        let mut app = picker_app("p8-drop-strip");
+        let directory = test_directory("p8-drop-strip-files");
+        let path = directory.join("striscia.txt");
+        std::fs::write(&path, b"una volta").expect("fixture");
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia@example.com>".to_owned();
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        let card = probe::composer_card_rect(&ctx).expect("composer card");
+        frame_with_drop(&ctx, &mut app, size, pos2(card.center().x, card.max.y - 60.0), vec![path]);
+        frame_at(&ctx, &mut app, size, vec![]);
+        assert_eq!(app.composer.attachments.len(), 1, "a drop over the strip was added twice");
+        assert_eq!(app.composer.attachments[0].filename, "striscia.txt");
+    }
+
+    #[test]
+    fn a_large_reply_subject_or_body_has_a_readable_save_refusal() {
+        let mut app = picker_app("p8-large-reply");
+        let source = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "x".repeat(998),
+                    body_text: "Corpo".to_owned(),
+                    attachments: Vec::new(),
+                    in_reply_to: None,
+                },
+            )
+            .expect("source");
+        app.reply_to(&source.summary.id, ComposeMode::Reply);
+        app.composer.touch(1.0);
+        assert!(!app.save_composer(true), "the oversized Re: subject must be refused");
+        let error = app.composer.save_error.clone().expect("readable error");
+        assert!(error.contains("998"), "{error}");
+        assert!(!error.contains("Non è stato possibile salvare la bozza. Controlla"), "a generic error hid the limit: {error}");
+        assert!(draft_save_error_message(&None, "invalid arguments: body_text is larger than 1048576 bytes").contains("1 MiB"));
+    }
+
+    #[test]
+    fn a_demo_draft_attachment_can_be_removed_locally_without_a_store() {
+        let mut app = PostinoApp::demo(true);
+        let draft = app
+            .engine
+            .save_draft(
+                None,
+                None,
+                postino_core::DraftContent {
+                    to: vec![postino_core::Address::new("Giulia", "giulia.ferri@example.com")],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "Bozza demo".to_owned(),
+                    body_text: "Corpo".to_owned(),
+                    attachments: vec![postino_core::Attachment {
+                        id: "att_demo".to_owned(),
+                        filename: "demo.pdf".to_owned(),
+                        mime: "application/pdf".to_owned(),
+                        size: 4,
+                    }],
+                    in_reply_to: None,
+                },
+            )
+            .expect("demo draft");
+        app.edit_draft(&draft.summary.id);
+        app.remove_composer_attachment("att_demo");
+        assert!(app.composer.attachments.is_empty(), "the demo remove button did nothing");
+        assert!(app.composer.dirty);
+        assert!(app.save_composer(false));
+        assert!(app.engine.message(&draft.summary.id).expect("draft").attachments.is_empty());
+    }
+
+    #[test]
+    fn the_attach_button_is_reachable_from_the_keyboard() {
+        let mut app = picker_app("p8-attach-keyboard");
+        let directory = test_directory("p8-attach-keyboard-files");
+        let path = directory.join("tastiera.txt");
+        std::fs::write(&path, b"keyboard bytes").expect("fixture");
+        let picker = crate::test_support::RecordingFilePicker::new();
+        picker.set_paths(vec![path]);
+        app.file_picker = picker.clone();
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia@example.com>".to_owned();
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        let widget = probe::composer_attach_widget_id(&ctx).expect("the attach widget id");
+        ctx.memory_mut(|memory| memory.request_focus(widget));
+        frame_at(&ctx, &mut app, size, vec![]);
+        assert!(ctx.memory(|memory| memory.has_focus(widget)), "the attach button did not take keyboard focus");
+        frame_at(&ctx, &mut app, size, vec![key(Key::Enter, Modifiers::NONE)]);
+        frame_at(&ctx, &mut app, size, vec![]);
+        assert_eq!(picker.calls(), 1, "Enter on the focused attach button did not open the picker");
+        assert_eq!(app.composer.attachments.len(), 1);
+        assert_eq!(app.engine.attachment_bytes(&app.composer.attachments[0].id).expect("bytes"), b"keyboard bytes");
+    }
+
+    #[test]
+    fn the_signature_editor_saves_per_account_and_escape_returns_to_the_account_row() {
+        let mut app = booted_app("p8-signature", Vec::new(), |store| {
+            seed_account_rows(store, "acc_a", "a@example.com", None);
+            seed_account_rows(store, "acc_b", "b@example.com", None);
+        });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.open_settings(&ctx, None);
+        let size = Vec2::new(980.0, 600.0);
+        settle_at(&ctx, &mut app, size);
+        let open = probe::signature_open_button_rect(&ctx, "acc_b").expect("the Firma button");
+        click_at(&ctx, &mut app, open.center(), size);
+        settle_at(&ctx, &mut app, size);
+        assert!(
+            probe::signature_open_click_count(&ctx) > 0,
+            "the Firma button did not receive the click (rect {open:?}, remove rect {:?}, hover {:?}, remove state {:?}, settings {:?})",
+            probe::account_remove_button_rect(&ctx, "acc_b"),
+            probe::signature_open_hover_state(&ctx, "acc_b"),
+            app.account_remove.is_some(),
+            probe::settings_sections(&ctx)
+        );
+        assert_eq!(app.signature_editor.as_ref().map(|editor| editor.account.as_str()), Some("acc_b"));
+        let editor_rect = probe::signature_editor_rect(&ctx, "acc_b").expect("the signature text area");
+        let appearance = probe::settings_sections(&ctx).get("ASPETTO").copied().expect("the appearance section");
+        assert!(editor_rect.max.y <= appearance.min.y + 1.0, "the signature editor crosses into ASPETTO: {editor_rect:?} vs {appearance:?}");
+        assert!(probe::signature_cancel_rect(&ctx, "acc_b").is_some(), "the cancel button is missing");
+        if let Some(editor) = app.signature_editor.as_mut() {
+            editor.text = "Firma B\nb@example.com".to_owned();
+        }
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let save = probe::signature_save_rect(&ctx, "acc_b").expect("Salva firma");
+        click_at(&ctx, &mut app, save.center(), size);
+        settle_at(&ctx, &mut app, size);
+        assert!(app.signature_editor.is_none(), "the editor did not close after Save");
+        assert_eq!(
+            app.engine.accounts().iter().find(|account| account.id == "acc_b").map(|account| account.signature.as_str()),
+            Some("Firma B\nb@example.com")
+        );
+        assert_eq!(
+            app.engine.accounts().iter().find(|account| account.id == "acc_a").map(|account| account.signature.as_str()),
+            Some(""),
+            "the other account was changed"
+        );
+
+        app.switch_account("acc_b".to_owned());
+        app.compose_new();
+        assert!(app.composer.body.contains("Firma B"), "the new message did not use the saved signature: {}", app.composer.body);
+
+        app.composer = ComposerState::closed();
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let open = probe::signature_open_button_rect(&ctx, "acc_a").expect("the Firma button");
+        let open_id = probe::signature_open_button_widget_id(&ctx, "acc_a").expect("the Firma widget id");
+        click_at(&ctx, &mut app, open.center(), size);
+        settle_at(&ctx, &mut app, size);
+        assert!(app.signature_editor.is_some());
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.signature_editor.is_none(), "Escape must close the editor");
+        assert!(app.show_accounts_dialog, "Escape must not close Settings with the editor open");
+        assert_eq!(app.signature_focus_account, None, "the focus request must be spent on the account button");
+        assert!(ctx.memory(|memory| memory.has_focus(open_id)), "Escape did not return focus to the Firma button");
+
+        // Closing Settings discards an unsaved editor instead of showing stale text on reopen.
+        let open = probe::signature_open_button_rect(&ctx, "acc_a").expect("the Firma button");
+        click_at(&ctx, &mut app, open.center(), size);
+        settle_at(&ctx, &mut app, size);
+        if let Some(editor) = app.signature_editor.as_mut() {
+            editor.text = "testo mai salvato".to_owned();
+        }
+        app.close_settings(&ctx);
+        assert!(app.signature_editor.is_none());
+        app.open_settings(&ctx, None);
+        assert!(app.signature_editor.is_none(), "closing Settings kept the unsaved editor text");
+    }
+
+    #[test]
+    fn composer_attachments_and_the_signature_editor_render_at_980_light_and_dark() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let mut app = PostinoApp::demo_at(true, screenshot_clock().expect("clock"));
+            app.dark = dark;
+            let mut composer = ComposerState::new(ComposeMode::New);
+            composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
+            composer.subject = "Allegati".to_owned();
+            composer.attachments = vec![
+                Attachment {
+                    id: "att_p8_1".to_owned(),
+                    filename: "preventivo-postino.pdf".to_owned(),
+                    mime: "application/pdf".to_owned(),
+                    size: 248_320,
+                },
+                Attachment {
+                    id: "att_p8_2".to_owned(),
+                    filename: "planimetria-ufficio.png".to_owned(),
+                    mime: "image/png".to_owned(),
+                    size: 1_048_576,
+                },
+            ];
+            app.composer = composer;
+            frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+            let card = probe::composer_card_rect(&ctx).expect("the composer card");
+            let send = probe::composer_send_rect(&ctx).expect("the Send button");
+            assert!(card.contains_rect(send), "Send is outside the composer at 980x600: {send:?} in {card:?}");
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            assert!(
+                text.iter().any(|line| line.contains("2 allegati")),
+                "the total is missing in {} mode: {text:?}",
+                if dark { "dark" } else { "light" }
+            );
+            assert!(text.iter().any(|line| line.contains("preventivo-postino.pdf")), "the first attachment is missing: {text:?}");
+
+            app.composer = ComposerState::closed();
+            app.seed_screenshot(ScreenshotState::SettingsSignature);
+            frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            assert!(text.iter().any(|line| line.contains("Firma")), "the signature editor is missing: {text:?}");
+            assert!(text.iter().any(|line| line.contains("byte")), "the byte count is missing: {text:?}");
+        }
     }
 
     #[test]
@@ -9023,6 +10299,7 @@ mod tests {
             ("reading_attachments", ScreenshotState::ReadingAttachments),
             ("link_confirm", ScreenshotState::LinkConfirm),
             ("settings", ScreenshotState::Settings),
+            ("settings_signature", ScreenshotState::SettingsSignature),
         ] {
             assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
         }
@@ -11755,6 +13032,7 @@ mod tests {
             subject: "Prova".to_owned(),
             body_text: body.to_owned(),
             attachments: Vec::new(),
+            in_reply_to: None,
         };
         app.engine.save_draft(None, None, content).expect("draft").summary.id
     }
@@ -11763,7 +13041,7 @@ mod tests {
     fn run_send_at(app: &mut PostinoApp, now_ms: i64) {
         app.now_utc = chrono::DateTime::<Utc>::from_timestamp_millis(now_ms).expect("instant");
         app.request_send();
-        for _ in 0..600 {
+        for _ in 0..1500 {
             app.handle_send_events();
             if !app.send_worker.as_ref().is_some_and(SendWorker::is_running) {
                 return;
@@ -11867,6 +13145,7 @@ mod tests {
             subject: "Prova".to_owned(),
             body_text: "una modifica arrivata tardi".to_owned(),
             attachments: Vec::new(),
+            in_reply_to: None,
         };
         let refused = app.engine.save_draft(None, Some(&draft_id), stale).expect_err("a stale Drafts save must be refused");
         assert!(
@@ -11923,7 +13202,9 @@ mod tests {
         assert!(send_error_message("invalid arguments: draft is already queued", false).contains("già in coda"));
         assert!(send_error_message("account \"acc_1\" has no SMTP endpoint", false).contains("SMTP"));
         assert!(send_error_message("the demo mailbox has no outbox", true).contains("demo"));
-        assert!(send_error_message("attachment \"x.pdf\" has no stored bytes", false).contains("allegato"));
+        let attachment_refusal = send_error_message("attachment \"x.pdf\" has no stored bytes", false);
+        assert!(attachment_refusal.to_lowercase().contains("allegato"), "{attachment_refusal}");
+        assert!(attachment_refusal.contains("x.pdf"), "{attachment_refusal}");
         assert!(send_error_message("draft \"d\" has a failed submission; discard that row", false).contains("rifiutato"));
         assert!(!send_error_message("some internal sentence", false).contains("internal"));
     }

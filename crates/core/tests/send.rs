@@ -85,7 +85,7 @@ async fn serve_smtp(mut conn: SmtpConn, capture: Arc<Mutex<SmtpCapture>>, reply:
 }
 
 fn draft(to: Vec<Address>, cc: Vec<Address>, bcc: Vec<Address>, subject: &str, body: &str) -> DraftContent {
-    DraftContent { to, cc, bcc, subject: subject.to_owned(), body_text: body.to_owned(), attachments: Vec::new() }
+    DraftContent { to, cc, bcc, subject: subject.to_owned(), body_text: body.to_owned(), attachments: Vec::new(), in_reply_to: None }
 }
 
 fn open_engine(harness: &Harness, vault: &Arc<MemoryVault>, smtp: &RunningSmtp, imap: &RunningAppendServer) -> Engine {
@@ -1805,18 +1805,28 @@ fn a_stale_engine_cannot_queue_a_draft_whose_attachments_changed() {
 }
 
 #[test]
-fn a_draft_with_a_reply_linkage_is_not_sent_as_a_plain_message() {
+fn a_reply_linkage_is_serialized_and_an_unhydrated_external_link_is_refused() {
     let harness = Harness::new();
     let store = harness.open();
     let vault = MemoryVault::new();
     seed_account_with_smtp(&store, &vault, ACCOUNT_ID, 1, 1, &[("drafts", "Drafts", FolderKind::Drafts)]);
     let mut engine = Engine::open_with_vault(harness.open(), vault).expect("engine");
-    let saved =
-        engine.save_draft(None, None, draft(vec![Address::new("", "one@example.com")], Vec::new(), Vec::new(), "Risposta", "corpo")).expect("draft");
-    let draft_id = saved.summary.id.clone();
-    let row = store.get_draft(&draft_id).expect("draft").expect("row");
-    // Another writer links the draft to a parent. This build's composer has no reply field and the
-    // serializer sends no `In-Reply-To`, so the engine must refuse instead of dropping the link.
+    let mut content = draft(vec![Address::new("", "one@example.com")], Vec::new(), Vec::new(), "Risposta", "corpo");
+    content.in_reply_to = Some("parent@example.com".to_owned());
+    let draft_id = engine.save_draft(None, None, content).expect("linked reply").summary.id.clone();
+    engine.message_send(&draft_id).expect("a linked reply is serialized with its headers");
+    let row = store.active_outbox_for_draft(&draft_id).expect("outbox lookup").expect("row");
+    let raw = store.blobs().get(&row.raw_blob_hash, 1024 * 1024).expect("raw blob");
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.contains("In-Reply-To: <parent@example.com>"), "{text}");
+    assert!(text.contains("References: <parent@example.com>"), "{text}");
+
+    // A different writer links another draft directly in the store. This engine never hydrated that
+    // link, so sending its snapshot would silently drop the header: refuse the stale snapshot.
+    let other =
+        engine.save_draft(None, None, draft(vec![Address::new("", "two@example.com")], Vec::new(), Vec::new(), "Altra", "corpo")).expect("draft");
+    let other_id = other.summary.id.clone();
+    let row = store.get_draft(&other_id).expect("draft").expect("row");
     store
         .save_draft(&DraftUpdate {
             id: row.id,
@@ -1827,12 +1837,11 @@ fn a_draft_with_a_reply_linkage_is_not_sent_as_a_plain_message() {
             cc: row.cc,
             bcc: row.bcc,
             subject: row.subject,
-            in_reply_to: Some("<parent@example.com>".to_owned()),
+            in_reply_to: Some("<external@example.com>".to_owned()),
         })
-        .expect("link the reply");
-    let error = engine.message_send(&draft_id).expect_err("a linked draft must not be sent as a plain message");
+        .expect("link the reply externally");
+    let error = engine.message_send(&other_id).expect_err("a stale unhydrated link must not be sent as a plain message");
     assert!(error.to_string().contains("changed in another session"), "{error}");
-    assert!(harness.open().list_outbox(None, 50).expect("outbox").is_empty(), "the linked draft wrote a row");
 }
 
 #[test]

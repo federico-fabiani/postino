@@ -125,6 +125,7 @@ pub(crate) fn ingest(
     let to = address_list(&parsed, |message| &message.to, &envelope.to);
     let cc = address_list(&parsed, |message| &message.cc, &envelope.cc);
     let bcc = address_list(&parsed, |message| &message.bcc, &envelope.bcc);
+    let reply_to = parsed.reply_to.iter().map(parsed_address).collect::<Vec<_>>();
 
     let mut attachments = Vec::with_capacity(parsed.attachments.len());
     let mut stored = 0u32;
@@ -183,6 +184,7 @@ pub(crate) fn ingest(
         size: Some(size),
     };
     store.upsert_synced_message(&row, &attachments).map_err(SyncError::Store)?;
+    store.set_message_reply_to(&id, &reply_to).map_err(SyncError::Store)?;
     index.inserted.insert(id.clone(), uid);
     Ok(Some(Ingested { message_id: id, new, drift, attachments_stored: stored }))
 }

@@ -390,6 +390,9 @@ pub struct DraftContent {
     pub subject: String,
     pub body_text: String,
     pub attachments: Vec<Attachment>,
+    /// Parent `Message-ID` for a reply, without angle brackets. `None` keeps the stored linkage on
+    /// an update; a new draft simply has none.
+    pub in_reply_to: Option<String>,
 }
 
 /// A message with its body. `body_html` is kept exactly as received; M0 renders `body_text`

@@ -14,7 +14,7 @@ use crate::model::{
     LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
     SyncState, UidEntry,
 };
-use crate::{SYNC_STATUS_KEY_PREFIX, Store, StoreError};
+use crate::{REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError};
 
 /// Largest page a caller can request. A mailbox list never needs more, and the cap bounds memory.
 const MAX_PAGE: u32 = 500;
@@ -48,6 +48,44 @@ impl Store {
 
     pub fn get_account(&self, id: &str) -> Result<Option<Account>, StoreError> {
         Ok(self.conn.query_row(&format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = ?1"), [id], row_to_account).optional()?)
+    }
+
+    /// Replace one account's plain-text signature. Returns whether the account exists.
+    ///
+    /// This is deliberately narrower than [`Store::upsert_account`]: changing a signature must never
+    /// rewrite the name, the address or the provider, and it must not need the row's `created_at`.
+    pub fn set_account_signature(&self, id: &str, signature: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute("UPDATE accounts SET signature = ?2 WHERE id = ?1", params![id, signature])? > 0)
+    }
+
+    /// Persist a received message's `Reply-To` list in the existing `meta` table.
+    ///
+    /// The shipped schema has no column for it and P8 may not migrate. An empty list clears the
+    /// key. The caller has already bounded and validated the addresses; this is a cache of a header,
+    /// never a credential or a body.
+    pub fn set_message_reply_to(&self, message_id: &str, reply_to: &[Address]) -> Result<(), StoreError> {
+        let key = format!("{REPLY_TO_KEY_PREFIX}{message_id}");
+        if reply_to.is_empty() {
+            self.conn.execute("DELETE FROM meta WHERE key = ?1", [&key])?;
+            return Ok(());
+        }
+        let value = serde_json::to_string(reply_to)?;
+        self.conn
+            .execute("INSERT INTO meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
+        Ok(())
+    }
+
+    /// The persisted `Reply-To` list for one message, or an empty list when it has none.
+    ///
+    /// A damaged value is a readable store error, never a silent empty list: the caller can then
+    /// fall back to `From` and say so if needed.
+    pub fn message_reply_to(&self, message_id: &str) -> Result<Vec<Address>, StoreError> {
+        let key = format!("{REPLY_TO_KEY_PREFIX}{message_id}");
+        let raw: Option<String> = self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [&key], |row| row.get(0)).optional()?;
+        match raw {
+            Some(raw) => serde_json::from_str(&raw).map_err(|error| StoreError::Corrupt { table: "messages.reply_to", detail: error.to_string() }),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Write an account, its IMAP server configuration and its folders in **one transaction**.
@@ -107,6 +145,7 @@ impl Store {
                 OR message_id IN (SELECT id FROM drafts WHERE account_id = ?1)",
             [account_id],
         )?;
+        tx.execute("DELETE FROM meta WHERE key IN (SELECT 'reply_to:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM messages WHERE account_id = ?1", [account_id])?;
         tx.execute("DELETE FROM drafts WHERE account_id = ?1", [account_id])?;
         tx.execute("DELETE FROM account_servers WHERE account_id = ?1", [account_id])?;
@@ -709,6 +748,7 @@ impl Store {
         let folder: Option<String> = tx.query_row("SELECT folder_id FROM messages WHERE id = ?1", [id], |row| row.get(0)).optional()?;
         tx.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
+        tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
         tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
         if let Some(folder) = &folder {
             refresh_folder_counts(&tx, folder)?;
@@ -828,7 +868,11 @@ impl Store {
             if is_draft {
                 continue;
             }
-            removed += tx.execute("DELETE FROM messages WHERE id = ?1 AND folder_id = ?2", params![id, folder_id])?;
+            let deleted = tx.execute("DELETE FROM messages WHERE id = ?1 AND folder_id = ?2", params![id, folder_id])?;
+            if deleted > 0 {
+                tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
+            }
+            removed += deleted;
         }
         if removed > 0 {
             refresh_folder_counts(&tx, folder_id)?;
@@ -847,6 +891,13 @@ impl Store {
     pub fn reset_folder_messages(&self, folder_id: &str) -> Result<u32, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         require_folder(&tx, folder_id)?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (
+                 SELECT 'reply_to:' || id FROM messages
+                 WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
+             )",
+            [folder_id],
+        )?;
         let removed =
             tx.execute("DELETE FROM messages WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)", [folder_id])?;
         tx.execute("DELETE FROM sync_state WHERE folder_id = ?1", [folder_id])?;
@@ -1171,11 +1222,20 @@ impl Store {
     /// keeps the stored one, so a field the caller does not own cannot clear it. On any error the
     /// transaction rolls back and the previous rows are exactly as they were.
     pub fn save_draft_message(&self, message: &Message, attachments: &[Attachment]) -> Result<Draft, StoreError> {
+        self.save_draft_message_linked(message, attachments, None)
+    }
+
+    /// [`Store::save_draft_message`] with an explicit reply linkage.
+    ///
+    /// `in_reply_to` is the parent `Message-ID` without angle brackets. `None` keeps whatever the
+    /// stored draft row already has, matching the column's `COALESCE` rule: a later patch that does
+    /// not own the field cannot clear it.
+    pub fn save_draft_message_linked(&self, message: &Message, attachments: &[Attachment], in_reply_to: Option<&str>) -> Result<Draft, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         validate_attachment_ids(&tx, &message.summary.id, attachments)?;
         upsert_message_row(&tx, message, true)?;
         replace_attachments_in_tx(&tx, &message.summary.id, attachments)?;
-        let draft = draft_update_from_message(message);
+        let draft = draft_update_from_message(message, in_reply_to);
         let saved = save_draft_row(&tx, &draft)?;
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
         tx.commit()?;
@@ -1212,6 +1272,7 @@ impl Store {
             && duplicate != message.summary.id
         {
             tx.execute("DELETE FROM messages WHERE id = ?1", [duplicate])?;
+            tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{duplicate}")])?;
         }
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
         tx.commit()?;
@@ -1543,7 +1604,7 @@ fn validate_attachment_ids(tx: &rusqlite::Transaction<'_>, message_id: &str, att
     Ok(())
 }
 
-fn draft_update_from_message(message: &Message) -> DraftUpdate {
+fn draft_update_from_message(message: &Message, in_reply_to: Option<&str>) -> DraftUpdate {
     DraftUpdate {
         id: message.summary.id.clone(),
         account_id: message.summary.account_id.clone(),
@@ -1553,8 +1614,7 @@ fn draft_update_from_message(message: &Message) -> DraftUpdate {
         cc: message.cc.clone(),
         bcc: message.bcc.clone(),
         subject: message.summary.subject.clone(),
-        // Core has no reply linkage yet; M2 adds it with the compose work.
-        in_reply_to: None,
+        in_reply_to: in_reply_to.map(str::to_owned),
     }
 }
 

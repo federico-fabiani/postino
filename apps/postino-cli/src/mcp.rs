@@ -11,6 +11,16 @@ use serde_json::{Value, json};
 
 const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// A legitimate 25 MiB attachment is a ~35 MB base64 string inside JSON. Anything above that plus
+/// headroom is not a request this server can serve, and must not become an unbounded `String`.
+const MAX_REQUEST_LINE: usize = (postino_core::MAX_ATTACHMENT_BYTES as usize).div_ceil(3) * 4 + 2 * 1024 * 1024;
+
+enum BoundedLine {
+    Eof,
+    Line(Vec<u8>),
+    TooLong,
+}
+
 /// Operations that can create a network submission or resolve a delivered one. They are listed but
 /// disabled unless the server was started with `--allow-send`; `outbox_retry` is included because it
 /// can send stored bytes, and `outbox_mark_sent` because it records a delivery decision that removes
@@ -22,10 +32,26 @@ const SEND_DISABLED_REASON: &str =
 
 pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
     let stdin = std::io::stdin();
-    let lines = stdin.lock().lines();
+    let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
-    for line in lines {
-        let line = line.context("reading stdin")?;
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_REQUEST_LINE) {
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::Line(line)) => line,
+            Ok(BoundedLine::TooLong) => {
+                let response = error_response(Value::Null, -32600, &format!("request line is longer than {MAX_REQUEST_LINE} bytes"));
+                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+                stdout.flush()?;
+                continue;
+            }
+            Err(error) => return Err(anyhow::Error::new(error)).context("reading stdin"),
+        };
+        let Ok(line) = String::from_utf8(line) else {
+            let response = error_response(Value::Null, -32700, "parse error: request is not UTF-8");
+            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+            stdout.flush()?;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -39,6 +65,40 @@ pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read one newline-delimited request with a hard ceiling. An over-long line is consumed (so the
+/// next request can still be served) but never stored in full.
+fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<BoundedLine> {
+    let mut out = Vec::new();
+    let mut too_long = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(if out.is_empty() && !too_long {
+                BoundedLine::Eof
+            } else if too_long {
+                BoundedLine::TooLong
+            } else {
+                BoundedLine::Line(out)
+            });
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(buffer.len());
+        if !too_long {
+            if out.len().saturating_add(take) > max {
+                too_long = true;
+                out.clear();
+            } else {
+                out.extend_from_slice(buffer.get(..take).unwrap_or_default());
+            }
+        }
+        if newline.is_some() {
+            reader.consume(take.saturating_add(1));
+            return Ok(if too_long { BoundedLine::TooLong } else { BoundedLine::Line(out) });
+        }
+        reader.consume(take);
+    }
 }
 
 fn handle(engine: &mut Engine, request: &Value, allow_send: bool) -> Option<Value> {
@@ -179,6 +239,17 @@ mod tests {
 
     fn request(engine: &mut Engine, method: &str) -> Value {
         handle(engine, &json!({ "jsonrpc": "2.0", "id": 1, "method": method })).expect("response")
+    }
+
+    #[test]
+    fn the_request_line_is_bounded_and_an_oversized_line_is_drained() {
+        let mut input = std::io::Cursor::new(b"12345678901234567\nshort\n".to_vec());
+        assert!(matches!(read_bounded_line(&mut input, 16), Ok(BoundedLine::TooLong)));
+        match read_bounded_line(&mut input, 16).expect("second line") {
+            BoundedLine::Line(line) => assert_eq!(line, b"short"),
+            _ => panic!("the line after an oversized one must still be readable"),
+        }
+        assert!(matches!(read_bounded_line(&mut input, 16).expect("eof"), BoundedLine::Eof));
     }
 
     #[test]
@@ -520,6 +591,120 @@ mod tests {
         for forbidden in [secret.as_str(), body.as_str(), recipient] {
             assert!(!encoded.contains(forbidden), "an MCP response contained server text: {encoded}");
         }
+    }
+
+    #[test]
+    fn attachment_and_signature_operations_are_exposed_without_a_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mail.db");
+        let mut key_bytes = [0u8; 32];
+        getrandom::fill(&mut key_bytes).expect("OS random source");
+        let store = postino_store::Store::open(&path, &postino_store::StoreKey::from_bytes(key_bytes)).expect("store");
+        store
+            .upsert_account(&postino_store::Account {
+                id: "acc_mcp".to_owned(),
+                name: "Postino Test".to_owned(),
+                email: "test@example.com".to_owned(),
+                provider: "custom".to_owned(),
+                signature: String::new(),
+                created_at: 1,
+            })
+            .expect("account");
+        for (suffix, name, kind) in [("drafts", "Bozze", postino_store::FolderKind::Drafts), ("sent", "Inviati", postino_store::FolderKind::Sent)] {
+            store
+                .upsert_folder(&postino_store::Folder {
+                    id: format!("fld_acc_mcp_{suffix}"),
+                    account_id: "acc_mcp".to_owned(),
+                    name: name.to_owned(),
+                    kind,
+                    unread: 0,
+                    total: 0,
+                    uid_validity: None,
+                    uid_next: None,
+                    last_sync_at: None,
+                })
+                .expect("folder");
+        }
+        let mut engine = Engine::open(store).expect("engine");
+
+        let tools = request(&mut engine, "tools/list");
+        let definitions = tools["result"]["tools"].as_array().expect("tools");
+        let add = definitions.iter().find(|tool| tool["name"] == "draft_attachment_add").expect("attachment add");
+        assert_eq!(add["annotations"]["readOnlyHint"], json!(false));
+        assert_eq!(add["annotations"]["destructiveHint"], json!(false));
+        let properties = add["inputSchema"]["properties"].as_object().expect("properties");
+        assert!(properties.contains_key("data_base64"), "{properties:?}");
+        assert!(!properties.contains_key("path"), "MCP must never read a local path");
+        assert!(!definitions.iter().any(|tool| tool["name"] == "account_add"), "sensitive ops stay absent");
+
+        let saved = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 50, "method": "tools/call",
+                "params": { "name": "draft_save", "arguments": {
+                    "account": "acc_mcp",
+                    "to": [{ "name": "Giulia", "email": "giulia@example.com" }],
+                    "subject": "Da MCP",
+                    "body_text": "Corpo"
+                }}
+            }),
+        )
+        .expect("response");
+        let draft = saved["result"]["structuredContent"]["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
+
+        let added = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 51, "method": "tools/call",
+                "params": { "name": "draft_attachment_add", "arguments": {
+                    "draft": draft,
+                    "filename": "nota.txt",
+                    "data_base64": "Y2lhbyBkYSBNQ1A="
+                }}
+            }),
+        )
+        .expect("response");
+        assert!(added.get("error").is_none(), "{added}");
+        assert_eq!(added["result"]["structuredContent"]["draft"]["attachments"][0]["filename"], "nota.txt");
+        assert_eq!(added["result"]["structuredContent"]["draft"]["attachments"][0]["size"], 11);
+
+        let removed = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 52, "method": "tools/call",
+                "params": { "name": "draft_attachment_remove", "arguments": { "draft": draft, "attachment": "nota.txt" }}
+            }),
+        )
+        .expect("response");
+        assert_eq!(removed["result"]["structuredContent"]["draft"]["attachments"].as_array().map(Vec::len), Some(0));
+
+        let signature = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 53, "method": "tools/call",
+                "params": { "name": "account_signature_set", "arguments": { "account": "acc_mcp", "signature": "Postino\nMCP" }}
+            }),
+        )
+        .expect("response");
+        assert_eq!(signature["result"]["structuredContent"]["account"]["account"]["signature"], "Postino\nMCP");
+    }
+
+    #[test]
+    fn the_attachment_payload_is_bounded_before_decode_over_mcp() {
+        let mut engine = Engine::demo();
+        let response = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 60, "method": "tools/call",
+                "params": { "name": "draft_attachment_add", "arguments": {
+                    "draft": "draft_1", "filename": "x.bin", "data_base64": "not base64"
+                }}
+            }),
+        )
+        .expect("response");
+        assert_eq!(response["result"]["isError"], json!(true));
+        let text = response["result"]["content"][0]["text"].as_str().expect("text");
+        assert!(text.contains("base64") || text.contains("no local store") || text.contains("demo"), "{text}");
     }
 
     #[test]

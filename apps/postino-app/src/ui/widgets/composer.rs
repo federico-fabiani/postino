@@ -1,13 +1,13 @@
 //! The composer surface: recipients, subject, body, formatting, attachments and draft state.
 //! The component owns no mail state. The screen saves and sends through the operation registry.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui::containers::Sides;
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{self, Align, FontFamily, FontId, Frame, Layout, Margin, Rect, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2, pos2};
-use postino_core::{Account, Address, Attachment};
+use postino_core::{Account, Address, Attachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS};
 
 use crate::theme::Tokens;
 use crate::ui::icons;
@@ -83,6 +83,17 @@ pub struct ComposerState {
     pub subject: String,
     pub body: String,
     pub attachments: Vec<Attachment>,
+    /// Parent `Message-ID` for a reply. It is part of the draft, not of the body.
+    pub in_reply_to: Option<String>,
+    /// Parent attachment ids a forward has not copied yet. The first save copies their bytes
+    /// through the engine, then clears this list.
+    pub forward_sources: Vec<String>,
+    /// A failed forward copy blocks Send until the named rows are removed. It is kept separately
+    /// from the draft body state because the body may already be saved.
+    pub attachment_failure: Option<String>,
+    /// Composer-local failure rows (metadata only, no blob). They are removable even before the
+    /// draft metadata save gives them a store row.
+    pub failed_attachment_ids: Vec<String>,
     pub focus: Option<ComposerFocus>,
     pub dirty: bool,
     pub last_edit: f64,
@@ -109,6 +120,10 @@ impl ComposerState {
             subject: String::new(),
             body: String::new(),
             attachments: Vec::new(),
+            in_reply_to: None,
+            forward_sources: Vec::new(),
+            attachment_failure: None,
+            failed_attachment_ids: Vec::new(),
             focus: Some(ComposerFocus::To),
             dirty: false,
             last_edit: 0.0,
@@ -236,6 +251,13 @@ pub struct ComposerResponse {
     pub save: bool,
     pub send: bool,
     pub discard: bool,
+    /// Ask the screen to open the injected file picker.
+    pub pick_files: bool,
+    /// Files dropped on the composer this frame. The screen reads and bounds them; the component
+    /// never touches the filesystem.
+    pub dropped_files: Vec<PathBuf>,
+    /// Ask the screen to remove one attachment row through the operation registry.
+    pub remove_attachment: Option<String>,
 }
 
 pub struct Composer<'a> {
@@ -243,12 +265,13 @@ pub struct Composer<'a> {
     account: &'a Account,
     send_available: bool,
     demo: bool,
+    attachments_available: bool,
 }
 
 impl<'a> Composer<'a> {
     #[must_use]
     pub fn new(state: &'a mut ComposerState, account: &'a Account) -> Self {
-        Self { state, account, send_available: true, demo: true }
+        Self { state, account, send_available: true, demo: true, attachments_available: false }
     }
 
     /// Whether this account can submit. The demo has no SMTP endpoint and must not pretend.
@@ -266,6 +289,14 @@ impl<'a> Composer<'a> {
         self
     }
 
+    /// Whether the composer can read files and store their bytes. The demo and a store-less
+    /// screenshot session pass false: the button stays visible but refuses with a reason.
+    #[must_use]
+    pub fn attachments_available(mut self, available: bool) -> Self {
+        self.attachments_available = available;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> ComposerResponse {
         let session = self.state.session;
         ui.push_id(("composer-session", session), |ui| self.show_session(ui)).inner
@@ -280,9 +311,22 @@ impl<'a> Composer<'a> {
         // The caller sizes the surface: a centred card at >= 1000×700, a sheet with LG margins
         // below it. The header and the footer are pinned here; only the body scrolls.
         let area = ui.max_rect();
+        // A drop anywhere on the composer is an attachment; the component reports paths and the
+        // screen owns the bounded read. Doing it here (not inside the pinned strip) keeps the body
+        // a valid drop target too.
+        if ui.ctx().pointer_interact_pos().is_some_and(|pointer| area.contains(pointer)) {
+            for file in ui.ctx().input(|input| input.raw.dropped_files.clone()) {
+                response.dropped_files.push(file.path().to_path_buf());
+            }
+        }
         let header_rect = Rect::from_min_size(area.min, Vec2::new(area.width(), ui_size::COMPOSER_HEADER_BLOCK));
         let footer_rect = Rect::from_min_max(pos2(area.min.x, area.max.y - ui_size::COMPOSER_FOOTER_BLOCK), area.max);
-        let body_rect = Rect::from_min_max(pos2(area.min.x, header_rect.max.y + space::XS), pos2(area.max.x, footer_rect.min.y - space::XS));
+        let strip_height = self.attachment_strip_height();
+        let strip_rect = Rect::from_min_max(
+            pos2(area.min.x, (footer_rect.min.y - strip_height - space::XS).max(header_rect.max.y)),
+            pos2(area.max.x, (footer_rect.min.y - space::XS).max(header_rect.max.y)),
+        );
+        let body_rect = Rect::from_min_max(pos2(area.min.x, header_rect.max.y + space::XS), pos2(area.max.x, strip_rect.min.y - space::XS));
 
         self.header(ui, &t, header_rect, &mut response);
 
@@ -320,8 +364,7 @@ impl<'a> Composer<'a> {
 
                     self.formatting_bar(ui, &t, now);
                     changed |= self.body_field(ui, &t);
-                    changed |= self.attachment_section(ui, &t, now);
-                    // A little tail so the last attachment breathes instead of touching the footer.
+                    // A little tail so the last line of the body breathes at the scroll edge.
                     ui.add_space(space::SM);
                 });
             #[cfg(test)]
@@ -329,6 +372,12 @@ impl<'a> Composer<'a> {
             #[cfg(not(test))]
             let _ = scroll;
         });
+
+        if strip_height > 0.0 {
+            ui.scope_builder(UiBuilder::new().max_rect(strip_rect), |ui| {
+                self.attachment_section(ui, &t, &mut response);
+            });
+        }
 
         self.footer(ui, &t, footer_rect, addresses_ok, send_ready, &mut response);
 
@@ -516,40 +565,64 @@ impl<'a> Composer<'a> {
         changed
     }
 
-    fn attachment_section(&mut self, ui: &mut Ui, t: &Tokens, now: f64) -> bool {
-        let mut changed = false;
+    /// The pinned attachment strip height. Two rows fit; more scroll inside the strip. An empty
+    /// composer with a usable picker shows a one-line hint; the demo shows nothing because its
+    /// disabled button already carries the reason.
+    fn attachment_strip_height(&self) -> f32 {
+        if self.state.attachments.is_empty() {
+            if self.attachments_available { 32.0 } else { 0.0 }
+        } else {
+            // Header + total + two content-sized rows + the small tail.
+            144.0
+        }
+    }
+
+    fn attachment_section(&mut self, ui: &mut Ui, t: &Tokens, response: &mut ComposerResponse) -> bool {
+        ui.add_space(space::XS);
         if !self.state.attachments.is_empty() {
-            ui.add_space(space::XS);
             SectionHeader::new("ALLEGATI").count(self.state.attachments.len()).show(ui);
+            let total = self.state.attachments.iter().map(|attachment| attachment.size).sum::<u64>();
+            ui.label(typography::mono(
+                format!("{} · {}", plural_attachments(self.state.attachments.len()), format_size_it(total)),
+                9.5,
+                t.text_muted,
+            ));
             ScrollArea::vertical().max_height(ui_size::ATTACHMENT_LIST_MAX).auto_shrink([false, true]).show(ui, |ui| {
                 let mut remove = None;
-                for (index, attachment) in self.state.attachments.iter().enumerate() {
+                for attachment in &self.state.attachments {
                     Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::SM, inset::XS)).show(
                         ui,
                         |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(icons::icon(icons::PAPERCLIP, ui_size::ICON_SM, t.text_muted));
-                                ui.add(egui::Label::new(typography::text(Role::Caption, attachment.filename.as_str(), t.text)).truncate());
-                                ui.label(typography::mono(format_size(attachment.size), 9.5, t.text_faint));
+                                let name = ui.add(egui::Label::new(typography::text(Role::Caption, attachment.filename.as_str(), t.text)).truncate());
+                                name.on_hover_text(attachment.filename.as_str());
+                                ui.label(typography::mono(attachment.mime.as_str(), 9.0, t.text_faint));
+                                ui.label(typography::mono(format_size_it(attachment.size), 9.5, t.text_faint));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if IconButton::new(icons::CLOSE, "Rimuovi allegato").size(IconButtonSize::Sm).show(ui).clicked() {
-                                        remove = Some(index);
+                                    let button = IconButton::new(icons::CLOSE, "Rimuovi allegato").size(IconButtonSize::Sm).show(ui);
+                                    #[cfg(test)]
+                                    crate::app::probe::composer_attachment_remove(ui, &attachment.id, button.rect);
+                                    #[cfg(test)]
+                                    crate::app::probe::composer_attachment_remove_id(ui, &attachment.id, button.id);
+                                    #[cfg(test)]
+                                    crate::app::probe::composer_attachment_remove_clicked(ui, &attachment.id, button.clicked());
+                                    if button.clicked() {
+                                        remove = Some(attachment.id.clone());
                                     }
                                 });
                             });
                         },
                     );
                 }
-                if let Some(index) = remove
-                    && index < self.state.attachments.len()
-                {
-                    self.state.attachments.remove(index);
-                    changed = true;
+                if let Some(id) = remove {
+                    response.remove_attachment = Some(id);
                 }
             });
-        }
-
-        if self.state.attachments.is_empty() {
+            if let Some(warning) = attachment_limit_warning(&self.state.attachments) {
+                ui.label(typography::text(Role::Caption, warning, t.danger));
+            }
+        } else if self.attachments_available {
             Frame::new()
                 .fill(t.panel_alt)
                 .stroke(Stroke::new(1.0, t.border))
@@ -558,29 +631,18 @@ impl<'a> Composer<'a> {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(icons::icon(icons::PAPERCLIP, ui_size::ICON_SM, t.text_faint));
-                        ui.label(typography::text(Role::Caption, "Gli allegati senza contenuto salvato bloccano l'invio", t.text_faint));
+                        ui.label(typography::text(
+                            Role::Caption,
+                            format!(
+                                "Trascina qui i file o usa Allega file · max {} per file, {MAX_DRAFT_ATTACHMENTS} allegati",
+                                format_size_it(MAX_ATTACHMENT_BYTES)
+                            ),
+                            t.text_faint,
+                        ));
                     });
                 });
         }
-
-        let dropped = ui.ctx().input(|input| input.raw.dropped_files.clone());
-        if !dropped.is_empty() && ui.rect_contains_pointer(ui.max_rect()) {
-            let mut added = false;
-            for file in dropped {
-                let path = file.path().to_path_buf();
-                if let Some(attachment) = attachment_from_path(&path, self.state.attachments.len()) {
-                    self.state.attachments.push(attachment);
-                    added = true;
-                } else {
-                    self.state.notice = Some(format!("Impossibile leggere il file {}", path.display()));
-                }
-            }
-            if added {
-                self.state.touch(now);
-                changed = true;
-            }
-        }
-        changed
+        false
     }
 
     fn footer(&mut self, ui: &mut Ui, t: &Tokens, rect: Rect, addresses_ok: bool, send_ready: bool, response: &mut ComposerResponse) {
@@ -599,7 +661,39 @@ impl<'a> Composer<'a> {
                     } else {
                         ("La bozza si salva da sola".to_owned(), t.text_faint)
                     };
-                    ui.add(egui::Label::new(typography::text(Role::Caption, text, color)).truncate());
+                    ui.horizontal(|ui| {
+                        let attach_reason = if self.attachments_available {
+                            "Scegli uno o più file da allegare"
+                        } else if self.demo {
+                            "La modalità demo non ha un archivio locale: gli allegati reali richiedono un account"
+                        } else {
+                            "Questo account non ha un archivio locale: riapri Postino su un archivio per allegare file"
+                        };
+                        let attach = Button::new("Allega file")
+                            .icon(icons::PAPERCLIP)
+                            .size(ButtonSize::Sm)
+                            .enabled(self.attachments_available)
+                            .disabled_reason(attach_reason)
+                            .show(ui);
+                        #[cfg(test)]
+                        crate::app::probe::composer_attach(ui, attach.rect, self.attachments_available);
+                        #[cfg(test)]
+                        crate::app::probe::composer_attach_id(ui, attach.id);
+                        #[cfg(test)]
+                        crate::app::probe::composer_attach_clicked(ui, attach.clicked());
+                        if attach.clicked() {
+                            response.pick_files = true;
+                        }
+                        ui.add(egui::Label::new(typography::text(Role::Caption, text, color)).truncate());
+                        if !self.state.attachments.is_empty() {
+                            let total = self.state.attachments.iter().map(|attachment| attachment.size).sum::<u64>();
+                            ui.label(typography::mono(
+                                format!("· {} · {}", plural_attachments(self.state.attachments.len()), format_size_it(total)),
+                                9.5,
+                                t.text_faint,
+                            ));
+                        }
+                    });
                 },
                 |ui| {
                     let send_reason = if !self.send_available && self.demo {
@@ -694,66 +788,34 @@ fn byte_at_char(text: &str, char_index: usize) -> usize {
     text.char_indices().nth(char_index).map_or(text.len(), |(index, _)| index)
 }
 
-fn attachment_from_path(path: &Path, position: usize) -> Option<Attachment> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    let filename = path.file_name()?.to_string_lossy().into_owned();
-    if filename.trim().is_empty() {
-        return None;
-    }
-    let mime = mime_for(&filename);
-    Some(Attachment { id: format!("att_drop_{position}"), filename, mime: mime.to_owned(), size: metadata.len() })
+fn plural_attachments(count: usize) -> String {
+    if count == 1 { "1 allegato".to_owned() } else { format!("{count} allegati") }
 }
 
-fn mime_for(filename: &str) -> &'static str {
-    let extension = filename.rsplit_once('.').map(|(_, extension)| extension.to_ascii_lowercase()).unwrap_or_default();
-    match extension.as_str() {
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "txt" | "md" => "text/plain",
-        "csv" => "text/csv",
-        "zip" => "application/zip",
-        "doc" => "application/msword",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xls" => "application/vnd.ms-excel",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        _ => "application/octet-stream",
-    }
-}
-
-fn format_size(bytes: u64) -> String {
+fn format_size_it(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+        format!("{:.1} KB", bytes as f64 / 1024.0).replace('.', ",")
     } else {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)).replace('.', ",")
     }
 }
 
-#[must_use]
-pub fn quote_body(body: &str) -> String {
-    body.lines().map(|line| if line.is_empty() { ">".to_owned() } else { format!("> {line}") }).collect::<Vec<_>>().join("\n")
-}
-
-#[must_use]
-pub fn signature_body(signature: &str) -> String {
-    if signature.trim().is_empty() { String::new() } else { format!("\n\n-- \n{}", signature.trim_end()) }
-}
-
-#[must_use]
-pub fn compose_body(signature: &str, quoted: Option<String>) -> String {
-    let mut body = signature_body(signature);
-    if let Some(quoted) = quoted {
-        body.push_str("\n\n");
-        body.push_str(&quoted);
+/// One sentence for the composer when a row set is already over a cap. The operation refuses the
+/// next file, but an older draft can still carry an over-limit set that must be visible.
+fn attachment_limit_warning(attachments: &[Attachment]) -> Option<String> {
+    if attachments.len() > MAX_DRAFT_ATTACHMENTS {
+        return Some(format!("Troppi allegati: il limite è {MAX_DRAFT_ATTACHMENTS}. Rimuovine alcuni prima di inviare."));
     }
-    body
+    if attachments.iter().any(|attachment| attachment.size > MAX_ATTACHMENT_BYTES) {
+        return Some(format!("Un allegato supera {}. Sostituiscilo con un file più piccolo.", format_size_it(MAX_ATTACHMENT_BYTES)));
+    }
+    let total = attachments.iter().map(|attachment| attachment.size).sum::<u64>();
+    if total > MAX_ATTACHMENT_TOTAL_BYTES {
+        return Some(format!("Gli allegati totali superano {}. Rimuovine alcuni prima di inviare.", format_size_it(MAX_ATTACHMENT_TOTAL_BYTES)));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -791,7 +853,7 @@ mod tests {
 
     #[test]
     fn quote_prefixes_every_line() {
-        assert_eq!(quote_body("Ciao\n\nGiulia"), "> Ciao\n>\n> Giulia");
+        assert_eq!(postino_core::quote_body("Ciao\n\nGiulia"), "> Ciao\n>\n> Giulia");
     }
 
     #[test]

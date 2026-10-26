@@ -3,7 +3,8 @@
 > **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c/P3d) + MIME
 > crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) + sync into the store (P5b) +
 > accounts and credentials (P6a) + app on real mail (P6b/P6c) + remote-content count (P6d) + SMTP
-> submission and the outbox (P7) ·
+> submission and the outbox (P7) + compose depth: attachment bytes, signatures per account and
+> reply/forward headers (P8) ·
 > **Last updated:** 2026-10-26 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
@@ -63,13 +64,15 @@ This is the same contract as the Crafting Apps, with one improvement: schemas ar
 types, so a handler and its public schema cannot drift.
 
 Current operations: `app_info`, `accounts_list`, `account_add`, `account_update`, `account_test`,
-`account_remove`, `sync_now`, `sync_status`, `folders_list`, `messages_list`, `message_get`,
-`message_flag`, `message_move`, `draft_save`, `message_send`, `send_schedule`, `outbox_list`,
-`outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `labels_list`,
-`label_create`, `label_update`, `label_delete`, `label_apply`. They are enough to prove the path
-through all three clients. `draft_save` updates one draft in place; `message_send` queues it with the
-undo window; `send_dry_run` returns the exact bytes without a row. Labels are local metadata: in
-memory in the demo, in the encrypted store otherwise, and never synced to a server.
+`account_remove`, `account_signature_set`, `sync_now`, `sync_status`, `folders_list`,
+`messages_list`, `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_attachment_add`,
+`draft_attachment_remove`, `message_send`, `send_schedule`, `outbox_list`, `outbox_cancel`,
+`outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `labels_list`, `label_create`,
+`label_update`, `label_delete`, `label_apply`. They are enough to prove the path through all three
+clients. `draft_save` updates one draft in place; `draft_attachment_add/remove` own the attachment
+bytes; `message_send` queues it with the undo window; `send_dry_run` returns the exact bytes without a
+row. Labels are local metadata: in memory in the demo, in the encrypted store otherwise, and never
+synced to a server.
 
 ## 3. The target shape
 
@@ -144,6 +147,12 @@ signature(id, account, identity, name, html)
 contact(id, account, display_name, email, vcard)
 sync_state(account, folder, uidvalidity, last_uid, modseq)
 ```
+
+- P8 adds no migration on this store: the draft reply link is the shipped `drafts.in_reply_to`, the
+  account signature is the shipped `accounts.signature`, and a received `Reply-To` is cached under
+  `meta` key `reply_to:<message_id>` until P9 can widen the message schema. The target schema above
+  shows the eventual `signature` table for multiple identities and HTML signatures, which M2 does not
+  implement.
 
 - The **server is the source of truth**. The local database is a cache plus an operation log.
 - Attachment bytes are content-addressed blobs: BLAKE3 of the plaintext names the file, zstd
@@ -998,6 +1007,62 @@ overwrite another process's move, a second process that reopens a crashed `sendi
 allocating distinct draft ids. The CLI suite proves that a plain `postino send` (no `--at`) submits and
 that a future `--at` only queues. The tests prove these windows; they do not prove atomicity IMAP and
 SMTP do not offer.
+
+### 4.10 Implemented in P8: compose depth, attachment bytes, signatures and reply headers
+
+**Attachment intake.** `draft_attachment_add { draft, filename, mime?, data_base64 }` is the one
+byte-accepting operation. Before the decode (the JSON string itself was already allocated by the
+transport) it checks the base64 string against
+`ceil(25 MiB / 3) × 4` characters, decodes with the standard alphabet, then applies the composer
+caps: 20 attachments, 25 MiB per file and 25 MiB total. The filename passes
+`postino_mime::sanitize_filename` (the same rule the serializer applies): CR/LF/NUL are refused,
+traversal separators, controls, bidi/format controls and trailing dots/spaces are removed, a Windows
+device stem is renamed with `_`, and the result is bounded to 255 bytes. A duplicate is renamed
+`name (2).ext`; the extension table decides the MIME type, an unknown extension is
+`application/octet-stream`, and a caller's bare `type/subtype` is accepted only when it agrees with
+that table (so a valid lie such as `evil.exe` + `image/png` cannot change the emitted type; the bytes
+are never inspected). The engine writes the blob first, then one `save_draft_message_linked`
+transaction writes the message row, the attachment rows (with the new hash), the draft revision and
+the folder counts. A failed row write leaves an unreferenced deduplicated blob, never a row that
+claims bytes it does not have. Before either attachment write the engine checks the store message and
+draft revision/snapshot, including the hydrated reply link and attachment rows; a draft saved, sent or
+moved by another process is refused with “changed in another session; refresh the mailbox” instead of
+overwriting the newer body or resurrecting a Sent row. `draft_attachment_remove` deletes the row and
+leaves the blob for the future GC. The desktop picker/drop reads a path locally with the same 25 MiB bound and calls the
+engine method; CLI `draft attach` reads the path and calls the operation with base64; MCP receives
+base64 and never a path. The metadata-only `draft_save` path runs the same sanitizer and duplicate
+renaming on its attachment names, so a caller cannot create reserved, tabbed or duplicate chips
+before the bytes arrive.
+
+**Blob lifecycle.** The blob store is content-addressed and encrypted; two drafts that forward or
+attach the same content share one file. Removing an attachment or deleting a draft frees the row, not
+necessarily the disk file; the unreferenced sweep is still P9/daemon work. Send reads every
+attachment through `attachment_bytes`, capped at the recorded size plus 1 MiB, and refuses a missing
+or corrupt blob with the filename before writing an outbox row. A 25 MiB attachment plus ten
+recipients is covered by the P7 submission test; the P8 add path accepts exactly 25 MiB and refuses
+one byte more.
+
+**Signature storage.** `accounts.signature` is the plain-text signature, capped at 4 KiB with only
+newline and tab allowed as controls. `account_signature_set` updates that column in one statement and
+the in-memory account; it does not touch drafts, messages or the keyring. The composer reads the
+active account's signature when it creates a new message, and `compose_reply` reads it when it
+prefills a reply or forward; an existing draft keeps the text it saved. The signature is not a MIME
+part, an attachment or HTML.
+
+**Reply headers and Reply-To.** A reply stores the parent `Message-ID` in the existing
+`drafts.in_reply_to` column (normalised without brackets, ASCII, ≤ 900 bytes, no controls or
+whitespace); a save that omits the field keeps the stored link, exactly like the column's `COALESCE`.
+`submission_for_draft` emits `In-Reply-To: <parent>` and `References: <parent>` — the parent id alone
+until P9 persists the full incoming chain — and the P7 snapshot check now compares the hydrated link
+instead of refusing every linked draft. A different process that writes a link this engine never
+hydrated still makes the snapshot stale: refusing is the honest result, because those bytes would
+silently drop a header. Received `Reply-To` lists are cached in the existing `meta` table under
+`reply_to:<message_id>` because P8 may not migrate; sync writes it, account/message deletion removes
+it, and `Engine::reply_target` returns it with the parent id. The reply prefill uses `Reply-To` for
+`To`, removes the account's own address case-insensitively, adds the original To/Cc minus the account
+and minus To for reply-all, never reads Bcc, prefixes the subject once, quotes in UTC and drops a
+second copy of the signature when the parent already carried it. Forward copies the parent attachment
+metadata and the engine copies each blob to a new row; a missing blob names the file and blocks Send.
 
 ## 5. Synchronization
 

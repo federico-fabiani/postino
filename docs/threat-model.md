@@ -1,7 +1,8 @@
 # Postino threat model
 
 > **Status:** M0 + M1 MIME parser (P4a) + encrypted attachment blobs (P4b) + IMAP sync into the store
-> (P5b) + SMTP submission and the outbox (P7) · **Last updated:** 2026-10-26 · **Review:** before every
+> (P5b) + SMTP submission and the outbox (P7) + compose attachment bytes, signatures and reply headers
+> (P8) · **Last updated:** 2026-10-26 · **Review:** before every
 > release that touches networking, storage, HTML rendering or MCP.
 
 ## 1. What we protect
@@ -100,6 +101,15 @@
   failure sentence, never a server name, an address, a credential or message content; the typed
   `SyncError` returned to the caller may name the host, exactly as a session error does. Logs carry
   account and folder ids and counts, never subjects, addresses or bodies.
+- Compose attachment intake (P8) is the other byte path: `draft_attachment_add` bounds the base64
+  string before the decode (the JSON string itself is already allocated by the transport), decodes at
+  most 25 MiB, checks the per-file and 25 MiB total caps,
+  sanitizes the name (controls, traversal, bidi/format controls, Windows device names) and accepts
+  the declared MIME only as a hint that must agree with the extension table. It never opens or
+  executes a file, never inspects the bytes to
+  guess a type, and stores only a content hash and the encrypted blob. A missing or corrupt blob is a
+  send-time refusal naming the file, not a silent drop. Removing a row does not delete a blob another
+  draft may share; the unreferenced sweep remains P9 work and is documented as such.
 
 ### 4.2 Account compromise
 
@@ -228,6 +238,14 @@ crash-dump entry above.
   capabilities; `sync_status` and `accounts_list` never include a secret.
 - Tool errors are structured and actionable. An agent cannot use error text to probe paths outside
   its roots.
+- `draft_attachment_add` accepts `data_base64`, never a path: an MCP client can store the bytes it
+  already holds, but it cannot make the server read a file, a directory or another root. The base64
+  length is checked against the 25 MiB decoded cap **before** the decode, an invalid alphabet is
+  refused, and the decoded size is checked again; a malformed declared MIME is not copied into a
+  header, and the filename is sanitized by the same rule as the serializer. The bytes go only to the
+  encrypted blob store. `account_signature_set` is plain text, ≤ 4 KiB, and never a credential.
+- P8's `Reply-To` cache lives in the existing `meta` table, keyed by local message id, and is removed
+  with its message or account. It is header text, not a body or a credential; it is never logged.
 
 ### 4.5 Supply chain
 

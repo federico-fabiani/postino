@@ -103,6 +103,36 @@ fn ids(values: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn account_signature_and_reply_to_are_persisted_and_cleaned_up_with_their_rows() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    assert!(store.set_account_signature(ACCOUNT, "Federico\nfederico@example.it").expect("signature"));
+    assert_eq!(store.get_account(ACCOUNT).expect("account").expect("row").signature, "Federico\nfederico@example.it");
+    assert!(!store.set_account_signature("acc_missing", "x").expect("unknown account"), "an unknown account is not created");
+
+    let reply_to = vec![Address::new("Segreteria", "segreteria@example.com")];
+    store.set_message_reply_to("msg_1", &reply_to).expect("reply-to");
+    assert_eq!(store.message_reply_to("msg_1").expect("read reply-to"), reply_to);
+    assert!(store.message_reply_to("msg_missing").expect("missing key").is_empty());
+    store.set_message_reply_to("msg_1", &[]).expect("clear reply-to");
+    assert!(store.message_reply_to("msg_1").expect("cleared").is_empty());
+
+    store.set_message_reply_to("msg_1", &reply_to).expect("reply-to again");
+    assert!(store.delete_message("msg_1").expect("delete"));
+    assert!(store.message_reply_to("msg_1").expect("the key is gone with the message").is_empty());
+
+    let mut draft = sample_message("draft_linked", INBOX, "Re: Ciao", "Risposta", 1_700_000_300_000);
+    store.upsert_folder(&folder("drafts", "Bozze", FolderKind::Drafts)).expect("drafts folder");
+    draft.summary.folder_id = "drafts".to_owned();
+    let saved = store.save_draft_message_linked(&draft, &[], Some("parent@example.com")).expect("linked draft");
+    assert_eq!(saved.in_reply_to.as_deref(), Some("parent@example.com"));
+    let kept = store.save_draft_message_linked(&draft, &[], None).expect("a patch without the link");
+    assert_eq!(kept.in_reply_to.as_deref(), Some("parent@example.com"), "None must keep the stored link");
+    assert_eq!(store.get_draft("draft_linked").expect("draft").expect("row").in_reply_to.as_deref(), Some("parent@example.com"));
+}
+
+#[test]
 fn draft_ids_are_allocated_by_the_store_and_never_collide() {
     let fixture = Fixture::new();
     let first_connection = fixture.open();

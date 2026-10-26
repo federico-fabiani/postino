@@ -14,19 +14,20 @@ mod mcp;
 #[cfg(test)]
 mod test_support;
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use postino_core::{
-    AccountAdd, AccountRemove, AccountRequest, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo, CredentialVault, DraftSave,
-    DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag,
-    MessageGet, MessageSummary, MessagesList, OpError, OutboxAction, OutboxListResult, Provider, SearchResult, SendQueued, SmtpSetup, SyncNow,
-    SyncReport, SyncStatusReport, VaultError,
+    AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
+    CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
+    LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OpError, OutboxAction, OutboxListResult,
+    Provider, SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, VaultError,
 };
 use postino_platform::Keyring;
 use serde::Serialize;
@@ -79,10 +80,28 @@ enum DraftCommand {
         /// Save the draft and queue it for real submission in the same command.
         #[arg(long)]
         send: bool,
+        /// Parent Message-ID for a reply, with or without angle brackets. Omit to keep the stored
+        /// linkage on update.
+        #[arg(long)]
+        in_reply_to: Option<String>,
     },
     /// Queue an existing draft for real SMTP submission. This is now the same as `postino send
     /// --draft <id>`; the local-only move is gone.
     Send { id: String },
+    /// Attach one local file to a draft. The path is read locally; the operation receives bytes.
+    Attach {
+        /// Draft id returned by `postino draft save`.
+        id: String,
+        /// File to read, at most 25 MiB.
+        path: PathBuf,
+    },
+    /// Remove one attachment from a draft by id or exact filename.
+    Detach {
+        /// Draft id returned by `postino draft save`.
+        id: String,
+        /// Attachment id or exact filename.
+        attachment: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -154,6 +173,11 @@ enum AccountCommand {
     },
     /// Log in with the stored credential and list folders. Writes nothing.
     Test {
+        /// Account id returned by `account list`.
+        id: String,
+    },
+    /// Set the plain-text signature for one account. The text is read from stdin, never argv.
+    Signature {
         /// Account id returned by `account list`.
         id: String,
     },
@@ -696,6 +720,19 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                     say(format_account_add(&view))?;
                 }
             }
+            AccountCommand::Signature { id } => {
+                let signature = read_signature_stdin(input)?;
+                let result: AccountSignature = decode(call(engine, "account_signature_set", json!({ "account": id, "signature": signature }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!(
+                        "Firma salvata per {} · {} caratteri.\nVale per i nuovi messaggi; le bozze già salvate mantengono il loro testo.",
+                        result.account.account.email,
+                        result.account.account.signature.chars().count()
+                    ))?;
+                }
+            }
             AccountCommand::Test { id } => {
                 let result: AccountTest = decode(call(engine, "account_test", json!({ "id": id }))?)?;
                 if json_output {
@@ -836,8 +873,8 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             }
         }
         Command::Draft { command } => match command {
-            DraftCommand::Save { id, account, to, cc, bcc, subject, body, send } => {
-                let args = draft_save_args(id, account, to, cc, bcc, subject, body)?;
+            DraftCommand::Save { id, account, to, cc, bcc, subject, body, send, in_reply_to } => {
+                let args = draft_save_args(id, account, to, cc, bcc, subject, body, in_reply_to)?;
                 let saved: DraftSave = decode(call(engine, "draft_save", args)?)?;
                 let draft_id = saved.draft.summary.id.clone();
                 if send {
@@ -849,6 +886,38 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 }
             }
             DraftCommand::Send { id } => send_now(engine, &id, None, json_output)?,
+            DraftCommand::Attach { id, path } => {
+                let attachment = read_cli_attachment(&path)?;
+                let result: DraftAttachmentResult = decode(call(
+                    engine,
+                    "draft_attachment_add",
+                    json!({
+                        "draft": id,
+                        "filename": attachment.filename,
+                        "data_base64": attachment.base64,
+                    }),
+                )?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    let line = result
+                        .draft
+                        .attachments
+                        .last()
+                        .map(|item| format!("{} · {} · {} byte", item.filename, item.mime, item.size))
+                        .unwrap_or_else(|| format!("allegato aggiunto a {id}"));
+                    say(format!("{line}\n{} allegati nella bozza.", result.draft.attachments.len()))?;
+                }
+            }
+            DraftCommand::Detach { id, attachment } => {
+                let result: DraftAttachmentResult =
+                    decode(call(engine, "draft_attachment_remove", json!({ "draft": id, "attachment": attachment }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Allegato rimosso: {}\n{} allegati nella bozza.", attachment, result.draft.attachments.len()))?;
+                }
+            }
         },
         Command::Send { draft, at, dry_run } => {
             if dry_run {
@@ -1106,6 +1175,54 @@ fn account_update_args(
 
 /// Read exactly one line from `reader` and strip its line ending. The raw line is zeroised before
 /// it is returned, so the password does not linger in two buffers.
+struct CliAttachment {
+    filename: String,
+    base64: String,
+}
+
+/// Read one attachment from a local path with the P8 per-file bound. The path never reaches an
+/// operation, a log line or an MCP client: only the sanitized filename and the bytes do.
+fn read_cli_attachment(path: &Path) -> Result<CliAttachment> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path).with_context(|| format!("lettura del file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} non è un file", path.display());
+    }
+    if metadata.len() > postino_core::MAX_ATTACHMENT_BYTES {
+        bail!("il file supera {} byte", postino_core::MAX_ATTACHMENT_BYTES);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    std::fs::File::open(path)
+        .with_context(|| format!("apertura del file {}", path.display()))?
+        .take(postino_core::MAX_ATTACHMENT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("lettura del file {}", path.display()))?;
+    if bytes.len() as u64 > postino_core::MAX_ATTACHMENT_BYTES {
+        bail!("il file supera {} byte", postino_core::MAX_ATTACHMENT_BYTES);
+    }
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| usage("il percorso non contiene un nome di file"))?;
+    Ok(CliAttachment { filename, base64: base64::engine::general_purpose::STANDARD.encode(bytes) })
+}
+
+/// Read a signature from stdin. CRLF becomes LF, a single trailing newline is dropped (a here-doc
+/// or `echo` adds one), and the text is bounded before it reaches the operation.
+fn read_signature_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<String> {
+    let mut raw = String::new();
+    let limit = postino_core::MAX_SIGNATURE_BYTES.saturating_add(1) as u64;
+    reader.take(limit).read_to_string(&mut raw).context("lettura della firma da stdin")?;
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let text = normalized.trim_end_matches('\n').to_owned();
+    if text.len() > postino_core::MAX_SIGNATURE_BYTES {
+        bail!("la firma supera {} byte", postino_core::MAX_SIGNATURE_BYTES);
+    }
+    Ok(text)
+}
+
 fn read_password_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<Zeroizing<String>> {
     let mut line = Zeroizing::new(String::new());
     reader.read_line(&mut line).context("reading the password from stdin")?;
@@ -1420,6 +1537,7 @@ fn truncate(text: &str, limit: usize) -> String {
 
 /// which makes an update a patch; an explicitly empty flag (`--to ""`, `--subject ""`) is sent so it
 /// clears the field.
+#[allow(clippy::too_many_arguments)]
 fn draft_save_args(
     id: Option<String>,
     account: Option<String>,
@@ -1428,6 +1546,7 @@ fn draft_save_args(
     bcc: Option<Vec<String>>,
     subject: Option<String>,
     body: Option<String>,
+    in_reply_to: Option<String>,
 ) -> Result<Value> {
     let mut args = serde_json::Map::new();
     if let Some(id) = id {
@@ -1450,6 +1569,9 @@ fn draft_save_args(
     }
     if let Some(body) = body {
         args.insert("body_text".to_owned(), json!(body));
+    }
+    if let Some(in_reply_to) = in_reply_to {
+        args.insert("in_reply_to".to_owned(), json!(in_reply_to));
     }
     Ok(Value::Object(args))
 }
@@ -1655,6 +1777,7 @@ mod tests {
                     subject: Some("Progetto".to_owned()),
                     body: Some("Prima versione".to_owned()),
                     send: false,
+                    in_reply_to: None,
                 },
             }),
             &mut engine,
@@ -1673,6 +1796,7 @@ mod tests {
                     subject: None,
                     body: Some("Solo il corpo".to_owned()),
                     send: false,
+                    in_reply_to: None,
                 },
             }),
             &mut engine,
@@ -1695,6 +1819,7 @@ mod tests {
                     subject: Some(String::new()),
                     body: None,
                     send: false,
+                    in_reply_to: None,
                 },
             }),
             &mut engine,
@@ -1711,6 +1836,7 @@ mod tests {
                     subject: Some(String::new()),
                     body: None,
                     send: false,
+                    in_reply_to: None,
                 },
             }),
             &mut engine,
@@ -1723,14 +1849,78 @@ mod tests {
     }
 
     #[test]
+    fn cli_draft_attach_reads_the_path_and_detach_removes_the_row() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: None,
+                    account: Some("acc_cli".to_owned()),
+                    to: Some(vec!["Giulia <giulia.ferri@example.com>".to_owned()]),
+                    cc: None,
+                    bcc: None,
+                    subject: Some("Allegato".to_owned()),
+                    body: Some("Corpo".to_owned()),
+                    send: false,
+                    in_reply_to: None,
+                },
+            }),
+            &mut engine,
+        )
+        .expect("draft save");
+        let draft = engine.messages().iter().find(|message| message.summary.subject == "Allegato").expect("draft").summary.id.clone();
+        let path = fixture.path().parent().expect("temp dir").join("relazione.pdf");
+        std::fs::write(&path, b"%PDF-1.7 byte esatti").expect("fixture file");
+
+        run(cli(Command::Draft { command: DraftCommand::Attach { id: draft.clone(), path: path.clone() } }), &mut engine).expect("attach");
+        let saved = engine.message(&draft).expect("draft");
+        assert_eq!(saved.attachments.len(), 1);
+        assert_eq!(saved.attachments[0].filename, "relazione.pdf");
+        assert_eq!(saved.attachments[0].mime, "application/pdf");
+        assert_eq!(engine.attachment_bytes(&saved.attachments[0].id).expect("bytes"), b"%PDF-1.7 byte esatti");
+
+        run(cli(Command::Draft { command: DraftCommand::Attach { id: draft.clone(), path: path.clone() } }), &mut engine).expect("second attach");
+        assert_eq!(engine.message(&draft).expect("draft").attachments[1].filename, "relazione (2).pdf");
+        assert_eq!(engine.message(&draft).expect("draft").attachments.len(), 2);
+
+        run(cli(Command::Draft { command: DraftCommand::Detach { id: draft.clone(), attachment: "relazione.pdf".to_owned() } }), &mut engine)
+            .expect("detach");
+        assert_eq!(engine.message(&draft).expect("draft").attachments.len(), 1);
+
+        let missing = fixture.path().parent().expect("temp dir").join("manca.pdf");
+        let error = run(cli(Command::Draft { command: DraftCommand::Attach { id: draft, path: missing } }), &mut engine).expect_err("missing file");
+        assert!(format!("{error:#}").contains("lettura del file"), "{error:#}");
+    }
+
+    #[test]
+    fn cli_account_signature_reads_stdin_and_is_bounded() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        let mut input = std::io::Cursor::new(b"Federico\nfederico@example.it\n".to_vec());
+        run_with_input(cli(Command::Account { command: AccountCommand::Signature { id: "acc_cli".to_owned() } }), &mut engine, &mut input, false)
+            .expect("signature from stdin");
+        let account = engine.accounts().iter().find(|account| account.id == "acc_cli").expect("account");
+        assert_eq!(account.signature, "Federico\nfederico@example.it", "the trailing newline must not become part of the signature");
+
+        let mut huge = std::io::Cursor::new(vec![b'x'; postino_core::MAX_SIGNATURE_BYTES + 1]);
+        let error =
+            run_with_input(cli(Command::Account { command: AccountCommand::Signature { id: "acc_cli".to_owned() } }), &mut engine, &mut huge, false)
+                .expect_err("over 4 KiB");
+        assert!(format!("{error:#}").contains("4096"), "{error:#}");
+    }
+
+    #[test]
     fn draft_save_args_omit_unset_flags_and_keep_an_explicit_account() {
-        let args = draft_save_args(None, Some("acc_b".to_owned()), None, None, None, None, Some("Corpo".to_owned())).expect("args");
+        let args = draft_save_args(None, Some("acc_b".to_owned()), None, None, None, None, Some("Corpo".to_owned()), None).expect("args");
         assert_eq!(args["account"], "acc_b");
         assert_eq!(args["body_text"], "Corpo");
         assert!(args.get("to").is_none(), "an omitted --to must stay absent for patch semantics");
         assert!(args.get("subject").is_none(), "an omitted --subject must stay absent for patch semantics");
 
-        let empty = draft_save_args(None, None, Some(Vec::new()), None, None, Some(String::new()), None).expect("empty args");
+        let empty = draft_save_args(None, None, Some(Vec::new()), None, None, Some(String::new()), None, None).expect("empty args");
         assert_eq!(empty["to"], json!([]));
         assert_eq!(empty["subject"], "");
     }
@@ -2022,6 +2212,7 @@ mod tests {
                         subject: Some("Bozza patch".to_owned()),
                         body: Some("Prima versione".to_owned()),
                         send: false,
+                        in_reply_to: None,
                     },
                 }),
                 &mut engine,
@@ -2040,6 +2231,7 @@ mod tests {
                         subject: None,
                         body: Some("Solo il corpo".to_owned()),
                         send: false,
+                        in_reply_to: None,
                     },
                 }),
                 &mut engine,
@@ -2083,6 +2275,7 @@ mod tests {
                         subject: Some("Per B".to_owned()),
                         body: Some("Corpo".to_owned()),
                         send: false,
+                        in_reply_to: None,
                     },
                 }),
                 &mut engine,

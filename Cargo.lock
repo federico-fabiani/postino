@@ -3341,6 +3341,7 @@ name = "postino-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "env_logger",
@@ -3376,6 +3377,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

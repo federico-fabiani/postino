@@ -1,12 +1,14 @@
 # Postino roadmap
 
-> **Current milestone:** M2 in progress — SMTP submission, the outbox and its closure are complete
-> (P7); compose attachments/signatures and full draft APPEND remain · **Last updated:** 2026-10-26
+> **Current milestone:** M2 in progress — SMTP submission, the outbox and compose depth (attachments,
+> signatures, reply/forward headers) are complete (P7/P8); full draft APPEND and HTML compose remain ·
+> **Last updated:** 2026-10-26
 >
 > M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
 > desktop app reads and syncs a real mailbox from the encrypted cache. M2 has started with SMTP,
-> the journaled outbox and independent Sent APPEND. P7 still has no daemon: scheduled mail waits for
-> the app or `postino send`, and an APPEND that keeps failing has no terminal give-up state (P8/P9).
+> the journaled outbox and independent Sent APPEND, and P8 closes compose depth. There is still no
+> daemon: scheduled mail waits for the app or `postino send`, and an APPEND that keeps failing has no
+> terminal give-up state (P9).
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.
@@ -102,9 +104,15 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] SMTP submission with STARTTLS/implicit TLS, AUTH, SMTPUTF8, DSN, SIZE and 8BITMIME (P7):
       `postino-net::smtp` with typed transient/permanent/uncertain errors, bounded lines/replies/
       messages, dot-stuffing and a fake server covering each stage.
-- [ ] Compose To/Cc/Bcc, subject, body, attachments, signatures per identity. To/Cc/Bcc and body
-      exist; the GUI still stores attachment metadata only and signatures are a single account text.
-- [x] Reply/reply-all/forward prefill exists in the composer; header-level threading is still M3.
+- [x] Compose To/Cc/Bcc, subject, body, attachments and signatures per identity (P8): real attachment
+      bytes through the encrypted blob store, a 20-file / 25 MiB-per-file / 25 MiB-total cap, filename
+      sanitization and duplicate renaming, picker and drag-and-drop intake, a removable row with the
+      Italian total, and a ≤ 4 KiB plain-text signature editor per account in Settings. `draft_save`
+      stays metadata-only; `draft_attachment_add/remove` own the bytes.
+- [x] Reply/reply-all/forward with correct recipients, subject prefix, deterministic UTC quote and
+      `In-Reply-To`/`References` from the parent `Message-ID` (P8). `Reply-To` is honored, the account's
+      own address is removed, Bcc is never copied, the signature is not duplicated in a reply, and
+      forwarded attachments carry their bytes. Full thread derivation and the conversation view stay M3.
 - [ ] Draft autosave with revisions, crash recovery, `APPEND` to Drafts. Autosave/revisions and crash
       recovery exist; the server-side Drafts APPEND is not implemented.
 - [x] Outbox with a stable per-revision idempotency key, a `draft_id` column with a partial unique
@@ -112,12 +120,13 @@ interaction model before real mail makes them expensive to change. Full spec:
       send, undo, cancel/discard and an uncertain state; `APPEND` to Sent with `\Seen`, its own claim
       and independent retries (P7). A duplicate `message_send` after a cancel is one row and one
       delivery; a revived row is the newest by `created_at`; a submission never leaves the machine if
-      the draft changed after it was serialized (body, headers, last-saved instant and attachment set;
-      a stored reply linkage this build cannot serialize is refused). The local Sent copy carries the
-      generated `Message-ID`, and a sync adopts it instead of inserting a second copy, whether the local
-      copy or the server copy was written first; in the server-first order the merge adopts the cached
-      UID and skips the APPEND. A Sent copy moved back to Drafts is never adopted or deleted by a Sent
-      sync.
+      the draft changed after it was serialized (body, headers, last-saved instant and attachment set).
+      A reply draft's `In-Reply-To`/`References` are serialized and compared with its hydrated link; a
+      link written by a process this engine never loaded is a stale snapshot and is refused. The local
+      Sent copy carries the generated `Message-ID`, and a sync adopts it instead of inserting a second
+      copy, whether the local copy or the server copy was written first; in the server-first order the
+      merge adopts the cached UID and skips the APPEND. A Sent copy moved back to Drafts is never
+      adopted or deleted by a Sent sync.
 - [x] Verify: crash between SMTP accept and Sent append does not send twice; a test seam fails after
       the server's `250` and before the durable transition, and reopening proves `sending` →
       `uncertain`, no connection and one DATA. The fake server proves the exact bytes/envelope across
@@ -127,6 +136,12 @@ interaction model before real mail makes them expensive to change. Full spec:
       a damaged append envelope that is never `sent`, and that an uncertain row is never retried
       automatically. The CLI suite proves plain `postino send` submits while a future `--at` only
       queues.
+- [x] Verify P8: exact attachment bytes survive blob → draft → reopen → queue → MIME (SHA-256 equal
+      before and after), filename injection/traversal/reserved/bidi, duplicate renaming, the 20/25 MiB
+      caps, base64 bounds, missing/corrupt blobs naming the file, forward bytes and missing-forward
+      refusal, signature per account and 4 KiB/control limits, reply-all/Reply-To/Bcc/dedupe/subject/
+      quote/headers matrices, CLI attach/detach and signature, MCP schemas with no path, picker/drop
+      recorders, keyboard Enter and 980×600 light/dark renders of the composer and the editor.
 - [ ] Verify end-to-end to a real test mailbox (needs a provider account and app password).
 
 ## M3 — organize

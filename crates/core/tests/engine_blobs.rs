@@ -294,6 +294,7 @@ fn a_metadata_patch_cannot_make_stored_bytes_unreadable() {
                     mime: "application/octet-stream".to_owned(),
                     size: 0,
                 }],
+                in_reply_to: None,
             },
         )
         .expect("draft");
@@ -360,6 +361,7 @@ fn a_draft_re_save_keeps_the_stored_bytes_of_a_kept_attachment() {
                     mime: "application/pdf".to_owned(),
                     size: 0,
                 }],
+                in_reply_to: None,
             },
         )
         .expect("draft");

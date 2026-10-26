@@ -1,8 +1,8 @@
 //! The operating-system seams this slice must not call directly from a test.
 //!
-//! Links, the native Save dialog and the file manager are the only places the desktop shell leaves
-//! Rust. Each one is a trait so a headless test can inject a recorder instead of opening a browser,
-//! a native dialog or a shell. Production adapters are tiny; they are never exercised by CI.
+//! Links, the native Save/Open dialogs and the file manager are the only places the desktop shell
+//! leaves Rust. Each one is a trait so a headless test can inject a recorder instead of opening a
+//! browser, a native dialog or a shell. Production adapters are tiny; they are never exercised by CI.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,6 +10,13 @@ use std::process::Command;
 /// Open an already-vetted URL in the user's browser.
 pub trait LinkOpener: Send + Sync {
     fn open(&self, url: &str) -> Result<(), String>;
+}
+
+/// Ask the person for one or more files to attach. Tests inject a recorder that never shows a
+/// dialog; the demo injects an unavailable picker so a stray click cannot read the filesystem.
+pub trait FilePicker: Send + Sync {
+    /// `Ok(vec![])` means the person cancelled. An empty list adds nothing and is not an error.
+    fn choose_files(&self) -> Result<Vec<PathBuf>, String>;
 }
 
 /// Ask for a destination and write bytes there. Tests inject a recorder that never shows a dialog.
@@ -39,6 +46,16 @@ pub struct SystemLinkOpener;
 impl LinkOpener for SystemLinkOpener {
     fn open(&self, url: &str) -> Result<(), String> {
         webbrowser::open(url).map_err(|error| error.to_string())
+    }
+}
+
+/// The production multi-file picker. It only chooses paths; the app bounds each file and hands the
+/// bytes to the engine, which owns the encrypted blob store.
+pub struct RfdFilePicker;
+
+impl FilePicker for RfdFilePicker {
+    fn choose_files(&self) -> Result<Vec<PathBuf>, String> {
+        Ok(rfd::FileDialog::new().pick_files().unwrap_or_default())
     }
 }
 
@@ -147,6 +164,16 @@ impl FileSaver for CancellingFileSaver {
     }
 }
 
+/// A picker that is never available. The demo, screenshot scenes and tests inject it so a stray
+/// click cannot open a native dialog or read a path without the test's explicit recorder.
+pub struct UnavailableFilePicker;
+
+impl FilePicker for UnavailableFilePicker {
+    fn choose_files(&self) -> Result<Vec<PathBuf>, String> {
+        Err("Scelta dei file non disponibile in questa sessione.".to_owned())
+    }
+}
+
 /// A folder opener that refuses. Used by the demo and screenshot constructors.
 pub struct UnavailableFolderOpener;
 
@@ -171,6 +198,8 @@ mod tests {
         let link = UnavailableLinkOpener.open("https://example.com").expect_err("no browser in tests");
         assert!(link.contains("non disponibile"));
         assert_eq!(CancellingFileSaver.choose_path("a.txt").expect("cancelled"), None);
+        let picker = UnavailableFilePicker.choose_files().expect_err("no native dialog in tests");
+        assert!(picker.contains("non disponibile"));
         let folder = UnavailableFolderOpener.open(Path::new(".")).expect_err("no shell in tests");
         assert!(folder.contains("non disponibile"));
     }

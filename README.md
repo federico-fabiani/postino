@@ -7,23 +7,24 @@ registry shared by the desktop app, the CLI and an MCP server.
 > the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
 > store (P5b/P5c) + accounts, credentials and sync operations (P6a) + onboarding and the app on real
 > data (P6b) + the text reading pane, safe links, attachment Save and full settings (P6c) + SMTP
-> submission and the outbox (P7).** The desktop app opens the encrypted SQLCipher store by default,
+> submission and the outbox (P7) + compose depth: attachment bytes, per-account signatures and
+> reply/forward headers (P8).** The desktop app opens the encrypted SQLCipher store by default,
 > offers a guided Aruba/Gmail/custom onboarding with a real connection test and background sync, and
 > reads cached mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI
 > and the MCP server use the same operation registry: `postino --store <path>` (or the default
 > `%LOCALAPPDATA%\Postino\mail.db` on Windows) runs the same operations on the encrypted database,
 > and the CLI can add a real Aruba or Gmail account with an app password, test it, sync it and remove
-> it. **Postino can now send real mail:** the composer queues a draft, the exact RFC 5322 bytes are
-> stored before any network call, an outbox survives restarts, a 5-second undo window precedes the
-> first attempt, and a Sent APPEND is retried independently of submission. The transaction never
-> resubmits an uncertain message. Passwords live only in the OS keyring; **Windows Credential Manager
-> is the only keyring backend in this build**, and macOS/Linux fail at the platform seam until their
-> keychains land with packaging. MIME parsing, sanitization and serialization exist as
-> `postino-mime`; `postino-net` is an IMAP4rev1 client and the SMTP submission client; and
-> `postino-sync` reconciles one account into the encrypted store. Attachment bytes are encrypted at
-> rest in a content-addressed blob directory next to the database. Gmail OAuth is P12, the background
-> daemon lands in M4, and the GUI still writes attachment *metadata* only: a GUI attachment without
-> stored bytes is refused before queueing (P8 completes compose attachments and signatures).
+> it. **Postino can now send real mail with real attachments:** the composer queues a draft, the exact
+> RFC 5322 bytes (including every attachment byte) are stored before any network call, an outbox
+> survives restarts, a 5-second undo window precedes the first attempt, and a Sent APPEND is retried
+> independently of submission. The transaction never resubmits an uncertain message. Passwords live
+> only in the OS keyring; **Windows Credential Manager is the only keyring backend in this build**,
+> and macOS/Linux fail at the platform seam until their keychains land with packaging. MIME parsing,
+> sanitization and serialization exist as `postino-mime`; `postino-net` is an IMAP4rev1 client and
+> the SMTP submission client; and `postino-sync` reconciles one account into the encrypted store.
+> Attachment bytes are encrypted at rest in a content-addressed blob directory next to the database.
+> Gmail OAuth is P12 and the background daemon lands in M4; inline `cid:` images, HTML compose and
+> server-side signatures are explicitly out of scope for M2.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -39,14 +40,19 @@ MCP      ─┘
   `#E4B96A`.
 - Folder rail, message table, reading pane, filters, read/starred toggles, command palette
   (`Ctrl+K`), dark theme and a demo inbox with realistic threads and attachments.
-- Compose window with To/Cc/Bcc, subject, signature, Markdown formatting, drag-and-drop attachment
-  metadata, autosaved drafts and reply/reply-all/forward prefill. **Invia** is a real submission: the
-  draft is queued with a 5-second undo window, the exact bytes are stored before any connection, and
-  the outbox (`Ctrl+Shift+O`) shows queue, sending, uncertain, failed and Sent states. The demo has no
-  SMTP endpoint and refuses to send with a visible reason. `draft_save` is a patch on update: an
-  omitted content field keeps the draft's current value, while an explicitly empty value clears it.
-  The CLI sends only the flags the user passed and accepts `--account`; the app keeps sending the full
-  content. A draft with a live journal row (`queued`, `sending`, `append_pending`, `uncertain` or
+- Compose window with To/Cc/Bcc, subject, a per-account plain-text signature, Markdown formatting,
+  real attachments with their exact bytes (picker or drag-and-drop), autosaved drafts and
+  reply/reply-all/forward prefill. The attachment row shows name, MIME, size and the running total;
+  the caps are 20 files, 25 MiB per file and 25 MiB total. **Invia** is a real submission: the draft
+  is queued with a 5-second undo window, the exact bytes are stored before any connection, and the
+  outbox (`Ctrl+Shift+O`) shows queue, sending, uncertain, failed and Sent states. The demo has no
+  store and no SMTP endpoint: **Allega file** is disabled with that reason and a stray drop reads
+  nothing. `draft_save` is a patch on update: an omitted content field keeps the draft's current
+  value, while an explicitly empty value clears it (the reply linkage is the one exception: P8 cannot
+  clear it yet); `draft_attachment_add/remove` own the bytes and
+  `draft_save` stays metadata-only. Reply drafts store the parent `Message-ID` and serialize
+  `In-Reply-To`/`References`; reply-all uses `Reply-To`, removes the account's own address and never
+  copies Bcc. A draft with a live journal row (`queued`, `sending`, `append_pending`, `uncertain` or
   `failed`) that belongs to a message still in Drafts cannot be edited or moved; a permanently failed
   row can be discarded from the outbox (CLI `postino outbox cancel`, or “Scarta”) to make the draft
   editable again, and a Sent copy is ordinary mail that can be moved or archived.
@@ -71,12 +77,12 @@ MCP      ─┘
   reading width), data (store and blob paths with a copy action, open the blob folder) and version,
   licences and shortcuts; every section fits 980×600 and returns focus to the account switcher on
   `Esc`.
-- Twenty-seven typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
-  `account_update`, `account_test`, `account_remove`, `sync_now`, `sync_status`, `folders_list`,
-  `messages_list`, `message_get`, `message_flag`, `message_move`, `draft_save`, `message_send`,
-  `send_schedule`, `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`,
-  `send_dry_run`, `search`, `labels_list`, `label_create`, `label_update`, `label_delete`,
-  `label_apply`.
+- Thirty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
+  `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
+  `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_flag`, `message_move`,
+  `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
+  `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`,
+  `labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`.
 - Real accounts from the CLI: Aruba and Gmail are discovered offline (Gmail needs 2FA + an app
   password; OAuth is P12), `custom` takes host/port/TLS, a no-echo prompt or `--password-stdin` is the
   only way in, and MCP cannot add or remove an account. Passwords live in the OS keyring, never in
@@ -154,6 +160,26 @@ MCP      ─┘
   The `Date` header is the draft's **last-saved instant**, not the send instant: that is what makes
   the dry run and the later send byte-identical, and it means a draft edited days ago and sent today
   carries that older date.
+- **Compose depth (P8): attachment bytes, signatures and reply/forward headers.**
+  `draft_attachment_add` decodes a bounded base64 payload (≤ 25 MiB), sanitizes the filename with the
+  serializer's own rule (traversal, CR/LF/NUL, bidi controls and Windows device names are repaired or
+  refused), derives the `type/subtype` from the extension table (a declared type is only a hint and
+  must agree with that table), renames a duplicate to `name (2).ext`, and writes
+  the bytes through the encrypted blob store before the draft row and revision in one transaction.
+  `draft_attachment_remove` deletes the row; the deduplicated blob stays until a later GC. At most
+  20 files, 25 MiB each and 25 MiB total; a missing or corrupt blob refuses `message_send` with the
+  filename and keeps the draft. The desktop composer opens the injected rfd multi-file picker or
+  accepts an egui drop, shows name/MIME/size and the Italian total, and refuses in the demo with a
+  reason instead of a dead button. Each account owns a ≤ 4 KiB plain-text signature, edited in
+  Settings → Account and inserted in new, reply and forward messages; changing it never rewrites an
+  existing draft. Reply/reply-all/forward use the parent's `Reply-To`, remove the account's own
+  addresses, never expose Bcc, prefix the subject once, quote deterministically in UTC and set
+  `In-Reply-To`/`References` from the parent `Message-ID` (the parent id alone until P9 carries the
+  full chain). Forwarded attachments are copied through the blob store with their bytes; a missing
+  source is reported and blocks the send. CLI `draft attach/detach` and MCP `draft_attachment_add`
+  reach the same operation; MCP accepts bytes, never a path. No schema migration: the reply link uses
+  the existing `drafts.in_reply_to` and the received `Reply-To` rides the existing `meta` table until
+  P9 widens the message schema.
 - Headless rendering tests of the shell, gallery, composer and label flows, the reading pane's
   link/attachment/settings paths with injected opener/saver recorders, operation-schema tests, MCP
   protocol tests, and store round-trip tests at both the repository and engine level.
@@ -174,9 +200,17 @@ MCP      ─┘
 
 ![Postino composer after P7: the Send button now reads Invia and the notice explains the real SMTP submission and the 5-second undo window](docs/images/postino-p7-compose-980.png)
 
-The last two captures were exported from a 1.25× scaled Windows host, so the PNGs are 1225×750 while
-the layout and every headless test are 980×600. The composer has no schedule control yet: scheduling is
-`postino send --at` or `send_schedule` over MCP until the UI action lands.
+![Postino composer at 980×600 after P8: two attachment rows with MIME and size (demo fixture, no bytes), the Italian total in the attachment row and the footer, Allega file in the pinned footer and Invia still on screen](docs/images/postino-p8-compose-980.png)
+
+![The same P8 composer in the dark theme at 980×600](docs/images/postino-p8-compose-980-dark.png)
+
+![Settings → Account after P8: the per-account Firma editor with the character count, Salva firma and Annulla, and the note that the change applies to new messages only](docs/images/postino-p8-signature-980.png)
+
+![The signature editor in the dark theme at 980×600](docs/images/postino-p8-signature-980-dark.png)
+
+The last four captures were exported from a 1.25× scaled Windows host, so the PNGs are 1225×750 while
+the layout and every headless test are 980×600. The composer still has no schedule control:
+scheduling is `postino send --at` or `send_schedule` over MCP until the UI action lands.
 
 Everything below the UI is headless and has no egui dependency.
 
@@ -201,6 +235,11 @@ cargo run -p postino-cli -- --demo label create "Ufficio" --color forest
 cargo run -p postino-cli -- --demo messages --label lbl_1
 cargo run -p postino-cli -- --demo messages --label lbl_1 --folder sent
 cargo run -p postino-cli -- --demo search preventivo --label lbl_1
+
+# P8 on the encrypted store: attach a local path, detach by name or id, set a signature from stdin
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" draft attach draft_1 "C:\Users\me\relazione.pdf"
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" draft detach draft_1 "relazione.pdf"
+Get-Content "C:\Users\me\firma.txt" -Raw | cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" account signature acc_0123456789abcdef
 
 # Encrypted local store: the same operations, persisted across restarts
 cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" info
@@ -332,12 +371,16 @@ The GNU toolchain plus MSYS2 is the path documented here.
   filters are provider features. The reading pane shows the plain-text alternative: it does not
   render HTML and never loads remote images. The MIME sanitizer removes remote images before storage
   and counts them; sync stores that count, `message_get` exposes it and the pane names it in Italian,
-  never fetching or re-adding a URL. In `--demo` the synthetic attachments have no bytes, so
-  Save is disabled with that reason rather than reporting a corrupt file. A link reaches the system
-  browser or mail client only after the confirmation sheet, and Save writes attachment bytes to the
-  chosen path without opening the file. The chosen path is a local trust boundary: the app sanitizes
-  the suggested filename and re-classifies the chosen name, but does not canonicalize a symlink,
-  reparse point or NTFS alternate data stream that the person selects. See
+  never fetching or re-adding a URL. Compose attachments are real files in the encrypted store, not
+  inline images or HTML: the caps are 20 files, 25 MiB each and 25 MiB total, unknown extensions are
+  labeled `application/octet-stream`, and no thumbnail or preview is generated. The signature is plain
+  text (no HTML, images or tracking), belongs to one identity, is not a separate MIME part, and a
+  provider-side signature is neither read nor synchronized. In `--demo` the synthetic attachments have
+  no bytes and Save/attach is disabled with that reason. A link reaches the system browser or mail
+  client only after the confirmation sheet, and Save writes attachment bytes to the chosen path
+  without opening the file. The chosen path is a local trust boundary: the app sanitizes the suggested
+  filename and re-classifies the chosen name, but does not canonicalize a symlink, reparse point or
+  NTFS alternate data stream that the person selects. See
   [docs/product.md](docs/product.md).
 
 ## Documentation

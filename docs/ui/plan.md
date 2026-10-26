@@ -594,6 +594,42 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   980×600 light and dark layout with the remote line and the attachment strip. The screenshot
   fixture is a stored-truth sanitized message with `remote_images = 1`; it contains no live tracker.
 
+### P8 Compose depth, attachment bytes and signatures — done
+
+- **Attachment row.** The composer lists each attachment as one content-sized row: paperclip,
+  filename (truncated with the full name in a tooltip), MIME in mono, size, and a focusable remove
+  button. The section header says `ALLEGATI`, and a mono line shows `2 allegati · 3,4 MB`; the pinned
+  footer repeats the count and total beside the draft state, so the total stays visible while the
+  body scrolls. `Allega file` lives in the pinned footer, is reachable with Tab/Enter, and opens the
+  injected multi-file picker. A drop on the composer goes through the same bounded reader; the
+  component never reads a path itself. In the demo the button is disabled with the reason
+  "La modalità demo non ha un archivio locale", and a drop is refused without touching the file.
+- **Caps and failures.** At most 20 files, 25 MiB each and 25 MiB total; the draft keeps the rows that
+  succeeded, and one readable toast names the first file that did not (never the full path). A long
+  filename truncates in the row and stays complete in the tooltip. The footer and Send remain on screen
+  at 980×600 because only the body scrolls.
+- **Signature editor.** Settings → Account has a `Firma` control on each account row. It expands an
+  inline plain-text editor with a live `N/4096 byte` count, a preview through the editor itself,
+  `Salva firma` and `Annulla`; the copy says the change applies to new messages, not to saved drafts.
+  Esc closes the editor first (returning focus to that account's Firma button) and only a second Esc
+  closes Settings. Over 4 KiB or a forbidden control keeps Save disabled with a sentence. The
+  signature is inserted in new, reply and forward messages for the active identity; changing it never
+  rewrites an existing draft.
+- **Reply and forward.** Reply/reply-all/forward are still prefilled from the reading pane and the
+  list menu. Reply-all uses the parent `Reply-To` when present, removes the active account's address
+  case-insensitively, never copies Bcc, dedupes, and puts the original To/Cc in Cc minus To. The
+  subject is prefixed once, the quote is plain text with a UTC date, and the draft stores the parent
+  `Message-ID`; `In-Reply-To`/`References` are emitted by the serializer and survive autosave and
+  reopen. Forward shows the parent attachments and copies their bytes through the encrypted store;
+  a missing source is named, stays visible and blocks Send.
+- **Screenshots.** `postino-p8-compose-980.png` and `-dark.png` show two attachments with the total
+  at 980×600; `postino-p8-signature-980.png` and `-dark.png` show the signature editor and its
+  character count.
+- **Tests.** Picker recorder (add/cancel/failure), drop recorder, exact bytes through the engine and
+  a store reopen, duplicate/traversal/reserved/bidi names, caps, missing/corrupt blobs, forward bytes,
+  signature per account and Esc focus, keyboard Enter on `Allega file`, and 980×600 light/dark renders
+  for the composer and the editor. No test opens a native dialog or a browser.
+
 Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 
 ## 11. Acceptance
@@ -612,6 +648,11 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   called empty because of a filter.
 - The composer fits 980×600, from the header to Send/Cancel, with a body that scrolls and a scrim that
   blocks the shell; Esc keeps the unsaved guard.
+- Every composer attachment has a real stored blob, a removable row and a visible total; the 20-file,
+  25 MiB-per-file and 25 MiB-total caps are enforced at the operation (the base64 string is bounded
+  before decode, and the decoded per-file buffer is bounded); a missing/corrupt blob refuses
+  Send with the filename; the demo never opens a dialog or reads a dropped path. The signature editor
+  saves per account in Settings, is keyboard reachable and closes before Settings on Esc.
 - A link is clickable only for absolute `http`, `https` or `mailto`; the exact destination and the
   host/recipient line are visible before **Apri**, userinfo, `mailto:` recipient lists/`attach`
   fields and hidden Cc/Bcc are refused, and cancelling never calls the opener. An attachment Save
