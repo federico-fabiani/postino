@@ -238,7 +238,7 @@ they have a reason to exist.
   dangerous-extension classification, exact attachment bytes, overwrite refusal then confirmation,
   cancel/missing blob, the keyboard Save path, the link sheet and its recorder, every settings
   section at 980×600 in both themes, focus return, the injected folder opener, one identity and one
-  Retry, Cc layout, a sanitized message with no remote line, and compose/reply identity. No UI test
+  Retry, Cc layout, the stored remote-image line with no URL painted, and compose/reply identity. No UI test
   opens a browser, a native dialog or a shell.
 - **Test infrastructure:** the fake IMAP/SMTP servers and TLS fixture live in `postino-testkit` and
   run in CI. Property tests for the network parsers and fuzzing for MIME remain future work.
