@@ -1153,6 +1153,7 @@ mod tests {
                     bcc: Vec::new(),
                     body_text: "Rapporto mensile completo".to_owned(),
                     body_html: None,
+                    remote_images: 0,
                     attachments: Vec::new(),
                 }
             })

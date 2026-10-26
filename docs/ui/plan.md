@@ -486,8 +486,11 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 - **Reading pane.** The body is the plain-text alternative (already HTML-to-text when only HTML
   exists) under a quiet `Vista testo` line that explains the HTML renderer arrives with the isolated
   viewer. The header shows sender, recipients, a content-sized Cc line truncated with a tooltip,
-  date, subject and label chips; selecting a label chip filters the mailbox. The attachment row is a
-  pinned strip above the body scroll, so it stays visible at 980×600.
+  date, subject and label chips; selecting a label chip filters the mailbox. Below the chips and above
+  `Vista testo`, a message whose stored count is greater than zero names `N immagini remote bloccate`
+  (`1 immagine remota bloccata` in the singular) with “il contenuto arriva dal server e non viene
+  caricato”. The attachment row is a pinned strip above the body scroll, so it stays visible at
+  980×600.
 - **Safe links.** `reading::find_links` is a pure scanner over the body: only absolute `http`,
   `https` and `mailto` URLs at a word boundary survive; balanced brackets are kept, two adjacent
   URLs are not merged, trailing punctuation is trimmed and `javascript:`, `file:`, `data:`,
@@ -556,25 +559,40 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   clicks, focus return, Esc, palette entry, neutral attribution titles, **Rimuovi** and the
   Annulla-first focus; one identity and one Retry in the wide split, 980 overlay, wide full-screen
   and Error states, with the Retry clicked; Cc fixture; a bidi attachment chip; four attachments at
-  980; a sanitized message with no remote-content line; compose/reply identity. No test opens a
-  browser, a native dialog or a shell.
+  980; the stored count line in singular, plural and zero states with no URL painted; compose/reply
+  identity. No test opens a browser, a native dialog or a shell.
 - **Screenshots.** `docs/images/postino-p6c-reading-attachments.png` and
-  `-reading-attachments-980.png` (text view, safe link, pinned attachment Save at 1280 and 980),
-  `postino-p6c-link-confirm.png` and `-980.png`, `postino-p6c-settings.png`,
-  `-settings-dark.png`, `-settings-980.png` and `-settings-980-dark.png`. The P6b mailbox and
-  offline images were regenerated for the single identity, the `N non letti` badge and the single
-  Retry.
+  `-reading-attachments-980.png` (text view, stored blocked-image line, safe link, pinned attachment
+  Save at 1280 and 980), `postino-p6c-link-confirm.png` and `-980.png`,
+  `postino-p6c-settings.png`, `-settings-dark.png`, `-settings-980.png` and
+  `-settings-980-dark.png`. The P6b mailbox and offline images were regenerated for the single
+  identity, the `N non letti` badge and the single Retry.
 - **Honest limits.** HTML is not rendered in this slice: the pane shows the text alternative and
   never requests remote images. The MIME sanitizer removes remote images before storage and counts
-  them internally, but that count is **not carried through sync and the store yet**, so the pane
-  shows no remote-content line and the screenshot fixture contains no injected HTML. Surfacing the
-  count is a follow-up tracked as **P6d** in `docs/delivery-plan.md`, after the schema v5 work owned
-  by P7; it is documented here and in the README as not delivered, not as a working feature. Save
-  writes the exact bytes to the path the person chooses and never opens or executes the file; the
-  extension warning is advisory. The chosen path is a local trust boundary: the app sanitizes the
-  suggested name and re-classifies the chosen name, but does not canonicalize a symlink, reparse
-  point or NTFS alternate data stream that the person selects. Links only reach the system browser
-  or mail client after the confirmation sheet.
+  them; P6d carries that stored count through sync, so the pane names it without re-deriving it from
+  the sanitized HTML, which no longer contains the references. Save writes the exact bytes to the
+  path the person chooses and never opens or executes the file; the extension warning is advisory.
+  The chosen path is a local trust boundary: the app sanitizes the suggested name and re-classifies
+  the chosen name, but does not canonicalize a symlink, reparse point or NTFS alternate data stream
+  that the person selects. Links only reach the system browser or mail client after the confirmation
+  sheet.
+
+### P6d Remote-content count — done
+
+- **Schema v6.** Additive after v5: `messages.remote_images INTEGER NOT NULL DEFAULT 0
+  CHECK(remote_images BETWEEN 0 AND 10000)`. Existing rows read `0`; a failed migration rolls back;
+  the repository clamps at the bound on read and write.
+- **Flow.** `postino-mime` counts the `http`/`https` images it removes and returns
+  `remote_images_blocked`; `postino-sync` caps it and writes `messages.remote_images` in the same
+  message transaction as the body, on insert and on a re-fetch. `message_get` exposes the field;
+  `Message` defaults older JSON to `0`; a draft never accepts it.
+- **Reading pane.** The Italian line reads the message's stored count, not `body_html`, and appears
+  only above zero. No remote URL is fetched, logged or retained in the sanitized HTML; the count is
+  metadata, not content.
+- **Evidence.** Parser fixture with two remote images and one `cid:` image; sync → reopen → offline
+  `message_get`; old-row default; singular/plural/absent headless render with no URL painted;
+  980×600 light and dark layout with the remote line and the attachment strip. The screenshot
+  fixture is a stored-truth sanitized message with `remote_images = 1`; it contains no live tracker.
 
 Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 

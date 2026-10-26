@@ -52,15 +52,15 @@ fn upgrades_a_v1_database_additively() {
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v1 to v5");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        let store = Store::open(&path, &key).expect("upgrade v1 to v6");
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v1"), "the upgrade lost meta data");
         store.upsert_account(&account("acc_1")).expect("the v2 tables exist");
         store.set_meta("schema", "v4").expect("write");
     }
 
     let store = Store::open(&path, &key).expect("reopen");
-    assert_eq!(store.schema_version().expect("version"), 5);
+    assert_eq!(store.schema_version().expect("version"), 6);
     assert!(store.get_account("acc_1").expect("account").is_some());
     assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v4"));
 }
@@ -87,15 +87,20 @@ fn upgrades_a_v2_database_and_seeds_the_draft_sequence() {
         store.upsert_account(&account("acc_1")).expect("account");
         store.save_draft(&draft("prima")).expect("draft");
         store.save_draft(&draft("seconda")).expect("second revision");
-        // Make the file look like the shipped v2 schema: the migration had not created draft_seq
-        // or the v4 server table.
+        // Make the file look like the shipped v2 schema: the migration had not created draft_seq,
+        // the v4 server table, the v5 outbox or the v6 remote-image column.
         let connection = raw_open(&path, &key);
-        connection.execute_batch("DROP TABLE draft_seq; DROP TABLE account_servers; DROP TABLE outbox; PRAGMA user_version = 2;").expect("forge v2");
+        connection
+            .execute_batch(
+                "DROP TABLE draft_seq; DROP TABLE account_servers; DROP TABLE outbox;
+                 ALTER TABLE messages DROP COLUMN remote_images; PRAGMA user_version = 2;",
+            )
+            .expect("forge v2");
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v2 to v5");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        let store = Store::open(&path, &key).expect("upgrade v2 to v6");
+        assert_eq!(store.schema_version().expect("version"), 6);
         let saved = store.save_draft(&draft("terza")).expect("the seeded sequence must continue");
         assert_eq!(saved.revision, 3, "the v2 draft revision did not seed draft_seq");
     }
@@ -141,23 +146,31 @@ fn upgrades_a_v3_database_and_keeps_its_mail() {
         bcc: Vec::new(),
         body_text: "corpo".to_owned(),
         body_html: None,
+        remote_images: 0,
         size: Some(5),
     };
 
     {
-        let store = Store::open(&path, &key).expect("open v5");
+        let store = Store::open(&path, &key).expect("open v6");
         store.upsert_account(&account("acc_1")).expect("account");
         store.upsert_folder(&folder).expect("folder");
         store.upsert_synced_message(&message, &[]).expect("message");
-        // Make the file look like the shipped v3 schema: the v4 table did not exist yet.
+        // Make the file look like the shipped v3 schema: the v4 table and the v6 column did not exist.
         let connection = raw_open(&path, &key);
-        connection.execute_batch("DROP TABLE account_servers; DROP TABLE outbox; PRAGMA user_version = 3;").expect("forge v3");
+        connection
+            .execute_batch(
+                "DROP TABLE account_servers; DROP TABLE outbox;
+                 ALTER TABLE messages DROP COLUMN remote_images; PRAGMA user_version = 3;",
+            )
+            .expect("forge v3");
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v3 to v5");
-        assert_eq!(store.schema_version().expect("version"), 5);
-        assert_eq!(store.list_all_messages().expect("messages").len(), 1, "the upgrade lost mail");
+        let store = Store::open(&path, &key).expect("upgrade v3 to v6");
+        assert_eq!(store.schema_version().expect("version"), 6);
+        let rows = store.list_all_messages().expect("messages");
+        assert_eq!(rows.len(), 1, "the upgrade lost mail");
+        assert_eq!(rows[0].remote_images, 0, "a v3 row did not default the remote-image count to 0");
         assert_eq!(store.get_folder("fld_inbox").expect("folder").expect("row").total, 1);
         assert_eq!(store.get_account_server("acc_1").expect("server"), None, "a v3 store starts with no server row");
         store
@@ -172,6 +185,113 @@ fn upgrades_a_v3_database_and_keeps_its_mail() {
             })
             .expect("the v4 table accepts a server");
     }
+}
+
+#[test]
+fn upgrades_a_v5_database_and_defaults_every_remote_count_to_zero() {
+    use postino_store::{Address, Folder, FolderKind, Message, MessageSummary};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("store.db");
+    let key = random_key();
+    let folder = Folder {
+        id: "fld_inbox".to_owned(),
+        account_id: "acc_1".to_owned(),
+        name: "INBOX".to_owned(),
+        kind: FolderKind::Inbox,
+        unread: 0,
+        total: 2,
+        uid_validity: Some(10),
+        uid_next: Some(12),
+        last_sync_at: None,
+    };
+    let message = |id: &str, uid: u32| Message {
+        summary: MessageSummary {
+            id: id.to_owned(),
+            account_id: "acc_1".to_owned(),
+            folder_id: "fld_inbox".to_owned(),
+            thread_id: format!("thread_{id}"),
+            from: Address::new("Giulia", "giulia@example.com"),
+            to: vec![Address::new("Me", "me@example.com")],
+            subject: format!("Prima della v6 {id}"),
+            snippet: "corpo".to_owned(),
+            date: 1_700_000_100_000,
+            unread: false,
+            starred: false,
+            has_attachments: false,
+            labels: Vec::new(),
+        },
+        uid: Some(uid),
+        message_id: Some(format!("<{id}@example.com>")),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        body_text: "corpo".to_owned(),
+        body_html: Some("<p>corpo</p>".to_owned()),
+        remote_images: 0,
+        size: Some(5),
+    };
+
+    {
+        let store = Store::open(&path, &key).expect("open v6");
+        store.upsert_account(&account("acc_1")).expect("account");
+        store.upsert_folder(&folder).expect("folder");
+        store.upsert_synced_message(&message("msg_1", 1), &[]).expect("first message");
+        store.upsert_synced_message(&message("msg_2", 2), &[]).expect("second message");
+        // Forge the shipped v5 shape: the v6 column did not exist yet, every other table does.
+        let connection = raw_open(&path, &key);
+        connection.execute_batch("ALTER TABLE messages DROP COLUMN remote_images; PRAGMA user_version = 5;").expect("forge v5");
+    }
+
+    let store = Store::open(&path, &key).expect("upgrade v5 to v6");
+    assert_eq!(store.schema_version().expect("version"), 6);
+    let rows = store.list_all_messages().expect("messages");
+    assert_eq!(rows.len(), 2, "the upgrade lost mail");
+    assert!(rows.iter().all(|row| row.remote_images == 0), "a v5 row did not default the count to 0: {rows:?}");
+    assert!(rows.iter().all(|row| row.body_text == "corpo" && row.body_html.is_some()), "the upgrade lost a body");
+    drop(store);
+
+    // Reopening a migrated store keeps the zero counts and does not add the column again.
+    let reopened = Store::open(&path, &key).expect("reopen v6");
+    assert_eq!(reopened.schema_version().expect("version"), 6);
+    assert!(reopened.list_all_messages().expect("messages").iter().all(|row| row.remote_images == 0));
+}
+
+#[test]
+fn a_failed_v6_migration_rolls_back_and_keeps_the_v5_version() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("store.db");
+    let key = random_key();
+
+    {
+        let store = Store::open(&path, &key).expect("open v6");
+        store.upsert_account(&account("acc_1")).expect("account");
+    }
+    {
+        // A v5 file that already has an unrelated `remote_images` column makes the additive v6
+        // statement fail. The migration transaction must roll back: the version stays 5 and the
+        // account row survives.
+        let connection = raw_open(&path, &key);
+        connection
+            .execute_batch(
+                "ALTER TABLE messages DROP COLUMN remote_images;
+                 ALTER TABLE messages ADD COLUMN remote_images TEXT;
+                 PRAGMA user_version = 5;",
+            )
+            .expect("forge the failing v5 fixture");
+    }
+
+    let error = Store::open(&path, &key).err().expect("the duplicate column must abort the v6 migration");
+    assert!(error.to_string().contains("duplicate column"), "{error}");
+
+    let connection = raw_open(&path, &key);
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).expect("version");
+    assert_eq!(version, 5, "the failed v6 transaction advanced the schema version");
+    let accounts: u32 = connection.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0)).expect("accounts");
+    assert_eq!(accounts, 1, "the failed migration rolled back more than itself");
+    let column_type: String = connection
+        .query_row("SELECT type FROM pragma_table_info('messages') WHERE name = 'remote_images'", [], |row| row.get(0))
+        .expect("the forged column");
+    assert_eq!(column_type, "TEXT", "the failed migration left a partial v6 column behind");
 }
 
 #[test]
@@ -226,7 +346,7 @@ fn reopening_does_not_run_a_migration_twice() {
 
     for round in 0..3 {
         let store = Store::open(&path, &key).unwrap_or_else(|error| panic!("open round {round}: {error}"));
-        assert_eq!(store.schema_version().expect("version"), 5);
+        assert_eq!(store.schema_version().expect("version"), 6);
         store.set_meta("rounds", &round.to_string()).expect("write");
         // Dropping the store closes the connection and checkpoints the WAL.
     }
@@ -242,7 +362,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     let key = random_key();
 
     {
-        let store = Store::open(&path, &key).expect("open v5");
+        let store = Store::open(&path, &key).expect("open v6");
         store.set_meta("canary", "still here").expect("write");
     }
     {
@@ -251,7 +371,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     }
 
     let error = Store::open(&path, &key).err().expect("a newer schema must not be opened");
-    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 5 }), "{error}");
+    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 6 }), "{error}");
 }
 
 #[test]

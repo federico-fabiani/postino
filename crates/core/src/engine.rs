@@ -1393,6 +1393,7 @@ impl Engine {
             bcc: draft.bcc,
             body_text: draft.body_text,
             body_html,
+            remote_images: 0,
             attachments,
         };
 

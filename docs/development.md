@@ -331,12 +331,15 @@ the docs fixture), `palette` (command palette open), `labels` (Lavoro filter act
 (Lavoro selected, its unread mail read, the unread filter on), `onboarding_welcome`, `onboarding_provider`,
 `onboarding_form`, `onboarding_error`, `onboarding_folders`, `onboarding_sync`, `mailbox` (the shell
 with a seeded updated-at state), `offline` (a cached message open under the offline banner),
-`reading_attachments` (a deterministic message with a safe link and one PDF
-attachment in the pinned strip), `link_confirm` (the same message under the full-destination sheet,
-which shows the host/recipient line as well as the exact URL) and `settings` (the full settings dialog).
-The onboarding, mailbox and P6c scenes are deterministic fixtures; they do not read a store or touch
-the network, and the P6c scenes install the unavailable/cancelling seams so no native dialog or
-browser can open. `--dark` applies the dark theme.
+`reading_attachments` (a deterministic sanitized message with one stored blocked remote image, a safe
+link and one PDF attachment in the pinned strip), `link_confirm` (the same message under the
+full-destination sheet, which shows the host/recipient line as well as the exact URL) and `settings`
+(the full settings dialog). The onboarding, mailbox, P6c and P6d scenes are deterministic fixtures;
+they do not read a store or touch the network, and the P6c scenes install the unavailable/cancelling
+seams so no native dialog or browser can open. The `reading_attachments` message is **stored truth**:
+its HTML is already sanitized (no remote `src`, no tracker) and `remote_images = 1` is the count sync
+would have written from the parser, so the capture neither parses nor fetches anything live.
+`--dark` applies the dark theme.
 `--gallery` is a separate component review window, not a screenshot state, and cannot be combined
 with `--screenshot`.
 

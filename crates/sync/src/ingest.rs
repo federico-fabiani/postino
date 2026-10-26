@@ -152,6 +152,11 @@ pub(crate) fn ingest(
         attachments.push(row);
     }
 
+    // The sanitized HTML no longer contains the remote references, so the parser's count is the only
+    // place the fact exists. Cap it before it reaches the bounded store column and the reading pane;
+    // a hostile message cannot make this overflow or grow without bound.
+    let remote_images = u32::try_from(parsed.remote_images_blocked).unwrap_or(u32::MAX).min(store::MAX_REMOTE_IMAGES);
+
     let row = store::Message {
         summary: store::MessageSummary {
             id: id.clone(),
@@ -174,6 +179,7 @@ pub(crate) fn ingest(
         bcc,
         body_text,
         body_html: parsed.html.take(),
+        remote_images,
         size: Some(size),
     };
     store.upsert_synced_message(&row, &attachments).map_err(SyncError::Store)?;

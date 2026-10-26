@@ -1562,6 +1562,9 @@ fn format_message(message: &postino_core::Message) -> String {
     let date = message.summary.date.with_timezone(&Local);
     text.push_str(&format!("Data:    {}\n", date.format("%d/%m/%Y %H:%M")));
     text.push_str(&format!("Oggetto: {}\n", message.summary.subject));
+    if message.remote_images > 0 {
+        text.push_str(&format!("Immagini remote bloccate: {}\n", message.remote_images));
+    }
     text.push('\n');
     text.push_str(&message.body_text);
     text.push('\n');
@@ -1601,6 +1604,18 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn the_cli_read_names_the_stored_blocked_remote_count_only_when_positive() {
+        let engine = Engine::demo();
+        let id = engine.messages().first().map(|message| message.summary.id.clone()).expect("a demo message");
+        let mut message = engine.message(&id).cloned().expect("the demo message");
+        message.remote_images = 2;
+        let text = format_message(&message);
+        assert!(text.contains("Immagini remote bloccate: 2"), "{text}");
+        message.remote_images = 0;
+        assert!(!format_message(&message).contains("Immagini remote bloccate"), "a zero count must not print a line");
+    }
 
     #[test]
     fn cli_run_args_reach_the_draft_and_dry_run_operations() {

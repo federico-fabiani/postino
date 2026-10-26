@@ -11,7 +11,8 @@ use rusqlite::{ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavi
 
 use crate::model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
-    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState, SyncState, UidEntry,
+    LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
+    SyncState, UidEntry,
 };
 use crate::{SYNC_STATUS_KEY_PREFIX, Store, StoreError};
 
@@ -22,7 +23,7 @@ const ACCOUNT_COLUMNS: &str = "id, name, email, provider, signature, created_at"
 const SERVER_COLUMNS: &str = "account_id, imap_host, imap_port, imap_tls, imap_username, created_at, smtp_host, smtp_port, smtp_tls, smtp_username";
 const FOLDER_COLUMNS: &str = "id, account_id, name, kind, unread, total, uid_validity, uid_next, last_sync_at";
 const SUMMARY_COLUMNS: &str = "m.id, m.account_id, m.folder_id, m.thread_id, m.from_name, m.from_email, m.to_json, m.subject, m.snippet, m.date, m.unread, m.starred, m.has_attachments";
-const MESSAGE_DETAIL_COLUMNS: &str = "m.uid, m.message_id, m.cc_json, m.bcc_json, m.body_text, m.body_html, m.size";
+const MESSAGE_DETAIL_COLUMNS: &str = "m.uid, m.message_id, m.cc_json, m.bcc_json, m.body_text, m.body_html, m.remote_images, m.size";
 const LABEL_COLUMNS: &str = "l.id, l.account_id, l.name, l.color";
 const DRAFT_COLUMNS: &str = "id, account_id, revision, updated_at, body_text, to_json, cc_json, bcc_json, subject, in_reply_to";
 const ATTACHMENT_COLUMNS: &str = "id, filename, mime, size, blob_hash";
@@ -1403,6 +1404,7 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
     let cc_json = serde_json::to_string(&message.cc)?;
     let bcc_json = serde_json::to_string(&message.bcc)?;
     let size = message.size.map(|value| to_i64(value, "message size")).transpose()?;
+    let remote_images = i64::from(message.remote_images.min(MAX_REMOTE_IMAGES));
     let folder_account: Option<String> =
         tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [&message.summary.folder_id], |row| row.get(0)).optional()?;
     let Some(folder_account) = folder_account else {
@@ -1422,8 +1424,8 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
         "INSERT INTO messages(
              id, account_id, folder_id, uid, message_id, thread_id, from_name, from_email,
              to_json, cc_json, bcc_json, subject, snippet, date, unread, starred,
-             has_attachments, body_text, body_html, size
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             has_attachments, body_text, body_html, remote_images, size
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT(id) DO UPDATE SET
              account_id = excluded.account_id,
              folder_id = excluded.folder_id,
@@ -1443,6 +1445,7 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
              has_attachments = excluded.has_attachments,
              body_text = excluded.body_text,
              body_html = excluded.body_html,
+             remote_images = excluded.remote_images,
              size = excluded.size",
         params![
             message.summary.id,
@@ -1464,6 +1467,7 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
             message.summary.has_attachments,
             message.body_text,
             message.body_html,
+            remote_images,
             size
         ],
     )?;
@@ -1854,7 +1858,8 @@ fn row_to_message(row: &Row<'_>) -> rusqlite::Result<Message> {
         bcc: decode_addresses(row, 16)?,
         body_text: row.get(17)?,
         body_html: row.get(18)?,
-        size: get_opt_u64(row, 19)?,
+        remote_images: get_u32(row, 19)?.min(MAX_REMOTE_IMAGES),
+        size: get_opt_u64(row, 20)?,
     })
 }
 
@@ -1957,6 +1962,7 @@ mod tests {
             bcc: Vec::new(),
             body_text: "Corpo".to_owned(),
             body_html: None,
+            remote_images: 0,
             size: None,
         }
     }

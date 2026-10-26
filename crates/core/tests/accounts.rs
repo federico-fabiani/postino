@@ -65,6 +65,7 @@ fn stored_message(id: &str, account_id: &str, folder_id: &str) -> Message {
         bcc: Vec::new(),
         body_text: "body".to_owned(),
         body_html: None,
+        remote_images: 0,
         size: Some(4),
     }
 }

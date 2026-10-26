@@ -2,7 +2,8 @@
 
 > **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c/P3d) + MIME
 > crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) + sync into the store (P5b) +
-> accounts and credentials (P6a) + app on real mail (P6b/P6c) + SMTP submission and the outbox (P7) ·
+> accounts and credentials (P6a) + app on real mail (P6b/P6c) + remote-content count (P6d) + SMTP
+> submission and the outbox (P7) ·
 > **Last updated:** 2026-10-26 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
@@ -17,7 +18,7 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounds, typed errors |
 | `crates/platform` | OS seams: store key and account credentials in the OS keyring |
-| `crates/store` | SQLCipher schema v5, migrations, the repository, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P7) |
+| `crates/store` | SQLCipher schema v6, migrations, the repository, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7) |
 | `crates/sync` | One account from IMAP into the store, plus submission serialization and the Sent append (P5b, P7) |
 | `crates/testkit` | Test-only fake IMAP/SMTP servers, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -132,7 +133,7 @@ operation registry. Nothing below the frontends depends on egui.
 account(id, email, display_name, provider)
 folder(id, account, name, kind, uidvalidity, uidnext, highest_modseq)
 message(id, account, folder, uid, message_id, thread_id, from, to, cc, bcc,
-        subject, date, size, flags, blob_hash, auth_results)
+        subject, date, size, flags, remote_images, blob_hash, auth_results)
 thread(id, account, subject_norm, last_date, unread, message_count)
 attachment(id, message, filename, mime, size, blob_hash)
 draft(id, account, revision, updated_at, blob_hash, in_reply_to)
@@ -320,7 +321,9 @@ body is never repeated as an attachment.
 removed; `http`/`https` sources are counted, `cid:` images survive with their `Content-ID`, and
 `javascript:`, `data:`, `vbscript:`, `file:`, relative and protocol-relative URLs never survive.
 CSS is not supported at all: this crate is the seam, not a second sanitizer. `html_to_text` is
-public and gives the plain alternative when a message has only HTML.
+public and gives the plain alternative when a message has only HTML. P6d carries
+`remote_images_blocked` through sync into `messages.remote_images`; the count is metadata, not
+content, and the sanitized HTML never keeps a reference from which it could be re-derived.
 
 **Serialization.** `serialize(&OutgoingMessage)` owns header folding, RFC 2047 B-encoding,
 quoted-printable, base64, RFC 2231 continuations, deterministic boundaries from a content hash and
@@ -526,6 +529,12 @@ UID FETCH <a>:<b> (UID FLAGS)        ──▶ full liveness/flags scan, 1 000 U
 deferred deletion                    ──▶ after every folder: drop missing ids seen nowhere
 recount                              ──▶ folder counts, last_sync_at
 ```
+
+**Remote-content count.** The sanitizer returns `ParsedMessage::remote_images_blocked`, and the
+message transaction writes `messages.remote_images` (capped at 10 000) beside the body. The stored
+HTML has no remote `src`, so this count is the only surviving fact: the reading pane renders it from
+the message and never scans `body_html`, and `message_get` exposes it. No remote URL is fetched,
+logged or re-added anywhere in the flow; a re-sync replaces the count with the newly parsed one.
 
 **UID discovery and the cursor.** `UIDNEXT` is a hint, never truth: a missing or stale value hides
 mail above a gap, and `EXISTS`/`RECENT` are counts, not liveness. After `SELECT` the reconciler
@@ -1094,3 +1103,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P5a: `postino-net` speaks IMAP4rev1 over implicit TLS or STARTTLS with OS verification, bounded lines/literals/commands, typed errors and a scripted hostile-server corpus; the sync loop and store writes are still missing |
 | 2026-10-25 | major | P5b: `postino-testkit` moves the scripted server and TLS CA out of the net tests; `postino-sync` reconciles folders, UIDVALIDITY, incremental UID windows, MIME bodies, attachment blobs, deletions, flags and a persistent status with cancellation. No operation, CLI or UI calls it yet. |
 | 2026-10-26 | major | P7: SMTP submission over implicit TLS/STARTTLS, schema v5 outbox journal, exact-bytes-before-network queue, lease/backoff/auth-halt state machine, uncertain-after-DATA policy, independent Sent APPEND with `\Seen`, `message_send`/`send_schedule`/outbox operations, CLI send/outbox, MCP `--allow-send`, desktop worker and outbox dialog |
+| 2026-10-26 | minor | P6d: schema v6 `messages.remote_images`, `ParsedMessage::remote_images_blocked` carried through sync and the store, `message_get` field and the Italian reading-pane line from stored truth; no HTML rendering and no remote fetch |

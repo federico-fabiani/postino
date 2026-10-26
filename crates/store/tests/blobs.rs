@@ -603,6 +603,7 @@ fn seed_message(store: &Store) {
             bcc: Vec::new(),
             body_text: "Corpo".to_owned(),
             body_html: None,
+            remote_images: 0,
             size: None,
         })
         .expect("message");

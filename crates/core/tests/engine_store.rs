@@ -138,6 +138,7 @@ fn message_row(message: &Message, account_id: &str) -> postino_store::Message {
         bcc: message.bcc.iter().map(store_address).collect(),
         body_text: message.body_text.clone(),
         body_html: message.body_html.clone(),
+        remote_images: message.remote_images,
         size: None,
     }
 }

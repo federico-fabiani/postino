@@ -71,6 +71,18 @@ fn newsletter_blocks_remote_images_and_converts_text() {
 }
 
 #[test]
+fn remote_images_are_counted_without_losing_the_inline_cid() {
+    let message = load(include_bytes!("fixtures/remote_images.eml"));
+    assert_eq!(message.remote_images_blocked, 2, "the parser must count exactly the two http(s) images");
+    let html = message.html.as_deref().expect("html");
+    assert!(html.contains("src=\"cid:logo@example.com\""), "the inline cid image must stay: {html}");
+    assert!(!html.contains("cdn.example.com"), "{html}");
+    assert!(!html.contains("tracker.example.com"), "{html}");
+    assert!(!html.contains("http://") && !html.contains("https://"), "a remote source survived: {html}");
+    assert!(warnings(&message).contains(&Warning::RemoteContentBlocked));
+}
+
+#[test]
 fn nested_mixed_keeps_bodies_and_attachments() {
     let message = load(include_bytes!("fixtures/nested.eml"));
     assert!(message.is_multipart);

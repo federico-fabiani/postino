@@ -84,9 +84,9 @@ MCP      ─┘
 - `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
-- The persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema v5
-  (SMTP endpoints on the account row and the outbox journal), additive migrations and a typed
-  repository (`postino-store`), plus the OS keyring seam (`postino-platform`). `Engine::open`
+- The persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema v6
+  (SMTP endpoints, the outbox journal and the stored remote-image count), additive migrations and a
+  typed repository (`postino-store`), plus the OS keyring seam (`postino-platform`). `Engine::open`
   loads the mailbox once, repairs orphan drafts, writes every mutation through in one transaction
   and keeps store errors categorised; the desktop app boots on the store, with `--demo` as the
   synthetic fallback.
@@ -94,7 +94,8 @@ MCP      ─┘
   recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
   guards and `Bcc` kept in the envelope. It is wired into sync and the engine; the desktop reading
-  pane shows its text alternative and does not render HTML yet.
+  pane shows its text alternative, does not render HTML yet and reports the stored blocked-image
+  count without loading anything.
 - Encrypted attachment bytes (P4b): `postino-crypto` derives an HKDF-SHA256 `blob` subkey from the
   store key and seals bytes with XChaCha20-Poly1305; `postino-store` keeps each distinct attachment
   content once under `<db file>.blobs/<xx>/<hash>.blob` (BLAKE3 name, zstd only when it helps,
@@ -329,9 +330,9 @@ The GNU toolchain plus MSYS2 is the path documented here.
 - **Honest limits.** IMAP is the sync protocol; the server stays the source of truth. Avatars shown
   to recipients depend on BIMI or a signature, not on this client. Auto-reply and server-side
   filters are provider features. The reading pane shows the plain-text alternative: it does not
-  render HTML and never loads remote images. The MIME sanitizer removes remote images before storage,
-  but the blocked-image count is not surfaced in the pane yet: carrying it through sync and the store
-  is the P6d follow-up after the schema v5 work. In `--demo` the synthetic attachments have no bytes, so
+  render HTML and never loads remote images. The MIME sanitizer removes remote images before storage
+  and counts them; sync stores that count, `message_get` exposes it and the pane names it in Italian,
+  never fetching or re-adding a URL. In `--demo` the synthetic attachments have no bytes, so
   Save is disabled with that reason rather than reporting a corrupt file. A link reaches the system
   browser or mail client only after the confirmation sheet, and Save writes attachment bytes to the
   chosen path without opening the file. The chosen path is a local trust boundary: the app sanitizes

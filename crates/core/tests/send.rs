@@ -1274,6 +1274,7 @@ fn store_message(folder_id: &str, id: &str, message_id: &str, subject: &str) -> 
         bcc: Vec::new(),
         body_text: "corpo".to_owned(),
         body_html: None,
+        remote_images: 0,
         size: None,
     }
 }

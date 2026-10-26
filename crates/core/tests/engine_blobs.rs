@@ -98,6 +98,7 @@ impl Fixture {
                 bcc: Vec::new(),
                 body_text: "Corpo del messaggio".to_owned(),
                 body_html: None,
+                remote_images: 0,
                 size: None,
             })
             .expect("message");

@@ -3,7 +3,7 @@
 **Layer:** foundation. Depends on `postino-crypto` (the blob subkey) and on no other workspace crate;
 no UI toolkit.
 
-The encrypted local store. One SQLCipher database with schema **v5**, a migration runner on
+The encrypted local store. One SQLCipher database with schema **v6**, a migration runner on
 `PRAGMA user_version`, a typed repository for the mailbox and outbox, and a content-addressed encrypted
 blob store for attachment bytes. The engine drives it through `Engine::open` (P3c), the attachment
 seam (P4b) and the outbox (P7); `postino-sync` (P5b) is the writer for received mail and P7's Sent
@@ -96,9 +96,15 @@ mail.db.blobs/<first two hex chars>/<64 lowercase hex>.blob
 - The blob directory has no garbage collector yet: deleting a message leaves its blob, because
   another message may reference the same content.
 
-## Schema v5
+## Schema v6
 
-v5 is additive from v4: nullable `smtp_host`, `smtp_port`, `smtp_tls`, `smtp_username` on
+v6 is additive from v5: `messages.remote_images INTEGER NOT NULL DEFAULT 0 CHECK(remote_images
+BETWEEN 0 AND 10000)`, the number of `http`/`https` images the MIME sanitizer removed from the stored
+HTML on receipt. Existing rows read `0`; the column is a read-only derived fact, never accepted from a
+draft or an agent. The repository clamps at 10 000 on both write and read, so a damaged row cannot
+produce an unbounded count.
+
+v5 was additive from v4: nullable `smtp_host`, `smtp_port`, `smtp_tls`, `smtp_username` on
 `account_servers`, and the `outbox` journal with `outbox_due(state, send_at)`, `outbox_draft(draft_id,
 created_at DESC)` and the partial unique index `outbox_active_draft(draft_id) WHERE state IN
 ('queued','sending','append_pending','uncertain','failed')`. There is still no password column: the
@@ -109,7 +115,7 @@ IMAP and optional SMTP secrets live in the OS keyring.
 | `accounts` | id, name, email, provider, signature, created_at |
 | `account_servers` | IMAP endpoint, plus the nullable SMTP endpoint (P7) |
 | `folders` | account, name, kind, cached unread/total, `uid_validity`, `uid_next`, `last_sync_at` |
-| `messages` | envelope, JSON recipient lists, flags, body text/HTML, size, optional IMAP uid |
+| `messages` | envelope, JSON recipient lists, flags, body text/HTML, stored blocked-image count, size, optional IMAP uid |
 | `attachments` | metadata: filename, mime, size, optional blob hash; the bytes live in `blobs/` |
 | `labels` | account-scoped or mailbox-wide, name, semantic colour name |
 | `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |

@@ -300,6 +300,7 @@ fn message(
         bcc: Vec::new(),
         body_text: body.to_owned(),
         body_html: None,
+        remote_images: 0,
         attachments: Vec::new(),
     }
 }

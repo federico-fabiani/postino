@@ -665,6 +665,13 @@ impl PostinoApp {
                     if let Some(mut message) = self.engine.message(&id).cloned() {
                         message.body_text = "Ciao Federico,\n\nho caricato il PDF del preventivo nella cartella condivisa.\n\nDettaglio: https://example.com/preventivo/postino-2026?token=anteprima\n\nScrivimi a mailto:giulia.ferri@example.com.\n\nGrazie,\nGiulia"
                             .to_owned();
+                        // Stored truth, not a live tracker: the sanitizer removed the remote image and
+                        // sync stored the count. This HTML is already the sanitized form and contains
+                        // no remote `src`, so a screenshot can never load anything.
+                        message.body_html = Some(
+                            "<p>Ciao Federico,</p><p>ho caricato il PDF del preventivo nella cartella condivisa.</p>".to_owned(),
+                        );
+                        message.remote_images = 1;
                         if message.attachments.is_empty() {
                             message.attachments.push(Attachment {
                                 id: "att_screenshot".to_owned(),
@@ -4533,6 +4540,16 @@ impl PostinoApp {
             self.select_label(id);
             return;
         }
+        // The count is stored truth from sync, not a scan of `body_html`: the sanitizer removed the
+        // remote references, so the HTML cannot tell the pane that anything was blocked.
+        if let Some(remote) = remote_images_text(message.remote_images) {
+            ui.add_space(space::XS);
+            ui.horizontal(|ui| {
+                ui.label(icons::icon(icons::EYE_OFF, 14.0, t.gold_ink));
+                ui.add_space(space::SM);
+                ui.label(typography::text(Role::Caption, remote, t.text_faint));
+            });
+        }
         ui.add_space(space::MD);
         ui.separator();
         ui.add_space(space::SM);
@@ -7429,6 +7446,16 @@ fn messages_text(count: usize) -> String {
 
 fn unread_text(unread: usize) -> String {
     plural(unread, "non letto", "non letti")
+}
+
+/// The remote-content line, or `None` when nothing was blocked. The count is the parser's stored
+/// fact carried by sync; the sanitized HTML deliberately contains no reference the pane could rescan.
+fn remote_images_text(count: u32) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 immagine remota bloccata · il contenuto arriva dal server e non viene caricato".to_owned()),
+        count => Some(format!("{count} immagini remote bloccate · il contenuto arriva dal server e non viene caricato")),
+    }
 }
 
 /// Translate an engine send failure into Italian copy. The raw sentence never reaches the shell.
@@ -10432,6 +10459,7 @@ mod tests {
             bcc: Vec::new(),
             body_text: format!("{subject}\n\nCorpo salvato nell'archivio locale."),
             body_html: None,
+            remote_images: 0,
             size: None,
         }
     }
@@ -11517,25 +11545,36 @@ mod tests {
     }
 
     #[test]
-    fn the_980_reading_overlay_shows_the_attachment_row_and_save() {
-        let clock = screenshot_clock().expect("the frozen screenshot clock");
-        let mut app = PostinoApp::demo_at(true, clock);
-        app.seed_screenshot(ScreenshotState::ReadingAttachments);
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        theme::apply(&ctx, false);
-        let size = Vec2::new(980.0, 600.0);
-        settle_at(&ctx, &mut app, size);
-        let content = ctx.content_rect();
-        let strip = probe::reading_attachments_rect(&ctx).expect("the pinned attachment strip");
-        let save = probe::attachment_save_rect(&ctx, "att_001").expect("the attachment Save button");
-        assert!(content.contains_rect(strip), "the attachment strip is off-screen: {strip:?}");
-        assert!(strip.contains_rect(save), "Save is outside the attachment strip: {save:?} in {strip:?}");
-        assert!(content.contains_rect(save), "Save is off-screen at 980x600: {save:?}");
-        assert_eq!(probe::attachment_save_is_enabled(&ctx, "att_001"), Some(true), "the store/screenshot path keeps Save usable");
-        let text = painted_text(&ctx, &mut app, size);
-        assert!(text.iter().any(|line| line.contains("ALLEGATI")), "{text:?}");
-        assert!(text.iter().any(|line| line == "Salva"), "the Salva label must be painted: {text:?}");
+    fn the_980_reading_overlay_shows_the_remote_line_and_attachment_save_in_both_themes() {
+        for dark in [false, true] {
+            let clock = screenshot_clock().expect("the frozen screenshot clock");
+            let mut app = PostinoApp::demo_at(true, clock);
+            app.seed_screenshot(ScreenshotState::ReadingAttachments);
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let size = Vec2::new(980.0, 600.0);
+            settle_at(&ctx, &mut app, size);
+            let fixture = app.screenshot_message.as_ref().expect("the stored-truth screenshot fixture");
+            assert_eq!(fixture.remote_images, 1, "dark={dark}: the fixture must carry the stored count");
+            let html = fixture.body_html.as_deref().expect("sanitized HTML");
+            assert!(!html.contains("http") && !html.contains("<img"), "dark={dark}: the fixture must not inject a tracker: {html}");
+            let content = ctx.content_rect();
+            let strip = probe::reading_attachments_rect(&ctx).expect("the pinned attachment strip");
+            let save = probe::attachment_save_rect(&ctx, "att_001").expect("the attachment Save button");
+            assert!(content.contains_rect(strip), "the attachment strip is off-screen in dark={dark}: {strip:?}");
+            assert!(strip.contains_rect(save), "Save is outside the attachment strip in dark={dark}: {save:?} in {strip:?}");
+            assert!(content.contains_rect(save), "Save is off-screen at 980x600 in dark={dark}: {save:?}");
+            assert_eq!(probe::attachment_save_is_enabled(&ctx, "att_001"), Some(true), "the store/screenshot path keeps Save usable");
+            let text = painted_text(&ctx, &mut app, size);
+            assert!(text.iter().any(|line| line.contains("ALLEGATI")), "dark={dark}: {text:?}");
+            assert!(text.iter().any(|line| line == "Salva"), "the Salva label must be painted in dark={dark}: {text:?}");
+            let remote = text.iter().position(|line| line.contains("1 immagine remota bloccata")).expect("the stored count line");
+            let mode = text.iter().position(|line| line.contains("Vista testo")).expect("the text-view line");
+            assert!(remote < mode, "the remote line must sit above Vista testo in dark={dark}: {text:?}");
+            let line = &text[remote];
+            assert!(!line.contains("http") && !line.contains("tracker"), "the line must not name a URL: {line:?}");
+        }
     }
 
     #[test]
@@ -11563,21 +11602,40 @@ mod tests {
     }
 
     #[test]
-    fn a_sanitized_message_shows_no_remote_content_line() {
-        let clock = screenshot_clock().expect("the frozen screenshot clock");
-        let mut app = PostinoApp::demo_at(true, clock);
-        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
-        app.open_message(id.clone());
-        let mut message = app.engine.message(&id).cloned().expect("the open message");
-        // The sanitizer keeps cid images and removes remote `src`; the blocked count is not carried
-        // through the store yet, so the pane must not invent a line from the cached HTML.
-        message.body_html = Some("<p>Sanitized</p><img src=\"cid:logo\">".to_owned());
-        app.screenshot_message = Some(message);
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        theme::apply(&ctx, false);
-        let text = painted_text(&ctx, &mut app, Vec2::new(1280.0, 800.0));
-        assert!(!text.iter().any(|line| line.contains("immagin") || line.contains("bloccat")), "no fixture-only remote line: {text:?}");
+    fn the_remote_content_line_uses_the_stored_count_and_never_a_url() {
+        for (count, expected) in [
+            (0, None),
+            (1, Some("1 immagine remota bloccata")),
+            (2, Some("2 immagini remote bloccate")),
+            (10_000, Some("10000 immagini remote bloccate")),
+        ] {
+            let clock = screenshot_clock().expect("the frozen screenshot clock");
+            let mut app = PostinoApp::demo_at(true, clock);
+            let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+            app.open_message(id.clone());
+            let mut message = app.engine.message(&id).cloned().expect("the open message");
+            // The sanitized HTML has no remote reference left: only the stored count may produce the
+            // line. A body with no link makes a URL in the painted copy a real failure.
+            message.body_html = Some("<p>Corpo già sanificato.</p>".to_owned());
+            message.body_text = "Corpo già sanificato.".to_owned();
+            message.remote_images = count;
+            app.screenshot_message = Some(message);
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, false);
+            let text = painted_text(&ctx, &mut app, Vec2::new(1280.0, 800.0));
+            let line = text.iter().find(|line| line.contains("immagin"));
+            match expected {
+                Some(expected) => {
+                    let line = line.unwrap_or_else(|| panic!("the count {count} has no remote-content line: {text:?}"));
+                    assert!(line.contains(expected), "count {count} must read {expected:?}: {line:?}");
+                    assert!(line.contains("il contenuto arriva dal server e non viene caricato"), "{line:?}");
+                    assert!(!line.contains("http") && !line.contains("tracker"), "the line must not name a URL: {line:?}");
+                }
+                None => assert!(line.is_none(), "a message with no blocked image must not invent a line: {text:?}"),
+            }
+            assert!(!text.iter().any(|line| line.contains("http")), "the pane painted a URL with no link in the body: {text:?}");
+        }
     }
 
     #[test]

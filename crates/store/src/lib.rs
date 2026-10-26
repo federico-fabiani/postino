@@ -12,7 +12,8 @@
 //! message_labels, drafts, sync_state and the P3a `meta` table. Version 3 adds `draft_seq`, the
 //! monotonic draft revision counter that survives a send and a move back to Drafts. Version 4 adds
 //! `account_servers`, the IMAP endpoint of each account, with no password column anywhere. Version 5
-//! adds the nullable SMTP endpoint columns and the `outbox` journal (P7).
+//! adds the nullable SMTP endpoint columns and the `outbox` journal (P7). Version 6 adds the stored
+//! remote-image count of each message (P6d), the count the MIME sanitizer removed on receipt.
 //!
 //! Every date is a **Unix timestamp in milliseconds** (`i64`). The choice is deliberate:
 //!
@@ -49,8 +50,8 @@ mod repo;
 pub use blob::BlobStore;
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
-    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState, SmtpServer, SyncState,
-    UidEntry,
+    LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
+    SmtpServer, SyncState, UidEntry,
 };
 pub use repo::{MAX_OUTBOX_ROWS, UNCERTAIN_AFTER_CRASH};
 
@@ -61,7 +62,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 /// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
 /// label id is never handed out again.
@@ -239,6 +240,14 @@ CREATE INDEX outbox_due ON outbox(state, send_at);
 CREATE INDEX outbox_draft ON outbox(draft_id, created_at DESC);
 CREATE UNIQUE INDEX outbox_active_draft ON outbox(draft_id)
     WHERE draft_id IS NOT NULL AND state IN ('queued', 'sending', 'append_pending', 'uncertain', 'failed');
+"#,
+    // v6 (P6d): the number of remote images the MIME sanitizer removed from the stored HTML. It is
+    // additive on purpose: an existing row keeps working with the `0` default, and the count is a
+    // read-only derived fact, never accepted from a draft or an agent. The CHECK bounds a hostile or
+    // damaged value at the storage boundary; the repository clamps at both ends as well.
+    r#"
+ALTER TABLE messages ADD COLUMN remote_images INTEGER NOT NULL DEFAULT 0
+    CHECK(remote_images BETWEEN 0 AND 10000);
 "#,
 ];
 

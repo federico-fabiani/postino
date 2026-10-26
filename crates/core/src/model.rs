@@ -401,6 +401,11 @@ pub struct Message {
     pub bcc: Vec<Address>,
     pub body_text: String,
     pub body_html: Option<String>,
+    /// Remote images the MIME sanitizer removed when this message was ingested, as stored by sync.
+    /// It is a read-only derived fact: `draft_save` does not accept it and `0` means "none removed".
+    /// `serde(default)` keeps older JSON and MCP callers valid.
+    #[serde(default)]
+    pub remote_images: u32,
     pub attachments: Vec<Attachment>,
 }
 
@@ -421,6 +426,39 @@ pub(crate) fn snippet(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_message_json_defaults_the_remote_count_to_zero() {
+        let mut value = serde_json::json!({
+            "summary": {
+                "id": "msg_1",
+                "thread_id": "thr_1",
+                "folder_id": "inbox",
+                "from": { "name": "Giulia", "email": "giulia@example.com" },
+                "to": [],
+                "subject": "Notizie",
+                "snippet": "corpo",
+                "date": "2026-10-24T10:42:00Z",
+                "unread": false,
+                "starred": false,
+                "has_attachments": false,
+                "labels": []
+            },
+            "cc": [],
+            "bcc": [],
+            "body_text": "corpo",
+            "body_html": null,
+            "attachments": []
+        });
+        let older: Message = serde_json::from_value(value.clone()).expect("an older message JSON");
+        assert_eq!(older.remote_images, 0, "a missing field must read as zero");
+
+        value["remote_images"] = serde_json::json!(2);
+        let newer: Message = serde_json::from_value(value).expect("the current message JSON");
+        assert_eq!(newer.remote_images, 2);
+        let encoded = serde_json::to_value(&newer).expect("serialize");
+        assert_eq!(encoded["remote_images"], serde_json::json!(2), "message_get must expose the field");
+    }
 
     #[test]
     fn parses_bare_and_named_addresses() {

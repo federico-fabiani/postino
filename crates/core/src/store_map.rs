@@ -180,6 +180,7 @@ pub(crate) fn message(row: store::Message, attachments: Vec<store::Attachment>) 
         bcc: row.bcc.iter().map(address).collect(),
         body_text: row.body_text,
         body_html: row.body_html,
+        remote_images: row.remote_images.min(store::MAX_REMOTE_IMAGES),
         attachments: attachments.into_iter().map(attachment).collect(),
     })
 }
@@ -210,6 +211,7 @@ pub(crate) fn message_row(message: &Message, account_id: &str, message_id: Optio
         bcc: message.bcc.iter().map(store_address).collect(),
         body_text: message.body_text.clone(),
         body_html: message.body_html.clone(),
+        remote_images: message.remote_images.min(store::MAX_REMOTE_IMAGES),
         size: None,
     }
 }
@@ -252,6 +254,7 @@ pub(crate) fn draft_message(draft: &store::Draft, account: &Account, folder_id: 
         bcc: draft.bcc.iter().map(address).collect(),
         body_text: draft.body_text.clone(),
         body_html: None,
+        remote_images: 0,
         attachments: Vec::new(),
     })
 }

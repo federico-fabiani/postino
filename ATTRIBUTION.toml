@@ -467,8 +467,8 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "2634b36f8cd563524d6fce566685481c12e304b9913e806583071aaa3471c88d"
-usage = "Documentation screenshot of the text reading pane, safe link and attachment Save chip"
+sha256 = "6f44ac7fb99492529cd1a6825cb09927db4954a44ec15bff52ede0fc9c0092ea"
+usage = "Documentation screenshot of the text reading pane, the stored blocked-image line, a safe link and attachment Save chip"
 
 [[asset]]
 path = "docs/images/postino-p6c-link-confirm.png"
@@ -477,7 +477,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "fadc242578d7ee1af39fc7971a8514b12206e3e37af3030711e642ba8b1fe56e"
+sha256 = "f6ae3f86591c03582e825e95dd933886f2d168c77f10a31172b1b84bb1275b2d"
 usage = "Documentation screenshot of the full-destination link confirmation sheet"
 
 [[asset]]
@@ -517,8 +517,8 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "1db60a64b42c6dfcf9048eb5f7a39ebe36d5d29db0383675c591c00249069d4c"
-usage = "Documentation screenshot of the pinned attachment strip and Save button at the minimum window"
+sha256 = "70f3468f1bd44172225822492650bd0c2ddb1cf1661245a074c264acb99c51c5"
+usage = "Documentation screenshot of the stored blocked-image line, pinned attachment strip and Save button at the minimum window"
 
 [[asset]]
 path = "docs/images/postino-p6c-link-confirm-980.png"
@@ -527,7 +527,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "cd2009341e12911ff22a0c681fd980264528f0791ede1fc9f895ed928665c175"
+sha256 = "5239e87493a093783717f9ac185f7d579cfb15c97c1c8b168667a535e8f7f40d"
 usage = "Documentation screenshot of the host/recipient link confirmation sheet at the minimum window"
 
 [[asset]]

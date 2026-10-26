@@ -1,0 +1,17 @@
+From: Notizie <notizie@example.com>
+To: iscritti@example.it
+Subject: Due immagini remote e un logo
+Date: Sun, 25 Oct 2026 09:35:00 +0000
+Message-ID: <remote-images-001@example.com>
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+<html>
+<body>
+<p>Il logo è incorporato, le due immagini esterne non vengono caricate.</p>
+<img src="https://cdn.example.com/banner.png" alt="Banner di ottobre">
+<img src="https://tracker.example.com/pixel.gif" width="1" height="1" alt="">
+<img src="cid:logo@example.com" alt="Logo">
+</body>
+</html>

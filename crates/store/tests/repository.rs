@@ -84,6 +84,7 @@ fn sample_message(id: &str, folder_id: &str, subject: &str, body: &str, date: i6
         bcc: Vec::new(),
         body_text: body.to_owned(),
         body_html: None,
+        remote_images: 0,
         size: Some(4096),
     }
 }
@@ -141,6 +142,7 @@ fn round_trip_account_folder_message_attachment_and_labels() {
     let mut message = sample_message("msg_1", INBOX, "Preventivo per il sito", "Ciao, ti mando il preventivo.", 1_700_000_100_000);
     message.summary.starred = true;
     message.size = Some(8192);
+    message.remote_images = 3;
     store.upsert_message(&message).expect("message");
 
     store
@@ -175,6 +177,7 @@ fn round_trip_account_folder_message_attachment_and_labels() {
     assert_eq!(loaded.summary.labels, vec!["lbl_1", "lbl_2"]);
     assert!(loaded.summary.has_attachments, "replace_attachments did not set the flag");
     assert_eq!(loaded.size, Some(8192));
+    assert_eq!(loaded.remote_images, 3, "the stored remote-image count did not round-trip");
     assert_eq!(loaded.uid, Some(1));
     assert_eq!(loaded.message_id.as_deref(), Some("<msg_1@example.com>"));
 
@@ -199,9 +202,11 @@ fn round_trip_account_folder_message_attachment_and_labels() {
     // Upserting the message again preserves label assignments and attachments.
     message.summary.subject = "Preventivo per il sito (rev 2)".to_owned();
     message.summary.labels.clear();
+    message.remote_images = 1;
     store.upsert_message(&message).expect("re-upsert");
     let refreshed = store.get_message("msg_1").expect("get").expect("message exists");
     assert_eq!(refreshed.summary.subject, "Preventivo per il sito (rev 2)");
+    assert_eq!(refreshed.remote_images, 1, "a body refresh did not replace the remote-image count");
     assert_eq!(refreshed.summary.labels, vec!["lbl_1", "lbl_2"], "the upsert dropped label assignments");
     assert_eq!(store.attachments("msg_1").expect("attachments").len(), 1, "the upsert dropped attachments");
 
@@ -343,6 +348,34 @@ fn mailbox_hydration_reads_every_message_label_and_attachment() {
     let first_attachments = attachments.get("msg_1").expect("msg_1 attachments");
     assert_eq!(first_attachments.iter().map(|attachment| attachment.filename.as_str()).collect::<Vec<_>>(), vec!["primo.pdf", "secondo.png"]);
     assert!(!attachments.contains_key("msg_2"));
+}
+
+#[test]
+fn a_remote_image_count_is_bounded_on_write_and_on_read() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+
+    let mut message = sample_message("msg_1", INBOX, "Notizie", "Corpo", 1_700_000_100_000);
+    message.remote_images = 25_000;
+    store.upsert_message(&message).expect("the write clamps instead of failing the CHECK");
+    assert_eq!(store.get_message("msg_1").expect("get").expect("message").remote_images, 10_000);
+
+    // A damaged row that bypassed the CHECK must not reach the reading pane unbounded either.
+    drop(store);
+    let connection = rusqlite::Connection::open(fixture.path()).expect("raw open");
+    let hex = fixture.key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA key = \"x'{hex}'\";
+             PRAGMA ignore_check_constraints = ON;
+             UPDATE messages SET remote_images = 20000 WHERE id = 'msg_1';"
+        ))
+        .expect("forge an out-of-range count");
+    drop(connection);
+
+    let reopened = fixture.open();
+    assert_eq!(reopened.get_message("msg_1").expect("get").expect("message").remote_images, 10_000, "the read must clamp");
 }
 
 #[test]

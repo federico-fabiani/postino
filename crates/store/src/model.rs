@@ -173,6 +173,12 @@ pub struct MessageSummary {
     pub labels: Vec<String>,
 }
 
+/// Largest remote-image count a message may carry.
+///
+/// The MIME parser can count more images in a hostile message, but the reading pane only needs a
+/// bounded fact and the database stores a bounded integer. Both the write and the read clamp to it.
+pub const MAX_REMOTE_IMAGES: u32 = 10_000;
+
 /// A message with its body. `body_html` is stored exactly as received; sanitization is the MIME
 /// layer's job, not the store's.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +190,10 @@ pub struct Message {
     pub bcc: Vec<Address>,
     pub body_text: String,
     pub body_html: Option<String>,
+    /// Remote images the MIME sanitizer removed from `body_html` when the message was ingested.
+    /// This is stored truth, never re-derived from the sanitized HTML (which no longer contains the
+    /// references). `0` on old rows and on drafts.
+    pub remote_images: u32,
     /// RFC 822 size in bytes, when the provider reports it.
     pub size: Option<u64>,
 }

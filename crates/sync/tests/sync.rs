@@ -495,6 +495,40 @@ fn a_synced_mailbox_is_readable_offline_through_the_engine() {
 }
 
 #[test]
+fn a_remote_image_count_is_stored_and_survives_an_offline_reopen() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let server = RunningServer::start(vec![inbox(vec![TestMessage::synthetic(synthetic_html_message(1))])]);
+    sync(&store, &server).expect("sync the HTML message");
+    server.finish();
+
+    let stored = message_by_header(&store, "synthetic-1@example.test");
+    assert_eq!(stored.remote_images, 1, "sync dropped the parser's blocked-image count");
+    let html = stored.body_html.as_deref().expect("sanitized HTML");
+    assert!(!html.contains("tracker.example.test"), "the stored HTML leaked the tracker URL: {html}");
+    let id = stored.summary.id.clone();
+    drop(store);
+
+    // The fake server is closed: the engine serves the count from the encrypted store alone.
+    let mut engine = Engine::open(harness.reopen()).expect("open the engine offline");
+    let read = engine.call("message_get", serde_json::json!({ "id": id })).expect("message_get");
+    assert_eq!(read.pointer("/message/remote_images").and_then(serde_json::Value::as_u64), Some(1), "{read}");
+    let body = read.pointer("/message/body_html").and_then(serde_json::Value::as_str).expect("sanitized HTML");
+    assert!(!body.contains("tracker.example.test"), "message_get exposed the tracker: {body}");
+    drop(engine);
+
+    // A UIDVALIDITY reset re-fetches the same message with a plain body: the stored count is replaced,
+    // not merged with the old value.
+    let store = harness.reopen();
+    let server = RunningServer::start(vec![
+        TestFolder::new("INBOX", 11).with_special_use("\\Inbox").with_messages(vec![TestMessage::synthetic(synthetic_message(1))]),
+    ]);
+    sync(&store, &server).expect("sync after the UIDVALIDITY reset");
+    server.finish();
+    assert_eq!(message_by_header(&store, "synthetic-1@example.test").remote_images, 0, "the refresh kept the old count");
+}
+
+#[test]
 fn a_message_over_the_message_limit_is_skipped_with_a_warning() {
     let harness = Harness::new();
     let store = seeded(&harness);
@@ -572,6 +606,7 @@ fn a_synced_sent_copy_adopts_the_locally_written_row() {
         bcc: Vec::new(),
         body_text: "corpo".to_owned(),
         body_html: None,
+        remote_images: 0,
         size: None,
     };
     store.upsert_message(&local).expect("the local Sent copy");
@@ -628,6 +663,7 @@ fn a_local_sent_copy_that_moved_to_archive_is_adopted_by_a_sent_sync() {
         bcc: Vec::new(),
         body_text: "corpo".to_owned(),
         body_html: None,
+        remote_images: 0,
         size: None,
     };
     store.upsert_message(&local).expect("the local Sent copy in Archive");
@@ -672,6 +708,7 @@ fn local_row(folder_id: &str, id: &str, message_id: &str) -> postino_store::Mess
         bcc: Vec::new(),
         body_text: "corpo".to_owned(),
         body_html: None,
+        remote_images: 0,
         size: None,
     }
 }
