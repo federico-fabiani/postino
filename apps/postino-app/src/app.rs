@@ -69,6 +69,8 @@ pub enum ScreenshotState {
     Settings,
     SettingsSignature,
     Outbox,
+    Search,
+    SearchError,
 }
 
 impl ScreenshotState {
@@ -98,6 +100,8 @@ impl ScreenshotState {
             "settings" => Ok(Self::Settings),
             "settings_signature" => Ok(Self::SettingsSignature),
             "outbox" => Ok(Self::Outbox),
+            "search" => Ok(Self::Search),
+            "search_error" => Ok(Self::SearchError),
             other => Err(format!(
                 "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
                  empty_unread, empty_attachments, empty_label_unread, onboarding_welcome, onboarding_provider, onboarding_form, onboarding_error, \
@@ -213,6 +217,16 @@ pub struct PostinoApp {
     pending_read: Option<PendingRead>,
     toast: Option<ToastState>,
     query: String,
+    /// The query the result list is actually showing. Typing starts a 250 ms debounce; Enter
+    /// commits immediately and Esc clears both. The field and the results never disagree.
+    search_committed: String,
+    /// Wall-clock seconds (`self.now`) at which the debounce expires.
+    search_debounce_until: Option<f64>,
+    /// The last parse error, with the byte position the pencil points at.
+    search_error: Option<(String, usize)>,
+    /// The last list/search read, keyed by its full signature and the engine revision. A frame that
+    /// changes nothing reuses it instead of querying SQL again.
+    list_cache: Option<(String, u64, Vec<MessageSummary>, usize, usize)>,
     unread_only: bool,
     attachments_only: bool,
     dark: bool,
@@ -406,6 +420,10 @@ impl PostinoApp {
             pending_read: None,
             toast: None,
             query: String::new(),
+            search_committed: String::new(),
+            search_debounce_until: None,
+            search_error: None,
+            list_cache: None,
             unread_only: false,
             attachments_only: false,
             dark: false,
@@ -522,8 +540,8 @@ impl PostinoApp {
                     .engine
                     .messages()
                     .iter()
-                    .filter(|message| message.summary.folder_id == "inbox" && message.summary.unread)
-                    .map(|message| message.summary.id.clone())
+                    .filter(|message| message.folder_id == "inbox" && message.unread)
+                    .map(|message| message.id.clone())
                     .collect::<Vec<_>>();
                 for id in ids {
                     let _ = self.engine.call("message_flag", json!({ "id": id, "unread": false, "starred": null }));
@@ -539,8 +557,8 @@ impl PostinoApp {
                     .engine
                     .messages()
                     .iter()
-                    .filter(|message| message.summary.folder_id == "inbox" && message.summary.has_attachments)
-                    .map(|message| message.summary.id.clone())
+                    .filter(|message| message.folder_id == "inbox" && message.has_attachments)
+                    .map(|message| message.id.clone())
                     .collect::<Vec<_>>();
                 for id in ids {
                     let _ = self.engine.call("message_move", json!({ "id": id, "folder": "archive" }));
@@ -555,8 +573,8 @@ impl PostinoApp {
                     .engine
                     .messages()
                     .iter()
-                    .filter(|message| message.summary.unread && message.summary.labels.iter().any(|id| id == "lbl_1"))
-                    .map(|message| message.summary.id.clone())
+                    .filter(|message| message.unread && message.labels.iter().any(|id| id == "lbl_1"))
+                    .map(|message| message.id.clone())
                     .collect::<Vec<_>>();
                 for id in ids {
                     let _ = self.engine.call("message_flag", json!({ "id": id, "unread": false, "starred": null }));
@@ -680,7 +698,7 @@ impl PostinoApp {
                     self.maybe_complete_read();
                     self.toast = None;
                     self.status.clear();
-                    if let Some(mut message) = self.engine.message(&id).cloned() {
+                    if let Some(mut message) = self.engine.message(&id) {
                         message.body_text = "Ciao Federico,\n\nho caricato il PDF del preventivo nella cartella condivisa.\n\nDettaglio: https://example.com/preventivo/postino-2026?token=anteprima\n\nScrivimi a mailto:giulia.ferri@example.com.\n\nGrazie,\nGiulia"
                             .to_owned();
                         // Stored truth, not a live tracker: the sanitizer removed the remote image and
@@ -749,6 +767,21 @@ impl PostinoApp {
                 self.outbox = demo_outbox(self.now_utc.timestamp_millis());
                 self.outbox_open = true;
                 self.outbox_loaded = true;
+                self.status.clear();
+            }
+            ScreenshotState::Search => {
+                self.query = "from:giulia is:unread".to_owned();
+                self.search_committed = self.query.clone();
+                self.search_debounce_until = None;
+                self.list_cache = None;
+                self.status.clear();
+            }
+            ScreenshotState::SearchError => {
+                self.query = "subject:\"unclosed".to_owned();
+                self.search_committed = self.query.clone();
+                self.search_debounce_until = None;
+                self.search_error = Some(("unclosed_quote".to_owned(), 8));
+                self.list_cache = None;
                 self.status.clear();
             }
         }
@@ -1162,7 +1195,7 @@ impl PostinoApp {
         }
         self.active_account = Some(id);
         self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
-        self.query.clear();
+        self.clear_search();
         self.unread_only = false;
         self.attachments_only = false;
         self.label_filter = None;
@@ -1187,7 +1220,7 @@ impl PostinoApp {
     fn enter_account(&mut self, id: String) {
         self.active_account = Some(id.clone());
         self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
-        self.query.clear();
+        self.clear_search();
         self.unread_only = false;
         self.attachments_only = false;
         self.label_filter = None;
@@ -1242,7 +1275,7 @@ impl PostinoApp {
             self.folder.clear();
             self.clear_selection();
             self.close_reading();
-            self.query.clear();
+            self.clear_search();
             self.label_filter = None;
             self.label_folder = None;
             self.sync_view = SyncView::Idle { last_sync: None };
@@ -1295,7 +1328,7 @@ impl PostinoApp {
         self.labels_cache = self.engine.label_summaries();
         self.clear_selection();
         self.close_reading();
-        self.query.clear();
+        self.clear_search();
         self.unread_only = false;
         self.attachments_only = false;
         self.label_filter = None;
@@ -1437,8 +1470,8 @@ impl PostinoApp {
         self.engine
             .messages()
             .iter()
-            .filter(|message| folders.contains(message.summary.folder_id.as_str()) && message.summary.starred)
-            .fold((0, 0), |(total, unread), message| (total.saturating_add(1), unread.saturating_add(if message.summary.unread { 1 } else { 0 })))
+            .filter(|message| folders.contains(message.folder_id.as_str()) && message.starred)
+            .fold((0, 0), |(total, unread), message| (total.saturating_add(1), unread.saturating_add(if message.unread { 1 } else { 0 })))
     }
 
     /// The honest tri-state shown by the status bar. `Errore` is a real failure that has not been
@@ -1600,7 +1633,7 @@ impl PostinoApp {
     fn apply_empty_action(&mut self, action: EmptyAction) {
         match action {
             EmptyAction::ShowAll => {
-                self.query.clear();
+                self.clear_search();
                 self.unread_only = false;
                 self.attachments_only = false;
                 self.label_filter = None;
@@ -1616,7 +1649,7 @@ impl PostinoApp {
             }
             EmptyAction::ClearUnread => self.unread_only = false,
             EmptyAction::ClearAttachments => self.attachments_only = false,
-            EmptyAction::ClearSearch => self.query.clear(),
+            EmptyAction::ClearSearch => self.clear_search(),
             EmptyAction::Compose => self.compose_new(),
             EmptyAction::Inbox => {
                 if let Some(folder) = self.folder_for_kind(FolderKind::Inbox) {
@@ -1647,7 +1680,7 @@ impl PostinoApp {
         }
         self.label_editor = None;
         self.label_menu = None;
-        self.query.clear();
+        self.clear_search();
         self.clear_selection();
         self.reading_open = false;
         self.reading_full = false;
@@ -1680,7 +1713,7 @@ impl PostinoApp {
         self.label_folder = None;
         self.label_editor = None;
         self.label_menu = None;
-        self.query.clear();
+        self.clear_search();
         self.unread_only = false;
         self.attachments_only = false;
         self.clear_selection();
@@ -1821,8 +1854,8 @@ impl PostinoApp {
             .engine
             .messages()
             .iter()
-            .filter(|message| message.summary.labels.iter().any(|candidate| candidate == id))
-            .map(|message| message.summary.id.clone())
+            .filter(|message| message.labels.iter().any(|candidate| candidate == id))
+            .map(|message| message.id.clone())
             .collect::<Vec<_>>();
         self.label_delete = Some(LabelDeleteState {
             id: id.to_owned(),
@@ -1866,7 +1899,7 @@ impl PostinoApp {
             folder: self.folder.clone(),
             label_filter: self.label_filter.clone(),
             label_folder: self.label_folder.clone(),
-            query: self.query.clone(),
+            query: self.search_committed.clone(),
             unread_only: self.unread_only,
             attachments_only: self.attachments_only,
         }
@@ -1880,7 +1913,7 @@ impl PostinoApp {
             || menu.context.folder != self.folder
             || menu.context.label_filter != self.label_filter
             || menu.context.label_folder != self.label_folder
-            || menu.context.query != self.query
+            || menu.context.query != self.search_committed
             || menu.context.unread_only != self.unread_only
             || menu.context.attachments_only != self.attachments_only
     }
@@ -2505,15 +2538,41 @@ impl PostinoApp {
     }
 
     fn visible_messages(&mut self) -> (Vec<MessageSummary>, usize, usize) {
+        // A programmatic query (tests, a palette action) commits immediately; typing sets a debounce.
+        if self.search_debounce_until.is_none() && self.query.trim() != self.search_committed {
+            self.commit_search();
+        }
+        // Commit a typed query once the 250 ms debounce expires. Enter commits earlier.
+        if let Some(until) = self.search_debounce_until
+            && self.now >= until
+        {
+            self.search_debounce_until = None;
+            self.commit_search();
+        }
         // A changed folder or filter is a fresh read: let it report a failure even if the previous
         // view's toast was dismissed.
-        let signature =
-            format!("{}|{}|{}|{}|{:?}|{:?}", self.folder, self.query, self.unread_only, self.attachments_only, self.label_filter, self.label_folder);
+        let signature = format!(
+            "{}|{}|{}|{}|{:?}|{:?}|{}",
+            self.folder,
+            self.search_committed,
+            self.unread_only,
+            self.attachments_only,
+            self.label_filter,
+            self.label_folder,
+            self.active_account.as_deref().unwrap_or_default()
+        );
         if signature != self.list_signature {
-            self.list_signature = signature;
+            self.list_signature = signature.clone();
             self.list_error_ack = false;
+            self.list_cache = None;
         }
-        let searching = !self.query.trim().is_empty();
+        if let Some((cached_signature, revision, rows, total, unread)) = &self.list_cache
+            && *cached_signature == signature
+            && *revision == self.engine.revision()
+        {
+            return (rows.clone(), *total, *unread);
+        }
+        let searching = !self.search_committed.trim().is_empty();
         // A label view spans every folder until the user narrows it. A plain view is one folder.
         let label_scoped = self.label_filter.is_some();
         let list_folder = if label_scoped { self.label_folder.clone() } else { Some(self.folder.clone()) };
@@ -2523,7 +2582,10 @@ impl PostinoApp {
             return (Vec::new(), 0, 0);
         }
         let (name, args) = if searching {
-            ("search", json!({ "query": self.query, "label": self.label_filter, "folder": search_folder, "limit": 200 }))
+            (
+                "search",
+                json!({ "query": self.search_committed, "account": account, "label": self.label_filter, "folder": search_folder, "limit": 200 }),
+            )
         } else {
             (
                 "messages_list",
@@ -2538,10 +2600,27 @@ impl PostinoApp {
             )
         };
         let active_folders = self.active_folder_ids();
-        match self.engine.call(name, args) {
+        if searching && let Err(error) = postino_core::parse_search(&self.search_committed) {
+            self.search_error = Some((error.code.to_owned(), error.position));
+            let empty = (Vec::new(), 0, 0);
+            self.list_cache = Some((signature, self.engine.revision(), Vec::new(), 0, 0));
+            return empty;
+        }
+        let result = match self.engine.call(name, args) {
             Ok(value) if searching => match serde_json::from_value::<SearchResult>(value) {
                 Ok(result) => {
-                    let mut rows = result.messages;
+                    self.search_error = None;
+                    let mut rows = result
+                        .hits
+                        .into_iter()
+                        .map(|hit| {
+                            let mut message = hit.message;
+                            // The list shows the matched sentence from the body, not the stored
+                            // first-line snippet.
+                            message.snippet = hit.snippet;
+                            message
+                        })
+                        .collect::<Vec<_>>();
                     rows.retain(|message| active_folders.contains(&message.folder_id));
                     if self.unread_only {
                         rows.retain(|message| message.unread);
@@ -2550,12 +2629,12 @@ impl PostinoApp {
                         rows.retain(|message| message.has_attachments);
                     }
                     let unread = rows.iter().filter(|message| message.unread).count();
-                    let total = rows.len();
-                    (rows, total, unread)
+                    let total = result.total;
+                    Some((rows, total, unread))
                 }
                 Err(_) => {
                     self.report_list_failure();
-                    (Vec::new(), 0, 0)
+                    Some((Vec::new(), 0, 0))
                 }
             },
             Ok(value) => match serde_json::from_value::<MessagesList>(value) {
@@ -2566,18 +2645,55 @@ impl PostinoApp {
                         result.total = usize::try_from(total).unwrap_or(usize::MAX);
                         result.unread = usize::try_from(unread).unwrap_or(usize::MAX);
                     }
-                    (result.messages, result.total, result.unread)
+                    Some((result.messages, result.total, result.unread))
                 }
                 Err(_) => {
                     self.report_list_failure();
-                    (Vec::new(), 0, 0)
+                    Some((Vec::new(), 0, 0))
                 }
             },
-            Err(_) => {
-                self.report_list_failure();
-                (Vec::new(), 0, 0)
+            Err(error) => {
+                if searching {
+                    if let postino_core::OpError::InvalidArgs(message) = &error
+                        && let Some(rest) = message.strip_prefix("search query: ")
+                        && let Some((code, position)) = rest.split_once(" at position ")
+                        && let Ok(position) = position.parse::<usize>()
+                    {
+                        self.search_error = Some((code.to_owned(), position));
+                    } else {
+                        self.report_failure("Non è stato possibile leggere i messaggi. Riprova.", true);
+                    }
+                } else {
+                    self.report_list_failure();
+                }
+                Some((Vec::new(), 0, 0))
             }
+        };
+        let (rows, total, unread) = result.unwrap_or_default();
+        self.list_cache = Some((signature, self.engine.revision(), rows.clone(), total, unread));
+        (rows, total, unread)
+    }
+
+    /// Commit the typed search immediately (Enter). Empty text clears the search.
+    fn commit_search(&mut self) {
+        let query = self.query.trim().to_owned();
+        self.query = query.clone();
+        self.search_committed = query;
+        self.search_debounce_until = None;
+        self.list_cache = None;
+        self.search_error = None;
+        if self.search_committed.is_empty() {
+            self.list_signature.clear();
         }
+    }
+
+    fn clear_search(&mut self) {
+        self.query.clear();
+        self.search_committed.clear();
+        self.search_debounce_until = None;
+        self.search_error = None;
+        self.list_cache = None;
+        self.list_signature.clear();
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -2824,10 +2940,10 @@ impl PostinoApp {
             .engine
             .messages()
             .iter()
-            .filter(|message| message.summary.unread)
-            .filter(|message| active_folders.contains(&message.summary.folder_id))
-            .filter(|message| if starred { message.summary.starred } else { message.summary.folder_id == folder })
-            .map(|message| message.summary.id.clone())
+            .filter(|message| message.unread)
+            .filter(|message| active_folders.contains(&message.folder_id))
+            .filter(|message| if starred { message.starred } else { message.folder_id == folder })
+            .map(|message| message.id.clone())
             .collect::<Vec<_>>();
         self.set_unread_many(&ids, false);
     }
@@ -2863,7 +2979,7 @@ impl PostinoApp {
     }
 
     fn reply_to(&mut self, id: &str, mode: ComposeMode) {
-        let Some(message) = self.engine.message(id).cloned() else {
+        let Some(message) = self.engine.message(id) else {
             self.status = "Messaggio non trovato".to_owned();
             return;
         };
@@ -2897,7 +3013,7 @@ impl PostinoApp {
     }
 
     fn edit_draft(&mut self, id: &str) {
-        let Some(message) = self.engine.message(id).cloned() else {
+        let Some(message) = self.engine.message(id) else {
             self.status = "Bozza non trovata".to_owned();
             return;
         };
@@ -3719,9 +3835,26 @@ impl PostinoApp {
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(search_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
                     let placeholder = self.search_placeholder();
-                    let _ = SearchField::new(&mut self.query, &placeholder).width(search_width).focus(self.focus_search).show(ui);
+                    let response = SearchField::new(&mut self.query, &placeholder).width(search_width).focus(self.focus_search).show(ui);
                     if self.focus_search {
                         self.focus_search = false;
+                    }
+                    if response.changed() {
+                        let typed = self.query.trim().to_owned();
+                        if typed.is_empty() {
+                            self.clear_search();
+                        } else {
+                            self.search_debounce_until = Some(self.now + 0.25);
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                        }
+                    }
+                    if response.has_focus() {
+                        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                            self.commit_search();
+                        }
+                        if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                            self.clear_search();
+                        }
                     }
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
@@ -4033,7 +4166,8 @@ impl PostinoApp {
             .map(|label| (label.id.clone(), label.name.clone(), label_color(label.color, &t)));
         let (rows, total, unread) = self.visible_messages();
         self.prune_selection(&rows);
-        let searching = !self.query.trim().is_empty();
+        let searching = !self.search_committed.trim().is_empty();
+        let search_error = self.search_error.clone();
         let multi = self.selection.len() > 1;
         let mut clear_filter = false;
         // The header always names the scope, so the label counts cannot read as folder-local.
@@ -4098,11 +4232,31 @@ impl PostinoApp {
             if searching {
                 ui.add_space(space::XS);
                 ui.horizontal(|ui| {
-                    ui.label(typography::text(Role::Meta, format!("Risultati per “{}”", self.query.trim()), t.text_muted));
+                    ui.label(typography::text(Role::Meta, format!("Risultati per “{}”", self.search_committed), t.text_muted));
                     if Button::ghost("Cancella").size(ButtonSize::Sm).show(ui).clicked() {
-                        self.query.clear();
+                        self.clear_search();
                     }
                 });
+                let chips = search_chips(&self.search_committed);
+                if !chips.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for chip in chips.into_iter().take(8) {
+                            if Chip::new(chip.as_str()).show(ui).clicked() {
+                                self.query = chip;
+                                self.commit_search();
+                            }
+                        }
+                    });
+                }
+                ui.label(typography::text(
+                    Role::Caption,
+                    "from: · to: · subject: · label: · folder: · is: · has: · after: · larger: — AND/OR/NOT, \"frase\", prefisso*",
+                    t.text_faint,
+                ));
+            }
+            if let Some((code, position)) = &search_error {
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Meta, search_error_text(code, *position), t.danger));
             }
             ui.add_space(space::MD);
             if rows.is_empty() {
@@ -4170,7 +4324,7 @@ impl PostinoApp {
                     Some(EmptyMenuAction::NewLabel) => self.start_label_create(),
                     Some(EmptyMenuAction::ClearLabel) => self.apply_empty_action(EmptyAction::ClearLabel),
                     Some(EmptyMenuAction::Compose) => self.compose_new(),
-                    Some(EmptyMenuAction::ClearSearch) => self.query.clear(),
+                    Some(EmptyMenuAction::ClearSearch) => self.clear_search(),
                     Some(EmptyMenuAction::Sync) => self.request_sync(),
                     None => {}
                 }
@@ -4608,7 +4762,7 @@ impl PostinoApp {
             .screenshot_message
             .clone()
             .filter(|message| selected.as_deref() == Some(message.summary.id.as_str()))
-            .or_else(|| selected.as_deref().and_then(|id| self.engine.message(id)).cloned());
+            .or_else(|| selected.as_deref().and_then(|id| self.engine.message(id)));
         let now_utc = self.now_utc;
         let Some(message) = message else {
             self.close_reading();
@@ -6518,6 +6672,17 @@ impl PostinoApp {
                         }
                     });
                 }
+                ui.add_space(space::MD);
+                ui.separator();
+                ui.add_space(space::SM);
+                ui.label(typography::strong(Role::BodySmall, "Sintassi di ricerca", t.text));
+                ui.label(typography::text(
+                    Role::Meta,
+                    "from: to: cc: bcc: subject: label: folder: is:unread|read|starred|unstarred \
+                     has:attachment before:2026-01-31 after:2026-01-01 larger:2m smaller:500k \
+                     \"frase\" prefisso* AND OR NOT (…). Date UTC; Esc cancella la ricerca.",
+                    t.text_muted,
+                ));
             });
         self.show_shortcuts = open;
     }
@@ -7854,6 +8019,58 @@ fn messages_text(count: usize) -> String {
 
 fn unread_text(unread: usize) -> String {
     plural(unread, "non letto", "non letti")
+}
+
+/// Up to eight leaf clauses of a parsed search query, in source order, for the chips under the
+/// search field. A click replaces the query with that clause. An unparsable query has no chips; the
+/// inline error explains why.
+fn search_chips(query: &str) -> Vec<String> {
+    let Ok(parsed) = postino_core::parse_search(query) else { return Vec::new() };
+    fn collect(expr: &postino_core::SearchExpr, out: &mut Vec<String>) {
+        match expr {
+            postino_core::SearchExpr::And(children) | postino_core::SearchExpr::Or(children) => {
+                for child in children {
+                    if out.len() < 8 {
+                        collect(child, out);
+                    }
+                }
+            }
+            postino_core::SearchExpr::Not(child) => collect(child, out),
+            leaf => {
+                if out.len() < 8 {
+                    out.push(leaf.canonical());
+                }
+            }
+        }
+    }
+    let mut chips = Vec::new();
+    collect(&parsed.expr, &mut chips);
+    chips
+}
+
+/// The Italian sentence for a search parse error. The code is stable English; the position is the
+/// byte offset in the query, so the field can point at the exact token.
+fn search_error_text(code: &str, position: usize) -> String {
+    let reason = match code {
+        "empty" => "la ricerca è vuota",
+        "too_long" => "la ricerca supera i 1024 byte",
+        "too_many_clauses" => "la ricerca ha più di 64 clausole",
+        "too_deep" => "la ricerca ha più di 8 parentesi annidate",
+        "too_many_terms" => "la ricerca ha più di 16 termini",
+        "control" => "la ricerca contiene un carattere di controllo",
+        "unclosed_quote" => "una virgoletta non è chiusa",
+        "unclosed_paren" => "una parentesi non è chiusa",
+        "unexpected_token" => "c'è un token inatteso",
+        "dangling_operator" => "AND o OR non hanno un operando",
+        "dangling_field" => "un campo non ha un valore",
+        "negative_only" => "NOT richiede almeno un termine positivo",
+        "bad_date" => "la data deve essere un giorno YYYY-MM-DD valido",
+        "bad_size" => "la dimensione deve essere un numero con k, m o g",
+        "bad_is" => "is: accetta unread, read, starred o unstarred",
+        "bad_has" => "has: accetta attachment",
+        _ => "la ricerca non è valida",
+    };
+    format!("Ricerca non valida: {reason} (posizione {position}). Correggi il testo o premi Esc per cancellarla.")
 }
 
 /// The remote-content line, or `None` when nothing was blocked. The count is the parser's stored
@@ -9272,7 +9489,7 @@ mod tests {
     #[test]
     fn selecting_opens_the_reading_pane() {
         let mut app = PostinoApp::demo(true);
-        let id = app.engine.messages()[0].summary.id.clone();
+        let id = app.engine.messages()[0].id.clone();
         app.open_message(id.clone());
         assert_eq!(app.selected.as_deref(), Some(id.as_str()));
         assert!(app.reading_open);
@@ -9282,7 +9499,7 @@ mod tests {
     #[test]
     fn focusing_does_not_open_the_reading_pane() {
         let mut app = PostinoApp::demo(true);
-        let id = app.engine.messages()[0].summary.id.clone();
+        let id = app.engine.messages()[0].id.clone();
         app.focus_message(id.clone());
         assert_eq!(app.selected.as_deref(), Some(id.as_str()));
         assert!(!app.reading_open);
@@ -9291,7 +9508,7 @@ mod tests {
     #[test]
     fn opening_an_unread_message_marks_it_read_after_the_delay_and_undoes() {
         let mut app = PostinoApp::demo(true);
-        let id = app.engine.messages().iter().find(|message| message.summary.unread).expect("an unread demo message").summary.id.clone();
+        let id = app.engine.messages().iter().find(|message| message.unread).expect("an unread demo message").id.clone();
         app.now = 10.0;
         app.open_message(id.clone());
         assert!(app.engine.message(&id).is_some_and(|message| message.summary.unread), "opening must not mark read immediately");
@@ -9406,14 +9623,7 @@ mod tests {
     fn batch_flags_share_one_undo_step() {
         let (ctx, mut app) = ready_app();
         frame(&ctx, &mut app, vec![]);
-        let ids = app
-            .engine
-            .messages()
-            .iter()
-            .filter(|message| message.summary.unread)
-            .take(2)
-            .map(|message| message.summary.id.clone())
-            .collect::<Vec<_>>();
+        let ids = app.engine.messages().iter().filter(|message| message.unread).take(2).map(|message| message.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids.len(), 2);
         app.set_unread_many(&ids, false);
         assert!(ids.iter().all(|id| app.engine.message(id).is_some_and(|message| !message.summary.unread)));
@@ -9636,7 +9846,7 @@ mod tests {
         app.reply_to(&second.summary.id, ComposeMode::Reply);
         assert!(app.save_composer(true), "Salva bozza must create the pristine reply");
         assert!(app.composer.draft_id.is_some());
-        assert!(app.engine.messages().iter().any(|message| message.summary.subject == "Re: Seconda origine"));
+        assert!(app.engine.messages().iter().any(|message| message.subject == "Re: Seconda origine"));
 
         let third = app
             .engine
@@ -9657,7 +9867,7 @@ mod tests {
         app.reply_to(&third.summary.id, ComposeMode::Reply);
         frame_at(&ctx, &mut app, size, vec![key(Key::Escape, Modifiers::NONE)]);
         assert!(!app.composer.open, "Esc did not close the reply");
-        assert!(app.engine.messages().iter().any(|message| message.summary.subject == "Re: Terza origine"), "Esc discarded the reply");
+        assert!(app.engine.messages().iter().any(|message| message.subject == "Re: Terza origine"), "Esc discarded the reply");
     }
 
     #[test]
@@ -10068,7 +10278,7 @@ mod tests {
         app.composer.touch(0.0);
         frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
         assert!(!app.composer.open, "Esc closes the composer");
-        assert!(app.engine.messages().iter().any(|message| message.summary.subject == "Bozza da tastiera"), "Esc must save the draft before closing");
+        assert!(app.engine.messages().iter().any(|message| message.subject == "Bozza da tastiera"), "Esc must save the draft before closing");
     }
 
     #[test]
@@ -10086,7 +10296,7 @@ mod tests {
         // button would refuse, so there is no error to show.
         assert!(app.composer.save_error.is_none(), "the shortcut attempted a disabled send: {:?}", app.composer.save_error);
         assert!(
-            !app.engine.messages().iter().any(|message| message.summary.subject == "Invio da tastiera" && message.summary.folder_id == "sent"),
+            !app.engine.messages().iter().any(|message| message.subject == "Invio da tastiera" && message.folder_id == "sent"),
             "the demo moved the message to Sent without a submission"
         );
     }
@@ -10098,8 +10308,8 @@ mod tests {
             .engine
             .messages()
             .iter()
-            .find(|message| message.summary.has_attachments && !message.attachments.is_empty())
-            .map(|message| message.summary.id.clone())
+            .find(|message| message.has_attachments)
+            .map(|message| message.id.clone())
             .expect("a demo message with an attachment");
 
         app.reply_to(&with_attachment, ComposeMode::Reply);
@@ -10128,7 +10338,7 @@ mod tests {
         assert!(!app.save_composer(true));
         assert!(app.composer.open);
         assert!(app.composer.save_error.is_some(), "the composer explains why it did not save");
-        assert!(!app.engine.messages().iter().any(|message| message.summary.subject == "Non salvabile"));
+        assert!(!app.engine.messages().iter().any(|message| message.subject == "Non salvabile"));
     }
 
     #[test]
@@ -10146,7 +10356,7 @@ mod tests {
         app.composer.touch(2.0);
         assert!(app.save_composer(false));
         assert_eq!(app.composer.draft_id.as_deref(), Some(id.as_str()));
-        assert_eq!(app.engine.message(&id).map(|message| message.body_text.as_str()), Some("Seconda versione"));
+        assert_eq!(app.engine.message(&id).map(|message| message.body_text), Some("Seconda versione".to_owned()));
         let after = app.engine.folders().iter().find(|folder| folder.kind == FolderKind::Drafts).map_or(0, |folder| folder.total);
         assert_eq!(after, before + 1, "autosave must not duplicate the draft");
     }
@@ -10161,20 +10371,14 @@ mod tests {
         app.composer.touch(1.0);
         app.close_composer();
         assert!(!app.composer.open);
-        let id = app
-            .engine
-            .messages()
-            .iter()
-            .find(|message| message.summary.subject == "Invio demo")
-            .map(|message| message.summary.id.clone())
-            .expect("saved draft");
-        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("drafts"));
+        let id = app.engine.messages().iter().find(|message| message.subject == "Invio demo").map(|message| message.id.clone()).expect("saved draft");
+        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.clone()), Some("drafts".to_owned()));
 
         app.edit_draft(&id);
         app.send_composer();
         assert!(app.composer.open, "the demo send must not close the composer as if the message left");
         assert!(app.composer.save_error.is_none(), "the demo attempted a submission the button refuses: {:?}", app.composer.save_error);
-        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("drafts"));
+        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.clone()), Some("drafts".to_owned()));
     }
 
     #[test]
@@ -10184,8 +10388,8 @@ mod tests {
             .engine
             .messages()
             .iter()
-            .find(|message| message.summary.folder_id == "sent" && message.summary.to.len() > 1)
-            .map(|message| message.summary.id.clone())
+            .find(|message| message.folder_id == "sent" && message.to.len() > 1)
+            .map(|message| message.id.clone())
             .expect("a sent message with several recipients");
         app.reply_to(&sent, ComposeMode::ReplyAll);
         assert!(app.composer.to.contains("marco.bianchi@example.com"));
@@ -10242,12 +10446,12 @@ mod tests {
     #[test]
     fn archiving_closes_the_pane_and_moves_the_message() {
         let mut app = PostinoApp::demo(true);
-        let id = app.engine.messages()[0].summary.id.clone();
+        let id = app.engine.messages()[0].id.clone();
         app.open_message(id.clone());
         app.move_selected(FolderKind::Archive, "archiviato", "archiviati");
         assert!(app.selected.is_none());
         assert!(!app.reading_open);
-        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("archive"));
+        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.clone()), Some("archive".to_owned()));
     }
 
     #[test]
@@ -10300,6 +10504,9 @@ mod tests {
             ("link_confirm", ScreenshotState::LinkConfirm),
             ("settings", ScreenshotState::Settings),
             ("settings_signature", ScreenshotState::SettingsSignature),
+            ("outbox", ScreenshotState::Outbox),
+            ("search", ScreenshotState::Search),
+            ("search_error", ScreenshotState::SearchError),
         ] {
             assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
         }
@@ -10314,7 +10521,7 @@ mod tests {
         assert_eq!(frozen.format("%Y-%m-%dT%H:%M:%SZ").to_string(), SCREENSHOT_CLOCK);
         let app = PostinoApp::demo_at(true, frozen);
         assert_eq!(app.now_utc, frozen);
-        assert_eq!(app.engine.messages()[0].summary.date, frozen - chrono::Duration::minutes(8), "demo dates must follow the seam");
+        assert_eq!(app.engine.messages()[0].date, frozen - chrono::Duration::minutes(8), "demo dates must follow the seam");
     }
 
     #[test]
@@ -10624,13 +10831,7 @@ mod tests {
         let (ctx, mut app) = ready_app();
         let wide = Vec2::new(1200.0, 800.0);
         frame_at(&ctx, &mut app, wide, vec![]);
-        let id = app
-            .engine
-            .messages()
-            .iter()
-            .find(|message| message.summary.unread)
-            .map(|message| message.summary.id.clone())
-            .expect("an unread demo message");
+        let id = app.engine.messages().iter().find(|message| message.unread).map(|message| message.id.clone()).expect("an unread demo message");
         frame_time(&ctx, &mut app, wide, vec![], 10.0);
         app.open_message(id.clone());
         assert!(app.pending_read.is_some(), "opening starts the auto-read timer");
@@ -10644,13 +10845,7 @@ mod tests {
     #[test]
     fn a_star_also_cancels_the_auto_read() {
         let mut app = PostinoApp::demo(true);
-        let id = app
-            .engine
-            .messages()
-            .iter()
-            .find(|message| message.summary.unread)
-            .map(|message| message.summary.id.clone())
-            .expect("an unread demo message");
+        let id = app.engine.messages().iter().find(|message| message.unread).map(|message| message.id.clone()).expect("an unread demo message");
         app.now = 5.0;
         app.open_message(id.clone());
         app.toggle_star_for(&id);
@@ -11157,6 +11352,58 @@ mod tests {
     }
 
     #[test]
+    fn search_debounces_commits_on_enter_and_explains_parse_errors() {
+        let mut app = PostinoApp::demo(true);
+        app.now = 10.0;
+        app.query = "preventivo".to_owned();
+        app.search_debounce_until = Some(10.1);
+        assert_eq!(app.search_committed, "");
+        app.now = 10.2;
+        let (_rows, _total, _) = app.visible_messages();
+        assert_eq!(app.search_committed, "preventivo");
+
+        app.query = "fattura".to_owned();
+        app.commit_search();
+        assert_eq!(app.search_committed, "fattura");
+        assert!(app.search_debounce_until.is_none());
+
+        app.query = "subject:\"unclosed".to_owned();
+        app.commit_search();
+        let (rows, _, _) = app.visible_messages();
+        assert!(rows.is_empty());
+        let (code, position) = app.search_error.clone().expect("parse error");
+        assert_eq!((code.as_str(), position), ("unclosed_quote", 8));
+        assert!(search_error_text("unclosed_quote", position).contains("posizione 8"));
+
+        app.clear_search();
+        assert!(app.query.is_empty() && app.search_committed.is_empty() && app.search_error.is_none());
+        assert!(search_chips("from:giulia is:unread label:Lavoro").len() == 3);
+        assert_eq!(search_chips("from:giulia AND subject:\"fattura\""), vec!["from:\"giulia\"".to_owned(), "subject:\"fattura\"".to_owned()]);
+    }
+
+    #[test]
+    fn search_scenes_render_at_980_light_and_dark() {
+        for dark in [false, true] {
+            let clock = screenshot_clock().expect("the frozen screenshot clock");
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let mut app = PostinoApp::demo_at(true, clock);
+            app.dark = dark;
+            app.seed_screenshot(ScreenshotState::Search);
+            frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            assert!(text.iter().any(|line| line.contains("Risultati per")), "search results are missing at 980: {text:?}");
+            assert!(text.iter().any(|line| line.contains("from:")), "the syntax help is missing at 980: {text:?}");
+
+            app.seed_screenshot(ScreenshotState::SearchError);
+            frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            assert!(text.iter().any(|line| line.contains("Ricerca non valida")), "the parse error is missing at 980: {text:?}");
+        }
+    }
+
+    #[test]
     fn filter_and_search_intersect() {
         let mut app = PostinoApp::demo(true);
         app.select_label("lbl_1".to_owned());
@@ -11190,8 +11437,8 @@ mod tests {
             .engine
             .messages()
             .iter()
-            .find(|message| message.summary.unread && message.summary.labels.iter().any(|id| id == "lbl_1"))
-            .map(|message| message.summary.id.clone())
+            .find(|message| message.unread && message.labels.iter().any(|id| id == "lbl_1"))
+            .map(|message| message.id.clone())
             .expect("an unread Lavoro message");
         app.open_message(unread);
         app.now = 10.7;
@@ -11204,8 +11451,8 @@ mod tests {
             .engine
             .messages()
             .iter()
-            .filter(|message| message.summary.unread && message.summary.labels.iter().any(|id| id == "lbl_1"))
-            .map(|message| message.summary.id.clone())
+            .filter(|message| message.unread && message.labels.iter().any(|id| id == "lbl_1"))
+            .map(|message| message.id.clone())
             .collect::<Vec<_>>();
         app.set_unread_many(&remaining, false);
         assert_eq!(label_unread(&app, "lbl_1"), Some(0), "a batch read updates the cache once");
@@ -11549,7 +11796,7 @@ mod tests {
         frame_at(&ctx, &mut app, wide, vec![key(Key::Escape, Modifiers::NONE)]);
         assert!(app.composer.open, "Esc keeps an unsaved, invalid draft open");
         assert!(app.composer.save_error.is_some(), "the composer says why it did not save");
-        assert!(!app.engine.messages().iter().any(|message| message.summary.subject == "Bozza aperta"), "a refused save must not create the draft");
+        assert!(!app.engine.messages().iter().any(|message| message.subject == "Bozza aperta"), "a refused save must not create the draft");
 
         app.composer = ComposerState::closed();
         app.compose_new();
@@ -11926,7 +12173,7 @@ mod tests {
         app.remove_account(&state);
         assert_eq!(app.engine.accounts().len(), 1);
         assert_eq!(app.active_account.as_deref(), Some("acc_a"));
-        assert!(app.engine.messages().iter().all(|message| !message.summary.id.contains("acc_b")));
+        assert!(app.engine.messages().iter().all(|message| !message.id.contains("acc_b")));
 
         let state = AccountRemoveState {
             id: "acc_a".to_owned(),
@@ -12016,7 +12263,7 @@ mod tests {
         assert!(app.onboarding.is_none(), "the first sync closes the wizard");
         assert_eq!(app.engine.accounts().len(), 1);
         assert_eq!(app.engine.messages().len(), 3);
-        assert!(app.engine.messages().iter().all(|message| message.summary.folder_id != "inbox"));
+        assert!(app.engine.messages().iter().all(|message| message.folder_id != "inbox"));
         assert!(matches!(app.sync_view, SyncView::Idle { last_sync: Some(_) }));
         server.finish();
     }
@@ -12062,10 +12309,10 @@ mod tests {
         app.composer.touch(0.0);
         assert!(app.save_composer(false));
         let draft = app.composer.draft_id.clone().expect("a saved draft");
-        assert_eq!(app.engine.message(&draft).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_b_drafts"));
+        assert_eq!(app.engine.message(&draft).map(|message| message.summary.folder_id.clone()), Some("fld_acc_b_drafts".to_owned()));
         assert_eq!(
-            app.engine.message(&draft).map(|message| message.summary.to.first().map(|address| address.email.as_str())),
-            Some(Some("dest@example.com"))
+            app.engine.message(&draft).map(|message| message.summary.to.first().map(|address| address.email.clone())),
+            Some(Some("dest@example.com".to_owned()))
         );
     }
 
@@ -12135,7 +12382,7 @@ mod tests {
             seed_attachment(store, "msg_acc_save_1", "att_save", &filename);
         });
         let message_id = "msg_acc_save_1".to_owned();
-        let attachment = app.engine.message(&message_id).and_then(|message| message.attachments.first()).cloned().expect("the seeded attachment");
+        let attachment = app.engine.message(&message_id).and_then(|message| message.attachments.first().cloned()).expect("the seeded attachment");
         if let Some(bytes) = bytes {
             app.engine.store_attachment_bytes(&message_id, &attachment.id, bytes).expect("store the test blob");
         }
@@ -12270,7 +12517,10 @@ mod tests {
             .engine
             .messages()
             .iter()
-            .find_map(|message| message.attachments.first().map(|attachment| (message.summary.id.clone(), attachment.clone())))
+            .filter(|message| message.has_attachments)
+            .map(|message| message.id.clone())
+            .find_map(|id| app.engine.message(&id))
+            .and_then(|message| message.attachments.first().map(|attachment| (message.summary.id.clone(), attachment.clone())))
             .expect("a demo attachment");
         app.open_message(message_id);
         settle_at(&ctx, &mut app, Vec2::new(1200.0, 800.0));
@@ -12760,7 +13010,7 @@ mod tests {
         let clock = screenshot_clock().expect("the frozen screenshot clock");
         let mut app = PostinoApp::demo_at(true, clock);
         let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
-        let mut message = app.engine.message(&id).cloned().expect("the open message");
+        let mut message = app.engine.message(&id).expect("the open message");
         message.attachments = (0..4)
             .map(|index| Attachment {
                 id: format!("att_many_{index}"),
@@ -12789,7 +13039,7 @@ mod tests {
         let clock = screenshot_clock().expect("the frozen screenshot clock");
         let mut app = PostinoApp::demo_at(true, clock);
         let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
-        let mut message = app.engine.message(&id).cloned().expect("the open message");
+        let mut message = app.engine.message(&id).expect("the open message");
         message.body_text = (0..100).map(|index| format!("https://example.com/{index}")).collect::<Vec<_>>().join("\n\n");
         app.screenshot_message = Some(message);
         app.open_message(id);
@@ -12860,7 +13110,7 @@ mod tests {
         let mut app = PostinoApp::demo_at(true, clock);
         let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
         app.open_message(id.clone());
-        let mut message = app.engine.message(&id).cloned().expect("the open message");
+        let mut message = app.engine.message(&id).expect("the open message");
         message.cc = vec![
             Address::new("Giulia Ferri", "giulia.ferri@example.com"),
             Address::new("Marco Bianchi", "marco.bianchi@example.com"),
@@ -12890,7 +13140,7 @@ mod tests {
             let mut app = PostinoApp::demo_at(true, clock);
             let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
             app.open_message(id.clone());
-            let mut message = app.engine.message(&id).cloned().expect("the open message");
+            let mut message = app.engine.message(&id).expect("the open message");
             // The sanitized HTML has no remote reference left: only the stored count may produce the
             // line. A body with no link makes a URL in the painted copy a real failure.
             message.body_html = Some("<p>Corpo già sanificato.</p>".to_owned());
@@ -12971,7 +13221,7 @@ mod tests {
         app.composer.touch(0.0);
         assert!(app.save_composer(false));
         let draft = app.composer.draft_id.clone().expect("the reply draft");
-        assert_eq!(app.engine.message(&draft).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_b_drafts"));
+        assert_eq!(app.engine.message(&draft).map(|message| message.summary.folder_id.clone()), Some("fld_acc_b_drafts".to_owned()));
     }
 
     #[test]
@@ -13079,8 +13329,8 @@ mod tests {
         // The worker wrote through its own connection; the app reloaded the mailbox from the store.
         let sent = app.engine.message(&draft_id).expect("the Sent copy");
         assert_eq!(sent.summary.folder_id, "fld_acc_smtp_sent", "the stale draft is still in Drafts");
-        assert_eq!(app.engine.messages().iter().filter(|message| message.summary.folder_id == "fld_acc_smtp_sent").count(), 1);
-        assert!(!app.engine.messages().iter().any(|message| message.summary.folder_id == "fld_acc_smtp_drafts"), "a draft survived a send");
+        assert_eq!(app.engine.messages().iter().filter(|message| message.folder_id == "fld_acc_smtp_sent").count(), 1);
+        assert!(!app.engine.messages().iter().any(|message| message.folder_id == "fld_acc_smtp_drafts"), "a draft survived a send");
         // The old draft id is a Sent message now: sending it again must fail.
         assert!(app.engine.message_send(&draft_id).is_err(), "a stale draft could be sent again");
         assert_eq!(app.outbox.entries.iter().filter(|row| row.state == postino_store::OutboxState::AppendPending).count(), 1);
@@ -13116,7 +13366,7 @@ mod tests {
         let submitted = smtp.submitted();
         smtp.finish();
         assert_eq!(submitted.len(), 1, "the externally queued row was not submitted");
-        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_smtp_sent"));
+        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.clone()), Some("fld_acc_smtp_sent".to_owned()));
     }
 
     #[test]
@@ -13137,7 +13387,7 @@ mod tests {
         };
         // Before the poll the app still believes the draft is in Drafts; the engine guard refuses to
         // let that stale copy overwrite the Sent row.
-        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_smtp_drafts"));
+        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.clone()), Some("fld_acc_smtp_drafts".to_owned()));
         let stale = postino_core::DraftContent {
             to: vec![postino_core::Address::new("", "one@example.com")],
             cc: Vec::new(),
@@ -13157,7 +13407,7 @@ mod tests {
         // The next scheduler tick sees the delivered row and reloads the whole mailbox.
         app.now_utc = chrono::DateTime::<Utc>::from_timestamp_millis(queued.outbox.send_at).expect("instant");
         app.poll_outbox();
-        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_smtp_sent"));
+        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.clone()), Some("fld_acc_smtp_sent".to_owned()));
         assert_eq!(app.outbox.entries.iter().filter(|row| row.state == postino_store::OutboxState::AppendPending).count(), 1);
         let submitted = smtp.submitted();
         smtp.finish();

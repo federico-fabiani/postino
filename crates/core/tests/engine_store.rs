@@ -53,14 +53,15 @@ impl Fixture {
                 })
                 .expect("label row");
         }
-        for message in source.messages() {
+        for summary in source.messages() {
+            let Some(message) = source.message(&summary.id) else { continue };
             let account_id = source
                 .folders()
                 .iter()
                 .find(|folder| folder.id == message.summary.folder_id)
                 .map(|folder| folder.account_id.as_str())
                 .expect("every fixture message lives in a folder");
-            store.upsert_message(&message_row(message, account_id)).expect("message row");
+            store.upsert_message(&message_row(&message, account_id)).expect("message row");
             store.replace_attachments(&message.summary.id, &attachment_rows(&message.attachments)).expect("attachment rows");
             for label in &message.summary.labels {
                 store.apply_label(label, std::slice::from_ref(&message.summary.id)).expect("label assignment");
@@ -233,10 +234,17 @@ fn demo_shaped_mailbox_survives_a_round_trip() {
         "folder ids, kinds and counts"
     );
     assert_eq!(
-        sorted_by_id(loaded.messages(), |message| &message.summary.id),
-        sorted_by_id(demo.messages(), |message| &message.summary.id),
-        "id, thread, folder, people, subject, snippet, date, flags, labels, body and attachments"
+        sorted_by_id(loaded.messages(), |message| &message.id),
+        sorted_by_id(demo.messages(), |message| &message.id),
+        "id, thread, folder, people, subject, snippet, date, flags and labels"
     );
+    for summary in demo.messages() {
+        let loaded_message = loaded.message(&summary.id).expect("the loaded body");
+        let demo_message = demo.message(&summary.id).expect("the demo body");
+        assert_eq!(loaded_message.body_text, demo_message.body_text, "body of {}", summary.id);
+        assert_eq!(loaded_message.body_html, demo_message.body_html, "html of {}", summary.id);
+        assert_eq!(loaded_message.attachments, demo_message.attachments, "attachments of {}", summary.id);
+    }
     assert_eq!(sorted_by_id(loaded.labels(), |label| &label.id), sorted_by_id(demo.labels(), |label| &label.id));
 
     // Spot checks with literal values, so a mapping that round-trips a mistake still fails.
@@ -253,10 +261,7 @@ fn demo_shaped_mailbox_survives_a_round_trip() {
     assert_eq!(message.attachments[0].filename, "preventivo-postino.pdf");
     assert_eq!(message.attachments[0].size, 248_320);
     assert!(message.body_text.contains("4.800 € + IVA"));
-    assert_eq!(
-        loaded.message("msg_005").and_then(|message| message.body_html.as_deref()),
-        demo.message("msg_005").and_then(|m| m.body_html.as_deref())
-    );
+    assert_eq!(loaded.message("msg_005").and_then(|message| message.body_html), demo.message("msg_005").and_then(|m| m.body_html));
     for summary in demo.label_summaries() {
         assert_eq!(loaded.label_summary(&summary.id), Some(summary.clone()), "label counts for {}", summary.id);
     }
@@ -318,7 +323,7 @@ fn labels_flags_and_moves_survive_a_reopen() {
     let mut engine = Engine::open(fixture.open()).expect("reopen");
     assert_eq!(engine.message("msg_001").map(|message| message.summary.labels.clone()), Some(vec!["lbl_1".to_owned(), "lbl_2".to_owned()]));
     assert_eq!(engine.message("msg_003").map(|message| message.summary.labels.clone()), Some(Vec::new()));
-    assert_eq!(engine.message("msg_004").map(|message| message.summary.folder_id.as_str()), Some("archive"));
+    assert_eq!(engine.message("msg_004").map(|message| message.summary.folder_id.clone()), Some("archive".to_owned()));
     let flagged = engine.message("msg_007").expect("msg_007");
     assert!(!flagged.summary.unread && flagged.summary.starred);
     assert_eq!(engine.folders(), before.as_slice(), "folder counts are preserved exactly");
@@ -504,7 +509,7 @@ fn a_repaired_draft_keeps_a_label_and_a_flag_across_a_reopen() {
     }
 
     let mut engine = Engine::open(fixture.open()).expect("the orphan is repaired on open");
-    assert_eq!(engine.message("drf_repaired").map(|message| message.summary.folder_id.as_str()), Some("drafts"));
+    assert_eq!(engine.message("drf_repaired").map(|message| message.summary.folder_id.clone()), Some("drafts".to_owned()));
     assert_eq!(engine.set_label("lbl_7", &["drf_repaired".to_owned()], true).expect("apply a label").1, 1);
     let flagged = engine.set_flags("drf_repaired", Some(true), Some(true)).expect("set a flag");
     assert!(flagged.unread && flagged.starred);
@@ -552,18 +557,18 @@ fn a_repo_failure_surfaces_and_leaves_memory_unchanged() {
     assert!(intruder.delete_message("msg_002").expect("delete the row behind the engine"));
 
     let folders_before = engine.folders().to_vec();
-    let messages_before = engine.message("msg_002").cloned().expect("in memory");
+    let messages_before = engine.summary("msg_002").expect("in memory").clone();
     let error = engine.set_flags("msg_002", Some(true), None).expect_err("the store must refuse the flag");
     assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("unknown message")), "{error}");
     assert!(!error.to_string().contains("free disk space"), "a caller mistake must not be reported as a disk problem");
-    assert_eq!(engine.message("msg_002"), Some(&messages_before), "the message was mutated in memory anyway");
+    assert_eq!(engine.summary("msg_002"), Some(&messages_before), "the message was mutated in memory anyway");
     assert_eq!(engine.folders(), folders_before.as_slice(), "counts were mutated after a failed write");
 
     let labels_before = engine.label_summaries();
     let error = engine.set_label("lbl_1", &["msg_002".to_owned()], false).expect_err("the store must refuse the label batch");
     assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("unknown message")), "{error}");
     assert_eq!(engine.label_summaries(), labels_before);
-    assert_eq!(engine.message("msg_002").map(|message| message.summary.labels.clone()), Some(vec!["lbl_1".to_owned()]));
+    assert_eq!(engine.summary("msg_002").map(|message| message.labels.clone()), Some(vec!["lbl_1".to_owned()]));
 }
 
 #[test]
@@ -571,7 +576,7 @@ fn storage_failures_are_failed_with_the_storage_advice() {
     let fixture = Fixture::new();
     fixture.seed(&Engine::demo_at(now()));
     let mut engine = Engine::open(fixture.open()).expect("engine");
-    let before = engine.message("msg_001").cloned().expect("msg_001");
+    let before = engine.message("msg_001").expect("msg_001");
 
     // A real storage failure: the table disappears under the engine. This is not a caller mistake,
     // so it must say the store refused the change and that memory is untouched.
@@ -584,7 +589,7 @@ fn storage_failures_are_failed_with_the_storage_advice() {
             if detail.contains("local store refused") && detail.contains("rolled back") && detail.contains("free disk space")),
         "{error}"
     );
-    assert_eq!(engine.message("msg_001"), Some(&before), "memory changed after a storage failure");
+    assert_eq!(engine.message("msg_001"), Some(before), "memory changed after a storage failure");
 }
 
 fn raw_connection(fixture: &Fixture) -> rusqlite::Connection {
@@ -607,7 +612,7 @@ fn a_failed_draft_save_leaves_store_rows_and_revision_unchanged() {
     second_content.attachments.push(attachment("att_b"));
     let second = engine.save_draft(None, None, second_content).expect("second draft");
 
-    let before_message = engine.message(&first.summary.id).cloned().expect("in-memory draft");
+    let before_message = engine.message(&first.summary.id).expect("in-memory draft");
     let store_before = fixture.open();
     let before_row = store_before.get_message(&first.summary.id).expect("row").expect("first row");
     let before_revision = store_before.get_draft(&first.summary.id).expect("draft").expect("first draft row").revision;
@@ -621,7 +626,7 @@ fn a_failed_draft_save_leaves_store_rows_and_revision_unchanged() {
     let error = engine.save_draft(None, Some(&first.summary.id), conflicting).expect_err("cross-message attachment id");
     assert!(matches!(&error, OpError::InvalidArgs(detail) if detail.contains("belongs to message") && detail.contains("omit")), "{error}");
     assert!(!error.to_string().contains("free disk space"), "a caller mistake must not carry disk advice");
-    assert_eq!(engine.message(&first.summary.id), Some(&before_message), "memory changed after a failed draft save");
+    assert_eq!(engine.message(&first.summary.id), Some(before_message), "memory changed after a failed draft save");
 
     let mut duplicated = draft("Bozza A", "Duplicato");
     duplicated.attachments.push(attachment("att_dup"));
@@ -671,7 +676,7 @@ fn a_subject_only_patch_keeps_the_html_body_and_the_reply_link() {
     }
 
     let mut engine = Engine::open(fixture.open()).expect("reopen");
-    assert_eq!(engine.message(&id).and_then(|message| message.body_html.as_deref()), Some(HTML), "the HTML body did not survive the engine load");
+    assert_eq!(engine.message(&id).and_then(|message| message.body_html), Some(HTML.to_owned()), "the HTML body did not survive the engine load");
     // The registry patch path: only `subject` is present, so `draft_content` keeps the rest.
     let patched = engine.call("draft_save", json!({ "id": id.clone(), "subject": "Solo l'oggetto cambia" })).expect("patch the subject");
     assert_eq!(patched["draft"]["summary"]["subject"], "Solo l'oggetto cambia");

@@ -234,7 +234,7 @@ fn a_metadata_only_attachment_refuses_send_with_the_filename() {
     let draft = value["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
     let error = engine.call("message_send", json!({ "draft": draft })).expect_err("send must refuse");
     assert!(error.to_string().contains("manca.pdf"), "the refusal must name the file: {error}");
-    assert_eq!(engine.message(&draft).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_test_drafts"));
+    assert_eq!(engine.message(&draft).map(|message| message.summary.folder_id.clone()), Some("fld_acc_test_drafts".to_owned()));
 }
 
 #[test]

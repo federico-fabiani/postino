@@ -83,12 +83,12 @@ fn migration_runs_once_and_is_recorded() {
 
     {
         let store = Store::open(&path, &key).expect("open");
-        assert_eq!(store.schema_version().expect("version"), 6);
+        assert_eq!(store.schema_version().expect("version"), 7);
         store.set_meta("schema", "m1").expect("write");
     }
 
     let store = Store::open(&path, &key).expect("reopen");
-    assert_eq!(store.schema_version().expect("version"), 6, "the migration ran twice");
+    assert_eq!(store.schema_version().expect("version"), 7, "the migration ran twice");
     assert_eq!(store.get_meta("schema").expect("read").as_deref(), Some("m1"));
     assert_eq!(store.get_meta("missing").expect("read"), None);
 }

@@ -115,12 +115,12 @@ What is still demo or missing:
   an APPEND that follows a long submission, still owns a full window. There is no daemon, pipe or
   cross-process lock yet (M4): do not copy or move the database while a command runs, and do not treat
   two clients as two independent mailboxes.
-- IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox and compose depth
-  (attachment bytes, per-account signatures, reply/forward headers) exist (P5-P8). Still missing: FTS5
-  search and threading (P9), the daemon and a scheduled send that runs with the app closed (M4), HTML
-  rendering (M5), server-side signatures and Gmail OAuth (P12). `message_send` queues real mail; the
-  desktop send worker (which polls the store every two seconds) and `postino send` process the outbox,
-  so a future `--at` row waits until one of them runs.
+- IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox, compose depth and
+  encrypted search (attachment bytes, per-account signatures, reply/forward headers, P5-P9a) exist.
+  Still missing: threads, saved searches and rules (P9b/P9c), the daemon and a scheduled send that runs
+  with the app closed (M4), HTML rendering (M5), server-side signatures and Gmail OAuth (P12).
+  `message_send` queues real mail; the desktop send worker (which polls the store every two seconds)
+  and `postino send` process the outbox, so a future `--at` row waits until one of them runs.
   A plain `postino send` (no `--at`) waits the 5-second undo window and submits in the same command.
   MCP only queues.
 - Sync writes `uid`, `Message-ID` and the RFC 822 size; a local draft keeps them empty until the
@@ -205,10 +205,17 @@ they have a reason to exist.
 - **CLI:** `run` argument parsing, recipient flags, label subcommands, `messages --label` with and
   without `--folder`, `search --label`, MCP protocol (`initialize`, `tools/list`, `tools/call`,
   errors, notifications).
-- **Store:** schema upgrade from v1, migration idempotence, repository round trips, counts after
-  read/move/delete, atomic batches, draft revisions across reopen, wrong key, schema-too-new and a
-  no-plaintext scan over the database, WAL and SHM; plus the one-query-per-table mailbox hydration
-  used by `Engine::open`.
+- **Store:** schema upgrade from v1, migration idempotence, the v6→v7 search index and inert tables,
+  repository round trips, counts after read/move/delete, atomic batches, draft revisions across reopen,
+  wrong key, schema-too-new and a no-plaintext scan over the database, WAL and SHM; plus the
+  one-query-per-table mailbox hydration used by `Engine::open`.
+- **Search:** migration v6→v7, an FTS5 capability probe (`contentless_delete=1`), insert/update/delete
+  reindexing without flag churn, attachment names and diacritics, bm25 and date order, filters,
+  pagination, hostile/metacharacter input, the 1 MiB body bound, drift and `search_reindex`, encrypted
+  shadow tables with no sidecar, the query grammar matrix and `parse(print(ast)) == ast`, op/CLI/MCP
+  parity, the headless search screens at 980×600 light/dark, and the 20k perf gate. The 100k fixture is
+  `POSTINO_SLOW_TESTS=1 cargo test -p postino-core --test search_perf -- --ignored one_hundred_thousand_messages`
+  and prints open/search/backfill numbers.
 - **Blobs:** round trip and reopen, dedup, wrong key, tampered ciphertext/tag/nonce, a swapped file,
   an oversized declared length, traversal and non-hex hashes, temp cleanup, eight concurrent puts,
   compression only when it helps, header layout, remove/has and a no-plaintext scan over the

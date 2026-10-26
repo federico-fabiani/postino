@@ -18,6 +18,7 @@ pub mod model;
 pub mod ops;
 pub mod outbox;
 mod reply;
+pub mod search;
 mod store_map;
 pub mod vault;
 
@@ -32,9 +33,11 @@ pub use model::{
 pub use ops::{
     AccountAdd, AccountRemove, AccountSignature, AccountTest, AccountUpdate, AccountsList, AppInfo, DraftAttachmentResult, DraftSave, DryRunResult,
     FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageFlag, MessageGet, MessagesList, OpDef, OutboxAction,
-    OutboxListResult, SearchResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView, op_defs,
+    OutboxListResult, SearchHit, SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport,
+    SyncStatusReport, SyncStatusView, op_defs,
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
 pub use postino_sync::{SyncPhase, SyncStatus};
 pub use reply::{ReplyMode, ReplyPrefill, compose_reply, forward_subject, new_message_body, quote_body, reply_subject, signature_block};
+pub use search::{Expr as SearchExpr, Field as SearchField, IsFilter, ParsedQuery, SearchError, Snippet, make_snippet, parse as parse_search};
 pub use vault::{CredentialVault, VaultError};

@@ -359,6 +359,7 @@ pub struct UidEntry {
 /// `limit` is clamped to 1..=500 (over the cap included) and `offset` is a row offset, not a page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageFilter {
+    pub account_id: Option<String>,
     pub folder_id: Option<String>,
     pub label_id: Option<String>,
     pub unread: Option<bool>,
@@ -370,8 +371,118 @@ pub struct MessageFilter {
 
 impl Default for MessageFilter {
     fn default() -> Self {
-        Self { folder_id: None, label_id: None, unread: None, starred: None, has_attachments: None, limit: 50, offset: 0 }
+        Self { account_id: None, folder_id: None, label_id: None, unread: None, starred: None, has_attachments: None, limit: 50, offset: 0 }
     }
+}
+
+/// The order of a search page. Relevance is bm25 ascending; date is newest first. Both end in the
+/// stable `(date DESC, id ASC)` tie-break so paging cannot repeat or skip a row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    /// bm25 rank, then newest first.
+    #[default]
+    Relevance,
+    /// Newest first.
+    Date,
+}
+
+/// One typed branch of a search filter.
+///
+/// The core crate owns the query language and translates its AST into this tree: it resolves a
+/// label or folder name to an id and escapes every text term as an FTS5 expression. The store never
+/// receives a fragment of SQL and never interpolates a caller string into a statement: `Match` is
+/// bound as the value of `MATCH ?`, and every other variant becomes a fixed predicate with a bound
+/// parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchExpr {
+    And(Vec<SearchExpr>),
+    Or(Vec<SearchExpr>),
+    Not(Box<SearchExpr>),
+    /// A complete, already-quoted FTS5 expression. It is always bound, never concatenated into SQL.
+    Match(String),
+    Folder(String),
+    Label(String),
+    Unread(bool),
+    Starred(bool),
+    HasAttachments(bool),
+    /// Messages on or after this Unix-millisecond instant.
+    After(i64),
+    /// Messages strictly before this Unix-millisecond instant.
+    Before(i64),
+    /// RFC 822 size strictly larger than this many bytes.
+    Larger(u64),
+    /// RFC 822 size strictly smaller than this many bytes.
+    Smaller(u64),
+}
+
+/// What to search, how to order the page and which accounts are in scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchFilter {
+    /// One account, or every account when `None`. The engine refuses an ambiguous multi-account
+    /// search before it reaches the store.
+    pub account_id: Option<String>,
+    /// `None` is a filter-only query: no FTS `MATCH` runs.
+    pub expr: Option<SearchExpr>,
+    pub sort: SearchSort,
+    /// Clamped to 1..=200 by the repository.
+    pub limit: u32,
+    /// Clamped to 0..=5_000 by the repository.
+    pub offset: u32,
+}
+
+impl Default for SearchFilter {
+    fn default() -> Self {
+        Self { account_id: None, expr: None, sort: SearchSort::Relevance, limit: 50, offset: 0 }
+    }
+}
+
+/// One search result row. `body_text` is a bounded prefix of the stored plain-text body (64 KiB at
+/// most) and exists only so the engine can build a plain-text snippet in Rust; `body_html` is never
+/// read by search. `rank` is `bm25` ascending and is internal to ordering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub message: MessageSummary,
+    pub body_text: String,
+    pub rank: f64,
+}
+
+/// One search page plus the exact total up to the documented cap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub total: u32,
+    /// True when more than [`SEARCH_TOTAL_CAP`] rows match, so `total` is a lower bound.
+    pub total_capped: bool,
+}
+
+/// Exact totals are computed up to this many rows; beyond it the engine reports a capped total
+/// instead of scanning a whole mailbox for a number nobody reads.
+pub const SEARCH_TOTAL_CAP: u32 = 10_000;
+
+/// The health of the FTS index, as persisted in `meta.search_index` and measured on read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchIndexStatus {
+    /// `pending`, `building`, `ready` or `error`.
+    pub state: String,
+    /// FTS documents present.
+    pub indexed: u32,
+    /// Message rows that should be indexed.
+    pub total: u32,
+    /// True when the state is `ready` and the two counts agree.
+    pub ready: bool,
+    pub last_error: Option<String>,
+    /// Size of the encrypted database file in bytes (index pages included; FTS5 has no sidecar).
+    pub size_bytes: u64,
+    /// Unix milliseconds of the last index update.
+    pub updated_at: i64,
+}
+
+/// What one reindex run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchReindexOutcome {
+    pub documents: u32,
+    pub took_ms: u64,
 }
 
 /// One page plus the totals for the filter before pagination.

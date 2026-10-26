@@ -22,8 +22,8 @@ const MAX_PAGE: u32 = 500;
 const ACCOUNT_COLUMNS: &str = "id, name, email, provider, signature, created_at";
 const SERVER_COLUMNS: &str = "account_id, imap_host, imap_port, imap_tls, imap_username, created_at, smtp_host, smtp_port, smtp_tls, smtp_username";
 const FOLDER_COLUMNS: &str = "id, account_id, name, kind, unread, total, uid_validity, uid_next, last_sync_at";
-const SUMMARY_COLUMNS: &str = "m.id, m.account_id, m.folder_id, m.thread_id, m.from_name, m.from_email, m.to_json, m.subject, m.snippet, m.date, m.unread, m.starred, m.has_attachments";
-const MESSAGE_DETAIL_COLUMNS: &str = "m.uid, m.message_id, m.cc_json, m.bcc_json, m.body_text, m.body_html, m.remote_images, m.size";
+pub(crate) const SUMMARY_COLUMNS: &str = "m.id, m.account_id, m.folder_id, m.thread_id, m.from_name, m.from_email, m.to_json, m.subject, m.snippet, m.date, m.unread, m.starred, m.has_attachments";
+pub(crate) const MESSAGE_DETAIL_COLUMNS: &str = "m.uid, m.message_id, m.cc_json, m.bcc_json, m.body_text, m.body_html, m.remote_images, m.size";
 const LABEL_COLUMNS: &str = "l.id, l.account_id, l.name, l.color";
 const DRAFT_COLUMNS: &str = "id, account_id, revision, updated_at, body_text, to_json, cc_json, bcc_json, subject, in_reply_to";
 const ATTACHMENT_COLUMNS: &str = "id, filename, mime, size, blob_hash";
@@ -615,6 +615,15 @@ impl Store {
         Ok(Some(message))
     }
 
+    /// One message with its labels **and** attachment metadata. This is the owned read behind
+    /// `Engine::message(id)`: the mailbox list holds summaries, so a body and its attachment rows
+    /// are read only when somebody opens the message.
+    pub fn get_message_with_attachments(&self, id: &str) -> Result<Option<(Message, Vec<Attachment>)>, StoreError> {
+        let Some(message) = self.get_message(id)? else { return Ok(None) };
+        let attachments = self.attachments(id)?;
+        Ok(Some((message, attachments)))
+    }
+
     /// One page of message rows plus the totals for the filter before pagination.
     ///
     /// `filter.limit` is clamped to `1..=MAX_PAGE`; `offset` is a row offset. `total` and `unread`
@@ -661,6 +670,26 @@ impl Store {
         for message in &mut messages {
             if let Some(ids) = labels.get(&message.summary.id) {
                 message.summary.labels.clone_from(ids);
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Every message summary with its label ids, newest first, **without bodies**.
+    ///
+    /// This is the mailbox-hydration read: one query for the list-row columns and one grouped query
+    /// for their labels, no matter how many messages there are. A body, HTML part or attachment row
+    /// is read only through [`Store::get_message_with_attachments`] when the caller opens a message.
+    pub fn list_all_summaries(&self) -> Result<Vec<MessageSummary>, StoreError> {
+        let mut stmt =
+            self.conn.prepare(&format!("SELECT {SUMMARY_COLUMNS} FROM messages m INDEXED BY messages_list_cover ORDER BY m.date DESC, m.id ASC"))?;
+        let rows = stmt.query_map([], row_to_summary)?;
+        let mut messages = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("messages", error))?;
+        drop(stmt);
+        let labels = self.labels_by_message_all()?;
+        for message in &mut messages {
+            if let Some(ids) = labels.get(&message.id) {
+                message.labels.clone_from(ids);
             }
         }
         Ok(messages)
@@ -765,9 +794,28 @@ impl Store {
     /// message row and every attachment row back together; blob files already written are
     /// unreferenced but harmless, because the blob store is content-addressed.
     pub fn upsert_synced_message(&self, message: &Message, attachments: &[Attachment]) -> Result<(), StoreError> {
+        self.upsert_synced_message_with_refs(message, attachments, None, &[])
+    }
+
+    /// The sync bulk path with the message's threading headers. `in_reply_to` is the normalised
+    /// parent `Message-ID`; `references` is the bounded chain in the order it appeared. Both are
+    /// written in the same transaction as the message row and its attachments, so P9b never sees a
+    /// cached message whose chain is missing.
+    pub fn upsert_synced_message_with_refs(
+        &self,
+        message: &Message,
+        attachments: &[Attachment],
+        in_reply_to: Option<&str>,
+        references: &[String],
+    ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         upsert_message_row(&tx, message, false)?;
         replace_attachments_in_tx(&tx, &message.summary.id, attachments)?;
+        let references_json = if references.is_empty() { None } else { Some(serde_json::to_string(references)?) };
+        tx.execute(
+            "UPDATE messages SET in_reply_to = ?1, references_json = ?2 WHERE id = ?3",
+            params![in_reply_to, references_json, message.summary.id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1088,7 +1136,7 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn labels_by_message(&self, message_ids: &[String]) -> Result<HashMap<String, Vec<String>>, StoreError> {
+    pub(crate) fn labels_by_message(&self, message_ids: &[String]) -> Result<HashMap<String, Vec<String>>, StoreError> {
         if message_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1141,6 +1189,15 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!("SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE message_id = ?1 ORDER BY rowid"))?;
         let rows = stmt.query_map([message_id], row_to_attachment)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every stored attachment hash, keyed by attachment id, in one small query. The engine hydrates
+    /// this map instead of every attachment row: opening a 100k mailbox must not build an attachment
+    /// tree, and the hashes are only needed when bytes are read or a draft is snapshotted.
+    pub fn list_blob_hashes(&self) -> Result<HashMap<String, String>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id, blob_hash FROM attachments WHERE blob_hash IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
     /// Every attachment row grouped by message id in one query, in MIME part order. Messages
@@ -1478,6 +1535,12 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
             folder_account,
         });
     }
+    let search_sender = address_text(Some(&message.summary.from));
+    let search_to = address_list_text(&message.summary.to);
+    let search_cc = address_list_text(&message.cc);
+    let search_bcc = address_list_text(&message.bcc);
+    let attachment_names = attachment_names_in_tx(tx, &message.summary.id)?.join(" ");
+    let subject_norm = normalise_subject(&message.summary.subject);
     let previous: Option<(String, bool)> = tx
         .query_row("SELECT folder_id, unread FROM messages WHERE id = ?1", [&message.summary.id], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
@@ -1485,8 +1548,11 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
         "INSERT INTO messages(
              id, account_id, folder_id, uid, message_id, thread_id, from_name, from_email,
              to_json, cc_json, bcc_json, subject, snippet, date, unread, starred,
-             has_attachments, body_text, body_html, remote_images, size
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+             has_attachments, body_text, body_html, remote_images, size,
+             search_sender, search_to, search_cc, search_bcc, attachment_names, subject_norm,
+             ingested_at
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                  ?22, ?23, ?24, ?25, ?26, ?27, ?28)
          ON CONFLICT(id) DO UPDATE SET
              account_id = excluded.account_id,
              folder_id = excluded.folder_id,
@@ -1507,7 +1573,13 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
              body_text = excluded.body_text,
              body_html = excluded.body_html,
              remote_images = excluded.remote_images,
-             size = excluded.size",
+             size = excluded.size,
+             search_sender = excluded.search_sender,
+             search_to = excluded.search_to,
+             search_cc = excluded.search_cc,
+             search_bcc = excluded.search_bcc,
+             attachment_names = excluded.attachment_names,
+             subject_norm = excluded.subject_norm",
         params![
             message.summary.id,
             message.summary.account_id,
@@ -1529,7 +1601,14 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
             message.body_text,
             message.body_html,
             remote_images,
-            size
+            size,
+            search_sender,
+            search_to,
+            search_cc,
+            search_bcc,
+            attachment_names,
+            subject_norm,
+            crate::now_ms(),
         ],
     )?;
     // Counts only move when the folder or the read flag changes; a body/subject refresh during a
@@ -1581,8 +1660,48 @@ fn replace_attachments_in_tx(tx: &rusqlite::Transaction<'_>, message_id: &str, a
             params![attachment.id, message_id, attachment.filename, attachment.mime, size, blob_hash],
         )?;
     }
-    tx.execute("UPDATE messages SET has_attachments = ?1 WHERE id = ?2", params![!attachments.is_empty(), message_id])?;
+    let names = attachments.iter().map(|attachment| attachment.filename.as_str()).collect::<Vec<_>>().join(" ");
+    // Both columns are derived from the rows just written. Naming `attachment_names` here is what
+    // re-runs the FTS trigger after a sync or a draft re-save; `has_attachments` alone is not indexed.
+    tx.execute("UPDATE messages SET has_attachments = ?1, attachment_names = ?2 WHERE id = ?3", params![!attachments.is_empty(), names, message_id])?;
     Ok(())
+}
+
+/// The sender/recipient text the FTS table indexes. Display names and addresses are both useful, so
+/// both are kept; the tokenizer does not care about the separator.
+fn address_text(address: Option<&Address>) -> String {
+    match address {
+        Some(address) if address.name.trim().is_empty() => address.email.clone(),
+        Some(address) if address.name.trim() == address.email.trim() => address.name.clone(),
+        Some(address) => format!("{} {}", address.name, address.email),
+        None => String::new(),
+    }
+}
+
+fn address_list_text(addresses: &[Address]) -> String {
+    addresses.iter().map(|address| address_text(Some(address))).collect::<Vec<_>>().join(", ")
+}
+
+/// Normalise a subject for P9b's fallback comparison: lowercase, collapsed whitespace and a bounded
+/// length. It is derived data, never accepted from a caller.
+fn normalise_subject(subject: &str) -> String {
+    let mut text = String::new();
+    for word in subject.split_whitespace() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.extend(word.chars().flat_map(char::to_lowercase));
+        if text.chars().count() >= 512 {
+            break;
+        }
+    }
+    text.chars().take(512).collect()
+}
+
+fn attachment_names_in_tx(tx: &rusqlite::Transaction<'_>, message_id: &str) -> Result<Vec<String>, StoreError> {
+    let mut stmt = tx.prepare("SELECT filename FROM attachments WHERE message_id = ?1 ORDER BY id")?;
+    let rows = stmt.query_map([message_id], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Validate attachment ids before a draft write: duplicates inside the request and ids owned by a
@@ -1677,6 +1796,10 @@ fn next_draft_revision(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<u32, 
 fn message_where(filter: &MessageFilter) -> (String, Vec<Value>) {
     let mut sql = String::from(" WHERE 1 = 1");
     let mut values = Vec::new();
+    if let Some(account) = &filter.account_id {
+        sql.push_str(" AND m.account_id = ?");
+        values.push(Value::Text(account.clone()));
+    }
     if let Some(folder) = &filter.folder_id {
         sql.push_str(" AND m.folder_id = ?");
         values.push(Value::Text(folder.clone()));
@@ -1890,20 +2013,24 @@ fn row_to_folder(row: &Row<'_>) -> rusqlite::Result<Folder> {
     })
 }
 
-fn row_to_summary(row: &Row<'_>) -> rusqlite::Result<MessageSummary> {
+pub(crate) fn row_to_summary(row: &Row<'_>) -> rusqlite::Result<MessageSummary> {
+    row_to_summary_at(row, 0)
+}
+
+pub(crate) fn row_to_summary_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<MessageSummary> {
     Ok(MessageSummary {
-        id: row.get(0)?,
-        account_id: row.get(1)?,
-        folder_id: row.get(2)?,
-        thread_id: row.get(3)?,
-        from: Address { name: row.get(4)?, email: row.get(5)? },
-        to: decode_addresses(row, 6)?,
-        subject: row.get(7)?,
-        snippet: row.get(8)?,
-        date: row.get(9)?,
-        unread: row.get(10)?,
-        starred: row.get(11)?,
-        has_attachments: row.get(12)?,
+        id: row.get(offset)?,
+        account_id: row.get(offset + 1)?,
+        folder_id: row.get(offset + 2)?,
+        thread_id: row.get(offset + 3)?,
+        from: Address { name: row.get(offset + 4)?, email: row.get(offset + 5)? },
+        to: decode_addresses(row, offset + 6)?,
+        subject: row.get(offset + 7)?,
+        snippet: row.get(offset + 8)?,
+        date: row.get(offset + 9)?,
+        unread: row.get(offset + 10)?,
+        starred: row.get(offset + 11)?,
+        has_attachments: row.get(offset + 12)?,
         labels: Vec::new(),
     })
 }

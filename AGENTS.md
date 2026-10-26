@@ -215,3 +215,11 @@ Append one line when significant time is lost to an issue likely to recur. Forma
 - [cargo] a shared test helper stored as `tests/support.rs` is compiled as its own test binary, not
   as a module of the tests that declare it. fix/avoid: keep it at `tests/support/mod.rs` and declare
   `mod support;` in each integration test file.
+- [SQLite/FTS5] `contentless_delete=1` accepts DELETE and full-row INSERT but rejects `UPDATE` of a
+  subset of columns (`cannot UPDATE a subset of columns`). fix/avoid: the update trigger does
+  delete+insert; never write a partial `UPDATE message_fts`.
+- [SQLite/FTS5] joining every FTS match to `messages` before `ORDER BY bm25` pays one encrypted-row
+  lookup per match (26 ms at 20k, 125 ms at 100k). fix/avoid: rank and page inside FTS first, then
+  join only the candidate window; keep the exact date/id tie-break in Rust.
+- [Windows/Rust] `PRAGMA page_count` through `pragma_query_value` returned 0 on this SQLCipher build.
+  fix/avoid: report the database file size with `std::fs::metadata` (FTS lives in the same file).

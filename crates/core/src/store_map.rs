@@ -160,22 +160,32 @@ pub(crate) fn label_row(id: &str, name: &str, color: LabelColor) -> store::Label
     store::Label { id: id.to_owned(), account_id: None, name: name.to_owned(), color: color.as_str().to_owned() }
 }
 
+pub(crate) fn summary(row: store::MessageSummary) -> MessageSummary {
+    MessageSummary {
+        id: row.id,
+        thread_id: row.thread_id,
+        folder_id: row.folder_id,
+        from: address(&row.from),
+        to: row.to.iter().map(address).collect(),
+        subject: row.subject,
+        snippet: row.snippet,
+        date: date_or_epoch(row.date),
+        unread: row.unread,
+        starred: row.starred,
+        has_attachments: row.has_attachments,
+        labels: row.labels,
+    }
+}
+
+/// A row date that is outside `chrono`'s range is clamped to the epoch rather than preventing the
+/// whole mailbox from opening: a damaged date belongs to one row, not to the list.
+fn date_or_epoch(value: i64) -> DateTime<Utc> {
+    date(value).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
 pub(crate) fn message(row: store::Message, attachments: Vec<store::Attachment>) -> Result<Message, OpError> {
     Ok(Message {
-        summary: MessageSummary {
-            id: row.summary.id,
-            thread_id: row.summary.thread_id,
-            folder_id: row.summary.folder_id,
-            from: address(&row.summary.from),
-            to: row.summary.to.iter().map(address).collect(),
-            subject: row.summary.subject,
-            snippet: row.summary.snippet,
-            date: date(row.summary.date)?,
-            unread: row.summary.unread,
-            starred: row.summary.starred,
-            has_attachments: row.summary.has_attachments,
-            labels: row.summary.labels,
-        },
+        summary: summary(row.summary),
         cc: row.cc.iter().map(address).collect(),
         bcc: row.bcc.iter().map(address).collect(),
         body_text: row.body_text,

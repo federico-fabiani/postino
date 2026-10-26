@@ -1,8 +1,8 @@
 # Postino roadmap
 
-> **Current milestone:** M2 in progress — SMTP submission, the outbox and compose depth (attachments,
-> signatures, reply/forward headers) are complete (P7/P8); full draft APPEND and HTML compose remain ·
-> **Last updated:** 2026-10-26
+> **Current milestone:** M2 complete for SMTP/outbox and compose depth (P7/P8); M3 organize has
+> started with encrypted search (P9a). Threads, saved searches and rules (P9b/P9c), full draft APPEND
+> and HTML compose remain · **Last updated:** 2026-10-26
 >
 > M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
 > desktop app reads and syncs a real mailbox from the encrypted cache. M2 has started with SMTP,
@@ -147,12 +147,16 @@ interaction model before real mail makes them expensive to change. Full spec:
 ## M3 — organize
 
 - [ ] Threading (References/In-Reply-To, JWZ fallback), thread view.
-- [ ] FTS5 search with operators and ranking.
+- [x] FTS5 search with operators and ranking (P9a): encrypted contentless-delete index, schema v7,
+      the documented grammar with a recursive-descent parser and canonical printer, typed bound SQL
+      with bm25/date order, plain snippets, 200-hit/5k-offset caps, `search_status`/`search_reindex`,
+      CLI/MCP/UI parity and the body-free read path. 100k first-page P50 30.6 ms / P95 35.1 ms; open
+      and RSS missed the P9a targets and are recorded in the architecture performance table.
 - [ ] Flags, move, archive, delete, spam, undo.
 - [ ] Tags/labels, local rules (move, tag, read, delete, forward), rule preview.
 - [ ] Attachment preview/save with path confinement.
-- [ ] Verify: thread fixtures, 100k-message search under 100 ms for the first page, rule
-      idempotency, no path escape.
+- [ ] Verify: thread fixtures, rule idempotency, no path escape. The search half of the 100k gate is
+      proven; the open/RSS half remains open.
 
 ## M4 — live in the background
 

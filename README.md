@@ -8,7 +8,8 @@ registry shared by the desktop app, the CLI and an MCP server.
 > store (P5b/P5c) + accounts, credentials and sync operations (P6a) + onboarding and the app on real
 > data (P6b) + the text reading pane, safe links, attachment Save and full settings (P6c) + SMTP
 > submission and the outbox (P7) + compose depth: attachment bytes, per-account signatures and
-> reply/forward headers (P8).** The desktop app opens the encrypted SQLCipher store by default,
+> reply/forward headers (P8) + encrypted FTS5 search with a documented query language, a
+> body-free read path and schema v7 (P9a).** The desktop app opens the encrypted SQLCipher store by default,
 > offers a guided Aruba/Gmail/custom onboarding with a real connection test and background sync, and
 > reads cached mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI
 > and the MCP server use the same operation registry: `postino --store <path>` (or the default
@@ -27,6 +28,8 @@ registry shared by the desktop app, the CLI and an MCP server.
 > server-side signatures are explicitly out of scope for M2.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
+
+![Encrypted search at 980×600: query chips, syntax help and bm25-ranked results](docs/images/postino-p9a-search.png)
 
 ```
 Desktop  ─┐
@@ -77,12 +80,21 @@ MCP      ─┘
   reading width), data (store and blob paths with a copy action, open the blob folder) and version,
   licences and shortcuts; every section fits 980×600 and returns focus to the account switcher on
   `Esc`.
-- Thirty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
+- Thirty-two typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
   `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_flag`, `message_move`,
   `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
   `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`,
-  `labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`.
+  `search_status`, `search_reindex`, `labels_list`, `label_create`, `label_update`, `label_delete`,
+  `label_apply`.
+- **Encrypted search (P9a).** `search` runs on the FTS5 index inside SQLCipher, not over an in-memory
+  body vector: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:`, `has:`,
+  `before:`/`after:`, `larger:`/`smaller:`, quoted phrases, `*` prefixes and uppercase `AND`/`OR`/`NOT`
+  with parentheses. Hits are bm25-ranked with a stable date/id tie-break, snippets are plain text
+  (≤240 characters, never HTML), and the total is exact up to 10 000 (`total_capped`). The index is
+  contentless-delete, has no sidecar, rebuilds in resumable 500-row batches and is repairable with
+  `search_reindex`; `search_status` reports readiness and drift. `Engine::open` now loads list rows
+  only (no bodies) and `Engine::message(id)` is an owned, cached read.
 - Real accounts from the CLI: Aruba and Gmail are discovered offline (Gmail needs 2FA + an app
   password; OAuth is P12), `custom` takes host/port/TLS, a no-echo prompt or `--password-stdin` is the
   only way in, and MCP cannot add or remove an account. Passwords live in the OS keyring, never in
@@ -90,12 +102,12 @@ MCP      ─┘
 - `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
-- The persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema v6
-  (SMTP endpoints, the outbox journal and the stored remote-image count), additive migrations and a
-  typed repository (`postino-store`), plus the OS keyring seam (`postino-platform`). `Engine::open`
-  loads the mailbox once, repairs orphan drafts, writes every mutation through in one transaction
-  and keeps store errors categorised; the desktop app boots on the store, with `--demo` as the
-  synthetic fallback.
+- The persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema v7
+  (the v5 outbox, the v6 remote-image count and the v7 search columns/index plus inert P9b/P9c
+  tables), additive migrations and a typed repository (`postino-store`), plus the OS keyring seam
+  (`postino-platform`). `Engine::open` loads summaries once, repairs orphan drafts, writes every
+  mutation through in one transaction and keeps store errors categorised; the desktop app boots on
+  the store, with `--demo` as the synthetic fallback.
 - The M1 MIME foundation as a crate (`postino-mime`, P4a): bounded RFC 5322/2045 parsing with
   recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
@@ -174,15 +186,16 @@ MCP      ─┘
   Settings → Account and inserted in new, reply and forward messages; changing it never rewrites an
   existing draft. Reply/reply-all/forward use the parent's `Reply-To`, remove the account's own
   addresses, never expose Bcc, prefix the subject once, quote deterministically in UTC and set
-  `In-Reply-To`/`References` from the parent `Message-ID` (the parent id alone until P9 carries the
-  full chain). Forwarded attachments are copied through the blob store with their bytes; a missing
-  source is reported and blocks the send. CLI `draft attach/detach` and MCP `draft_attachment_add`
-  reach the same operation; MCP accepts bytes, never a path. No schema migration: the reply link uses
-  the existing `drafts.in_reply_to` and the received `Reply-To` rides the existing `meta` table until
-  P9 widens the message schema.
-- Headless rendering tests of the shell, gallery, composer and label flows, the reading pane's
-  link/attachment/settings paths with injected opener/saver recorders, operation-schema tests, MCP
-  protocol tests, and store round-trip tests at both the repository and engine level.
+  `In-Reply-To`/`References` from the parent `Message-ID` (the parent id alone; P9a stores the full
+  incoming chain for P9b). Forwarded attachments are copied through the blob store with their bytes; a
+  missing source is reported and blocks the send. CLI `draft attach/detach` and MCP
+  `draft_attachment_add` reach the same operation; MCP accepts bytes, never a path. The reply link uses
+  the existing `drafts.in_reply_to`; the received `Reply-To` still rides the existing `meta` table, and
+  v7 stores the incoming `In-Reply-To`/`References` for the future thread view.
+- Headless rendering tests of the shell, gallery, composer, label and search flows (980×600
+  light/dark, including the parse error), the reading pane's link/attachment/settings paths with
+  injected opener/saver recorders, operation-schema tests, MCP protocol tests, store round-trip tests
+  at both the repository and engine level, and the FTS5 migration/query/performance suites.
 
 ![Postino composer: recipients, subject, Markdown formatting bar, body and attachment, with the draft save state in the footer](docs/images/postino-u04-compose.png)
 
@@ -228,6 +241,10 @@ cargo run -p postino-cli -- --demo folders
 cargo run -p postino-cli -- --demo messages --folder inbox --limit 5
 cargo run -p postino-cli -- --demo read msg_001
 cargo run -p postino-cli -- --demo search fattura
+cargo run -p postino-cli -- --demo search "from:giulia is:unread" --sort date
+cargo run -p postino-cli -- --demo search "subject:\"fattura 2026\" OR label:lbl_1"
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" search-status
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" search-reindex
 cargo run -p postino-cli -- --demo run messages_list folder=inbox limit=2
 cargo run -p postino-cli -- --demo draft save --to "Giulia <giulia.ferri@example.com>" --subject "Ciao" --body "Ci sentiamo domani."
 cargo run -p postino-cli -- --demo label list

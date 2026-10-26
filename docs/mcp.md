@@ -76,7 +76,9 @@ agent can read the message and recover.
 | `outbox_retry` | no | Retry a failed/uncertain row with `confirm: true`; disabled unless `--allow-send` |
 | `outbox_mark_sent` | no | Resolve an uncertain row locally without contacting the server; disabled unless `--allow-send` |
 | `send_dry_run` | yes | Exact RFC 822 bytes (base64) and envelope without queueing |
-| `search` | yes | Case-insensitive search over subjects, people and bodies, with optional folder and label filters |
+| `search` | yes | FTS5 search with fields, phrases, prefixes and AND/OR/NOT; bm25 order, plain snippets, pageable |
+| `search_status` | yes | Index readiness, document/message counts, size, last error and update time |
+| `search_reindex` | no | Delete and rebuild the encrypted FTS index in resumable batches |
 | `labels_list` | yes | Labels with mailbox-wide total and unread counts |
 | `label_create` | no | Create a local label with a semantic colour |
 | `label_update` | no | Rename and/or recolour a label; the id is stable |
@@ -171,6 +173,30 @@ folder or label id is an error instead of an empty list. `search` also accepts `
 before the row limit, so a match outside the first 200 rows is still returned. `label_apply`
 validates every message id before changing anything, caps a call at 500 ids and returns how many
 messages actually changed, so an agent can retry safely.
+
+### Search syntax
+
+`search` takes `{query, account?, folder?, label?, limit?, offset?, sort?}` and returns
+`{query,total,total_capped,hits,messages,took_ms}`. A hit is `{message,snippet,highlights,matched}`;
+`messages` is the deprecated `hits[].message` alias for one milestone. The grammar is:
+
+```
+from: to: cc: bcc: subject: label: folder:
+is:unread is:read is:starred is:unstarred
+has:attachment
+before:YYYY-MM-DD after:YYYY-MM-DD
+larger:2m smaller:500k
+"a phrase"  prefisso*  NOT  AND  OR  (…)
+```
+
+Bare terms search every indexed text column. `AND`/`OR`/`NOT` are uppercase; juxtaposition is `AND`;
+quotes support `\"`; `*` is a prefix. Dates are UTC (`after` inclusive, `before` exclusive). Label and
+folder values accept an id or an exact name. The total is exact up to 10 000 and `total_capped` says
+when it is not; hits are at most 200 and offset at most 5 000. `sort` is `relevance` (bm25, default) or
+`date`. Snippets are plain text, never HTML. A parse error is an invalid-argument result naming the
+error code and byte position; the query itself is never echoed into a log. `search_status` is offline
+and read-only; `search_reindex` is a local write and never contacts a server.
+
 
 `draft_save` refuses CR/LF in addresses or the subject, validates every recipient, and returns the
 draft with a stable id. **It is a patch on update:** every content field (`to`, `cc`, `bcc`,

@@ -13,7 +13,9 @@
 //! monotonic draft revision counter that survives a send and a move back to Drafts. Version 4 adds
 //! `account_servers`, the IMAP endpoint of each account, with no password column anywhere. Version 5
 //! adds the nullable SMTP endpoint columns and the `outbox` journal (P7). Version 6 adds the stored
-//! remote-image count of each message (P6d), the count the MIME sanitizer removed on receipt.
+//! remote-image count of each message (P6d), the count the MIME sanitizer removed on receipt. Version
+//! 7 adds the derived search columns, the contentless-delete `message_fts` index and its triggers, and
+//! the still-inert P9b/P9c tables (threads, aliases, saved searches and rules).
 //!
 //! Every date is a **Unix timestamp in milliseconds** (`i64`). The choice is deliberate:
 //!
@@ -46,12 +48,14 @@
 mod blob;
 mod model;
 mod repo;
+mod search;
 
 pub use blob::BlobStore;
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
     LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
-    SmtpServer, SyncState, UidEntry,
+    SEARCH_TOTAL_CAP, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer, SyncState,
+    UidEntry,
 };
 pub use repo::{MAX_OUTBOX_ROWS, UNCERTAIN_AFTER_CRASH};
 
@@ -62,7 +66,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
 /// label id is never handed out again.
@@ -257,6 +261,150 @@ CREATE UNIQUE INDEX outbox_active_draft ON outbox(draft_id)
 ALTER TABLE messages ADD COLUMN remote_images INTEGER NOT NULL DEFAULT 0
     CHECK(remote_images BETWEEN 0 AND 10000);
 "#,
+    // v7 (P9a): the search columns, the FTS5 index and the inert P9b/P9c tables.
+    //
+    // The indexed text is derived by the repository from data it already receives: sender and
+    // recipient display strings, attachment names and a normalised subject. The triggers copy those
+    // columns into a contentless-delete FTS5 table keyed by `messages.rowid`; a flag, folder or date
+    // update does not name an indexed column and therefore never reindexes. Body text is bounded to
+    // 262144 characters, which is at most 1 MiB of UTF-8, so a hostile body cannot make the index
+    // grow without bound.
+    //
+    // The probe (crates/store/tests/fts_probe.rs) proves the bundled SQLCipher 4.19 / SQLite 3.53.4
+    // accepts `contentless_delete=1`; delete+insert is the supported update form, which is exactly
+    // what the update trigger does. Snippets are computed in Rust from the plain body, so the index
+    // stores no content and can never return an HTML marker to the UI.
+    //
+    // `threads`, `thread_aliases`, `saved_searches`, `rules` and the rule journal are created empty
+    // and inert so P9b/P9c need no second migration. Nothing in P9a reads or writes them.
+    r#"
+ALTER TABLE messages ADD COLUMN search_sender TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN search_to TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN search_cc TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN search_bcc TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN attachment_names TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN subject_norm TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN in_reply_to TEXT NULL;
+ALTER TABLE messages ADD COLUMN references_json TEXT NULL;
+ALTER TABLE messages ADD COLUMN ingested_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN rules_applied_at INTEGER NULL;
+
+CREATE INDEX messages_account_thread_date ON messages(account_id, thread_id, date DESC);
+-- A covering list index: the mailbox-open query reads summary columns only and never touches the
+-- 2 KiB body pages that sit in the table row. It is derived data, like the FTS index.
+CREATE INDEX messages_list_cover ON messages(
+    date DESC, id, folder_id, thread_id, account_id, from_name, from_email, to_json,
+    subject, snippet, unread, starred, has_attachments
+);
+
+CREATE VIRTUAL TABLE message_fts USING fts5(
+    subject,
+    search_sender,
+    search_to,
+    search_cc,
+    search_bcc,
+    body_text,
+    attachment_names,
+    content='',
+    contentless_delete=1,
+    tokenize='unicode61 remove_diacritics 2',
+    prefix='2 3'
+);
+
+CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO message_fts(rowid, subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names)
+    VALUES (new.rowid, new.subject, new.search_sender, new.search_to, new.search_cc, new.search_bcc,
+            substr(new.body_text, 1, 262144), new.attachment_names);
+END;
+
+CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM message_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, search_sender, search_to, search_cc,
+    search_bcc, body_text, attachment_names ON messages BEGIN
+    DELETE FROM message_fts WHERE rowid = old.rowid;
+    INSERT INTO message_fts(rowid, subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names)
+    VALUES (new.rowid, new.subject, new.search_sender, new.search_to, new.search_cc, new.search_bcc,
+            substr(new.body_text, 1, 262144), new.attachment_names);
+END;
+
+CREATE TABLE threads(
+    account_id        TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    id                TEXT NOT NULL,
+    subject           TEXT NOT NULL DEFAULT '',
+    last_date         INTEGER NOT NULL DEFAULT 0,
+    message_count     INTEGER NOT NULL DEFAULT 0,
+    unread_count      INTEGER NOT NULL DEFAULT 0,
+    starred_count     INTEGER NOT NULL DEFAULT 0,
+    has_attachments   INTEGER NOT NULL DEFAULT 0,
+    latest_message_id TEXT NULL,
+    PRIMARY KEY(account_id, id)
+);
+
+CREATE TABLE thread_aliases(
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    old_id     TEXT NOT NULL,
+    new_id     TEXT NOT NULL,
+    PRIMARY KEY(account_id, old_id)
+);
+
+CREATE TABLE saved_searches(
+    id         TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    query      TEXT NOT NULL,
+    sort       TEXT NOT NULL DEFAULT 'relevance',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX saved_searches_name ON saved_searches(account_id, name COLLATE NOCASE);
+
+CREATE TABLE rules(
+    id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    priority     INTEGER NOT NULL DEFAULT 0,
+    stop         INTEGER NOT NULL DEFAULT 0,
+    query        TEXT NOT NULL,
+    actions_json TEXT NOT NULL DEFAULT '[]',
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+CREATE INDEX rules_priority ON rules(account_id, priority, id);
+
+CREATE TABLE rule_runs(
+    id          TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL,
+    started_at  INTEGER NOT NULL,
+    finished_at INTEGER NULL,
+    dry         INTEGER NOT NULL DEFAULT 0,
+    rule_count  INTEGER NOT NULL DEFAULT 0,
+    matched     INTEGER NOT NULL DEFAULT 0,
+    changed     INTEGER NOT NULL DEFAULT 0,
+    errors      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX rule_runs_recent ON rule_runs(account_id, started_at DESC);
+
+CREATE TABLE rule_actions(
+    run_id      TEXT NOT NULL REFERENCES rule_runs(id) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,
+    rule_id     TEXT NOT NULL,
+    message_id  TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    value_json  TEXT NOT NULL DEFAULT 'null',
+    changed     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(run_id, ordinal)
+);
+
+INSERT INTO meta(key, value)
+SELECT 'search_index',
+       '{"state":"pending","last_rowid":0,"indexed":0,"total":' || count(*) || ',"updated_at":0,"last_error":null}'
+FROM messages
+WHERE 1
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+"#,
 ];
 
 /// A 256-bit store key.
@@ -365,6 +513,14 @@ pub enum StoreError {
     Crypto(#[from] postino_crypto::CryptoError),
 }
 
+/// The wall clock in Unix milliseconds for derived write timestamps (`ingested_at`).
+///
+/// A clock before the epoch is stored as `0` rather than failing a mail write; rules compare
+/// `ingested_at` with their own creation instant, and `0` means "before any rule".
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+}
+
 fn translate(error: rusqlite::Error) -> StoreError {
     match &error {
         rusqlite::Error::SqliteFailure(code, _) if code.code == ErrorCode::NotADatabase => StoreError::WrongKeyOrCorrupt,
@@ -377,6 +533,9 @@ fn translate(error: rusqlite::Error) -> StoreError {
 pub struct Store {
     conn: Connection,
     blobs: BlobStore,
+    /// The database file this connection owns, for a truthful size report. FTS5 shadow tables live
+    /// in this file; there is no index sidecar.
+    path: PathBuf,
 }
 
 /// The blob directory that belongs to a database file: `mail.db` → `mail.db.blobs`.
@@ -425,7 +584,11 @@ impl Store {
         .map_err(translate)?;
         migrate(&mut conn)?;
         let blobs = BlobStore::open(blob_root(path), key)?;
-        Ok(Self { conn, blobs })
+        let store = Self { conn, blobs, path: path.to_path_buf() };
+        // v7 writes a pending marker; finish or resume the index before the mailbox is served.
+        // A ready index whose counts agree is a no-op, so an ordinary open never reads a body.
+        store.ensure_search_index()?;
+        Ok(store)
     }
 
     /// The encrypted attachment blob store that lives next to this database.
@@ -459,7 +622,7 @@ impl Store {
             return Err(StoreError::SchemaTooOld { found: version, supported: SCHEMA_VERSION });
         }
         let blobs = BlobStore::open(blob_root(path), key)?;
-        Ok(Self { conn, blobs })
+        Ok(Self { conn, blobs, path: path.to_path_buf() })
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {

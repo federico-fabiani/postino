@@ -17,6 +17,7 @@ use crate::engine::{AccountSetup, Engine, OpError, unknown_account, unknown_fold
 use crate::model::{
     AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary, Provider,
 };
+use crate::store_map;
 
 /// The largest standard-base64 string that can decode to [`crate::MAX_ATTACHMENT_BYTES`]. Checked
 /// before allocating the decoded buffer: a hostile caller cannot make the engine allocate 25 MiB
@@ -182,9 +183,25 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search",
             "Search mail",
-            "Case-insensitive search across subjects, people, snippets and bodies of the local mailbox, demo or store-backed. Optional `folder` and `label` filters are applied before the row limit; unknown ids are an error.",
+            "Search the encrypted local index. Grammar: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:unread|read|starred|unstarred`, `has:attachment`, `before:`/`after:` (YYYY-MM-DD UTC), `larger:`/`smaller:` (k/m/g). Bare terms search all text, `*` marks a prefix, quoted values support `\\\"`, and AND/OR/NOT (uppercase) plus parentheses compose clauses. Hits are bm25-ranked with a stable date/id tie-break; `sort: \"date\"` orders newest first. `total` is exact up to 10 000 and `total_capped` says when it is not. At most 200 hits per page and offset 5000. Snippets are plain text, never HTML. Unknown folder or label names/ids are an error. A parse error is an invalid argument carrying the error code and position.",
             SearchArgs,
             true,
+            false
+        ),
+        def!(
+            "search_status",
+            "Search index status",
+            "Report whether the local full-text index is ready, how many documents and message rows it covers, its size, the last error and when it was last updated. Read-only and offline. A `ready: false` index is repairable with search_reindex.",
+            SearchStatusArgs,
+            true,
+            false
+        ),
+        def!(
+            "search_reindex",
+            "Rebuild the search index",
+            "Delete and rebuild the encrypted full-text index from the stored message rows in resumable 500-row batches. Idempotent and safe to run while the mailbox is open; it never vacuums the database and never contacts a server. Returns the document count and duration. Thread rows are created by P9b and stay 0 here.",
+            SearchReindexArgs,
+            false,
             false
         ),
         def!(
@@ -490,15 +507,41 @@ pub struct SendDryRunArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchArgs {
-    /// Words to look for. Empty queries are refused.
+    /// The query: words, phrases and fields such as from:, subject:, label:, is:, has:, after:.
+    /// Bare terms search every indexed field; `*` marks a prefix; AND/OR/NOT are uppercase.
     pub query: String,
-    /// Restrict to one folder id.
+    /// Restrict to one account. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Restrict to one folder id or exact folder name.
     pub folder: Option<String>,
-    /// Restrict to messages carrying this label id. Unknown label ids are an error.
+    /// Restrict to messages carrying this label id or exact label name.
     pub label: Option<String>,
-    /// Maximum matches, 1-200. Defaults to 50. Applied after the folder and label filters.
+    /// Maximum hits, 1-200. Defaults to 50.
     pub limit: Option<u32>,
+    /// Row offset, 0-5000.
+    pub offset: Option<u32>,
+    /// relevance (default) or date.
+    pub sort: Option<SearchSort>,
 }
+
+/// Search result order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    /// bm25 rank, then newest first.
+    #[default]
+    Relevance,
+    /// Newest first.
+    Date,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchStatusArgs {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchReindexArgs {}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -714,10 +757,45 @@ pub struct DryRunResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub message: MessageSummary,
+    /// Plain text, at most 240 characters, never HTML.
+    pub snippet: String,
+    /// The query terms that occur in the snippet, in source order, at most eight.
+    pub highlights: Vec<String>,
+    /// The field that produced the hit, or `all` for a bare term.
+    pub matched: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub query: String,
-    pub messages: Vec<MessageSummary>,
+    /// Exact total up to 10 000; above that `total_capped` is true.
     pub total: usize,
+    pub total_capped: bool,
+    pub hits: Vec<SearchHit>,
+    /// Deprecated alias of `hits[].message`, kept for one milestone so existing clients do not break.
+    pub messages: Vec<MessageSummary>,
+    pub took_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchStatusResult {
+    pub ready: bool,
+    pub indexed: u32,
+    pub total: u32,
+    pub last_error: Option<String>,
+    pub size_bytes: u64,
+    pub state: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchReindexResult {
+    pub documents: u32,
+    /// Thread rows refreshed. P9a creates the table but does not derive threads, so this is 0.
+    pub threads: u32,
+    pub took_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -918,6 +996,14 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let args: SearchArgs = parse(args)?;
             search(engine, args)
         }
+        "search_status" => {
+            let _args: SearchStatusArgs = parse(args)?;
+            search_status(engine)
+        }
+        "search_reindex" => {
+            let _args: SearchReindexArgs = parse(args)?;
+            search_reindex(engine)
+        }
         "labels_list" => {
             let _: LabelsListArgs = parse(args)?;
             value(LabelsList { labels: engine.label_summaries() })
@@ -1109,43 +1195,69 @@ fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
             folder.id, folder.account_id
         )));
     }
+    if let Some(account) = &args.account
+        && !engine.accounts().iter().any(|candidate| candidate.id == *account)
+    {
+        return Err(unknown_account(account));
+    }
+    let (limit, offset) = page_bounds(args.limit, args.offset);
+    if let Some(store) = engine.store() {
+        let filter = postino_store::MessageFilter {
+            account_id: args.account.clone(),
+            folder_id: folder.filter(|folder| !folder.kind.is_virtual()).map(|folder| folder.id.clone()),
+            label_id: args.label.clone(),
+            unread: if args.unread_only { Some(true) } else { None },
+            starred: match folder {
+                Some(folder) if folder.kind == FolderKind::Starred => Some(true),
+                _ if args.starred_only => Some(true),
+                _ => None,
+            },
+            has_attachments: if args.with_attachments { Some(true) } else { None },
+            limit: u32::try_from(limit).unwrap_or(200),
+            offset: u32::try_from(offset).unwrap_or(0),
+        };
+        let page = store.list_messages(&filter).map_err(store_map::read_error)?;
+        // The virtual starred view is derived from flags; a real folder named starred is not a
+        // mailbox. The store filter already asks for starred rows, so no second pass is needed.
+        return value(MessagesList {
+            folder: folder.map(|folder| folder.id.clone()),
+            messages: page.messages.into_iter().map(store_map::summary).collect(),
+            total: usize::try_from(page.total).unwrap_or(usize::MAX),
+            unread: usize::try_from(page.unread).unwrap_or(usize::MAX),
+        });
+    }
     let account_folders = match (&args.account, folder) {
         (Some(account), None) => {
-            if !engine.accounts().iter().any(|candidate| candidate.id == *account) {
-                return Err(unknown_account(account));
-            }
             Some(engine.folders().iter().filter(|folder| folder.account_id == *account).map(|folder| folder.id.as_str()).collect::<BTreeSet<_>>())
         }
         _ => None,
     };
-
-    let mut rows: Vec<&Message> = engine
+    let mut rows: Vec<&MessageSummary> = engine
         .messages()
         .iter()
         .filter(|message| {
             let in_scope = match folder {
-                Some(folder) if folder.kind == FolderKind::Starred => message.summary.starred,
-                Some(folder) => message.summary.folder_id == folder.id,
-                None => account_folders.as_ref().is_none_or(|folders| folders.contains(message.summary.folder_id.as_str())),
+                Some(folder) if folder.kind == FolderKind::Starred => message.starred,
+                Some(folder) => message.folder_id == folder.id,
+                None => account_folders.as_ref().is_none_or(|folders| folders.contains(message.folder_id.as_str())),
             };
             in_scope
-                && (!args.unread_only || message.summary.unread)
-                && (!args.starred_only || message.summary.starred)
-                && (!args.with_attachments || message.summary.has_attachments)
-                && args.label.as_ref().is_none_or(|label| message.summary.labels.contains(label))
+                && (!args.unread_only || message.unread)
+                && (!args.starred_only || message.starred)
+                && (!args.with_attachments || message.has_attachments)
+                && args.label.as_ref().is_none_or(|label| message.labels.contains(label))
         })
         .collect();
-    rows.sort_by_key(|left| std::cmp::Reverse(left.summary.date));
+    rows.sort_by_key(|left| std::cmp::Reverse(left.date));
 
     let total = rows.len();
-    let unread = rows.iter().filter(|message| message.summary.unread).count();
-    let (limit, offset) = page_bounds(args.limit, args.offset);
-    let messages = rows.into_iter().skip(offset).take(limit).map(|message| message.summary.clone()).collect();
+    let unread = rows.iter().filter(|message| message.unread).count();
+    let messages = rows.into_iter().skip(offset).take(limit).cloned().collect();
     value(MessagesList { folder: folder.map(|folder| folder.id.clone()), messages, total, unread })
 }
 
 fn message(engine: &Engine, args: MessageGetArgs) -> Result<Value, OpError> {
-    let message = engine.message(&args.id).cloned().ok_or_else(|| unknown_message(&args.id))?;
+    let message = engine.message_result(&args.id)?.ok_or_else(|| unknown_message(&args.id))?;
     value(MessageGet { message })
 }
 
@@ -1155,49 +1267,288 @@ fn flag(engine: &mut Engine, args: MessageFlagArgs) -> Result<Value, OpError> {
 }
 
 fn search(engine: &Engine, args: SearchArgs) -> Result<Value, OpError> {
-    let query = args.query.trim().to_lowercase();
-    if query.is_empty() {
-        return Err(OpError::InvalidArgs("query must not be empty".to_owned()));
+    let parsed = crate::search::parse(&args.query)
+        .map_err(|error| OpError::InvalidArgs(format!("search query: {} at position {}", error.code, error.position)))?;
+    let account = search_account(engine, args.account.as_deref())?;
+    let mut filters = Vec::new();
+    let mut folder_filter = None;
+    let mut label_filter = None;
+    if let Some(folder) = args.folder.as_deref() {
+        let folder = resolve_folder(engine, folder, account.as_deref())?;
+        folder_filter = Some(folder.clone());
+        filters.push(folder_expr(engine, folder));
     }
-    let folder = match args.folder.as_deref() {
-        Some(id) => Some(find_folder(engine, id)?),
-        None => None,
+    if let Some(label) = args.label.as_deref() {
+        let label = resolve_label(engine, label)?;
+        label_filter = Some(label.id.clone());
+        filters.push(postino_store::SearchExpr::Label(label.id));
+    }
+    let expression = translate_search(&parsed.expr, engine, account.as_deref())?;
+    filters.push(expression);
+    let expression = match filters.len() {
+        0 => None,
+        1 => filters.pop(),
+        _ => Some(postino_store::SearchExpr::And(filters)),
     };
-    if let Some(label) = &args.label
-        && engine.label(label).is_none()
-    {
-        return Err(unknown_label(label));
-    }
-
-    let mut rows: Vec<&Message> =
-        engine
-            .messages()
-            .iter()
-            .filter(|message| {
-                let in_folder = folder.is_none_or(|folder| {
-                    if folder.kind == FolderKind::Starred { message.summary.starred } else { message.summary.folder_id == folder.id }
-                });
-                let in_label = args.label.as_ref().is_none_or(|label| message.summary.labels.contains(label));
-                in_folder && in_label && matches_query(message, &query)
-            })
-            .collect();
-    rows.sort_by_key(|left| std::cmp::Reverse(left.summary.date));
-
-    let total = rows.len();
-    let limit = usize::try_from(args.limit.unwrap_or(50).clamp(1, 200)).unwrap_or(50);
-    let messages = rows.into_iter().take(limit).map(|message| message.summary.clone()).collect();
-    value(SearchResult { query, messages, total })
+    let limit = args.limit.unwrap_or(50).clamp(1, 200);
+    let offset = args.offset.unwrap_or(0).min(5_000);
+    let sort = match args.sort.unwrap_or_default() {
+        SearchSort::Relevance => postino_store::SearchSort::Relevance,
+        SearchSort::Date => postino_store::SearchSort::Date,
+    };
+    let started = std::time::Instant::now();
+    let (hits, total, total_capped) = match engine.store() {
+        Some(store) => {
+            // With one account every row is in scope; omitting the account filter lets the fast
+            // relevance path count inside FTS5 without a message-row lookup per match. With several
+            // accounts the caller's account is part of the query.
+            let store_account = if engine.accounts().len() > 1 { account.clone() } else { None };
+            let page = store
+                .search(&postino_store::SearchFilter { account_id: store_account, expr: expression, sort, limit, offset })
+                .map_err(store_map::read_error)?;
+            let terms = parsed.expr.terms();
+            let hits = page
+                .hits
+                .into_iter()
+                .map(|hit| {
+                    let snippet = crate::search::make_snippet(&hit.message.subject, &hit.body_text, &terms);
+                    SearchHit {
+                        message: store_map::summary(hit.message),
+                        snippet: snippet.text,
+                        highlights: snippet.highlights,
+                        matched: matched_label(&parsed.expr),
+                    }
+                })
+                .collect::<Vec<_>>();
+            (hits, usize::try_from(page.total).unwrap_or(usize::MAX), page.total_capped)
+        }
+        None => demo_search(engine, &parsed.expr, limit, offset, label_filter.as_deref(), folder_filter.as_deref(), account.as_deref())?,
+    };
+    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let messages = hits.iter().map(|hit| hit.message.clone()).collect();
+    value(SearchResult { query: parsed.text, total, total_capped, hits, messages, took_ms })
 }
 
-fn matches_query(message: &Message, query: &str) -> bool {
-    let summary = &message.summary;
-    summary.subject.to_lowercase().contains(query)
-        || summary.from.display().to_lowercase().contains(query)
-        || summary.to.iter().any(|address| address.display().to_lowercase().contains(query))
-        || message.cc.iter().any(|address| address.display().to_lowercase().contains(query))
-        || message.bcc.iter().any(|address| address.display().to_lowercase().contains(query))
-        || summary.snippet.to_lowercase().contains(query)
-        || message.body_text.to_lowercase().contains(query)
+fn search_status(engine: &Engine) -> Result<Value, OpError> {
+    let store = engine.require_store_for_read("search_status")?;
+    let status = store.search_status().map_err(store_map::read_error)?;
+    value(SearchStatusResult {
+        ready: status.ready,
+        indexed: status.indexed,
+        total: status.total,
+        last_error: status.last_error,
+        size_bytes: status.size_bytes,
+        state: status.state,
+        updated_at: status.updated_at,
+    })
+}
+
+fn search_reindex(engine: &Engine) -> Result<Value, OpError> {
+    let store = engine.require_store_for_read("search_reindex")?;
+    let outcome = store.search_reindex().map_err(store_map::read_error)?;
+    value(SearchReindexResult { documents: outcome.documents, threads: 0, took_ms: outcome.took_ms })
+}
+
+/// Resolve the account scope of a search: one account is implied, several require an explicit id.
+fn search_account(engine: &Engine, requested: Option<&str>) -> Result<Option<String>, OpError> {
+    if let Some(id) = requested {
+        if !engine.accounts().iter().any(|account| account.id == id) {
+            return Err(unknown_account(id));
+        }
+        return Ok(Some(id.to_owned()));
+    }
+    match engine.accounts() {
+        [] => Ok(None),
+        [account] => Ok(Some(account.id.clone())),
+        accounts => Err(OpError::InvalidArgs(format!(
+            "the mailbox has {} accounts; pass `account` with one of {}",
+            accounts.len(),
+            accounts.iter().map(|account| format!("{:?}", account.id)).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+fn resolve_folder(engine: &Engine, value: &str, account: Option<&str>) -> Result<String, OpError> {
+    let folder = engine
+        .folders()
+        .iter()
+        .find(|folder| folder.id == value)
+        .or_else(|| engine.folders().iter().find(|folder| folder.name.eq_ignore_ascii_case(value)))
+        .ok_or_else(|| unknown_folder(value))?;
+    if let Some(account) = account
+        && folder.account_id != account
+    {
+        return Err(OpError::InvalidArgs(format!(
+            "folder {:?} belongs to account {:?}, not {account:?}; use a folder from the same account",
+            folder.id, folder.account_id
+        )));
+    }
+    Ok(folder.id.clone())
+}
+
+fn folder_expr(engine: &Engine, id: String) -> postino_store::SearchExpr {
+    if engine.folders().iter().any(|folder| folder.id == id && folder.kind == FolderKind::Starred) {
+        postino_store::SearchExpr::Starred(true)
+    } else {
+        postino_store::SearchExpr::Folder(id)
+    }
+}
+
+fn resolve_label(engine: &Engine, value: &str) -> Result<Label, OpError> {
+    engine
+        .labels()
+        .iter()
+        .find(|label| label.id == value)
+        .or_else(|| engine.labels().iter().find(|label| label.name.eq_ignore_ascii_case(value)))
+        .cloned()
+        .ok_or_else(|| unknown_label(value))
+}
+
+/// Translate the parsed AST into the store's typed filter tree. Text leaves become a safe FTS5
+/// phrase; label and folder names become ids here, in core, so the store never sees a name lookup.
+fn translate_search(expr: &crate::search::Expr, engine: &Engine, account: Option<&str>) -> Result<postino_store::SearchExpr, OpError> {
+    use crate::search::{Expr, Field};
+    Ok(match expr {
+        Expr::And(children) => {
+            postino_store::SearchExpr::And(children.iter().map(|child| translate_search(child, engine, account)).collect::<Result<Vec<_>, _>>()?)
+        }
+        Expr::Or(children) => {
+            postino_store::SearchExpr::Or(children.iter().map(|child| translate_search(child, engine, account)).collect::<Result<Vec<_>, _>>()?)
+        }
+        Expr::Not(child) => postino_store::SearchExpr::Not(Box::new(translate_search(child, engine, account)?)),
+        Expr::Text { field, value, prefix } => {
+            let column = match field {
+                Some(Field::From) => Some("search_sender"),
+                Some(Field::To) => Some("search_to"),
+                Some(Field::Cc) => Some("search_cc"),
+                Some(Field::Bcc) => Some("search_bcc"),
+                Some(Field::Subject) => Some("subject"),
+                _ => None,
+            };
+            postino_store::SearchExpr::Match(crate::search::fts_phrase(column, value, *prefix))
+        }
+        Expr::Label(value) => postino_store::SearchExpr::Label(resolve_label(engine, value)?.id),
+        Expr::Folder(value) => folder_expr(engine, resolve_folder(engine, value, account)?),
+        Expr::Is(value) => match value {
+            crate::search::IsFilter::Unread => postino_store::SearchExpr::Unread(true),
+            crate::search::IsFilter::Read => postino_store::SearchExpr::Unread(false),
+            crate::search::IsFilter::Starred => postino_store::SearchExpr::Starred(true),
+            crate::search::IsFilter::Unstarred => postino_store::SearchExpr::Starred(false),
+        },
+        Expr::HasAttachment => postino_store::SearchExpr::HasAttachments(true),
+        Expr::After(instant) => postino_store::SearchExpr::After(*instant),
+        Expr::Before(instant) => postino_store::SearchExpr::Before(*instant),
+        Expr::Larger(bytes) => postino_store::SearchExpr::Larger(*bytes),
+        Expr::Smaller(bytes) => postino_store::SearchExpr::Smaller(*bytes),
+    })
+}
+
+fn matched_label(expr: &crate::search::Expr) -> String {
+    use crate::search::Expr;
+    match expr {
+        Expr::Text { field: Some(field), .. } => field.as_str().to_owned(),
+        Expr::Text { field: None, .. } => "all".to_owned(),
+        Expr::And(children) | Expr::Or(children) => children.first().map_or_else(|| "all".to_owned(), matched_label),
+        Expr::Not(child) => matched_label(child),
+        _ => "filter".to_owned(),
+    }
+}
+
+/// The demo mailbox has no FTS table: evaluate the AST over its full in-memory messages, then sort
+/// by date. The operation surface and the result shape are identical to the store-backed path.
+fn demo_search(
+    engine: &Engine,
+    expr: &crate::search::Expr,
+    limit: u32,
+    offset: u32,
+    label: Option<&str>,
+    folder: Option<&str>,
+    account: Option<&str>,
+) -> Result<(Vec<SearchHit>, usize, bool), OpError> {
+    let terms = expr.terms();
+    let account_folders = account.map(|account| {
+        engine.folders().iter().filter(|folder| folder.account_id == account).map(|folder| folder.id.as_str()).collect::<BTreeSet<_>>()
+    });
+    let starred_folder = folder.is_some_and(|id| engine.folders().iter().any(|folder| folder.id == id && folder.kind == FolderKind::Starred));
+    let mut rows = engine
+        .messages()
+        .iter()
+        .filter(|summary| {
+            label.is_none_or(|label| summary.labels.iter().any(|candidate| candidate == label))
+                && folder.is_none_or(|folder| if starred_folder { summary.starred } else { summary.folder_id == folder })
+                && account_folders.as_ref().is_none_or(|folders| folders.contains(summary.folder_id.as_str()))
+        })
+        .filter_map(|summary| engine.message(&summary.id).map(|message| (summary, message)))
+        .filter(|(_, message)| demo_matches(expr, message, engine))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(summary, _)| std::cmp::Reverse(summary.date));
+    let total = rows.len();
+    let hits = rows
+        .into_iter()
+        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        .take(usize::try_from(limit).unwrap_or(50))
+        .map(|(summary, message)| {
+            let snippet = crate::search::make_snippet(&message.summary.subject, &message.body_text, &terms);
+            SearchHit { message: summary.clone(), snippet: snippet.text, highlights: snippet.highlights, matched: matched_label(expr) }
+        })
+        .collect::<Vec<_>>();
+    Ok((hits, total, total > 10_000))
+}
+
+fn demo_matches(expr: &crate::search::Expr, message: &Message, engine: &Engine) -> bool {
+    use crate::search::Expr;
+    match expr {
+        Expr::And(children) => children.iter().all(|child| demo_matches(child, message, engine)),
+        Expr::Or(children) => children.iter().any(|child| demo_matches(child, message, engine)),
+        Expr::Not(child) => !demo_matches(child, message, engine),
+        Expr::Text { field, value, prefix } => {
+            let needle = value.to_lowercase();
+            let matches = |haystack: &str| {
+                let haystack = haystack.to_lowercase();
+                if *prefix {
+                    haystack.split(|character: char| !character.is_alphanumeric()).any(|word| word.starts_with(&needle))
+                } else {
+                    haystack.contains(&needle)
+                }
+            };
+            match field {
+                Some(crate::search::Field::From) => message.summary.from.display().to_lowercase().contains(&needle),
+                Some(crate::search::Field::To) => message.summary.to.iter().any(|address| address.display().to_lowercase().contains(&needle)),
+                Some(crate::search::Field::Cc) => message.cc.iter().any(|address| address.display().to_lowercase().contains(&needle)),
+                Some(crate::search::Field::Bcc) => message.bcc.iter().any(|address| address.display().to_lowercase().contains(&needle)),
+                Some(crate::search::Field::Subject) => matches(&message.summary.subject),
+                _ => {
+                    matches(&message.summary.subject)
+                        || matches(&message.body_text)
+                        || matches(&message.summary.from.display())
+                        || message.summary.to.iter().any(|address| matches(&address.display()))
+                        || message.cc.iter().any(|address| matches(&address.display()))
+                        || message.bcc.iter().any(|address| matches(&address.display()))
+                        || message.attachments.iter().any(|attachment| matches(&attachment.filename))
+                }
+            }
+        }
+        Expr::Label(value) => resolve_label(engine, value).is_ok_and(|label| message.summary.labels.contains(&label.id)),
+        Expr::Folder(value) => resolve_folder(engine, value, None).is_ok_and(|folder| {
+            if engine.folders().iter().any(|candidate| candidate.id == folder && candidate.kind == FolderKind::Starred) {
+                message.summary.starred
+            } else {
+                message.summary.folder_id == folder
+            }
+        }),
+        Expr::Is(value) => match value {
+            crate::search::IsFilter::Unread => message.summary.unread,
+            crate::search::IsFilter::Read => !message.summary.unread,
+            crate::search::IsFilter::Starred => message.summary.starred,
+            crate::search::IsFilter::Unstarred => !message.summary.starred,
+        },
+        Expr::HasAttachment => message.summary.has_attachments,
+        Expr::After(instant) => message.summary.date.timestamp_millis() >= *instant,
+        Expr::Before(instant) => message.summary.date.timestamp_millis() < *instant,
+        // The demo messages carry no RFC 822 size; a size filter matches nothing rather than
+        // pretending a body length is a server size.
+        Expr::Larger(_) | Expr::Smaller(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -1320,6 +1671,14 @@ mod tests {
             assert!(!def.description.is_empty());
         }
         assert!(defs.iter().any(|def| def.name == "messages_list"));
+        let find = |name: &str| defs.iter().find(|def| def.name == name).unwrap_or_else(|| panic!("{name} is missing"));
+        assert!(find("search").read_only);
+        assert!(find("search_status").read_only);
+        assert!(!find("search_reindex").read_only);
+        assert!(!find("search_reindex").destructive);
+        for name in ["search", "search_status", "search_reindex"] {
+            assert!(!find(name).sensitive, "{name} handles no credential");
+        }
     }
 
     #[test]
@@ -1371,7 +1730,7 @@ mod tests {
     #[test]
     fn flag_requires_a_change() {
         let mut engine = Engine::demo();
-        let id = engine.messages()[0].summary.id.clone();
+        let id = engine.messages()[0].id.clone();
         let error = engine.call("message_flag", json!({ "id": id })).expect_err("no flags");
         assert!(matches!(error, crate::OpError::InvalidArgs(_)));
     }
@@ -1393,7 +1752,7 @@ mod tests {
     #[test]
     fn every_unknown_id_path_is_invalid_args() {
         let mut engine = Engine::demo();
-        let message = engine.messages()[0].summary.id.clone();
+        let message = engine.messages()[0].id.clone();
         let cases = [
             ("folders_list", json!({ "account": "acc_missing" })),
             ("messages_list", json!({ "folder": "missing" })),
@@ -1421,7 +1780,7 @@ mod tests {
     #[test]
     fn moving_a_message_updates_both_folders() {
         let mut engine = Engine::demo();
-        let id = engine.messages()[0].summary.id.clone();
+        let id = engine.messages()[0].id.clone();
         let inbox_before = engine.folders().iter().find(|folder| folder.id == "inbox").map_or(0, |folder| folder.total);
         let archive_before = engine.folders().iter().find(|folder| folder.id == "archive").map_or(0, |folder| folder.total);
         let result = call(&mut engine, "message_move", json!({ "id": id, "folder": "archive" }));
@@ -1435,7 +1794,7 @@ mod tests {
     #[test]
     fn virtual_folders_cannot_receive_messages() {
         let mut engine = Engine::demo();
-        let id = engine.messages()[0].summary.id.clone();
+        let id = engine.messages()[0].id.clone();
         let error = engine.call("message_move", json!({ "id": id, "folder": "starred" })).expect_err("virtual folder");
         assert!(matches!(error, crate::OpError::InvalidArgs(_)));
     }
@@ -1582,7 +1941,7 @@ mod tests {
         let result = call(&mut engine, "label_delete", json!({ "id": "lbl_1" }));
         assert_eq!(result["label"]["id"], "lbl_1");
         assert_eq!(result["affected"], 6);
-        assert!(engine.messages().iter().all(|message| !message.summary.labels.iter().any(|label| label == "lbl_1")));
+        assert!(engine.messages().iter().all(|message| !message.labels.iter().any(|label| label == "lbl_1")));
         let labels = call(&mut engine, "labels_list", json!({}));
         assert_eq!(labels["labels"].as_array().expect("labels").len(), 2);
     }

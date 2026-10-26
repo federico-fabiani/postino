@@ -222,6 +222,28 @@ Selection never mutates. Opening a message marks it read after 600 ms, with an 8
 `U` marks unread. Archive/delete/star show the same toast with `Annulla`. One undo stack, one step
 per action, no hidden mutation.
 
+### 6.5 Search
+
+- `/` focuses the centred field. Typing debounces 250 ms, `Enter` searches immediately, `Esc` clears
+  the query and the results. `Esc` in an unfocused list keeps its existing meaning.
+- Results are FTS5 hits, not a client-side filter: the header says `Risultati per “…”`, the parsed
+  clauses appear as chips (at most two rows, eight chips), and a caption names the syntax
+  (`from: · to: · subject: · label: · folder: · is: · has: · after: · larger:`, `AND/OR/NOT`,
+  `"frase"`, `prefisso*`). Clicking a chip replaces the query with that clause, so the chip is an
+  action, not decoration.
+- A parse error is inline, red and positional: `Ricerca non valida: una virgoletta non è chiusa
+  (posizione 8). Correggi il testo o premi Esc per cancellarla.` The field and the error never echo
+  message content; the position is the byte offset in the user's own query.
+- The list shows the plain snippet from the matched sentence (≤240 characters). HTML never reaches
+  the row. Empty results use the existing filter-aware empty state, primary action `Cancella ricerca`.
+- Loading, index building and error states reuse the shell: a search read failure uses the list
+  failure toast; `search_status` exposes readiness for a future partial index, and `search_reindex`
+  is available from the CLI. Saved searches and a recent-query row are P9b.
+- 980×600 light/dark screenshots: `docs/images/postino-p9a-search.png`,
+  `postino-p9a-search-dark.png`, `postino-p9a-search-error.png`,
+  `postino-p9a-search-error-dark.png`. The headless render test asserts the results, syntax help and
+  parse error at the minimum size.
+
 ## 7. Compose and drafts
 
 - `Scrivi` opens a **composer modal** (not a status message or a floating window): To/Cc/Bcc,

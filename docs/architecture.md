@@ -4,7 +4,7 @@
 > crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) + sync into the store (P5b) +
 > accounts and credentials (P6a) + app on real mail (P6b/P6c) + remote-content count (P6d) + SMTP
 > submission and the outbox (P7) + compose depth: attachment bytes, signatures per account and
-> reply/forward headers (P8) ·
+> reply/forward headers (P8) + encrypted FTS5 search, the body-free read path and schema v7 (P9a) ·
 > **Last updated:** 2026-10-26 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
@@ -19,7 +19,7 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounds, typed errors |
 | `crates/platform` | OS seams: store key and account credentials in the OS keyring |
-| `crates/store` | SQLCipher schema v6, migrations, the repository, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7) |
+| `crates/store` | SQLCipher schema v7, migrations, the repository, FTS5 search, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7, P9a) |
 | `crates/sync` | One account from IMAP into the store, plus submission serialization and the Sent append (P5b, P7) |
 | `crates/testkit` | Test-only fake IMAP/SMTP servers, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -67,12 +67,13 @@ Current operations: `app_info`, `accounts_list`, `account_add`, `account_update`
 `account_remove`, `account_signature_set`, `sync_now`, `sync_status`, `folders_list`,
 `messages_list`, `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_attachment_add`,
 `draft_attachment_remove`, `message_send`, `send_schedule`, `outbox_list`, `outbox_cancel`,
-`outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `labels_list`, `label_create`,
-`label_update`, `label_delete`, `label_apply`. They are enough to prove the path through all three
-clients. `draft_save` updates one draft in place; `draft_attachment_add/remove` own the attachment
-bytes; `message_send` queues it with the undo window; `send_dry_run` returns the exact bytes without a
-row. Labels are local metadata: in memory in the demo, in the encrypted store otherwise, and never
-synced to a server.
+`outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `search_status`, `search_reindex`,
+`labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`. They are enough to
+prove the path through all three clients. `draft_save` updates one draft in place;
+`draft_attachment_add/remove` own the attachment bytes; `message_send` queues it with the undo
+window; `send_dry_run` returns the exact bytes without a row. Labels are local metadata: in memory in
+the demo, in the encrypted store otherwise, and never synced to a server. `search` is SQL over the
+encrypted FTS5 index; `search_status` is a read and `search_reindex` rebuilds the index offline.
 
 ## 3. The target shape
 
@@ -115,7 +116,7 @@ decision and the migration path.
 | Crate | Responsibility |
 |---|---|
 | `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
-| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 later |
+| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a) |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
 | `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. Autodiscovery and QRESYNC later |
 | `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler and full threading later |
@@ -136,8 +137,16 @@ operation registry. Nothing below the frontends depends on egui.
 account(id, email, display_name, provider)
 folder(id, account, name, kind, uidvalidity, uidnext, highest_modseq)
 message(id, account, folder, uid, message_id, thread_id, from, to, cc, bcc,
-        subject, date, size, flags, remote_images, blob_hash, auth_results)
+        subject, date, size, flags, remote_images, blob_hash, auth_results,
+        search_sender, search_to, search_cc, search_bcc, attachment_names,
+        subject_norm, in_reply_to, references_json, ingested_at, rules_applied_at)
 thread(id, account, subject_norm, last_date, unread, message_count)
+thread_alias(account, old_id, new_id)
+saved_search(id, account, name, query, sort)
+rule(id, account, name, enabled, priority, stop, query, actions_json)
+rule_run(id, account, started_at, finished_at, dry, counts)
+rule_action(run, ordinal, rule, message, action, value, changed)
+message_fts(subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names)
 attachment(id, message, filename, mime, size, blob_hash)
 draft(id, account, revision, updated_at, blob_hash, in_reply_to)
 draft_seq(message_id, revision)
@@ -148,11 +157,11 @@ contact(id, account, display_name, email, vcard)
 sync_state(account, folder, uidvalidity, last_uid, modseq)
 ```
 
-- P8 adds no migration on this store: the draft reply link is the shipped `drafts.in_reply_to`, the
+- P8 added no migration on this store: the draft reply link is the shipped `drafts.in_reply_to`, the
   account signature is the shipped `accounts.signature`, and a received `Reply-To` is cached under
-  `meta` key `reply_to:<message_id>` until P9 can widen the message schema. The target schema above
-  shows the eventual `signature` table for multiple identities and HTML signatures, which M2 does not
-  implement.
+  `meta` key `reply_to:<message_id>`. P9a's v7 now also stores the incoming `In-Reply-To` and
+  `References` chain for P9b; `Reply-To` still rides `meta`. The target schema above shows the eventual
+  `signature` table for multiple identities and HTML signatures, which M2 does not implement.
 
 - The **server is the source of truth**. The local database is a cache plus an operation log.
 - Attachment bytes are content-addressed blobs: BLAKE3 of the plaintext names the file, zstd
@@ -259,14 +268,15 @@ behave exactly as before; `open(store)` hydrates the mailbox and keeps the conne
 write-through. The store crate does not depend on core: `crates/core/src/store_map.rs` is the only
 translation between domain types and store rows.
 
-**Load once.** `Engine::open` issues one query per table: accounts, folders, messages (with labels
-in a second grouped query), attachments grouped by message and labels. There is no per-message read.
-Before hydrating, it repairs every `drafts` row that has no message row into a real message row in
-the Drafts folder of its account, in one transaction, using the body and recipients from the
-revision row. If an account, folder or date cannot be repaired, the open fails with an actionable
-error instead of serving a ghost draft. The label sequence is read from `meta.label_seq`, seeded
-from `max(meta, existing label ids)` and written back when an older store lacks it; the next label
-id is therefore never one that was already used.
+**Load once.** `Engine::open` issues one query per table: accounts, folders, summaries, blob hashes,
+labels and drafts. There is no per-message read. Since P9a the list rows are `MessageSummary` values:
+bodies, HTML and attachment rows are read only by `Engine::message(id)`, which owns the result and
+keeps a revision-keyed cache (§4.11). Before hydrating, it repairs every `drafts` row that has no
+message row into a real message row in the Drafts folder of its account, in one transaction, using the
+body and recipients from the revision row. If an account, folder or date cannot be repaired, the open
+fails with an actionable error instead of serving a ghost draft. The label sequence is read from
+`meta.label_seq`, seeded from `max(meta, existing label ids)` and written back when an older store lacks
+it; the next label id is therefore never one that was already used.
 
 **Write through.** Every mutating operation writes the repository first and only then updates
 memory; a failed write leaves memory untouched. `save_draft` is one `save_draft_message`
@@ -303,9 +313,9 @@ the daemon (M4). The repository returns folders and labels ordered by name; onbo
 server's folder tree in that order.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
-a store. **Still missing:** the onboarding UI (P6b) and its `sync_now` binding, FTS5 (P9), the
-daemon scheduler (M4) and full threading (M3). The default store path, the account/sync operations and their CLI/MCP bindings
-landed in P6a (§4.7).
+a store. **Still missing:** full threading and saved searches (P9b), local rules (P9c), the daemon
+scheduler (M4) and HTML rendering (M5). The default store path, the account/sync operations and their
+CLI/MCP bindings landed in P6a (§4.7); the body-free read path and search landed in P9a (§4.11).
 
 ### 4.3 Implemented in P4a: the MIME crate
 
@@ -583,7 +593,7 @@ cannot follow; the old row is removed only after the new copy exists, at the end
 
 **Threading.** `thread_id` is the first `References` entry, else `In-Reply-To`, else the message's own
 Message-ID (or the local id when it has none), all without angle brackets. That is a stable
-placeholder that links a reply to a root; full JWZ threading is P9.
+placeholder that links a reply to a root; full JWZ threading is P9b.
 
 **Flags.** Server flags are applied only when a message is first inserted: `\Seen` becomes
 `unread = false`, `\Flagged` becomes `starred = true`. On later runs the local `unread`/`starred` are
@@ -647,8 +657,8 @@ run or an explicit `recount_folder`.
 
 **Not synced.** Server-side filters and rules, flag changes pushed out, `EXPUNGE`, `APPEND` of drafts
 or sent mail, `CONDSTORE`/`QRESYNC` increments, a folder-removal pass (a folder deleted on the server
-keeps its cached rows until a later package decides), full JWZ threading, FTS5 and any periodic
-scheduler. P6a adds the operations and the CLI/MCP bindings; P6b adds the worker, so a run starts on
+keeps its cached rows until a later package decides), full JWZ threading (P9b) and any periodic
+scheduler. P9a adds the FTS trigger path to every synced message; P6a adds the operations and the CLI/MCP bindings; P6b adds the worker, so a run starts on
 launch, on Refresh, or from onboarding. There is still no daemon and no timer inside the process.
 
 **Evidence.** The scripted server moved to `postino-testkit`, and the sync tests script real protocol
@@ -1052,8 +1062,9 @@ part, an attachment or HTML.
 **Reply headers and Reply-To.** A reply stores the parent `Message-ID` in the existing
 `drafts.in_reply_to` column (normalised without brackets, ASCII, ≤ 900 bytes, no controls or
 whitespace); a save that omits the field keeps the stored link, exactly like the column's `COALESCE`.
-`submission_for_draft` emits `In-Reply-To: <parent>` and `References: <parent>` — the parent id alone
-until P9 persists the full incoming chain — and the P7 snapshot check now compares the hydrated link
+`submission_for_draft` emits `In-Reply-To: <parent>` and `References: <parent>` — a draft submission
+still emits the parent id alone; v7 stores the full incoming chain for P9b — and the P7 snapshot check
+now compares the hydrated link
 instead of refusing every linked draft. A different process that writes a link this engine never
 hydrated still makes the snapshot stale: refusing is the honest result, because those bytes would
 silently drop a header. Received `Reply-To` lists are cached in the existing `meta` table under
@@ -1063,6 +1074,113 @@ it, and `Engine::reply_target` returns it with the parent id. The reply prefill 
 and minus To for reply-all, never reads Bcc, prefixes the subject once, quotes in UTC and drops a
 second copy of the signature when the parent already carried it. Forward copies the parent attachment
 metadata and the engine copies each blob to a new row; a missing blob names the file and blocks Send.
+
+### 4.11 Implemented in P9a: the body-free read path and encrypted search
+
+Search is SQL on the encrypted database, and opening a mailbox no longer means loading every body.
+The two changes ship together because the in-memory search that FTS replaces was the reason
+`Engine::open` held bodies in the first place.
+
+**Read path.** A store-backed `Engine` holds `accounts`, `folders`, `labels` and a
+`Vec<MessageSummary>`; `Engine::open` issues one list-row query, one label query, one blob-hash query
+and one drafts query, and never selects `body_text`, `body_html` or an attachment row. `messages()`
+returns the summaries. `Engine::message(id)` is an owned read: it looks in an eight-entry cache keyed
+by the engine revision and otherwise calls `Store::get_message_with_attachments`. Every write and
+every reload bumps the revision, so a stale body cannot survive a flag, label, draft or sync change.
+Drafts are the one exception: their full messages are preloaded at open because the outbox snapshot
+check must compare the bytes this engine loaded, not a later read that hides another process's edit.
+`messages_list` uses `Store::list_messages` with folder, label, account, unread, starred and
+attachment filters, so the list is a bounded SQL page. `label_summaries` reads live counts from the
+store. ADR-0004 records the split. In memory, the demo engine keeps its full synthetic messages and
+answers through the same API.
+
+**Schema v7** is additive after v6, in one transaction:
+
+```sql
+ALTER TABLE messages ADD COLUMN search_sender TEXT NOT NULL DEFAULT '';
+-- …search_to, search_cc, search_bcc, attachment_names, subject_norm,
+--   in_reply_to, references_json, ingested_at, rules_applied_at
+CREATE INDEX messages_account_thread_date ON messages(account_id, thread_id, date DESC);
+CREATE INDEX messages_list_cover ON messages(date DESC, id, folder_id, thread_id, account_id,
+    from_name, from_email, to_json, subject, snippet, unread, starred, has_attachments);
+CREATE VIRTUAL TABLE message_fts USING fts5(
+    subject, search_sender, search_to, search_cc, search_bcc, body_text, attachment_names,
+    content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2', prefix='2 3');
+```
+
+The repository derives sender/recipient text, the attachment-name list and `subject_norm`; the
+triggers copy those values and at most 262 144 characters of `body_text` (≤ 1 MiB of UTF-8) into the
+index. `AFTER INSERT`, `AFTER DELETE` and `AFTER UPDATE OF` the indexed columns maintain the FTS row;
+flag, folder and date updates name no indexed column and do not reindex. The pre-flight probe
+(`crates/store/tests/fts_probe.rs`) proves the bundled SQLCipher 4.19 / SQLite 3.53.4 accepts
+`contentless_delete=1` and that delete+insert is the supported update form. FTS5 shadow tables live
+in the SQLCipher file; there is no sidecar and no content in the index, so snippets cannot leak HTML.
+`meta.search_index` holds `{state,last_rowid,indexed,total,updated_at,last_error}`. `Store::open`
+finishes a pending build in 500-row transactions (`ensure_search_index`); `search_reindex` deletes
+all and rebuilds; `search_status` reports readiness, counts, drift and the file size. Nothing runs
+`VACUUM`, because FTS keys on `messages.rowid`.
+
+`threads`, `thread_aliases`, `saved_searches`, `rules`, `rule_runs` and `rule_actions` are created empty
+and inert in v7 so P9b/P9c need no second migration. P9a does not read or write them.
+
+**Query language.** `postino-core::search` is a hand-written recursive-descent parser with one AST and
+one canonical printer:
+
+```
+query := or; or := and (OR and)*; and := unary (AND? unary)*; unary := NOT unary | primary
+primary := '(' query ')' | field ':' value | phrase | term
+field := from|to|cc|bcc|subject|label|folder|is|has|before|after|larger|smaller
+```
+
+Bare terms search every text column; `*` is a prefix; quoted values support `\"`; `AND`/`OR`/`NOT`
+are uppercase and juxtaposition is AND; `word:` is a field only for the documented names. Dates are
+`YYYY-MM-DD` UTC (`after` inclusive, `before` exclusive), sizes accept `k`/`m`/`g`. The caps are 1024
+bytes, 64 clauses, depth 8 and 16 terms. Every failure is `{code, position}`; the CLI and MCP render
+an English sentence and the UI an Italian one, without echoing the query. The printer fully quotes
+values and parenthesises composite nodes, so `parse(print(ast)) == ast`; a property matrix covers
+fields, phrases, prefixes, Unicode, escapes, lowercase `or`, `Re:` and `http://`.
+
+**Execution.** Core resolves `label:`/`folder:` names to ids and escapes every value as an FTS5
+phrase. The store receives a typed `SearchExpr`; SQL fragments are fixed and every value is bound, so
+no caller text reaches `MATCH` or a statement by interpolation. For a text query on one account, the
+store ranks inside FTS5 first, joins only a bounded candidate window to `messages`, applies the exact
+`bm25` order with `(date DESC, id ASC)` tie-break in Rust and returns the page; total is a separate
+FTS count, exact up to 10 000 and flagged with `total_capped`. A mixed query (text plus folder/label/
+flag/date/size) compiles to typed SQL predicates and per-leaf `MATCH` subqueries; a filter-only query
+never runs `MATCH`. Hits are capped at 200 and offset at 5 000. Snippets are built in Rust from the
+subject or the first 64 KiB of `body_text`, normalised to one line and at most 240 characters; the
+store never reads `body_html` for search. `Store::interrupt_handle` is exposed so the shell can cancel
+a superseded statement. The desktop app debounces 250 ms, commits on Enter, clears on Esc and caches
+results by `(signature, revision)`; it shows the parsed clauses as chips, the Italian parse position,
+plain snippets and a scope-aware empty state.
+
+**Performance.** Fixture: 100 000 messages, 2 KiB plain bodies, 20% attachment names, one account;
+20 000 in CI and 100 000 behind `POSTINO_SLOW_TESTS=1`. On the Windows GNU host (debug, opt-level 1,
+SQLCipher 4.19 / SQLite 3.53.4), five runs after the index was built:
+
+| Measure | 20k | 100k | P9a target |
+|---|---|---|---|
+| First relevance page (P50) | 20.3 ms | 30.6 ms | < 100 ms |
+| First relevance page (P95) | 21.3 ms | 35.1 ms | < 100 ms |
+| `open` including summaries | 158 ms | 293 ms | < 150 ms |
+| `sort:"date"` first page | 51 ms | 282 ms | not gated, reported |
+| Seed + FTS build | 2.9 s | 16.6 s | backfill reported |
+| Full `search_reindex` | 2.4 s | 17.7 s | backfill reported |
+| Peak working set in the seeding test process | — | 156.5 MiB | < 120 MiB |
+
+Release `--release` measurements on the same host: open 262 ms, search P50 30.6 ms / P95 33.3 ms,
+reindex 17.3 s, peak 156.5 MiB. The debug build is the CI profile; release does not change the
+conclusion.
+
+The search target is met. **The open and RSS targets are missed and reported, not hidden:** a covering
+summary index keeps body pages out of the open scan (that alone took open from 1.4 s to 293 ms debug /
+262 ms release), but 100 000 summary rows still cost ~170–184 ms to decrypt and decode plus the engine's
+Vec, index and counts. The seeding test process's peak also includes the allocator high-water mark of
+100 000-message seed. A separate body table (or a compact summary table) is the next step if the open
+target must be met; P9a does not silently claim it. `sort:"date"` is slower than relevance because it
+must join every match to read the date; the default path is the fast one.
+
+
 
 ## 5. Synchronization
 
@@ -1169,3 +1287,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | major | P5b: `postino-testkit` moves the scripted server and TLS CA out of the net tests; `postino-sync` reconciles folders, UIDVALIDITY, incremental UID windows, MIME bodies, attachment blobs, deletions, flags and a persistent status with cancellation. No operation, CLI or UI calls it yet. |
 | 2026-10-26 | major | P7: SMTP submission over implicit TLS/STARTTLS, schema v5 outbox journal, exact-bytes-before-network queue, lease/backoff/auth-halt state machine, uncertain-after-DATA policy, independent Sent APPEND with `\Seen`, `message_send`/`send_schedule`/outbox operations, CLI send/outbox, MCP `--allow-send`, desktop worker and outbox dialog |
 | 2026-10-26 | minor | P6d: schema v6 `messages.remote_images`, `ParsedMessage::remote_images_blocked` carried through sync and the store, `message_get` field and the Italian reading-pane line from stored truth; no HTML rendering and no remote fetch |
+| 2026-10-26 | major | P9a: body-free store read path (summaries + owned cached `message`), schema v7 search columns and contentless-delete FTS5, recursive-descent query language with canonical printer, typed bound execution with bm25 ranking, `search`/`search_status`/`search_reindex`, CLI/MCP/UI parity, 100k evidence |

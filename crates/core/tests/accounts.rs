@@ -248,12 +248,18 @@ fn sync_now_caches_three_folders_refreshes_memory_and_fetches_only_new_mail() {
     assert_eq!(status.folders_total, 3);
     assert!(status.last_success.is_some());
 
-    let attachment = engine.messages().iter().find_map(|message| message.attachments.first()).expect("attachment");
+    let attachment = engine
+        .messages()
+        .iter()
+        .filter(|message| message.has_attachments)
+        .find_map(|summary| engine.message(&summary.id))
+        .and_then(|message| message.attachments.first().cloned())
+        .expect("attachment");
     assert_eq!(engine.attachment_bytes(&attachment.id).expect("stored bytes").as_slice(), ATTACHMENT_BYTES);
 
     // A local label must survive the next run's memory refresh.
     let label = engine.create_label("Cliente", LabelColor::Gold).expect("label");
-    let labelled = engine.messages().first().expect("a message").summary.id.clone();
+    let labelled = engine.messages().first().expect("a message").id.clone();
     engine.set_label(&label.id, std::slice::from_ref(&labelled), true).expect("label applied");
 
     {

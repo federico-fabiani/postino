@@ -79,6 +79,29 @@ pub(crate) fn thread_id(references: &[String], in_reply_to: Option<&str>, fallba
     fallback.to_owned()
 }
 
+/// The bounded, normalised threading headers stored beside a message.
+///
+/// The first `References` entries are kept (at most 32, each at most 512 bytes after normalisation,
+/// duplicates removed) so P9b can resolve a thread without re-reading the MIME source. `In-Reply-To`
+/// is the normalised parent id. A header that cannot be normalised is dropped rather than stored as
+/// a half-valid identity.
+#[must_use]
+pub(crate) fn thread_headers(references: &[String], in_reply_to: Option<&str>) -> (Option<String>, Vec<String>) {
+    let parent = in_reply_to.and_then(normalise_message_id);
+    let mut chain = Vec::new();
+    for reference in references {
+        if chain.len() >= 32 {
+            break;
+        }
+        let Some(reference) = normalise_message_id(reference) else { continue };
+        if reference.len() > 512 || chain.contains(&reference) {
+            continue;
+        }
+        chain.push(reference);
+    }
+    (parent, chain)
+}
+
 /// Reduce one header value to the exact trimmed Message-ID, or `None` when it is unusable.
 ///
 /// One pair of angle brackets is removed and the surrounding whitespace is trimmed; nothing else is

@@ -317,12 +317,24 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
         #[arg(long)]
         folder: Option<String>,
-        /// Only messages carrying this label id.
+        /// Only messages carrying this label id or name.
         #[arg(long)]
         label: Option<String>,
+        /// Restrict to one account when the mailbox has several.
+        #[arg(long)]
+        account: Option<String>,
+        /// relevance (default) or date.
+        #[arg(long)]
+        sort: Option<String>,
     },
+    /// Report whether the local full-text index is ready.
+    SearchStatus,
+    /// Rebuild the local full-text index.
+    SearchReindex,
     /// Change read/starred flags.
     Flag {
         id: String,
@@ -523,14 +535,14 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Info | Command::Tools | Command::Schema { .. } | Command::Accounts => true,
         Command::Account { command } => matches!(command, AccountCommand::List | AccountCommand::Test { .. }),
         Command::Sync { command } => matches!(command, SyncCommand::Status { .. }),
-        Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } => true,
+        Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } | Command::SearchStatus => true,
         Command::Read { mark_read, .. } => !mark_read,
         Command::Label { command } => matches!(command, LabelCommand::List),
         Command::Outbox { command } => matches!(command, OutboxCommand::List { .. }),
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
         // operation is refused before dispatch and must not create one either.
         Command::Run { op, .. } => postino_core::op_defs().iter().find(|def| def.name == op).is_none_or(|def| def.read_only || def.sensitive),
-        Command::Flag { .. } | Command::Draft { .. } | Command::Send { .. } | Command::Mcp { .. } => false,
+        Command::Flag { .. } | Command::Draft { .. } | Command::Send { .. } | Command::Mcp { .. } | Command::SearchReindex => false,
     }
 }
 
@@ -835,16 +847,52 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 }
             }
         }
-        Command::Search { query, limit, folder, label } => {
-            let result: SearchResult = decode(call(engine, "search", json!({ "query": query, "limit": limit, "folder": folder, "label": label }))?)?;
+        Command::Search { query, limit, offset, folder, label, account, sort } => {
+            if let Some(sort) = &sort
+                && !matches!(sort.as_str(), "relevance" | "date")
+            {
+                bail!("--sort accepts relevance or date");
+            }
+            let result: SearchResult = decode(call(
+                engine,
+                "search",
+                json!({ "query": query, "limit": limit, "offset": offset, "folder": folder, "label": label, "account": account, "sort": sort }),
+            )?)?;
             if json_output {
                 print_json(&result)?;
             } else {
-                let mut text = format!("{} risultati per {:?}\n\n", result.total, result.query);
-                for message in &result.messages {
-                    text.push_str(&format_summary(message));
+                let mut text = format!("{} risultati per {:?} in {} ms\n\n", result.total, result.query, result.took_ms);
+                if result.total_capped {
+                    text.push_str("Il totale è limitato ai primi 10.000 risultati.\n\n");
+                }
+                for hit in &result.hits {
+                    text.push_str(&format_summary(&hit.message));
+                    if !hit.snippet.is_empty() {
+                        text.push_str(&format!("    {}\n", hit.snippet));
+                    }
                 }
                 say(text)?;
+            }
+        }
+        Command::SearchStatus => {
+            let status: postino_core::SearchStatusResult = decode(call(engine, "search_status", json!({}))?)?;
+            if json_output {
+                print_json(&status)?;
+            } else {
+                let state = if status.ready { "pronto".to_owned() } else { status.state.clone() };
+                let error = status.last_error.as_deref().map_or(String::new(), |error| format!("\n{error}"));
+                say(format!(
+                    "indice: {state}\ndocumenti: {}\nmessaggi: {}\ndimensione: {} byte\naggiornato: {}{error}",
+                    status.indexed, status.total, status.size_bytes, status.updated_at
+                ))?;
+            }
+        }
+        Command::SearchReindex => {
+            let result: postino_core::SearchReindexResult = decode(call(engine, "search_reindex", json!({}))?)?;
+            if json_output {
+                print_json(&result)?;
+            } else {
+                say(format!("indice ricostruito: {} documenti in {} ms", result.documents, result.took_ms))?;
             }
         }
         Command::Flag { id, unread, read, starred, unstar } => {
@@ -1730,8 +1778,8 @@ mod tests {
     #[test]
     fn the_cli_read_names_the_stored_blocked_remote_count_only_when_positive() {
         let engine = Engine::demo();
-        let id = engine.messages().first().map(|message| message.summary.id.clone()).expect("a demo message");
-        let mut message = engine.message(&id).cloned().expect("the demo message");
+        let id = engine.messages().first().map(|message| message.id.clone()).expect("a demo message");
+        let mut message = engine.message(&id).expect("the demo message");
         message.remote_images = 2;
         let text = format_message(&message);
         assert!(text.contains("Immagini remote bloccate: 2"), "{text}");
@@ -1783,7 +1831,7 @@ mod tests {
             &mut engine,
         )
         .expect("create a draft from the CLI");
-        let id = engine.messages().iter().find(|message| message.summary.subject == "Progetto").expect("draft").summary.id.clone();
+        let id = engine.messages().iter().find(|message| message.subject == "Progetto").expect("draft").id.clone();
 
         run(
             cli(Command::Draft {
@@ -1870,7 +1918,7 @@ mod tests {
             &mut engine,
         )
         .expect("draft save");
-        let draft = engine.messages().iter().find(|message| message.summary.subject == "Allegato").expect("draft").summary.id.clone();
+        let draft = engine.messages().iter().find(|message| message.subject == "Allegato").expect("draft").id.clone();
         let path = fixture.path().parent().expect("temp dir").join("relazione.pdf");
         std::fs::write(&path, b"%PDF-1.7 byte esatti").expect("fixture file");
 
@@ -2034,19 +2082,51 @@ mod tests {
     }
 
     #[test]
+    fn cli_search_status_and_reindex_are_offline_store_commands() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        run(cli(Command::SearchStatus), &mut engine).expect("search-status");
+        run(cli(Command::SearchReindex), &mut engine).expect("search-reindex");
+        let status: postino_core::SearchStatusResult = decode(call(&mut engine, "search_status", json!({})).expect("status")).expect("status JSON");
+        assert!(status.ready);
+    }
+
+    #[test]
     fn cli_search_label_flag_reaches_the_operation() {
         let mut engine = Engine::demo();
-        run(cli(Command::Search { query: "preventivo".to_owned(), limit: 50, folder: None, label: Some("lbl_1".to_owned()) }), &mut engine)
-            .expect("search --label");
+        run(
+            cli(Command::Search {
+                query: "preventivo".to_owned(),
+                limit: 50,
+                offset: 0,
+                folder: None,
+                label: Some("lbl_1".to_owned()),
+                account: None,
+                sort: None,
+            }),
+            &mut engine,
+        )
+        .expect("search --label");
         let result: SearchResult =
             decode(call(&mut engine, "search", json!({ "query": "preventivo", "limit": 50, "folder": null, "label": "lbl_1" })).expect("search"))
                 .expect("search result");
         assert!(result.total >= 1);
         assert!(result.messages.iter().all(|message| message.labels.contains(&"lbl_1".to_owned())));
 
-        let error =
-            run(cli(Command::Search { query: "preventivo".to_owned(), limit: 50, folder: None, label: Some("lbl_missing".to_owned()) }), &mut engine)
-                .expect_err("unknown label");
+        let error = run(
+            cli(Command::Search {
+                query: "preventivo".to_owned(),
+                limit: 50,
+                offset: 0,
+                folder: None,
+                label: Some("lbl_missing".to_owned()),
+                account: None,
+                sort: None,
+            }),
+            &mut engine,
+        )
+        .expect_err("unknown label");
         assert!(error.to_string().contains("unknown label"));
     }
 
@@ -2218,7 +2298,7 @@ mod tests {
                 &mut engine,
             )
             .expect("create a draft in the store");
-            let id = engine.messages().iter().find(|message| message.summary.subject == "Bozza patch").expect("draft").summary.id.clone();
+            let id = engine.messages().iter().find(|message| message.subject == "Bozza patch").expect("draft").id.clone();
 
             run(
                 cli(Command::Draft {

@@ -258,7 +258,13 @@ mod tests {
         let response = request(&mut engine, "tools/list");
         let tools = response["result"]["tools"].as_array().expect("tools");
         assert!(tools.iter().any(|tool| tool["name"] == "messages_list"));
+        for name in ["search", "search_status", "search_reindex"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap_or_else(|| panic!("{name} is missing"));
+            assert!(tool["inputSchema"].is_object());
+            assert!(tool["description"].as_str().is_some_and(|description| !description.is_empty()));
+        }
         assert!(tools.iter().all(|tool| tool["inputSchema"].is_object()));
+        assert!(tools.iter().all(|tool| tool["name"] != "account_add" && tool["name"] != "account_remove"), "sensitive tools are never listed");
     }
 
     #[test]

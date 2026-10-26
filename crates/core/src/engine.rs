@@ -7,7 +7,8 @@
 //! leaves memory untouched: caller mistakes are [`OpError::InvalidArgs`] and storage failures are
 //! [`OpError::Failed`], and each engine mutation is one store transaction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -208,7 +209,22 @@ pub struct AccountUpdateRequest {
 pub struct Engine {
     accounts: Vec<Account>,
     folders: Vec<Folder>,
-    messages: Vec<Message>,
+    /// List rows only. A store-backed engine does not hold a body, an HTML part or an attachment
+    /// tree at open; [`Engine::message`] reads one message on demand and keeps a small cache.
+    messages: Vec<MessageSummary>,
+    /// Id → position in `messages`. Rebuilt after a structural change, so a one-message lookup is
+    /// O(1) even with 100k rows and the list stays a contiguous slice for the UI.
+    message_index: HashMap<String, usize>,
+    /// The full synthetic messages of the demo engine. Empty for a store-backed engine.
+    demo_messages: HashMap<String, Message>,
+    /// True when this engine has no store at all. Unlike `store.is_none()`, this stays true/false
+    /// when an outbox pass temporarily takes the connection out of the engine.
+    in_memory: bool,
+    /// A bounded cache of full messages read from the store, keyed by id and engine revision. Any
+    /// write bumps the revision, so a stale body can never be served after a flag, label or draft
+    /// change.
+    body_cache: RefCell<VecDeque<(u64, Message)>>,
+    revision: u64,
     labels: Vec<Label>,
     next_label_seq: u32,
     demo: bool,
@@ -256,6 +272,11 @@ impl Engine {
             accounts: Vec::new(),
             folders: Vec::new(),
             messages: Vec::new(),
+            message_index: HashMap::new(),
+            demo_messages: HashMap::new(),
+            in_memory: true,
+            body_cache: RefCell::new(VecDeque::new()),
+            revision: 0,
             labels: Vec::new(),
             next_label_seq: 1,
             demo: false,
@@ -374,22 +395,10 @@ impl Engine {
         let accounts = store.list_accounts().map_err(store_map::read_error)?.into_iter().map(store_map::account).collect::<Vec<_>>();
         let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
         repair_orphan_drafts(&store, &accounts, &folders)?;
-        let mut attachment_rows = store.list_all_attachments().map_err(store_map::read_error)?;
-        let mut blob_hashes = HashMap::new();
-        let messages = store
-            .list_all_messages()
-            .map_err(store_map::read_error)?
-            .into_iter()
-            .map(|row| {
-                let rows = attachment_rows.remove(&row.summary.id).unwrap_or_default();
-                for attachment in &rows {
-                    if let Some(hash) = &attachment.blob_hash {
-                        blob_hashes.insert(attachment.id.clone(), hash.clone());
-                    }
-                }
-                store_map::message(row, rows)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // One list-row query and one attachment-hash query. Bodies, HTML parts and attachment rows
+        // wait for a message open; a 100k mailbox must fit in a summary vector.
+        let messages = store.list_all_summaries().map_err(store_map::read_error)?.into_iter().map(store_map::summary).collect::<Vec<_>>();
+        let blob_hashes = store.list_blob_hashes().map_err(store_map::read_error)?;
         let labels = store.list_labels(None).map_err(store_map::read_error)?.into_iter().map(store_map::label).collect::<Result<Vec<_>, _>>()?;
         let label_seq = repair_label_seq(&store, &labels)?;
         let reply_links = store
@@ -399,11 +408,12 @@ impl Engine {
             .filter_map(|draft| draft.in_reply_to.map(|parent| (draft.id, parent)))
             .collect::<HashMap<_, _>>();
 
-        let mut engine = Self::from_parts(accounts, folders, messages, labels, false, Some(store));
+        let mut engine = Self::from_summaries(accounts, folders, messages, labels, false, Some(store));
         engine.vault = vault;
         engine.next_label_seq = label_seq.saturating_add(1);
         engine.blob_hashes = blob_hashes;
         engine.reply_links = reply_links;
+        engine.preload_drafts();
         Ok(engine)
     }
 
@@ -415,11 +425,33 @@ impl Engine {
         demo: bool,
         store: Option<Store>,
     ) -> Self {
+        let summaries = messages.iter().map(|message| message.summary.clone()).collect::<Vec<_>>();
+        let in_memory = store.is_none();
+        let mut engine = Self::from_summaries(accounts, folders, summaries, labels, demo, store);
+        if in_memory {
+            engine.demo_messages = messages.into_iter().map(|message| (message.summary.id.clone(), message)).collect();
+        }
+        engine
+    }
+
+    fn from_summaries(
+        accounts: Vec<Account>,
+        folders: Vec<Folder>,
+        messages: Vec<MessageSummary>,
+        labels: Vec<Label>,
+        demo: bool,
+        store: Option<Store>,
+    ) -> Self {
         let next_label_seq = labels.iter().filter_map(label_number).max().unwrap_or(0).saturating_add(1);
         let mut engine = Self {
             accounts,
             folders,
             messages,
+            message_index: HashMap::new(),
+            demo_messages: HashMap::new(),
+            in_memory: store.is_none(),
+            body_cache: RefCell::new(VecDeque::new()),
+            revision: 0,
             labels,
             next_label_seq,
             demo,
@@ -435,6 +467,7 @@ impl Engine {
             blob_hashes: HashMap::new(),
             reply_links: HashMap::new(),
         };
+        engine.rebuild_message_index();
         engine.recount();
         engine
     }
@@ -458,12 +491,76 @@ impl Engine {
         &self.folders
     }
 
-    pub fn messages(&self) -> &[Message] {
+    pub fn messages(&self) -> &[MessageSummary] {
         &self.messages
     }
 
-    pub fn message(&self, id: &str) -> Option<&Message> {
-        self.messages.iter().find(|message| message.summary.id == id)
+    /// The list row for one message, if it exists. O(1), no body.
+    pub fn summary(&self, id: &str) -> Option<&MessageSummary> {
+        self.message_index.get(id).and_then(|index| self.messages.get(*index))
+    }
+
+    /// One full message, owned. A store-backed engine reads it from SQL and keeps a small cache; the
+    /// demo engine returns its synthetic copy. A storage error reads as `None` here; operations use
+    /// [`Engine::message_result`] to report the cause.
+    pub fn message(&self, id: &str) -> Option<Message> {
+        self.message_result(id).ok().flatten()
+    }
+
+    /// The monotic revision of the in-memory view. The desktop app keys its search/list cache on
+    /// `(signature, revision)` and every write or reload bumps it.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn message_result(&self, id: &str) -> Result<Option<Message>, OpError> {
+        if let Some(message) = self.demo_messages.get(id) {
+            return Ok(Some(message.clone()));
+        }
+        {
+            let cache = self.body_cache.borrow();
+            if let Some((_, cached)) = cache.iter().rev().find(|(revision, message)| *revision == self.revision && message.summary.id == id) {
+                return Ok(Some(cached.clone()));
+            }
+        }
+        let Some(store) = &self.store else { return Ok(None) };
+        let Some((row, attachments)) = store.get_message_with_attachments(id).map_err(store_map::read_error)? else { return Ok(None) };
+        let message = store_map::message(row, attachments)?;
+        self.cache_message(&message);
+        Ok(Some(message))
+    }
+
+    /// Read the few full draft messages into the cache after an open or reload. A draft's snapshot is
+    /// the unit the outbox compares before sending, so a stale engine must keep its loaded copy:
+    /// re-reading it at send time would hide an edit made by another process.
+    fn preload_drafts(&self) {
+        for summary in &self.messages {
+            let drafts = self.folders.iter().any(|folder| folder.id == summary.folder_id && folder.kind == FolderKind::Drafts);
+            if drafts {
+                let _ = self.message_result(&summary.id);
+            }
+        }
+    }
+
+    fn cache_message(&self, message: &Message) {
+        let mut cache = self.body_cache.borrow_mut();
+        if cache.front().is_none_or(|(revision, _)| *revision != self.revision) {
+            cache.clear();
+        }
+        cache.retain(|(_, cached)| cached.summary.id != message.summary.id);
+        cache.push_back((self.revision, message.clone()));
+        while cache.len() > 8 {
+            cache.pop_front();
+        }
+    }
+
+    fn rebuild_message_index(&mut self) {
+        self.message_index = self.messages.iter().enumerate().map(|(index, message)| (message.id.clone(), index)).collect();
+    }
+
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.body_cache.borrow_mut().clear();
     }
 
     pub fn labels(&self) -> &[Label] {
@@ -482,15 +579,34 @@ impl Engine {
         self.labels.iter().find(|label| label.id == id)
     }
 
-    /// Labels with mailbox-wide counts, computed in one pass over the messages so the work does
-    /// not grow with labels × messages.
+    /// Labels with mailbox-wide counts. A store-backed engine reads the live counts from the store;
+    /// the demo computes them in one pass over its summaries.
     pub fn label_summaries(&self) -> Vec<LabelSummary> {
+        if let Some(store) = &self.store
+            && let Ok(rows) = store.list_labels(None)
+        {
+            let mut summaries = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let color = LabelColor::parse(&row.label.color)?;
+                    Some(LabelSummary {
+                        id: row.label.id,
+                        name: row.label.name,
+                        color,
+                        message_count: row.message_count,
+                        unread_count: row.unread_count,
+                    })
+                })
+                .collect::<Vec<_>>();
+            summaries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()).then(left.id.cmp(&right.id)));
+            return summaries;
+        }
         let mut counts: HashMap<&str, (u32, u32)> = HashMap::new();
         for message in &self.messages {
-            for id in &message.summary.labels {
+            for id in &message.labels {
                 let entry = counts.entry(id.as_str()).or_insert((0, 0));
                 entry.0 = entry.0.saturating_add(1);
-                if message.summary.unread {
+                if message.unread {
                     entry.1 = entry.1.saturating_add(1);
                 }
             }
@@ -505,14 +621,25 @@ impl Engine {
     }
 
     pub fn label_summary(&self, id: &str) -> Option<LabelSummary> {
+        if let Some(store) = &self.store
+            && let Ok(rows) = store.list_labels(None)
+            && let Some(row) = rows.into_iter().find(|row| row.label.id == id)
+        {
+            let color = LabelColor::parse(&row.label.color).or_else(|| self.label(id).map(|label| label.color))?;
+            return Some(LabelSummary {
+                id: row.label.id,
+                name: row.label.name,
+                color,
+                message_count: row.message_count,
+                unread_count: row.unread_count,
+            });
+        }
         let label = self.label(id)?;
         let (message_count, unread_count) = self
             .messages
             .iter()
-            .filter(|message| message.summary.labels.iter().any(|candidate| candidate == id))
-            .fold((0u32, 0u32), |(total, unread), message| {
-                (total.saturating_add(1), unread.saturating_add(if message.summary.unread { 1 } else { 0 }))
-            });
+            .filter(|message| message.labels.iter().any(|candidate| candidate == id))
+            .fold((0u32, 0u32), |(total, unread), message| (total.saturating_add(1), unread.saturating_add(if message.unread { 1 } else { 0 })));
         Some(LabelSummary { id: label.id.clone(), name: label.name.clone(), color: label.color, message_count, unread_count })
     }
 
@@ -945,9 +1072,12 @@ impl Engine {
             self.folders.iter().filter(|folder| folder.account_id == account.id).map(|folder| folder.id.clone()).collect::<BTreeSet<_>>();
         self.accounts.retain(|candidate| candidate.id != account.id);
         self.folders.retain(|folder| folder.account_id != account.id);
-        self.messages.retain(|message| !folder_ids.contains(&message.summary.folder_id));
-        let live = self.messages.iter().map(|message| message.summary.id.clone()).collect::<BTreeSet<_>>();
+        self.messages.retain(|message| !folder_ids.contains(&message.folder_id));
+        self.rebuild_message_index();
+        let live = self.messages.iter().map(|message| message.id.clone()).collect::<BTreeSet<_>>();
+        self.demo_messages.retain(|id, _| live.contains(id));
         self.reply_links.retain(|draft_id, _| live.contains(draft_id));
+        self.bump_revision();
         self.recount();
         match (imap_credential, smtp_credential) {
             (Ok(()), Ok(())) => Ok(view),
@@ -1072,6 +1202,17 @@ impl Engine {
         }
     }
 
+    /// The store connection when this engine has one. Read paths that also work on the demo use it
+    /// to choose SQL over the in-memory fallback.
+    pub(crate) fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+
+    /// The store, or the same readable demo/empty explanation the write operations use.
+    pub(crate) fn require_store_for_read(&self, operation: &str) -> Result<&Store, OpError> {
+        self.require_store(operation)
+    }
+
     fn require_vault(&self, operation: &str) -> Result<&dyn CredentialVault, OpError> {
         match &self.vault {
             Some(vault) => Ok(vault.as_ref()),
@@ -1089,22 +1230,8 @@ impl Engine {
             return Ok(());
         };
         let folders = store.list_folders(None).map_err(store_map::read_error)?.into_iter().map(store_map::folder).collect::<Vec<_>>();
-        let mut attachment_rows = store.list_all_attachments().map_err(store_map::read_error)?;
-        let mut blob_hashes = HashMap::new();
-        let messages = store
-            .list_all_messages()
-            .map_err(store_map::read_error)?
-            .into_iter()
-            .map(|row| {
-                let rows = attachment_rows.remove(&row.summary.id).unwrap_or_default();
-                for attachment in &rows {
-                    if let Some(hash) = &attachment.blob_hash {
-                        blob_hashes.insert(attachment.id.clone(), hash.clone());
-                    }
-                }
-                store_map::message(row, rows)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let messages = store.list_all_summaries().map_err(store_map::read_error)?.into_iter().map(store_map::summary).collect::<Vec<_>>();
+        let blob_hashes = store.list_blob_hashes().map_err(store_map::read_error)?;
         let reply_links = store
             .list_drafts(None)
             .map_err(store_map::read_error)?
@@ -1113,9 +1240,12 @@ impl Engine {
             .collect::<HashMap<_, _>>();
         self.folders = folders;
         self.messages = messages;
+        self.rebuild_message_index();
         self.blob_hashes = blob_hashes;
         self.reply_links = reply_links;
+        self.bump_revision();
         self.recount();
+        self.preload_drafts();
         Ok(())
     }
 
@@ -1133,6 +1263,7 @@ impl Engine {
         // Only now is the id spent: a failed write must not leave a hole in the sequence.
         self.next_label_seq = self.next_label_seq.saturating_add(1);
         self.labels.push(Label { id: id.clone(), name, color });
+        self.bump_revision();
         self.label_summary(&id).ok_or_else(|| OpError::Failed(format!("could not read back the new label {id:?}")))
     }
 
@@ -1161,6 +1292,7 @@ impl Engine {
         let label = self.labels.get_mut(index).ok_or_else(|| OpError::Failed(format!("unknown label {id:?}")))?;
         label.name = resolved_name;
         label.color = resolved_color;
+        self.bump_revision();
         self.label_summary(id).ok_or_else(|| OpError::Failed(format!("unknown label {id:?}")))
     }
 
@@ -1174,12 +1306,16 @@ impl Engine {
         let label = self.labels.remove(index);
         let mut affected = 0usize;
         for message in &mut self.messages {
-            let before = message.summary.labels.len();
-            message.summary.labels.retain(|candidate| candidate != id);
-            if message.summary.labels.len() != before {
+            let before = message.labels.len();
+            message.labels.retain(|candidate| candidate != id);
+            if message.labels.len() != before {
                 affected = affected.saturating_add(1);
             }
         }
+        for message in self.demo_messages.values_mut() {
+            message.summary.labels.retain(|candidate| candidate != id);
+        }
+        self.bump_revision();
         Ok((label, affected))
     }
 
@@ -1197,7 +1333,7 @@ impl Engine {
         }
         let ids = message_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
         for message_id in &ids {
-            if !self.messages.iter().any(|message| message.summary.id == **message_id) {
+            if !self.messages.iter().any(|message| message.id == **message_id) {
                 return Err(unknown_message(message_id));
             }
         }
@@ -1208,18 +1344,30 @@ impl Engine {
         }
         let mut changed = 0usize;
         for message in &mut self.messages {
+            if !ids.contains(message.id.as_str()) {
+                continue;
+            }
+            let has = message.labels.iter().any(|candidate| candidate == id);
+            if apply && !has {
+                message.labels.push(id.to_owned());
+                changed = changed.saturating_add(1);
+            } else if !apply && has {
+                message.labels.retain(|candidate| candidate != id);
+                changed = changed.saturating_add(1);
+            }
+        }
+        for message in self.demo_messages.values_mut() {
             if !ids.contains(message.summary.id.as_str()) {
                 continue;
             }
             let has = message.summary.labels.iter().any(|candidate| candidate == id);
             if apply && !has {
                 message.summary.labels.push(id.to_owned());
-                changed = changed.saturating_add(1);
             } else if !apply && has {
                 message.summary.labels.retain(|candidate| candidate != id);
-                changed = changed.saturating_add(1);
             }
         }
+        self.bump_revision();
         let summary = self.label_summary(id).ok_or_else(|| OpError::Failed(format!("unknown label {id:?}")))?;
         Ok((summary, changed))
     }
@@ -1247,22 +1395,31 @@ impl Engine {
         if unread.is_none() && starred.is_none() {
             return Err(OpError::InvalidArgs("provide unread and/or starred".to_owned()));
         }
-        if !self.messages.iter().any(|message| message.summary.id == id) {
+        if !self.messages.iter().any(|message| message.id == id) {
             return Err(unknown_message(id));
         }
         if let Some(store) = &self.store {
             store.set_flags(&[id.to_owned()], FlagUpdate { unread, starred }).map_err(store_map::write_error)?;
         }
-        let Some(message) = self.messages.iter_mut().find(|message| message.summary.id == id) else {
+        let Some(message) = self.messages.iter_mut().find(|message| message.id == id) else {
             return Err(OpError::Failed(format!("unknown message {id:?}")));
         };
         if let Some(unread) = unread {
-            message.summary.unread = unread;
+            message.unread = unread;
         }
         if let Some(starred) = starred {
-            message.summary.starred = starred;
+            message.starred = starred;
         }
-        let summary = message.summary.clone();
+        if let Some(full) = self.demo_messages.get_mut(id) {
+            if let Some(unread) = unread {
+                full.summary.unread = unread;
+            }
+            if let Some(starred) = starred {
+                full.summary.starred = starred;
+            }
+        }
+        let summary = message.clone();
+        self.bump_revision();
         self.recount();
         Ok(summary)
     }
@@ -1279,8 +1436,8 @@ impl Engine {
             return Err(OpError::InvalidArgs(format!("folder {folder_id:?} is virtual and cannot receive messages")));
         }
         let target_id = target.id.clone();
-        let current = self.messages.iter().find(|message| message.summary.id == id).ok_or_else(|| unknown_message(id))?;
-        let current_kind = self.folders.iter().find(|folder| folder.id == current.summary.folder_id).map(|folder| folder.kind);
+        let current = self.messages.iter().find(|message| message.id == id).ok_or_else(|| unknown_message(id))?;
+        let current_kind = self.folders.iter().find(|folder| folder.id == current.folder_id).map(|folder| folder.kind);
         if let Some(store) = &self.store {
             // The store, not this engine's snapshot, says where the message is. A stale view must not
             // move a row another process already sent, and a vanished row is not a movable message.
@@ -1288,7 +1445,7 @@ impl Engine {
                 .get_message(id)
                 .map_err(store_map::read_error)?
                 .ok_or_else(|| OpError::InvalidArgs(format!("message {id:?} no longer exists; refresh the mailbox")))?;
-            if row.summary.folder_id != current.summary.folder_id {
+            if row.summary.folder_id != current.folder_id {
                 return Err(OpError::InvalidArgs(format!("message {id:?} changed in another session; refresh the mailbox before moving it")));
             }
         }
@@ -1298,11 +1455,15 @@ impl Engine {
         if let Some(store) = &self.store {
             store.move_messages(&[id.to_owned()], &target_id).map_err(store_map::write_error)?;
         }
-        let Some(message) = self.messages.iter_mut().find(|message| message.summary.id == id) else {
+        let Some(message) = self.messages.iter_mut().find(|message| message.id == id) else {
             return Err(OpError::Failed(format!("unknown message {id:?}")));
         };
-        message.summary.folder_id = target_id;
-        let summary = message.summary.clone();
+        message.folder_id = target_id.clone();
+        if let Some(full) = self.demo_messages.get_mut(id) {
+            full.summary.folder_id = target_id;
+        }
+        let summary = message.clone();
+        self.bump_revision();
         self.recount();
         Ok(summary)
     }
@@ -1334,9 +1495,9 @@ impl Engine {
                 let index = self
                     .messages
                     .iter()
-                    .position(|message| message.summary.id == id)
+                    .position(|message| message.id == id)
                     .ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}; omit id to create a draft")))?;
-                let kind = self.folders.iter().find(|folder| folder.id == self.messages[index].summary.folder_id).map(|folder| folder.kind);
+                let kind = self.folders.iter().find(|folder| folder.id == self.messages[index].folder_id).map(|folder| folder.kind);
                 if kind != Some(FolderKind::Drafts) {
                     return Err(OpError::InvalidArgs(format!("message {id:?} is not a draft")));
                 }
@@ -1351,7 +1512,7 @@ impl Engine {
                         .get_message(id)
                         .map_err(store_map::read_error)?
                         .ok_or_else(|| OpError::InvalidArgs(format!("draft {id:?} no longer exists; refresh the mailbox")))?;
-                    if row.summary.folder_id != self.messages[index].summary.folder_id {
+                    if row.summary.folder_id != self.messages[index].folder_id {
                         return Err(OpError::InvalidArgs(format!(
                             "message {id:?} changed in another session (it is no longer in this folder); refresh the mailbox before editing it"
                         )));
@@ -1361,7 +1522,15 @@ impl Engine {
             }
             None => None,
         };
-        let current_folder = index.and_then(|index| self.messages.get(index)).map(|message| message.summary.folder_id.as_str());
+        let current_full = match index {
+            Some(index) => {
+                let current_id =
+                    self.messages.get(index).map(|message| message.id.clone()).ok_or_else(|| OpError::Failed("the draft disappeared".to_owned()))?;
+                self.message_result(&current_id)?
+            }
+            None => None,
+        };
+        let current_folder = index.and_then(|index| self.messages.get(index)).map(|message| message.folder_id.as_str());
         let current_account =
             current_folder.and_then(|folder_id| self.folders.iter().find(|folder| folder.id == folder_id)).map(|folder| folder.account_id.clone());
         let account = match (index, current_account) {
@@ -1385,7 +1554,7 @@ impl Engine {
             _ => self.draft_account(account)?,
         };
         let draft_folder = match index.and_then(|index| self.messages.get(index)) {
-            Some(current) => current.summary.folder_id.clone(),
+            Some(current) => current.folder_id.clone(),
             None => self
                 .folders
                 .iter()
@@ -1418,8 +1587,8 @@ impl Engine {
         let has_attachments = !attachments.is_empty();
         // The ids this draft carries *now*: an id that disappears from the list must stop resolving
         // to a stored blob, because the repository deletes its row.
-        let replaced_ids = index
-            .and_then(|index| self.messages.get(index))
+        let replaced_ids = current_full
+            .as_ref()
             .map(|message| message.attachments.iter().map(|attachment| attachment.id.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         let summary_snippet = snippet(&draft.body_text);
@@ -1427,7 +1596,12 @@ impl Engine {
         // HTML body. The composer patches `body_text`; a subject-only save must not destroy the
         // stored HTML part.
         let (thread_id, starred, labels, body_html) = match index.and_then(|index| self.messages.get(index)) {
-            Some(current) => (current.summary.thread_id.clone(), current.summary.starred, current.summary.labels.clone(), current.body_html.clone()),
+            Some(current) => (
+                current.thread_id.clone(),
+                current.starred,
+                current.labels.clone(),
+                current_full.as_ref().and_then(|message| message.body_html.clone()),
+            ),
             None => (format!("thr_{message_id}"), false, Vec::new(), None),
         };
         let mut saved = Message {
@@ -1503,10 +1677,18 @@ impl Engine {
                 let Some(message) = self.messages.get_mut(index) else {
                     return Err(OpError::Failed(format!("unknown draft {message_id:?}")));
                 };
-                *message = saved.clone();
+                *message = saved.summary.clone();
             }
-            None => self.messages.push(saved.clone()),
+            None => {
+                self.messages.push(saved.summary.clone());
+                self.rebuild_message_index();
+            }
         }
+        if self.in_memory {
+            self.demo_messages.insert(saved.summary.id.clone(), saved.clone());
+        }
+        self.bump_revision();
+        self.cache_message(&saved);
         self.recount();
         Ok(saved)
     }
@@ -1702,7 +1884,7 @@ impl Engine {
     /// The Message-ID is derived from that digest, so it is stable too. A scheduled message therefore
     /// carries the instant it was last edited; the header dates the message, not the queue.
     fn submission_for_draft(&self, draft_id: &str) -> Result<(postino_sync::SerializedSubmission, Account, Message), OpError> {
-        let current = self.messages.iter().find(|message| message.summary.id == draft_id).cloned().ok_or_else(|| unknown_message(draft_id))?;
+        let current = self.message_result(draft_id)?.ok_or_else(|| unknown_message(draft_id))?;
         let folder = self
             .folders
             .iter()
@@ -2289,18 +2471,21 @@ impl Engine {
         expected_revision: Option<u32>,
         store: &Store,
     ) -> Result<FinalizeOutcome, OpError> {
-        let Some(message) = self.messages.iter().find(|message| message.summary.id == draft_id) else {
+        let Some(summary) = self.summary(draft_id) else {
             return Ok(FinalizeOutcome::NotADraft);
         };
-        let Some(folder) = self.folders.iter().find(|folder| folder.id == message.summary.folder_id) else {
+        let Some(folder) = self.folders.iter().find(|folder| folder.id == summary.folder_id) else {
             return Ok(FinalizeOutcome::NotADraft);
         };
         if folder.kind != FolderKind::Drafts {
             return Ok(FinalizeOutcome::NotADraft);
         }
         if let Some(expected) = expected_revision {
+            let Some(message) = self.message_result(draft_id)? else {
+                return Ok(FinalizeOutcome::NotADraft);
+            };
             match store.get_draft(draft_id).map_err(store_map::read_error)? {
-                Some(draft) if draft.revision == expected && self.draft_snapshot_matches(message, &draft, store)? => {}
+                Some(draft) if draft.revision == expected && self.draft_snapshot_matches(&message, &draft, store)? => {}
                 _ => return Ok(FinalizeOutcome::SnapshotChanged),
             }
         }
@@ -2325,9 +2510,7 @@ impl Engine {
     /// Move the draft to Sent. Returns the summary and, when a server copy with the same Message-ID
     /// was already cached, the UID it adopted (which means the server already has this message).
     fn finish_draft(&mut self, id: &str, message_id: Option<&str>, persist: Option<&Store>) -> Result<(MessageSummary, Option<u32>), OpError> {
-        let index =
-            self.messages.iter().position(|message| message.summary.id == id).ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}")))?;
-        let Some(current) = self.messages.get(index) else {
+        let Some(current) = self.message_result(id)? else {
             return Err(OpError::InvalidArgs(format!("unknown draft {id:?}")));
         };
         let folder = self
@@ -2388,23 +2571,27 @@ impl Engine {
             merged_duplicate = duplicate;
         }
         if let Some(duplicate) = &merged_duplicate {
-            self.messages.retain(|message| message.summary.id != *duplicate);
+            self.messages.retain(|message| message.id != *duplicate);
+            self.rebuild_message_index();
             let prefix = format!("att_{duplicate}_");
             self.blob_hashes.retain(|attachment_id, _| !attachment_id.starts_with(&prefix));
             self.reply_links.remove(duplicate);
         }
         self.reply_links.remove(id);
 
-        let Some(slot) = self.messages.iter_mut().find(|message| message.summary.id == id) else {
+        let Some(index) = self.messages.iter().position(|message| message.id == id) else {
             return Err(OpError::Failed(format!("unknown draft {id:?}")));
         };
-        *slot = message;
-        let summary = self
-            .messages
-            .iter()
-            .find(|message| message.summary.id == id)
-            .map(|message| message.summary.clone())
-            .ok_or_else(|| OpError::Failed(format!("unknown draft {id:?}")))?;
+        let Some(slot) = self.messages.get_mut(index) else {
+            return Err(OpError::Failed(format!("unknown draft {id:?}")));
+        };
+        *slot = message.summary.clone();
+        if self.in_memory {
+            self.demo_messages.insert(id.to_owned(), message.clone());
+        }
+        self.bump_revision();
+        self.cache_message(&message);
+        let summary = message.summary;
         self.recount();
         Ok((summary, adopted_uid))
     }
@@ -2452,23 +2639,27 @@ impl Engine {
                 "attachment bytes are {size} bytes; this build stores at most {MAX_ATTACHMENT_BYTES} bytes per attachment"
             )));
         }
-        let Some(message_index) = self.messages.iter().position(|message| message.summary.id == message_id) else {
-            return Err(unknown_message(message_id));
-        };
-        let Some(attachment_index) =
-            self.messages.get(message_index).and_then(|message| message.attachments.iter().position(|attachment| attachment.id == attachment_id))
-        else {
+        let mut current = self.message_result(message_id)?.ok_or_else(|| unknown_message(message_id))?;
+        let Some(attachment) = current.attachments.iter().find(|attachment| attachment.id == attachment_id) else {
             return Err(OpError::InvalidArgs(format!(
                 "attachment {attachment_id:?} is not on message {message_id:?}; each attachment id belongs to exactly one message"
             )));
         };
+        let _ = attachment;
         let hash = store.blobs().put(bytes).map_err(store_map::blob_write_error)?;
         store.set_attachment_blob_hash(message_id, attachment_id, Some(&hash), size).map_err(store_map::write_error)?;
         // Only now, after both durable writes, does memory change.
         self.blob_hashes.insert(attachment_id.to_owned(), hash);
-        if let Some(attachment) = self.messages.get_mut(message_index).and_then(|message| message.attachments.get_mut(attachment_index)) {
+        if let Some(attachment) = current.attachments.iter_mut().find(|attachment| attachment.id == attachment_id) {
             attachment.size = size;
         }
+        if let Some(full) = self.demo_messages.get_mut(message_id)
+            && let Some(attachment) = full.attachments.iter_mut().find(|attachment| attachment.id == attachment_id)
+        {
+            attachment.size = size;
+        }
+        self.bump_revision();
+        self.cache_message(&current);
         Ok(())
     }
 
@@ -2512,7 +2703,7 @@ impl Engine {
     pub fn add_draft_attachment(&mut self, draft_id: &str, filename: &str, mime: Option<&str>, data: &[u8]) -> Result<Message, OpError> {
         let store = self.require_store("draft_attachment_add")?;
         let index = self.draft_index(draft_id, "allegato")?;
-        let current = self.messages.get(index).cloned().ok_or_else(|| unknown_message(draft_id))?;
+        let current = self.message_result(draft_id)?.ok_or_else(|| unknown_message(draft_id))?;
         self.ensure_draft_current(&current)?;
         if filename.chars().any(|character| matches!(character, '\r' | '\n' | '\0')) {
             return Err(OpError::InvalidArgs(format!("attachment file name {filename:?} contains a line break or NUL; header injection is refused")));
@@ -2563,8 +2754,13 @@ impl Engine {
         // Durable rows are written; only now does memory change.
         self.blob_hashes.insert(attachment_id, hash);
         if let Some(slot) = self.messages.get_mut(index) {
-            *slot = saved.clone();
+            *slot = saved.summary.clone();
         }
+        if self.in_memory {
+            self.demo_messages.insert(saved.summary.id.clone(), saved.clone());
+        }
+        self.bump_revision();
+        self.cache_message(&saved);
         self.recount();
         Ok(saved)
     }
@@ -2573,7 +2769,7 @@ impl Engine {
     pub fn remove_draft_attachment(&mut self, draft_id: &str, attachment: &str) -> Result<Message, OpError> {
         let store = self.require_store("draft_attachment_remove")?;
         let index = self.draft_index(draft_id, "allegato")?;
-        let current = self.messages.get(index).cloned().ok_or_else(|| unknown_message(draft_id))?;
+        let current = self.message_result(draft_id)?.ok_or_else(|| unknown_message(draft_id))?;
         self.ensure_draft_current(&current)?;
         let position = current
             .attachments
@@ -2596,8 +2792,13 @@ impl Engine {
         store.save_draft_message_linked(&row, &rows, link.as_deref()).map_err(store_map::write_error)?;
         self.blob_hashes.remove(&removed.id);
         if let Some(slot) = self.messages.get_mut(index) {
-            *slot = saved.clone();
+            *slot = saved.summary.clone();
         }
+        if self.in_memory {
+            self.demo_messages.insert(saved.summary.id.clone(), saved.clone());
+        }
+        self.bump_revision();
+        self.cache_message(&saved);
         self.recount();
         Ok(saved)
     }
@@ -2608,7 +2809,7 @@ impl Engine {
     /// the same capped blob path as the reading pane and writes the new row. A missing or corrupt
     /// source blob is refused with the source filename, never silently dropped.
     pub fn copy_attachment_to_draft(&mut self, draft_id: &str, source_attachment: &str) -> Result<Message, OpError> {
-        let source = self.find_attachment(source_attachment)?.clone();
+        let source = self.find_attachment(source_attachment)?;
         let data = self.attachment_bytes(source_attachment).map_err(|error| {
             OpError::Failed(format!("attachment {:?} cannot be copied ({error}); the draft keeps its other attachments", source.filename))
         })?;
@@ -2654,15 +2855,12 @@ impl Engine {
     /// One draft's index in memory, with the same folder and outbox checks every edit uses.
     fn draft_index(&self, draft_id: &str, action: &str) -> Result<usize, OpError> {
         let index = self
-            .messages
-            .iter()
-            .position(|message| message.summary.id == draft_id)
+            .message_index
+            .get(draft_id)
+            .copied()
             .ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {draft_id:?}; omit id to create a draft")))?;
-        let kind = self
-            .messages
-            .get(index)
-            .and_then(|message| self.folders.iter().find(|folder| folder.id == message.summary.folder_id))
-            .map(|folder| folder.kind);
+        let kind =
+            self.messages.get(index).and_then(|message| self.folders.iter().find(|folder| folder.id == message.folder_id)).map(|folder| folder.kind);
         if kind != Some(FolderKind::Drafts) {
             return Err(OpError::InvalidArgs(format!("message {draft_id:?} is not a draft")));
         }
@@ -2695,12 +2893,7 @@ impl Engine {
     }
 
     fn draft_account_id(&self, draft_id: &str) -> Result<String, OpError> {
-        let folder_id = self
-            .messages
-            .iter()
-            .find(|message| message.summary.id == draft_id)
-            .map(|message| message.summary.folder_id.clone())
-            .ok_or_else(|| unknown_message(draft_id))?;
+        let folder_id = self.summary(draft_id).map(|message| message.folder_id.clone()).ok_or_else(|| unknown_message(draft_id))?;
         self.folders
             .iter()
             .find(|folder| folder.id == folder_id)
@@ -2720,12 +2913,29 @@ impl Engine {
     }
 
     /// One attachment by its globally unique id, with a readable error when it does not exist.
-    fn find_attachment(&self, attachment_id: &str) -> Result<&Attachment, OpError> {
-        self.messages
-            .iter()
-            .flat_map(|message| message.attachments.iter())
-            .find(|attachment| attachment.id == attachment_id)
-            .ok_or_else(|| OpError::InvalidArgs(format!("unknown attachment {attachment_id:?}; attachment ids come from message_get")))
+    fn find_attachment(&self, attachment_id: &str) -> Result<Attachment, OpError> {
+        {
+            let cache = self.body_cache.borrow();
+            if let Some(found) = cache
+                .iter()
+                .filter(|(revision, _)| *revision == self.revision)
+                .flat_map(|(_, message)| message.attachments.iter())
+                .find(|attachment| attachment.id == attachment_id)
+            {
+                return Ok(found.clone());
+            }
+        }
+        if let Some(found) =
+            self.demo_messages.values().flat_map(|message| message.attachments.iter()).find(|attachment| attachment.id == attachment_id)
+        {
+            return Ok(found.clone());
+        }
+        if let Some(store) = &self.store
+            && let Some((_, attachment)) = store.find_attachment(attachment_id).map_err(store_map::read_error)?
+        {
+            return Ok(store_map::attachment(attachment));
+        }
+        Err(OpError::InvalidArgs(format!("unknown attachment {attachment_id:?}; attachment ids come from message_get")))
     }
 
     /// The operation catalogue, with JSON Schemas. CLI and MCP share it.
@@ -2743,7 +2953,7 @@ impl Engine {
         let base = self.messages.len().saturating_add(1);
         for offset in 0..10_000 {
             let candidate = format!("{prefix}_{}", base.saturating_add(offset));
-            if !self.messages.iter().any(|message| message.summary.id == candidate) {
+            if !self.message_index.contains_key(&candidate) {
                 return Ok(candidate);
             }
         }
@@ -2753,12 +2963,12 @@ impl Engine {
     pub(crate) fn recount(&mut self) {
         for folder in &mut self.folders {
             let (total, unread) = if folder.kind == FolderKind::Starred {
-                self.messages.iter().filter(|message| message.summary.starred).fold((0u32, 0u32), |(total, unread), message| {
-                    (total.saturating_add(1), unread.saturating_add(if message.summary.unread { 1 } else { 0 }))
+                self.messages.iter().filter(|message| message.starred).fold((0u32, 0u32), |(total, unread), message| {
+                    (total.saturating_add(1), unread.saturating_add(if message.unread { 1 } else { 0 }))
                 })
             } else {
-                self.messages.iter().filter(|message| message.summary.folder_id == folder.id).fold((0u32, 0u32), |(total, unread), message| {
-                    (total.saturating_add(1), unread.saturating_add(if message.summary.unread { 1 } else { 0 }))
+                self.messages.iter().filter(|message| message.folder_id == folder.id).fold((0u32, 0u32), |(total, unread), message| {
+                    (total.saturating_add(1), unread.saturating_add(if message.unread { 1 } else { 0 }))
                 })
             };
             folder.total = total;
@@ -3407,14 +3617,14 @@ mod tests {
     fn demo_dates_are_relative_to_the_requested_instant() {
         let now = DateTime::parse_from_rfc3339("2026-10-24T10:42:00Z").expect("fixture").with_timezone(&Utc);
         let engine = Engine::demo_at(now);
-        assert_eq!(engine.messages()[0].summary.date, now - chrono::Duration::minutes(8));
-        assert!(engine.messages().iter().all(|message| message.summary.date < now));
+        assert_eq!(engine.messages()[0].date, now - chrono::Duration::minutes(8));
+        assert!(engine.messages().iter().all(|message| message.date < now));
     }
 
     #[test]
     fn flags_update_folder_counts() {
         let mut engine = Engine::demo();
-        let id = engine.messages()[0].summary.id.clone();
+        let id = engine.messages()[0].id.clone();
         let before = engine.folders().iter().find(|f| f.id == "inbox").map_or(0, |f| f.unread);
         let was_unread = engine.message(&id).is_some_and(|m| m.summary.unread);
         let summary = engine.set_flags(&id, Some(!was_unread), None).expect("flag");

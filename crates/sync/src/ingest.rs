@@ -183,7 +183,8 @@ pub(crate) fn ingest(
         remote_images,
         size: Some(size),
     };
-    store.upsert_synced_message(&row, &attachments).map_err(SyncError::Store)?;
+    let (in_reply_to, references) = ids::thread_headers(&parsed.references, parsed.in_reply_to.as_deref());
+    store.upsert_synced_message_with_refs(&row, &attachments, in_reply_to.as_deref(), &references).map_err(SyncError::Store)?;
     store.set_message_reply_to(&id, &reply_to).map_err(SyncError::Store)?;
     index.inserted.insert(id.clone(), uid);
     Ok(Some(Ingested { message_id: id, new, drift, attachments_stored: stored }))
