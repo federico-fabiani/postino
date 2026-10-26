@@ -340,6 +340,21 @@ impl FileSaver for RecordingFileSaver {
         }
         std::fs::write(path, bytes).map_err(|error| error.to_string())
     }
+
+    fn write_new(&self, path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write as _;
+        if let Ok(fail) = self.fail.lock()
+            && let Some(error) = fail.as_ref()
+        {
+            return Err(error.clone());
+        }
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|error| error.to_string())?;
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        if let Ok(mut writes) = self.writes.lock() {
+            writes.push((path.to_path_buf(), bytes.to_vec()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]

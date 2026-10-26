@@ -483,56 +483,80 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 
 - **Reading pane.** The body is the plain-text alternative (already HTML-to-text when only HTML
   exists) under a quiet `Vista testo` line that explains the HTML renderer arrives with the isolated
-  viewer. The header shows sender, recipients, an optional Cc line, date, subject, label chips and a
-  remote-content line; selecting a label chip filters the mailbox.
+  viewer. The header shows sender, recipients, a content-sized Cc line truncated with a tooltip,
+  date, subject and label chips; selecting a label chip filters the mailbox. The attachment row is a
+  pinned strip above the body scroll, so it stays visible at 980×600.
 - **Safe links.** `reading::find_links` is a pure scanner over the body: only absolute `http`,
-  `https` and `mailto` URLs at a word boundary survive; trailing punctuation is trimmed and
-  `javascript:`, `file:`, `data:`, `vbscript:` and relative targets stay ordinary text. A link shows
-  its destination on hover; activating it opens a confirmation sheet with the full URL and, for a
-  host with an `xn--` label, a punycode warning. Only the sheet's **Apri** reaches the injected
-  `LinkOpener` (production: the system browser; tests: a recorder). Cancelling opens nothing and a
-  failure is a readable toast.
-- **Attachments.** The ALLEGATI section lists filename, MIME and size, with a **Salva** button per
-  row. Save reads the engine's exact blob bytes, warns before choosing a path when the
-  extension is executable (`.exe`, `.msi`, `.bat`, `.cmd`, `.ps1`, `.js`, `.vbs`, `.scr`, `.jar`)
-  or macro-enabled (`.docm`, `.xlsm`, `.pptm`), then asks for a destination through the injected
-  `FileSaver` (production: `rfd`). An existing file is never replaced without a second confirmation;
-  Cancel writes nothing; a missing or corrupt blob is a readable toast. A suggested filename loses
-  directories, control characters and Windows-reserved punctuation, and is length-bounded. Enter on
-  the focused Save button is the keyboard path.
-- **Settings.** One dialog has four sections. **Account** lists accounts with the active badge,
-  adds through onboarding, removes with a destructive confirmation that names what leaves the
-  machine, and names the active account's last sync under Data. **Aspetto** chooses Chiaro, Scuro or
-  Sistema (the preference is persisted and follows the OS while selected), toggles reduced motion
-  and resets the reading-pane width. **Dati** shows the store and blob paths, the last sync, and
-  opens the blob directory through the injected `FolderOpener` (production: the platform file
-  manager). **Informazioni** shows the version, opens the embedded `ATTRIBUTION.md` in a local
-  dialog and links to the shortcut sheet. `Esc`, the header button and the footer button close it;
-  focus returns to the account switcher, the palette entry is **Impostazioni**, and the layout is
-  verified at 1280×720 and 980×600 in both themes.
+  `https` and `mailto` URLs at a word boundary survive; balanced brackets are kept, two adjacent
+  URLs are not merged, trailing punctuation is trimmed and `javascript:`, `file:`, `data:`,
+  `vbscript:` and relative targets stay ordinary text. Userinfo (`user@host`) and `mailto:` queries
+  that add `to`, `cc` or `bcc` recipients are rejected outright. Activating a link opens a
+  confirmation sheet that keeps the exact raw string, shows the normalized **host the browser will
+  contact** on its own line, and warns when a backslash changes the authority or when the host has
+  an `xn--` or non-ASCII label. Only the sheet's **Apri** reaches the injected `LinkOpener`
+  (production: the system browser; tests: a recorder), and the allowlist is rechecked at that
+  action boundary. Cancelling opens nothing and a failure is a readable toast. Links are capped per
+  paragraph and a displayed inline label is capped while the full URL stays in the tooltip and sheet.
+- **Attachments.** The ALLEGATI strip lists filename, MIME and size, with a **Salva** button per
+  row. Save reads the engine's exact blob bytes, classifies the **sanitized** suggested filename
+  (Unicode whitespace, bidi controls, trailing dots/spaces and Windows device names cannot hide an
+  extension), warns before choosing a path when the extension is executable (`.exe`, `.msi`, `.bat`,
+  `.cmd`, `.ps1`, `.js`, `.vbs`, `.scr`, `.jar`) or macro-enabled (`.docm`, `.xlsm`, `.pptm`), and
+  re-classifies the path the person actually chose in the dialog before writing. It then asks for a
+  destination through the injected `FileSaver` (production: `rfd`). An existing file is never
+  replaced without a second confirmation; the write is exclusive (`create_new`) unless that
+  overwrite was confirmed, so a file created by another process is not silently replaced. Cancel
+  writes nothing; a missing or corrupt blob is a readable toast. In `--demo` the synthetic
+  attachment has no bytes, so **Salva** is disabled with the reason “La modalità demo non ha
+  allegati reali” instead of reporting a fake corruption. Enter on the focused Save button is the
+  keyboard path.
+- **Settings.** One dialog has four sections. **Account** lists accounts with the active badge and
+  its own **Ultimo sync** line, adds through onboarding and removes with a destructive confirmation
+  that names what leaves the machine, keeps the encrypted blob cache caveat and starts focus on
+  **Annulla**. **Aspetto** chooses Chiaro, Scuro or Sistema (the preference is persisted and follows
+  the OS while selected), toggles reduced motion and resets the reading-pane width. **Dati** shows
+  selectable store and blob paths with a keyboard-reachable copy action, and opens the blob
+  directory through the injected `FolderOpener` (production: the platform file manager).
+  **Informazioni** shows the version, opens the embedded `ATTRIBUTION.md` in a local dialog and links
+  to the shortcut sheet. `Esc`, the header button and the footer button close it; focus returns to
+  the account switcher, the palette entry is **Impostazioni**, and the layout is verified at
+  1280×720 and 980×600 in both themes with the section and footer rectangles inside the window and
+  the scroll viewport.
 - **Chrome and identity.** The toolbar shows only the product mark; the sidebar account row is the
-  single identity and opens the switcher. Its badge reads `N totali` with a tooltip and accessible
-  name that say `in tutte le cartelle`. The offline banner is the only owner of **Riprova**; the
-  status bar is informational for offline and keeps **Riprova** only for an error. No milestone code
-  or status duplication remains in the chrome. Compose's `Da` and replies use the active account and
-  its Drafts folder.
-- **Tests.** The pure scanner (allowlist, word boundary, IDN, second action gate), safe filenames,
-  dangerous extensions, remote counts, a long inline paragraph staying inside the column; exact saved
-  bytes, overwrite refusal then confirmation,
-  executable/macro warning ordering, cancel writes nothing, missing blob, keyboard Save; link
-  sheet and confirmation before the recorder; settings sections, store path, injected folder opener,
-  focus return, Esc, palette entry, licences and account removal; one identity and one Retry;
-  compose/reply identity. No test opens a browser, a native dialog or a shell.
-- **Screenshots.** `docs/images/postino-p6c-reading-attachments.png` (text view, safe link,
-  remote-content line, attachment Save), `postino-p6c-link-confirm.png`, `postino-p6c-settings.png`,
-  `-settings-dark.png` and `-settings-980.png`. The P6b mailbox and offline images were regenerated
-  for the single identity, the mailbox-wide badge and the single Retry.
+  single identity and opens the switcher. Its badge reads `N non letti` (`1 non letto` when
+  singular) with a tooltip and accessible name that say `in tutte le cartelle`. The offline banner
+  owns **Riprova** while the list is visible; below the 1000 px breakpoint the open reading overlay
+  hides that list, so the status bar carries the one compact **Riprova**. The status bar keeps
+  **Riprova** for an error and never duplicates the banner. No milestone code or duplicated status
+  remains in the chrome. Compose's `Da` and replies use the active account and its Drafts folder.
+- **Tests.** The pure scanner (allowlist, userinfo, hidden `mailto` recipients, backslash authority,
+  non-ASCII host, balanced brackets, comma-separated URLs, action boundary), safe filenames
+  (NBSP/thin/narrow no-break space, trailing dot/space, bidi control, reserved device names),
+  dangerous extensions, caps and a long inline paragraph staying inside the column; exact saved
+  bytes through the real Save button, overwrite refusal then **Sostituisci**, a `.exe` chosen in the
+  dialog warning again, executable/macro warning ordering, cancel writes nothing, missing blob,
+  keyboard Save, demo Save disabled; **Apri** and **Annulla** through their real buttons plus the
+  recorder, the full destination and effective host in the sheet, backslash and non-ASCII warnings;
+  settings sections/footer inside the 980×600 window and scroll viewport, per-account sync lines,
+  store/blob path visibility, copy actions, injected folder opener, focus return, Esc, palette
+  entry, neutral attribution titles, **Rimuovi** and the Annulla-first focus; one identity in the
+  painted text and one Retry in the wide and 980 overlay states; Cc fixture; a sanitized message
+  with no remote-content line; compose/reply identity. No test opens a browser, a native dialog or a
+  shell.
+- **Screenshots.** `docs/images/postino-p6c-reading-attachments.png` and
+  `-reading-attachments-980.png` (text view, safe link, pinned attachment Save at 1280 and 980),
+  `postino-p6c-link-confirm.png` and `-980.png`, `postino-p6c-settings.png`,
+  `-settings-dark.png`, `-settings-980.png` and `-settings-980-dark.png`. The P6b mailbox and
+  offline images were regenerated for the single identity, the `N non letti` badge and the single
+  Retry.
 - **Honest limits.** HTML is not rendered in this slice: the pane shows the text alternative and
-  never requests remote images. The remote-content count can only count references still present in
-  the cached HTML; a synced message is sanitized before storage, so the line is usually visible only
-  for fixtures or a store shape that retains them. Save writes the exact bytes to the path the
-  person chooses and never opens or executes the file; the extension warning is advisory. Links only
-  reach the system browser after the confirmation sheet.
+  never requests remote images. The MIME sanitizer removes remote images before storage and counts
+  them internally, but that count is **not carried through sync and the store yet**, so the pane
+  shows no remote-content line and the screenshot fixture contains no injected HTML. Surfacing the
+  count is a follow-up tracked as **P6d** in `docs/delivery-plan.md`, after the schema v5 work owned
+  by P7; it is documented here and in the README as not delivered, not as a working feature. Save writes the exact bytes to the path the person
+  chooses and never opens or executes the file; the extension warning is advisory. Links only reach
+  the system browser after the confirmation sheet.
 
 Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 
@@ -552,13 +576,16 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   called empty because of a filter.
 - The composer fits 980×600, from the header to Send/Cancel, with a body that scrolls and a scrim that
   blocks the shell; Esc keeps the unsaved guard.
-- A link is clickable only for absolute `http`, `https` or `mailto`; its full destination is visible
-  before **Apri**, and cancelling never calls the opener. An attachment Save writes the exact blob
-  bytes, refuses an existing file until confirmed, warns on executable and macro-enabled names and
-  cancels without a write. No test opens a browser, a native dialog or a shell.
+- A link is clickable only for absolute `http`, `https` or `mailto`; the exact destination and the
+  effective host are visible before **Apri**, userinfo and hidden `mailto` Cc/Bcc are refused, and
+  cancelling never calls the opener. An attachment Save writes the exact blob bytes, refuses an
+  existing file until confirmed, re-warns when the chosen path has a dangerous extension, warns on
+  executable and macro-enabled names and cancels without a write. No test opens a browser, a native
+  dialog or a shell.
 - Settings fits 980×600 in light and dark, shows Account/Aspetto/Dati/Informazioni, uses the injected
   folder opener and returns focus to the account switcher on Esc. The sidebar is the only account
-  identity and the offline banner is the only Retry; the status bar keeps Retry only for an error.
+  identity and one Retry is visible in both the wide offline banner and the 980 reading overlay; the
+  status bar keeps Retry for an error and never duplicates the banner.
 - Contrast and focus pass the checks in `docs/design.md`; every gold mark on ivory uses `GOLD_INK`,
   shortcut hints and placeholders clear 4.5:1.
 - Message rows are named buttons; the star has a 28×28 target and its own name; the focus ring is

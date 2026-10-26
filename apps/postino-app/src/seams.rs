@@ -17,8 +17,14 @@ pub trait FileSaver: Send + Sync {
     /// Ask for a destination. `Ok(None)` means the person cancelled.
     fn choose_path(&self, suggested_name: &str) -> Result<Option<PathBuf>, String>;
 
-    /// Write `bytes` exactly as given. The caller has already handled overwrite confirmation.
+    /// Write `bytes` exactly as given, replacing the file. The caller has already handled overwrite
+    /// confirmation for this exact path.
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), String>;
+
+    /// Write `bytes` only when `path` does not exist. This closes the window between the overwrite
+    /// check and the write: a file created by another process makes the call fail instead of being
+    /// silently replaced.
+    fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<(), String>;
 }
 
 /// Open a directory in the platform file manager.
@@ -47,6 +53,12 @@ impl FileSaver for RfdFileSaver {
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
         std::fs::write(path, bytes).map_err(|error| error.to_string())
+    }
+
+    fn write_new(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|error| error.to_string())?;
+        file.write_all(bytes).map_err(|error| error.to_string())
     }
 }
 
@@ -80,8 +92,8 @@ impl FolderOpener for SystemFolderOpener {
     }
 }
 
-/// A browser that is never available. Tests must inject a recorder before exercising a link; a
-/// screenshot or a demo session cannot start a real browser by accident.
+/// A browser that is never available. Tests and screenshot scenes inject it so a stray click cannot
+/// start a real browser from a headless session; a normal `--demo` launch installs the real adapter.
 pub struct UnavailableLinkOpener;
 
 impl LinkOpener for UnavailableLinkOpener {
@@ -100,6 +112,10 @@ impl FileSaver for CancellingFileSaver {
     }
 
     fn write(&self, _path: &Path, _bytes: &[u8]) -> Result<(), String> {
+        Err("Nessun salvataggio configurato.".to_owned())
+    }
+
+    fn write_new(&self, _path: &Path, _bytes: &[u8]) -> Result<(), String> {
         Err("Nessun salvataggio configurato.".to_owned())
     }
 }

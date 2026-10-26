@@ -161,7 +161,7 @@ impl<'a> Toast<'a> {
                         ui.add_space(space::SM);
                         let response = Button::new(label).kind(crate::ui::widgets::ButtonKind::Ghost).size(ButtonSize::Sm).show(ui);
                         #[cfg(test)]
-                        probe::button(label, response.rect);
+                        probe::button(ui.ctx(), label, response.rect);
                         if response.clicked() {
                             result = Some(ToastResult::Undo);
                         }
@@ -170,7 +170,7 @@ impl<'a> Toast<'a> {
                         ui.add_space(space::SM);
                         let response = Button::new(label).kind(crate::ui::widgets::ButtonKind::Secondary).size(ButtonSize::Sm).show(ui);
                         #[cfg(test)]
-                        probe::button(label, response.rect);
+                        probe::button(ui.ctx(), label, response.rect);
                         if response.clicked() {
                             result = Some(ToastResult::Action);
                         }
@@ -179,7 +179,7 @@ impl<'a> Toast<'a> {
                         ui.add_space(space::XS);
                         let response = IconButton::new(icons::CLOSE, "Chiudi").size(IconButtonSize::Sm).show(ui);
                         #[cfg(test)]
-                        probe::button("Chiudi", response.rect);
+                        probe::button(ui.ctx(), "Chiudi", response.rect);
                         if response.clicked() {
                             result = Some(ToastResult::Dismiss);
                         }
@@ -204,26 +204,27 @@ impl<'a> Toast<'a> {
 pub(crate) mod probe {
     //! Rectangles of the toast controls, so an app-level test can click the dismiss or retry
     //! control the way a user would instead of calling the handler directly.
+    //!
+    //! The rectangles live in the egui context, not a process-wide mutex: tests run in parallel and
+    //! a shared buffer would hand one test another test's toast rectangle.
 
-    use std::sync::Mutex;
+    use eframe::egui::{Context, Id, Rect};
 
-    use eframe::egui::Rect;
-
-    static BUTTONS: Mutex<Vec<(String, Rect)>> = Mutex::new(Vec::new());
-
-    pub fn clear() {
-        if let Ok(mut buttons) = BUTTONS.lock() {
-            buttons.clear();
-        }
+    fn id() -> Id {
+        Id::new("postino-toast-probe")
     }
 
-    pub fn button(label: &str, rect: Rect) {
-        if let Ok(mut buttons) = BUTTONS.lock() {
-            buttons.push((label.to_owned(), rect));
-        }
+    pub fn clear(ctx: &Context) {
+        ctx.data_mut(|data| data.insert_temp(id(), Vec::<(String, Rect)>::new()));
     }
 
-    pub fn take() -> Vec<(String, Rect)> {
-        BUTTONS.lock().map(|mut buttons| std::mem::take(&mut *buttons)).unwrap_or_default()
+    pub fn button(ctx: &Context, label: &str, rect: Rect) {
+        ctx.data_mut(|data| {
+            data.get_temp_mut_or_default::<Vec<(String, Rect)>>(id()).push((label.to_owned(), rect));
+        });
+    }
+
+    pub fn take(ctx: &Context) -> Vec<(String, Rect)> {
+        ctx.data_mut(|data| std::mem::take(data.get_temp_mut_or_default::<Vec<(String, Rect)>>(id())))
     }
 }

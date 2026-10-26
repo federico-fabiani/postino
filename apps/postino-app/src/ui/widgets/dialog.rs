@@ -79,12 +79,21 @@ impl<'a> Dialog<'a> {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let primary = if self.danger { Button::danger(self.primary) } else { Button::new(self.primary).kind(ButtonKind::Primary) };
                     let response = primary.show(ui);
+                    #[cfg(test)]
+                    crate::app::probe::dialog_button(ui, self.title, true, crate::app::probe::DialogButton { rect: response.rect, id: response.id });
                     if self.focus_primary {
                         response.request_focus();
                     }
                     result.primary = response.clicked();
                     if let Some(label) = self.secondary {
                         let response = Button::new(label).kind(ButtonKind::Ghost).show(ui);
+                        #[cfg(test)]
+                        crate::app::probe::dialog_button(
+                            ui,
+                            self.title,
+                            false,
+                            crate::app::probe::DialogButton { rect: response.rect, id: response.id },
+                        );
                         if self.focus_secondary {
                             response.request_focus();
                         }

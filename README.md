@@ -50,16 +50,19 @@ MCP      ─┘
   narrows it; ids are stable and never reused. Rename, delete and apply/remove are undoable in the
   app; creating a label is not an undo step. Labels are in-memory metadata until M1.
 - A text reading pane with sender, recipients, Cc, date, subject and label chips, a quiet “Vista
-  testo” note, the remote-content references still visible in the cached HTML, and safe links. Only
-  absolute `http`, `https` and `mailto` are clickable; the full destination appears on hover and in a
-  confirmation sheet, and only **Apri** hands it to the system browser. A punycode (`xn--`) host
-  warns first. No `javascript:`, `file:`, `data:`, `vbscript:` or relative target is ever a link.
+  testo” note, and safe links. Only absolute `http`, `https` and `mailto` are clickable; the full
+  destination and the effective host appear in the confirmation sheet, and only **Apri** hands it to
+  the system browser. A punycode (`xn--`) or non-ASCII host warns first, and userinfo, backslash
+  tricks and `mailto:` Cc/Bcc queries are refused. No `javascript:`, `file:`, `data:`, `vbscript:`
+  or relative target is ever a link.
 - Attachment Save through the native Save dialog writes the exact blob bytes, warns before saving an
-  executable or macro-enabled file, refuses to replace an existing file until confirmed, and reports
-  a missing blob as a readable toast. Settings covers accounts (add, remove, active, last sync),
-  appearance (light/dark/system, reduced motion, reading width), data (store and blob paths, open the
-  blob folder) and version, licences and shortcuts; every section fits 980×600 and returns focus to
-  the account switcher on `Esc`.
+  executable or macro-enabled file (including a `.exe` chosen in the dialog), refuses to replace an
+  existing file until confirmed, and reports a missing blob as a readable toast. In `--demo` Save is
+  visibly disabled because the synthetic mailbox has no attachment bytes. Settings covers accounts
+  (add, remove, active, last sync per account), appearance (light/dark/system, reduced motion,
+  reading width), data (store and blob paths with a copy action, open the blob folder) and version,
+  licences and shortcuts; every section fits 980×600 and returns focus to the account switcher on
+  `Esc`.
 - Twenty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_test`, `account_remove`, `sync_now`, `sync_status`, `folders_list`, `messages_list`,
   `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_send`, `search`, `labels_list`,
@@ -119,7 +122,9 @@ MCP      ─┘
 
 ![Postino label menu: the modal label picker with its scrim over the list, Lavoro already applied and visible in the reading-pane chip](docs/images/postino-u05-label-menu.png)
 
-![Postino reading pane: sender and recipients, label chip, remote-content line, the text view note, a safe link and an attachment with Save](docs/images/postino-p6c-reading-attachments.png)
+![Postino reading pane: sender and recipients, label chip, the text view note, a safe link and a pinned attachment strip with Save](docs/images/postino-p6c-reading-attachments.png)
+
+![Postino reading pane at 980×600: the text view and the pinned attachment strip with Save above the status bar](docs/images/postino-p6c-reading-attachments-980.png)
 
 ![Postino settings: accounts with the active badge, appearance choices, store and blob paths, last sync, and the licences and shortcut entries](docs/images/postino-p6c-settings.png)
 
@@ -253,9 +258,12 @@ The GNU toolchain plus MSYS2 is the path documented here.
 - **Honest limits.** IMAP is the sync protocol; the server stays the source of truth. Avatars shown
   to recipients depend on BIMI or a signature, not on this client. Auto-reply and server-side
   filters are provider features. The reading pane shows the plain-text alternative: it does not
-  render HTML and never loads remote images. A link reaches the system browser only after the
-  confirmation sheet, and Save writes attachment bytes to the chosen path without opening the file.
-  See [docs/product.md](docs/product.md).
+  render HTML and never loads remote images. The MIME sanitizer removes remote images before storage,
+  but the blocked-image count is not surfaced in the pane yet: carrying it through sync and the store
+  is the P6d follow-up after the schema v5 work. In `--demo` the synthetic attachments have no bytes, so
+  Save is disabled with that reason rather than reporting a corrupt file. A link reaches the system
+  browser only after the confirmation sheet, and Save writes attachment bytes to the chosen path
+  without opening the file. See [docs/product.md](docs/product.md).
 
 ## Documentation
 

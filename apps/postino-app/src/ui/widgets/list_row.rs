@@ -223,21 +223,38 @@ impl<'a> ListRow<'a> {
             title_font.clone(),
         );
         let subtitle_font = FontId::new(type_size::META, FontFamily::Proportional);
+        // The account badge sits on the title line, so the e-mail line can use the full width
+        // instead of being squeezed by the unread count.
+        let subtitle_width = if self.kind == ListRowKind::Account { (rect.width() - cursor - space::LG).max(20.0) } else { text_width };
         let subtitle = eframe::egui::WidgetText::from(eframe::egui::RichText::new(self.subtitle).font(subtitle_font.clone()).color(muted))
-            .into_galley(ui, Some(TextWrapMode::Truncate), text_width, subtitle_font.clone());
+            .into_galley(ui, Some(TextWrapMode::Truncate), subtitle_width, subtitle_font.clone());
 
-        if self.kind == ListRowKind::Message || self.kind == ListRowKind::Account {
+        let (title_top, subtitle_top) = if self.kind == ListRowKind::Message || self.kind == ListRowKind::Account {
             let total = title.size().y + 2.0 + subtitle.size().y;
             let top = rect.center().y - total * 0.5;
-            ui.painter().galley(pos2(cursor, top), title.clone(), Color32::PLACEHOLDER);
-            ui.painter().galley(pos2(cursor, top + title.size().y + 2.0), subtitle, Color32::PLACEHOLDER);
+            (top, top + title.size().y + 2.0)
         } else {
-            ui.painter().galley(pos2(cursor, rect.center().y - title.size().y * 0.5), title, Color32::PLACEHOLDER);
+            (rect.center().y - title.size().y * 0.5, rect.center().y)
+        };
+        let title_height = title.size().y;
+        if self.kind == ListRowKind::Message || self.kind == ListRowKind::Account {
+            ui.painter().galley(pos2(cursor, title_top), title.clone(), Color32::PLACEHOLDER);
+            ui.painter().galley(pos2(cursor, subtitle_top), subtitle, Color32::PLACEHOLDER);
+        } else {
+            ui.painter().galley(pos2(cursor, title_top), title, Color32::PLACEHOLDER);
         }
 
         if !self.meta.is_empty() {
             let galley = layout(ui, self.meta, &FontId::new(type_size::CAPTION, FontFamily::Monospace), faint);
-            paint_right(ui, rect, rect.right() - space::LG - star_width, &galley);
+            if self.kind == ListRowKind::Account {
+                ui.painter().galley(
+                    pos2(rect.right() - space::LG - galley.size().x, title_top + (title_height - galley.size().y) * 0.5),
+                    galley,
+                    Color32::PLACEHOLDER,
+                );
+            } else {
+                paint_right(ui, rect, rect.right() - space::LG - star_width, &galley);
+            }
         }
         if self.kind == ListRowKind::Message {
             let star_color = if self.starred {
