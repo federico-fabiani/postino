@@ -80,7 +80,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P6b | M1 onboarding UI | autodiscovery screen, Aruba app-password flow, app on real data | done |
 | P6c | M1 reading + settings | text reading pane, safe links, attachment Save, full settings, chrome cleanup | done |
 | P6c-fix | M1 review closure | filename-warning bypass, effective link destination, narrow-overlay Retry, demo Save, test depth, settings minors | active |
-| P6d | M1 remote-content count | carry `remote_images_blocked` from MIME through sync/store after schema v5; render it only from stored truth | todo |
+| P6d | M1 remote-content count | schema v6 `messages.remote_images`, carry `remote_images_blocked` MIME→sync→store, render stored truth | todo |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | active |
 | P8 | M2 compose | attachment bytes, signatures per identity, reply/forward recipients and headers, size caps | todo |
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, saved search model | todo |
