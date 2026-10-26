@@ -4832,7 +4832,7 @@ impl PostinoApp {
                             response.clone().on_hover_text(if saved.valid {
                                 format!("{}\n{}", saved.name, saved.query)
                             } else {
-                                format!("{}\n{}", saved.name, saved.error.as_deref().unwrap_or("Query non risolvibile"))
+                                format!("{}\nRicerca non valida: correggila o eliminala", saved.name)
                             });
                         }
                         response.context_menu(|ui| {
@@ -5552,9 +5552,9 @@ impl PostinoApp {
                 ui.add_space(space::XS);
                 ui.label(typography::text(Role::Meta, search_error_text(code, *position), t.danger));
             }
-            if let Some(error) = &saved_error {
+            if let Some(_error) = &saved_error {
                 ui.add_space(space::XS);
-                ui.label(typography::text(Role::Meta, format!("Ricerca salvata non valida: {error}"), t.danger));
+                ui.label(typography::text(Role::Meta, "Ricerca salvata non valida: correggila o eliminala.", t.danger));
             }
             if let Some(index) = &index_progress {
                 ui.add_space(space::XS);
