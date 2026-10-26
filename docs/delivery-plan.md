@@ -82,7 +82,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P6c-fix | M1 review closure | filename-warning bypass, effective link destination, narrow-overlay Retry, demo Save, test depth, settings minors | active |
 | P6d | M1 remote-content count | carry `remote_images_blocked` from MIME through sync/store after schema v5; render it only from stored truth | todo |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | active |
-| P8 | M2 compose | attachments bytes, signatures per identity, scheduled send, undo send | todo |
+| P8 | M2 compose | attachment bytes, signatures per identity, reply/forward recipients and headers, size caps | todo |
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, saved search model | todo |
 | P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | todo |
 | P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | todo |
