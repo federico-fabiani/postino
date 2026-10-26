@@ -8,8 +8,9 @@ If a rule here conflicts with a habit from another project, this file wins.
 Postino is a local-first, agent-first mail client written in Rust. The desktop app, the `postino`
 CLI and the `postino mcp` server are three clients of **one operation registry**. The engine runs on
 synthetic demo mail in memory or on the encrypted local store (`postino --store <path>`); accounts,
-credentials, IMAP sync and the desktop onboarding exist (P6a/P6b), there is no SMTP and no daemon
-yet, and the desktop app boots on the encrypted store with `--demo` as the synthetic fallback.
+credentials, IMAP sync, SMTP submission with the outbox and the desktop onboarding exist (P6/P7),
+there is no daemon yet, and the desktop app boots on the encrypted store with `--demo` as the
+synthetic fallback.
 
 **The current milestone is the only source of truth for scope.** Read `ROADMAP.md` before
 starting. Do not build M1 features into M0.
@@ -72,8 +73,8 @@ Rules enforced by `cargo xtask layers`:
 - `postino-crypto`, `postino-mime`, `postino-platform` and `postino-store` are foundation: no
   workspace dependency and no UI. `postino-net` is network: it depends on no other workspace crate.
 - The credential seam is explicit: core defines `CredentialVault` and never calls a keyring crate;
-  `postino-platform` owns the OS keyring and the `account:<id>:imap` scopes; the CLI adapts one to
-  the other. Do not move a keyring call into core or a password into the store.
+  `postino-platform` owns the OS keyring and the `account:<id>:imap` / `account:<id>:smtp` scopes; the
+  CLI adapts one to the other. Do not move a keyring call into core or a password into the store.
 - `postino-app` and `postino-cli` may depend on `postino-core` and on libraries, never on each other.
   The CLI may use `postino-net` only in tests (the fake server types).
 - New crates need a layer and a README before they need code. Planned crates are listed in

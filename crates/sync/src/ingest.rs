@@ -186,8 +186,13 @@ pub(crate) fn ingest(
 /// The plain `msg_<hash>` is the mailbox-wide identity. If it is already cached in **this** folder
 /// with a different UID, the message is a second copy with the same `Message-ID`: try
 /// `msg_<hash>_<uid>`, then `msg_<hash>_<uid>_<uidvalidity>`. If the plain id exists in another
-/// folder it is a move, so the id and the local flags are reused. `None` means every candidate is
-/// taken; the caller skips the message rather than overwrite another row.
+/// folder it is a move, so the id and the local flags are reused. A locally written Sent/Archive row
+/// with the same `Message-ID` and no UID (the Sent copy of a submitted draft) is preferred,
+/// account-wide, so a server copy that arrives before or after the local move — and even after moving
+/// to Archive — is one row; if the server copy was already cached first, the stale local row is
+/// deleted. Drafts and Trash rows are never adopted: a Sent copy moved back to Drafts is being edited.
+/// `None` means every candidate is taken; the caller skips the message rather than overwrite another
+/// row.
 fn choose_identity(
     store: &store::Store,
     folder: &store::Folder,
@@ -203,6 +208,20 @@ fn choose_identity(
         return Ok(Some((id, existing)));
     };
     let variants = ids::message_id_variants(account_id, message_id, uid, uid_validity);
+    // A locally written Sent/Archive row (the Sent copy of a submitted draft) has no UID. It is found
+    // first so that a provider auto-save or a sync that ran before the local move adopts it instead of
+    // creating a second row; account-wide, so a server copy that moved to Archive is still the same
+    // message. Drafts/Trash are excluded by the store lookup: a moved-back Sent copy is being edited.
+    let local = store.local_message_for_id(account_id, message_id)?;
+    if let Some(local_id) = &local
+        && let Some(cached) = index.cached.get(&variants[0])
+        && cached.uid.is_some()
+    {
+        // The server copy is already cached under the plain identity: the uid-null row is a duplicate
+        // left by an older finalize. Remove it and let the normal identity win.
+        store.delete_message(local_id).map_err(SyncError::Store)?;
+    }
+    let local = if let Some(cached) = index.cached.get(&variants[0]) { if cached.uid.is_some() { None } else { local } } else { local };
     for (position, variant) in variants.iter().enumerate() {
         if let Some(row) = index.cached.get(variant) {
             if row.uid == Some(uid) {
@@ -222,6 +241,14 @@ fn choose_identity(
                 return Ok(Some((variant.clone(), Some(Existing { unread: existing.unread, starred: existing.starred }))));
             }
             continue;
+        }
+        if position == 0
+            && let Some(local) = &local
+            && let Some(flags) = store.message_flags(local)?
+        {
+            // The local row is the same message as this server copy: give it the UID (and, through
+            // the upsert, the folder it arrived in) instead of inserting a duplicate.
+            return Ok(Some((local.clone(), Some(Existing { unread: flags.unread, starred: flags.starred }))));
         }
         return Ok(Some((variant.clone(), None)));
     }

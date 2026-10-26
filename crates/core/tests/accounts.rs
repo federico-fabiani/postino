@@ -8,11 +8,16 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 
-use postino_core::{Engine, LabelColor, MailTls, OpError, Provider, SyncPhase};
+use postino_core::{AccountUpdateRequest, CredentialVault, Engine, LabelColor, MailTls, OpError, Provider, SmtpSetup, SyncPhase};
 use postino_store::{AccountServer, Address, FolderKind, Message, MessageSummary};
-use postino_testkit::{FailPoint, MailboxScript, TestFolder, TestMessage, USER, synthetic_message, synthetic_message_with_attachment};
+use postino_testkit::{
+    FailPoint, MailboxScript, TestFolder, TestMessage, USER, expected_smtp_sasl, synthetic_message, synthetic_message_with_attachment,
+};
 use serde_json::json;
-use support::{ACCOUNT_ID, Harness, MemoryVault, RunningServer, account_setup, refuse_list_with_secret, reject_login, seed_account, start_handler};
+use support::{
+    ACCOUNT_ID, Harness, MemoryVault, RunningServer, RunningSmtp, account_setup, refuse_list_with_secret, reject_login, seed_account,
+    seed_account_with_smtp, start_handler,
+};
 use zeroize::Zeroizing;
 
 const ATTACHMENT_BYTES: &[u8] = b"postino p6a attachment";
@@ -145,6 +150,7 @@ fn an_unreachable_host_writes_nothing() {
         host: Some("127.0.0.1".to_owned()),
         port: Some(port),
         tls: Some(MailTls::Implicit),
+        smtp: None,
         extra_roots: Vec::new(),
     };
 
@@ -203,6 +209,7 @@ fn account_test_reports_folders_capabilities_and_survives_a_broken_credential() 
             tls: postino_store::AccountTls::Implicit,
             username: USER.to_owned(),
             created_at: 1_700_000_000_000,
+            smtp: None,
         })
         .expect("point at the rejecting server");
     vault.set(ACCOUNT_ID, b"wrong-password");
@@ -409,7 +416,7 @@ fn a_failed_account_transaction_removes_the_just_stored_credential_and_writes_no
     server.finish();
     let text = error.to_string();
     assert!(text.contains("the local store refused the account"), "{text}");
-    assert!(text.contains("credential was removed again"), "the cleanup did not run: {text}");
+    assert!(text.contains("credentials were removed again"), "the cleanup did not run: {text}");
     assert_eq!(vault.len(), 0, "the credential survived a failed account transaction");
     let deletions = vault.deletions();
     assert_eq!(deletions.len(), 1, "the credential deletion was not recorded");
@@ -463,6 +470,7 @@ fn the_demo_engine_answers_account_and_sync_operations_with_a_readable_error() {
         host: Some("localhost".to_owned()),
         port: Some(1),
         tls: Some(MailTls::Implicit),
+        smtp: None,
         extra_roots: Vec::new(),
     };
     let error = engine.add_account(setup).expect_err("the demo has no store");
@@ -485,6 +493,7 @@ fn account_add_validates_input_before_anything_is_written() {
         host: Some("localhost".to_owned()),
         port: Some(993),
         tls: Some(MailTls::Implicit),
+        smtp: None,
         extra_roots: Vec::new(),
     };
 
@@ -520,4 +529,142 @@ fn account_add_validates_input_before_anything_is_written() {
 
     assert!(engine.accounts().is_empty());
     assert_eq!(vault.len(), 0);
+}
+
+#[test]
+fn account_add_probes_stores_and_removes_the_smtp_credential() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    let mut engine = Engine::open_with_vault(harness.open(), vault.clone()).expect("engine");
+    let imap = RunningServer::start(mailbox(), 1);
+    let smtp = RunningSmtp::start(1, |_, mut conn| async move {
+        conn.greet(&["AUTH PLAIN LOGIN", "SIZE 1024000"]).await;
+        conn.auth_plain_ok(&expected_smtp_sasl()).await;
+        conn.expect("QUIT").await;
+        conn.send_line("221 bye").await;
+    });
+    engine.set_test_extra_roots(vec![imap.ca(), smtp.ca()]);
+    let mut setup = account_setup(&imap);
+    setup.smtp = Some(SmtpSetup {
+        host: "localhost".to_owned(),
+        port: smtp.port(),
+        tls: MailTls::Implicit,
+        username: USER.to_owned(),
+        password: Some(Zeroizing::new(postino_testkit::SMTP_PASSWORD.to_owned())),
+    });
+    let view = engine.add_account(setup).expect("account with SMTP");
+    let server = view.server.expect("server settings");
+    let endpoint = server.smtp.expect("SMTP endpoint");
+    assert_eq!((endpoint.host.as_str(), endpoint.port, endpoint.tls), ("localhost", smtp.port(), MailTls::Implicit));
+    assert_eq!(endpoint.username, USER);
+    assert_eq!(
+        vault.load_smtp_password(&view.account.id).expect("load SMTP").as_deref().map(Vec::as_slice),
+        Some(postino_testkit::SMTP_PASSWORD.as_bytes())
+    );
+    engine.remove_account(&view.account.id, true).expect("remove");
+    assert!(vault.load_smtp_password(&view.account.id).expect("load after remove").is_none());
+    smtp.finish();
+    imap.finish();
+}
+
+#[test]
+fn account_update_adds_and_clears_the_smtp_endpoint_without_touching_mail() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    let store = harness.open();
+    seed_account(&store, &vault, ACCOUNT_ID, 1, &[("drafts", "Drafts", FolderKind::Drafts), ("sent", "Sent", FolderKind::Sent)]);
+    let smtp = RunningSmtp::start(1, |_, mut conn| async move {
+        conn.greet(&["AUTH PLAIN"]).await;
+        conn.auth_plain_ok(&postino_testkit::expected_sasl()).await;
+        conn.expect("QUIT").await;
+        conn.send_line("221 bye").await;
+    });
+    let mut engine = Engine::open_with_vault(harness.open(), vault.clone()).expect("engine");
+    engine.set_test_extra_roots(vec![smtp.ca()]);
+    let view = engine
+        .update_account(AccountUpdateRequest {
+            id: ACCOUNT_ID.to_owned(),
+            smtp_host: Some("localhost".to_owned()),
+            smtp_port: Some(smtp.port()),
+            smtp_tls: Some(MailTls::Implicit),
+            smtp_username: Some(USER.to_owned()),
+            smtp_password: None,
+            clear_smtp: false,
+        })
+        .expect("add SMTP");
+    let endpoint = view.server.expect("server").smtp.expect("SMTP endpoint");
+    assert_eq!(endpoint.port, smtp.port());
+    assert_eq!(vault.password(ACCOUNT_ID).as_deref(), Some(postino_testkit::PASSWORD.as_bytes()), "the IMAP credential was changed");
+    let cleared = engine
+        .update_account(AccountUpdateRequest {
+            id: ACCOUNT_ID.to_owned(),
+            smtp_host: None,
+            smtp_port: None,
+            smtp_tls: None,
+            smtp_username: None,
+            smtp_password: None,
+            clear_smtp: true,
+        })
+        .expect("clear SMTP");
+    assert!(cleared.server.expect("server").smtp.is_none());
+    smtp.finish();
+}
+
+#[test]
+fn account_update_refuses_to_clear_and_set_smtp_at_once() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    seed_account(&harness.open(), &vault, ACCOUNT_ID, 1, &[]);
+    let mut engine = Engine::open_with_vault(harness.open(), vault).expect("engine");
+    let base = AccountUpdateRequest {
+        id: ACCOUNT_ID.to_owned(),
+        smtp_host: None,
+        smtp_port: None,
+        smtp_tls: None,
+        smtp_username: None,
+        smtp_password: None,
+        clear_smtp: true,
+    };
+    for request in [
+        AccountUpdateRequest { smtp_host: Some("smtp.example.com".to_owned()), ..base.clone() },
+        AccountUpdateRequest { smtp_port: Some(587), ..base.clone() },
+        AccountUpdateRequest { smtp_tls: Some(MailTls::StartTls), ..base.clone() },
+        AccountUpdateRequest { smtp_username: Some(USER.to_owned()), ..base.clone() },
+        AccountUpdateRequest { smtp_password: Some(Zeroizing::new("secret".to_owned())), ..base.clone() },
+    ] {
+        let error = engine.update_account(request).expect_err("clear_smtp with endpoint fields must be refused");
+        assert!(matches!(error, OpError::InvalidArgs(_)), "{error}");
+        assert!(error.to_string().contains("clear_smtp"), "{error}");
+    }
+}
+
+#[test]
+fn account_test_probes_a_configured_smtp_endpoint_without_echoing_it() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    let imap = RunningServer::start(mailbox(), 1);
+    // The submission server rejects the credential and repeats the password it received.
+    let smtp = RunningSmtp::start(1, |_, mut conn| async move {
+        conn.greet(&["SIZE 1024000", "AUTH PLAIN"]).await;
+        conn.expect_prefix("AUTH PLAIN ").await;
+        conn.send_line(&format!("535 5.7.8 {}", postino_testkit::SMTP_PASSWORD)).await;
+    });
+    let store = harness.open();
+    seed_account_with_smtp(
+        &store,
+        &vault,
+        ACCOUNT_ID,
+        imap.port(),
+        smtp.port(),
+        &[("inbox", "INBOX", FolderKind::Inbox), ("sent", "Sent", FolderKind::Sent)],
+    );
+    let mut engine = Engine::open_with_vault(harness.open(), vault).expect("engine");
+    engine.set_test_extra_roots(vec![imap.ca(), smtp.ca()]);
+    let error = engine.test_account(ACCOUNT_ID).expect_err("the SMTP credential is refused");
+    imap.finish();
+    smtp.finish();
+    assert!(matches!(error, OpError::Auth(_)), "{error}");
+    assert!(error.to_string().contains("SMTP"), "{error}");
+    assert!(!error.to_string().contains(postino_testkit::SMTP_PASSWORD), "the server echo leaked: {error}");
+    assert!(!error.to_string().contains("535 5.7.8"), "the server text leaked: {error}");
 }

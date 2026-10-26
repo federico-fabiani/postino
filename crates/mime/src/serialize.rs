@@ -65,6 +65,9 @@ pub struct Serialized {
     pub raw: Vec<u8>,
     /// Envelope information for the transport, including blind recipients.
     pub envelope: Envelope,
+    /// The generated or caller-provided `Message-ID`, with angle brackets. The outbox records it so
+    /// a person can match a queued row to the Sent copy.
+    pub message_id: String,
 }
 
 /// The SMTP envelope: who the server should treat as sender and recipients.
@@ -206,7 +209,7 @@ pub fn serialize(message: &OutgoingMessage) -> Result<Serialized, MimeError> {
     }
 
     let envelope = envelope(message);
-    Ok(Serialized { raw: writer.finish(), envelope })
+    Ok(Serialized { raw: writer.finish(), envelope, message_id })
 }
 
 struct PreparedAttachment {

@@ -157,6 +157,28 @@ impl Connection {
         }
     }
 
+    /// Write a large literal with a fresh timeout for every chunk.
+    ///
+    /// A 25 MiB `APPEND` on a slow but healthy uplink can legitimately take longer than one command
+    /// timeout; a connection that stops accepting bytes is still caught within one timeout per
+    /// chunk. The whole transfer is bounded by [`crate::MAX_BODY_TRANSFER`], which is shorter than the
+    /// outbox append lease, so a live append cannot be expired as a crash.
+    pub(crate) async fn write_all_chunked(&mut self, bytes: &[u8], phase: &'static str) -> Result<(), NetError> {
+        const WRITE_CHUNK: usize = 16 * 1024;
+        let transfer_deadline = Instant::now().checked_add(crate::MAX_BODY_TRANSFER).unwrap_or_else(Instant::now);
+        for chunk in bytes.chunks(WRITE_CHUNK) {
+            let chunk_deadline = Instant::now().checked_add(self.timeout).unwrap_or_else(Instant::now);
+            let deadline = chunk_deadline.min(transfer_deadline);
+            if let Err(error) = self.write_all(chunk, phase, deadline).await {
+                return match (error, deadline == transfer_deadline) {
+                    (NetError::Timeout { .. }, true) => Err(NetError::Timeout { phase, after: crate::MAX_BODY_TRANSFER }),
+                    (other, _) => Err(other),
+                };
+            }
+        }
+        Ok(())
+    }
+
     /// Read one logical response: a line, plus any literals that end it and their continuation
     /// lines.
     pub(crate) async fn read_response(&mut self, phase: &'static str, deadline: Instant, budget: &mut Budget) -> Result<Vec<Segment>, NetError> {

@@ -33,7 +33,9 @@ impl VaultError {
 /// Storage for account credentials that must survive a restart without touching the database.
 ///
 /// The engine stores an account's password only after the server accepted it, and deletes it when
-/// the account is removed. A missing password is `Ok(None)`: it is a state, not a crash.
+/// the account is removed. A missing password is `Ok(None)`: it is a state, not a crash. The SMTP
+/// password is separate: when no `smtp` credential exists, the engine falls back to the IMAP one
+/// (the common Aruba/Gmail app-password setup) and never copies it into the other scope.
 pub trait CredentialVault: Send + Sync {
     /// Create or replace one account's IMAP password.
     fn store_imap_password(&self, account_id: &str, password: &[u8]) -> Result<(), VaultError>;
@@ -44,6 +46,15 @@ pub trait CredentialVault: Send + Sync {
     /// Delete one account's IMAP password. Deleting a missing credential succeeds, so cleanup is
     /// retryable.
     fn delete_imap_password(&self, account_id: &str) -> Result<(), VaultError>;
+
+    /// Create or replace one account's SMTP password.
+    fn store_smtp_password(&self, account_id: &str, password: &[u8]) -> Result<(), VaultError>;
+
+    /// Read one account's SMTP password. `Ok(None)` means "use the IMAP credential".
+    fn load_smtp_password(&self, account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError>;
+
+    /// Delete one account's SMTP password. Deleting a missing credential succeeds.
+    fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError>;
 }
 
 #[cfg(test)]

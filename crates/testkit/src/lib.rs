@@ -1,9 +1,9 @@
-//! Test-only fake IMAP server, TLS fixture, response builders and synthetic mail.
+//! Test-only fake IMAP and SMTP servers, TLS fixture, response builders and synthetic mail.
 //!
-//! This crate exists for `postino-net` and `postino-sync` integration tests: it listens on a real
-//! loopback socket, presents a certificate from a throwaway `rcgen` CA, asserts the exact command
-//! lines a client writes and answers with the bytes a test scripts. It is a **dev-dependency only**;
-//! no production crate may link it (`cargo xtask layers` enforces that).
+//! This crate exists for `postino-net`, `postino-sync` and `postino-core` integration tests: it
+//! listens on a real loopback socket, presents a certificate from a throwaway `rcgen` CA, asserts
+//! the exact command lines a client writes and answers with the bytes a test scripts. It is a
+//! **dev-dependency only**; no production crate may link it (`cargo xtask layers` enforces that).
 //!
 //! A scripted server has to fail loudly, so helper code here uses `expect`/`panic!` on purpose: a
 //! mismatched expectation is a broken test, not a runtime condition. That is the one exception to
@@ -28,6 +28,7 @@
 mod mailbox;
 mod responses;
 mod server;
+mod smtp;
 mod synthetic;
 mod tls;
 
@@ -37,5 +38,6 @@ pub use responses::{
     quoted, select_lines,
 };
 pub use server::{Conn, FakeServer, PASSWORD, USER, config_with_timeout, expected_sasl};
+pub use smtp::{FakeSmtp, SMTP_PASSWORD, SMTP_USER, SmtpConn, expected_smtp_login_password, expected_smtp_login_user, expected_smtp_sasl};
 pub use synthetic::{SyntheticMessage, synthetic_html_message, synthetic_message, synthetic_message_with_attachment, synthetic_messages};
 pub use tls::TlsFixture;

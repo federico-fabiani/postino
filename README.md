@@ -6,24 +6,24 @@ registry shared by the desktop app, the CLI and an MCP server.
 > **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
 > the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
 > store (P5b/P5c) + accounts, credentials and sync operations (P6a) + onboarding and the app on real
-> data (P6b) + the text reading pane, safe links, attachment Save and full settings (P6c).** The
-> desktop app opens the encrypted SQLCipher store by default, offers a guided Aruba/Gmail/custom
-> onboarding with a real connection test and background sync, and reads cached mail offline; `--demo`
-> keeps the synthetic mailbox for screenshots and trials. The CLI and the MCP
-> server use the same operation registry: `postino --store <path>` (or the default
+> data (P6b) + the text reading pane, safe links, attachment Save and full settings (P6c) + SMTP
+> submission and the outbox (P7).** The desktop app opens the encrypted SQLCipher store by default,
+> offers a guided Aruba/Gmail/custom onboarding with a real connection test and background sync, and
+> reads cached mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI
+> and the MCP server use the same operation registry: `postino --store <path>` (or the default
 > `%LOCALAPPDATA%\Postino\mail.db` on Windows) runs the same operations on the encrypted database,
 > and the CLI can add a real Aruba or Gmail account with an app password, test it, sync it and remove
-> it. Passwords live only in the OS keyring; **Windows Credential Manager is the only keyring backend
-> in this build**, and macOS/Linux fail at the platform seam until their keychains land with
-> packaging. MIME parsing, sanitization and serialization exist as `postino-mime`;
-> `postino-net` is an IMAP4rev1 client that logs in over TLS, lists folders, selects, fetches
-> envelopes and `BODY.PEEK[]` bodies, stores flags and idles; and `postino-sync` reconciles one
-> account into the encrypted store: folders with special-use, UIDVALIDITY resets, incremental UID
-> fetches, MIME bodies, attachment bytes in the blob store, deletions, flags on first insert, a
-> cancellable run and a persistent status. Attachment bytes are encrypted at rest in a
-> content-addressed blob directory next to the database. Gmail OAuth is P12 and SMTP and the
-> background daemon land in M2-M4: no mail is sent, and the composer's send is still a local move to
-> Sent.
+> it. **Postino can now send real mail:** the composer queues a draft, the exact RFC 5322 bytes are
+> stored before any network call, an outbox survives restarts, a 5-second undo window precedes the
+> first attempt, and a Sent APPEND is retried independently of submission. The transaction never
+> resubmits an uncertain message. Passwords live only in the OS keyring; **Windows Credential Manager
+> is the only keyring backend in this build**, and macOS/Linux fail at the platform seam until their
+> keychains land with packaging. MIME parsing, sanitization and serialization exist as
+> `postino-mime`; `postino-net` is an IMAP4rev1 client and the SMTP submission client; and
+> `postino-sync` reconciles one account into the encrypted store. Attachment bytes are encrypted at
+> rest in a content-addressed blob directory next to the database. Gmail OAuth is P12, the background
+> daemon lands in M4, and the GUI still writes attachment *metadata* only: a GUI attachment without
+> stored bytes is refused before queueing (P8 completes compose attachments and signatures).
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -40,10 +40,16 @@ MCP      ─┘
 - Folder rail, message table, reading pane, filters, read/starred toggles, command palette
   (`Ctrl+K`), dark theme and a demo inbox with realistic threads and attachments.
 - Compose window with To/Cc/Bcc, subject, signature, Markdown formatting, drag-and-drop attachment
-  metadata, autosaved drafts and reply/reply-all/forward prefill. Send is a local move to Sent until
-  M2 (no SMTP) and is undoable. `draft_save` is a patch on update: an omitted content field keeps the
-  draft's current value, while an explicitly empty value clears it. The CLI sends only the flags the
-  user passed and accepts `--account`; the app keeps sending the full content.
+  metadata, autosaved drafts and reply/reply-all/forward prefill. **Invia** is a real submission: the
+  draft is queued with a 5-second undo window, the exact bytes are stored before any connection, and
+  the outbox (`Ctrl+Shift+O`) shows queue, sending, uncertain, failed and Sent states. The demo has no
+  SMTP endpoint and refuses to send with a visible reason. `draft_save` is a patch on update: an
+  omitted content field keeps the draft's current value, while an explicitly empty value clears it.
+  The CLI sends only the flags the user passed and accepts `--account`; the app keeps sending the full
+  content. A draft with a live journal row (`queued`, `sending`, `append_pending`, `uncertain` or
+  `failed`) that belongs to a message still in Drafts cannot be edited or moved; a permanently failed
+  row can be discarded from the outbox (CLI `postino outbox cancel`, or “Scarta”) to make the draft
+  editable again, and a Sent copy is ordinary mail that can be moved or archived.
 - Local labels with a semantic colour palette: create, rename and delete from the sidebar; apply and
   remove from the message menu (`L`), the command palette, the CLI and MCP; filter the list by label
   and see label chips in the reading pane. A label view spans every folder by default and a folder
@@ -65,10 +71,12 @@ MCP      ─┘
   reading width), data (store and blob paths with a copy action, open the blob folder) and version,
   licences and shortcuts; every section fits 980×600 and returns focus to the account switcher on
   `Esc`.
-- Twenty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
-  `account_test`, `account_remove`, `sync_now`, `sync_status`, `folders_list`, `messages_list`,
-  `message_get`, `message_flag`, `message_move`, `draft_save`, `draft_send`, `search`, `labels_list`,
-  `label_create`, `label_update`, `label_delete`, `label_apply`.
+- Twenty-seven typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
+  `account_update`, `account_test`, `account_remove`, `sync_now`, `sync_status`, `folders_list`,
+  `messages_list`, `message_get`, `message_flag`, `message_move`, `draft_save`, `message_send`,
+  `send_schedule`, `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`,
+  `send_dry_run`, `search`, `labels_list`, `label_create`, `label_update`, `label_delete`,
+  `label_apply`.
 - Real accounts from the CLI: Aruba and Gmail are discovered offline (Gmail needs 2FA + an app
   password; OAuth is P12), `custom` takes host/port/TLS, a no-echo prompt or `--password-stdin` is the
   only way in, and MCP cannot add or remove an account. Passwords live in the OS keyring, never in
@@ -76,11 +84,12 @@ MCP      ─┘
 - `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
-- The M1 persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema
-  v4 (draft revision sequence, label high-water mark, per-account IMAP endpoint), additive migrations
-  and a typed repository (`postino-store`), plus the OS keyring seam (`postino-platform`). `Engine::open`
+- The persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema v5
+  (SMTP endpoints on the account row and the outbox journal), additive migrations and a typed
+  repository (`postino-store`), plus the OS keyring seam (`postino-platform`). `Engine::open`
   loads the mailbox once, repairs orphan drafts, writes every mutation through in one transaction
-  and keeps store errors categorised; `Engine::demo()` is unchanged and the desktop app still uses it.
+  and keeps store errors categorised; the desktop app boots on the store, with `--demo` as the
+  synthetic fallback.
 - The M1 MIME foundation as a crate (`postino-mime`, P4a): bounded RFC 5322/2045 parsing with
   recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
@@ -114,6 +123,36 @@ MCP      ─┘
   cancellation + reopen, `BODY.PEEK`-only and an offline read through `Engine::open`), with a
   2 000-message test in CI and 10 000 behind `POSTINO_SLOW_TESTS=1`. P6a wires it to `sync_now`, so
   the CLI (`postino sync run`) and MCP can run it on demand; there is still no scheduler or daemon.
+- **SMTP submission and the outbox (P7).** `postino-net` now also speaks SMTP over implicit TLS or
+  STARTTLS: `EHLO`, `AUTH PLAIN`/`LOGIN`, `MAIL`/`RCPT`/`DATA`, `SIZE`, `8BITMIME`, `SMTPUTF8`, DSN,
+  dot-stuffing, bounded lines/replies/messages and typed errors. Before the final `.`, a 4xx is
+  transient and a 5xx is permanent; after it, every failure (a refusal, a timeout, a close or a
+  malformed reply) is *uncertain* and never retried automatically. `message_send` serializes the draft,
+  stores the exact bytes in the encrypted blob store and inserts an outbox row before the network. A
+  worker stamps each row's `lease_at` when it claims that row (45 minutes, above the client's
+  30-minute body budget, so a live transfer is never expired as a crash), retries transient failures
+  with 30 s → 1 h backoff (eight attempts), stops an account on an auth failure, and copies accepted
+  mail to the server's `\Sent` with `\Seen`. The append claim is stamped when the `250` arrives, not at
+  the pass start, so a long submission cannot leave it backdated; it also has its own attempt counter,
+  so a failed append backs off 30 s → 1 h without resubmitting the message, and two passes cannot
+  append the same row. The outbox has a `draft_id`
+  column and a partial unique index over every active state, so a draft can have at most one active
+  row: a repeated `message_send` (even after a cancel) is one row and one SMTP delivery, and an edit
+  after a cancel is a new revision. `last_error` is a fixed sentence (stage and code), never the
+  server's text. A crash during `DATA` becomes `Invio incerto`, with “Segna come inviato” and “Riprova
+  manualmente”, never an automatic retry. The CLI has `postino send --draft <id> [--at …]
+  [--dry-run]` and `postino outbox list [--limit N] [--offset N] | cancel | retry | mark-sent`; a plain
+  `postino send` waits the 5-second undo window and submits, while only a future `--at` leaves the row
+  queued. MCP exposes the same tools but gates sending behind `postino mcp --allow-send` and only
+  queues. The desktop app polls the store every two seconds, so a row queued by the CLI or MCP is sent
+  when due, and reloads the mailbox when another process delivers a row, so the draft leaves Drafts and
+  Sent is current. The journal keeps 30 days of terminal history and pages newest-first. A Sent copy
+  moved back to Drafts must be edited before it can be sent again: the engine compares the draft
+  revision with the sent envelope, so the crash window where the local move did not run cannot become a
+  duplicate delivery, and a stale engine cannot overwrite a message another process already sent.
+  The `Date` header is the draft's **last-saved instant**, not the send instant: that is what makes
+  the dry run and the later send byte-identical, and it means a draft edited days ago and sent today
+  carries that older date.
 - Headless rendering tests of the shell, gallery, composer and label flows, the reading pane's
   link/attachment/settings paths with injected opener/saver recorders, operation-schema tests, MCP
   protocol tests, and store round-trip tests at both the repository and engine level.
@@ -129,6 +168,14 @@ MCP      ─┘
 ![Postino reading pane at 980×600: the text view and the pinned attachment strip with Save above the status bar](docs/images/postino-p6c-reading-attachments-980.png)
 
 ![Postino settings: accounts with the active badge, appearance choices, store and blob paths, last sync, and the licences and shortcut entries](docs/images/postino-p6c-settings.png)
+
+![Postino outbox: a queued row with Annulla, an uncertain row with Segna come inviato / Riprova manualmente, a failed 550 with a fixed sentence (the server's text is never stored) and a Scarta action, and a sent row](docs/images/postino-p7-outbox-980.png)
+
+![Postino composer after P7: the Send button now reads Invia and the notice explains the real SMTP submission and the 5-second undo window](docs/images/postino-p7-compose-980.png)
+
+The last two captures were exported from a 1.25× scaled Windows host, so the PNGs are 1225×750 while
+the layout and every headless test are 980×600. The composer has no schedule control yet: scheduling is
+`postino send --at` or `send_schedule` over MCP until the UI action lands.
 
 Everything below the UI is headless and has no egui dependency.
 
@@ -147,7 +194,7 @@ cargo run -p postino-cli -- --demo messages --folder inbox --limit 5
 cargo run -p postino-cli -- --demo read msg_001
 cargo run -p postino-cli -- --demo search fattura
 cargo run -p postino-cli -- --demo run messages_list folder=inbox limit=2
-cargo run -p postino-cli -- --demo draft save --to "Giulia <giulia.ferri@example.com>" --subject "Ciao" --body "Ci sentiamo domani." --send
+cargo run -p postino-cli -- --demo draft save --to "Giulia <giulia.ferri@example.com>" --subject "Ciao" --body "Ci sentiamo domani."
 cargo run -p postino-cli -- --demo label list
 cargo run -p postino-cli -- --demo label create "Ufficio" --color forest
 cargo run -p postino-cli -- --demo messages --label lbl_1
@@ -160,9 +207,21 @@ cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" info
 # A real account: the password is prompted without echo (or pipe one line with --password-stdin)
 cargo run -p postino-cli -- account add --provider aruba --email me@example.it --name "Federico"
 cargo run -p postino-cli -- account list
+cargo run -p postino-cli -- account update acc_0123456789abcdef --smtp-host smtp.example.com --smtp-port 465 --smtp-tls implicit
 cargo run -p postino-cli -- account test acc_0123456789abcdef
 cargo run -p postino-cli -- sync run
 cargo run -p postino-cli -- sync status
+
+# Real send (P7): dry run, queue now, schedule, inspect and cancel
+cargo run -p postino-cli -- send --draft draft_1 --dry-run
+cargo run -p postino-cli -- send --draft draft_1
+cargo run -p postino-cli -- send --draft draft_1 --at "2026-10-27T09:00:00+01:00"
+cargo run -p postino-cli -- outbox list
+cargo run -p postino-cli -- outbox cancel ob_0123456789abcdef
+cargo run -p postino-cli -- outbox retry ob_0123456789abcdef --yes
+
+# MCP sending is off unless the server is started with the flag
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" mcp --allow-send
 cargo run -p postino-cli -- account remove acc_0123456789abcdef --yes
 ```
 
@@ -175,9 +234,13 @@ fail at the `postino-platform` seam with `PlatformError::Unsupported` until thei
 land with packaging, so there is no platform-equivalent default store yet. `--store` picks another
 SQLCipher database; `--demo` and `--store` are mutually exclusive. First-run key creation is
 serialised with `<app local data>/Postino/keyring.lock` and verified by reading the key back. An IMAP
-credential is stored under `account:<id>:imap` in the same keyring, never in the database; the CLI's
-prompt does not echo and there is no `--password` argument. One process owns the database: do not
-point two `postino --store` commands at the same file.
+credential is stored under `account:<id>:imap` and an optional separate SMTP credential under
+`account:<id>:smtp` in the same keyring, never in the database; when no SMTP secret exists the IMAP
+credential is used for submission. The CLI's prompt does not echo and there is no `--password`
+argument. The app's sync and send workers open their own connections by design and the outbox lease
+(one row, one owner, each claim stamped when it is taken, a conditional transition per write) makes
+concurrent passes safe; still, do not copy or move the database while `postino` runs, and do not
+expect two clients to behave as two independent mailboxes.
 
 Read-only commands (`info`, `tools`, `schema`, `account list`, `account test`, `sync status`, mail
 reads) never create a missing default store and never touch the keyring for it: they report that no
@@ -186,8 +249,8 @@ is a usage error. Mutations (`account add`, `sync run`, account removal, draft/l
 create the default store. Exit codes are 0 for success, 1 for an operation failure and 2 for a usage
 error, including `OpError::InvalidArgs` (missing `--yes`, an invalid address/name/endpoint, an unknown
 id) and malformed `postino run` arguments. The `add | test | list | remove` account commands,
-`sync run | status` and the desktop onboarding all use the same encrypted store; Gmail OAuth is P12
-and no SMTP connection is opened.
+`sync run | status`, `send` and the desktop onboarding all use the same encrypted store; Gmail OAuth
+is P12. Sending opens the account's SMTP server; a dry run never connects.
 
 ### MCP
 
@@ -197,6 +260,11 @@ cargo run -p postino-cli -- --demo mcp
 
 The server speaks newline-delimited JSON-RPC 2.0 on stdin/stdout, implements `initialize`,
 `ping`, `tools/list` and `tools/call`, and stops at EOF. It is never started automatically.
+`postino mcp --allow-send` enables `message_send`, `send_schedule`, `outbox_retry` and
+`outbox_mark_sent`; without the flag those tools are listed as disabled with the reason and refused.
+`outbox_list`, `outbox_cancel` and `send_dry_run` stay available: a dry run is read-only and a cancel
+discards a queued or permanently failed row rather than sending one. The MCP server never runs the
+outbox pass — it only queues; the desktop app or `postino send` is what submits.
 
 Example client configuration:
 
@@ -212,10 +280,11 @@ Example client configuration:
 ```
 
 Without `--demo` and `--store`, `postino mcp` opens the default store. The tools are the same
-registry as the CLI, but `account_add` and `account_remove` are marked sensitive: they are absent
-from `tools/list` and refused by `tools/call`, so an agent can neither set nor see a password and
-cannot create or remove an account. `accounts_list`, `account_test`, `sync_now` and `sync_status` are
-available; none of their results contains a credential.
+registry as the CLI, but `account_add`, `account_update` and `account_remove` are marked sensitive:
+they are absent from `tools/list` and refused by `tools/call`, so an agent can neither set nor see a
+password and cannot create, reconfigure or remove an account. `accounts_list`, `account_test`,
+`sync_now` and `sync_status` are available; none of their results contains a credential. Sending is a
+separate, explicit opt-in: `postino mcp --allow-send`.
 
 ## Quality gates
 

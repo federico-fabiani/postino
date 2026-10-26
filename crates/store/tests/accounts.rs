@@ -50,6 +50,7 @@ fn server(account_id: &str, port: u16) -> AccountServer {
         tls: AccountTls::Implicit,
         username: format!("{account_id}@example.com"),
         created_at: 1_700_000_000_000,
+        smtp: None,
     }
 }
 
@@ -241,7 +242,7 @@ fn a_read_only_store_refuses_writes_and_rejects_an_old_schema() {
     drop(store);
 
     let read_only = Store::open_read_only(&fixture.path(), &fixture.key).expect("read-only open");
-    assert_eq!(read_only.schema_version().expect("version"), 4);
+    assert_eq!(read_only.schema_version().expect("version"), 5);
     assert_eq!(read_only.list_accounts().expect("read").len(), 1);
     let error = read_only.upsert_account(&account(ACCOUNT_B, "b@example.com")).expect_err("a write must fail on a read-only store");
     assert!(error.to_string().contains("readonly") || error.to_string().contains("read-only"), "{error}");
@@ -256,7 +257,7 @@ fn a_read_only_store_refuses_writes_and_rejects_an_old_schema() {
         connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\"; PRAGMA user_version = 3;")).expect("forge v3");
     }
     let error = Store::open_read_only(&fixture.path(), &fixture.key).err().expect("an old schema must be refused read-only");
-    assert!(matches!(error, postino_store::StoreError::SchemaTooOld { found: 3, supported: 4 }), "{error}");
+    assert!(matches!(error, postino_store::StoreError::SchemaTooOld { found: 3, supported: 5 }), "{error}");
 }
 
 #[test]
@@ -268,7 +269,21 @@ fn the_schema_has_no_password_column() {
     connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\"; PRAGMA foreign_keys = ON;")).expect("key");
     let mut stmt = connection.prepare("SELECT name FROM pragma_table_info('account_servers') ORDER BY cid").expect("columns");
     let columns = stmt.query_map([], |row| row.get::<_, String>(0)).expect("names").collect::<rusqlite::Result<Vec<_>>>().expect("rows");
-    assert_eq!(columns, vec!["account_id", "imap_host", "imap_port", "imap_tls", "imap_username", "created_at"]);
+    assert_eq!(
+        columns,
+        vec![
+            "account_id",
+            "imap_host",
+            "imap_port",
+            "imap_tls",
+            "imap_username",
+            "created_at",
+            "smtp_host",
+            "smtp_port",
+            "smtp_tls",
+            "smtp_username"
+        ]
+    );
     assert!(!columns.iter().any(|column| column.contains("password") || column.contains("secret")));
     drop(stmt);
     drop(connection);

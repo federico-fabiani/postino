@@ -11,7 +11,8 @@
 //! migrations. Version 2 is the M1 mailbox schema: accounts, folders, messages, attachments, labels,
 //! message_labels, drafts, sync_state and the P3a `meta` table. Version 3 adds `draft_seq`, the
 //! monotonic draft revision counter that survives a send and a move back to Drafts. Version 4 adds
-//! `account_servers`, the IMAP endpoint of each account, with no password column anywhere.
+//! `account_servers`, the IMAP endpoint of each account, with no password column anywhere. Version 5
+//! adds the nullable SMTP endpoint columns and the `outbox` journal (P7).
 //!
 //! Every date is a **Unix timestamp in milliseconds** (`i64`). The choice is deliberate:
 //!
@@ -48,8 +49,10 @@ mod repo;
 pub use blob::BlobStore;
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
-    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
+    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState, SmtpServer, SyncState,
+    UidEntry,
 };
+pub use repo::{MAX_OUTBOX_ROWS, UNCERTAIN_AFTER_CRASH};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -58,7 +61,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
 /// label id is never handed out again.
@@ -197,6 +200,46 @@ CREATE TABLE account_servers(
     created_at    INTEGER NOT NULL
 );
 "#,
+    // v5 (P7): SMTP submission endpoints and the outbox journal. The four SMTP columns are nullable
+    // because an existing account has no endpoint until it is re-added or edited; an account without
+    // one can still read mail and refuses to send with an actionable sentence. No password column.
+    //
+    // `draft_id` names the local draft the submission was built from. The partial unique index makes
+    // a second *active* row for one draft impossible: `queued`, `sending`, `append_pending`,
+    // `uncertain` and `failed` all still own the draft (a failed row must be discarded before a new
+    // queue, an uncertain row is a possible delivery), so a cancelled or sent row is the only way the
+    // slot frees up. `idempotency_key` is stable per draft revision and content hash, so the same
+    // queue request from two processes is one row, not two.
+    //
+    // `lease_at` is the lease epoch, written when a worker claims the row (submission or Sent
+    // append). `send_at` is the user-visible due time: a row scheduled for 09:00 and leased at 10:00
+    // is fresh for the whole lease window because the window is measured from `lease_at`, never from
+    // `send_at`.
+    r#"
+ALTER TABLE account_servers ADD COLUMN smtp_host TEXT;
+ALTER TABLE account_servers ADD COLUMN smtp_port INTEGER;
+ALTER TABLE account_servers ADD COLUMN smtp_tls TEXT;
+ALTER TABLE account_servers ADD COLUMN smtp_username TEXT;
+CREATE TABLE outbox(
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    draft_id TEXT,                    -- the local draft this submission came from
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    send_at INTEGER NOT NULL,         -- user-visible due time
+    state TEXT NOT NULL,              -- queued | sending | sent | append_pending | uncertain | failed | cancelled
+    attempts INTEGER NOT NULL DEFAULT 0,
+    append_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    raw_blob_hash TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    lease_at INTEGER                  -- written when a worker claims the row
+);
+CREATE INDEX outbox_due ON outbox(state, send_at);
+CREATE INDEX outbox_draft ON outbox(draft_id, created_at DESC);
+CREATE UNIQUE INDEX outbox_active_draft ON outbox(draft_id)
+    WHERE draft_id IS NOT NULL AND state IN ('queued', 'sending', 'append_pending', 'uncertain', 'failed');
+"#,
 ];
 
 /// A 256-bit store key.
@@ -271,6 +314,8 @@ pub enum StoreError {
     DuplicateAttachment { id: String },
     #[error("attachment id {id:?} belongs to message {owner:?}; omit the id so the engine assigns a new one")]
     AttachmentOwnedByOther { id: String, owner: String },
+    #[error("outbox already holds a {state} row for draft {draft_id:?}")]
+    OutboxAlreadyActive { draft_id: String, state: OutboxState },
     #[error("store row in {table} is not readable: {detail}")]
     Corrupt { table: &'static str, detail: String },
     #[error("store value cannot be encoded: {0}")]

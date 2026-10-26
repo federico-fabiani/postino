@@ -63,6 +63,20 @@ pub struct AccountServer {
     pub username: String,
     /// Unix milliseconds.
     pub created_at: i64,
+    /// The submission endpoint. `None` for an account added before P7 or one that may only read.
+    pub smtp: Option<SmtpServer>,
+}
+
+/// Where one account submits mail. The credential is in the keyring under `account:<id>:smtp`.
+///
+/// The username is separate from IMAP on purpose: providers such as Aruba may use the same address,
+/// but a custom server can require a different login. Never a password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmtpServer {
+    pub host: String,
+    pub port: u16,
+    pub tls: AccountTls,
+    pub username: String,
 }
 
 /// The role a folder plays. `Custom` is an ordinary IMAP folder.
@@ -204,8 +218,115 @@ pub struct FolderMessageFlags {
     pub starred: bool,
 }
 
-/// The per-folder sync cursor.
+/// The state of one outbox row.
 ///
+/// `Queued` and `Sending` are the only states a submitter may act on. `AppendPending` means SMTP
+/// already accepted the message and only the IMAP Sent copy is missing; it is retried independently
+/// and never resubmitted. `Uncertain` means the final `.` was written and no reply was read: only a
+/// person may resolve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxState {
+    /// Waiting for its due time.
+    Queued,
+    /// Leased by one worker; a crash here becomes `uncertain` after the lease window.
+    Sending,
+    /// Submitted and appended to Sent.
+    Sent,
+    /// Submitted, but the Sent append still has to succeed.
+    AppendPending,
+    /// The outcome of the submission is unknown. Never retried automatically.
+    Uncertain,
+    /// A permanent error or the attempt ceiling stopped the queue.
+    Failed,
+    /// Cancelled before submission.
+    Cancelled,
+}
+
+impl OutboxState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Sending => "sending",
+            Self::Sent => "sent",
+            Self::AppendPending => "append_pending",
+            Self::Uncertain => "uncertain",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "sending" => Some(Self::Sending),
+            "sent" => Some(Self::Sent),
+            "append_pending" => Some(Self::AppendPending),
+            "uncertain" => Some(Self::Uncertain),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OutboxState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One row of the submission journal.
+///
+/// `draft_id` is the local message this submission was built from. It is a real column, not an
+/// envelope field, because the state machine needs it: "the newest row for this draft" decides
+/// whether a queue is idempotent, and a partial unique index makes a second *active* row impossible.
+/// `None` only on an imported or damaged row.
+///
+/// `envelope_json` is opaque to this crate: the engine writes the envelope, the subject, the local
+/// draft id and the generated Message-ID there. It is encrypted with the rest of the database and is
+/// never logged. `raw_blob_hash` names the exact RFC 5322 bytes in the blob store.
+///
+/// `lease_at` is the instant one worker claimed the row. It is the only lease epoch: `send_at` is
+/// the user-visible due time and may be hours old while a live submission is still in `DATA`.
+///
+/// `append_attempts` counts Sent-append attempts separately from submission attempts: the two have
+/// independent backoff budgets, and a failed append must never look like a failed submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxEntry {
+    pub id: String,
+    pub account_id: String,
+    pub draft_id: Option<String>,
+    pub idempotency_key: String,
+    pub created_at: i64,
+    pub send_at: i64,
+    pub state: OutboxState,
+    pub attempts: u32,
+    pub append_attempts: u32,
+    pub last_error: Option<String>,
+    pub raw_blob_hash: String,
+    pub envelope_json: String,
+    pub lease_at: Option<i64>,
+}
+
+impl OutboxState {
+    /// Whether this row still owns a draft: a new queue for the same draft is refused and the draft
+    /// cannot be edited or moved. `Sent` is not active (the draft is already in Sent), and
+    /// `Cancelled` is a discard.
+    #[must_use]
+    pub fn blocks_draft(self) -> bool {
+        matches!(self, Self::Queued | Self::Sending | Self::AppendPending | Self::Uncertain | Self::Failed)
+    }
+
+    /// Whether a database row in this state prevents a second row for the same draft from being
+    /// queued. Only a row that can still deliver the message counts.
+    #[must_use]
+    pub fn occupies_draft_slot(self) -> bool {
+        matches!(self, Self::Queued | Self::Sending)
+    }
+}
+
+/// The per-folder sync cursor.///
 /// `uid_next` is the next UID the reconciler still has to fetch: the highest committed UID plus one,
 /// advanced only after a message transaction succeeds. It is deliberately separate from
 /// [`Folder::uid_next`], which is the raw `UIDNEXT` the server advertised at `SELECT` time.

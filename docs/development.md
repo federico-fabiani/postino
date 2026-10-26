@@ -107,14 +107,25 @@ What is still demo or missing:
 - A fresh store has no accounts: the app opens onboarding, the CLI uses `postino account add`.
   `postino --store <path> info` answers on a fresh store and the mail commands report that no account
   is configured.
-- One app process owns the store and its background sync worker opens a second connection in the
-  same process; SQLite WAL and the busy timeout serialise them. There is no daemon, pipe or
-  cross-process lock yet (M4): do not run two `postino --store` commands against one database.
-- IMAP, MIME, attachment blobs, sync and real accounts exist (P5-P6). Still missing: SMTP and
-  scheduled send (P7), FTS5 search and threading (P9), the daemon (M4), HTML rendering (M5) and
-  Gmail OAuth (P12). `draft_send` is still a local move to Sent and contacts no server.
-- Sync writes `uid`, `Message-ID` and the RFC 822 size; local drafts keep them empty until they are
-  submitted.
+- One app process owns the store and its background sync and send workers open their own connections
+  in the same process; SQLite WAL and the busy timeout serialise them, and the outbox lease, the append
+  claim and their guarded transitions make two passes (app + CLI) safe row by row. Every lease and
+  append claim is stamped when it is taken, so a row leased after an earlier row spent time in SMTP, or
+  an APPEND that follows a long submission, still owns a full window. There is no daemon, pipe or
+  cross-process lock yet (M4): do not copy or move the database while a command runs, and do not treat
+  two clients as two independent mailboxes.
+- IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission and the outbox exist
+  (P5-P7). Still missing: FTS5 search and threading (P9), the daemon and a scheduled send that runs
+  with the app closed (M4), HTML rendering (M5), compose attachments/signatures (P8) and Gmail OAuth
+  (P12). `message_send` queues real mail; the desktop send worker (which polls the store every two
+  seconds) and `postino send` process the outbox, so a future `--at` row waits until one of them runs.
+  A plain `postino send` (no `--at`) waits the 5-second undo window and submits in the same command.
+  MCP only queues.
+- Sync writes `uid`, `Message-ID` and the RFC 822 size; a local draft keeps them empty until the
+  submission is accepted, then the worker writes the Sent copy with the generated `Message-ID` so the
+  next Sent sync adopts it instead of duplicating it — including when the server copy was cached first:
+  the merge adopts the cached UID and skips the APPEND. A Sent copy moved back to Drafts is excluded
+  from adoption (only Sent/Archive rows are adopted), so the user can still edit it.
 - The database file lives wherever `--store` points; Postino does not create the parent directory.
 
 A quick manual check that persistence works (unit level, no keyring):
@@ -124,6 +135,18 @@ cargo test -p postino-cli cli_store_keeps_a_draft_across_a_reopen -- --nocapture
 cargo test -p postino-core --test engine_store -- --nocapture
 cargo test -p postino-core --test engine_blobs -- --nocapture
 ```
+
+The send pipeline has its own fake servers; no keyring or real account is touched:
+
+```sh
+cargo test -p postino-net --test smtp
+cargo test -p postino-core --test send -- --test-threads=1
+cargo test -p postino-store --test outbox
+cargo test -p postino-cli cli_send_queues_submits_and_reports_a_pending_sent_append
+```
+
+`postino-core --test send` includes a 25 MiB attachment case and four restart points; it takes about
+40 s on the Windows GNU host. `--test-threads=1` keeps the fake servers' ports and assertions readable.
 
 ## 4. Adding an operation
 
@@ -217,8 +240,8 @@ they have a reason to exist.
   section at 980×600 in both themes, focus return, the injected folder opener, one identity and one
   Retry, Cc layout, a sanitized message with no remote line, and compose/reply identity. No UI test
   opens a browser, a native dialog or a shell.
-- **Future:** a fake IMAP/SMTP server, property tests for the network parsers, fuzzing for MIME and
-  HTML.
+- **Test infrastructure:** the fake IMAP/SMTP servers and TLS fixture live in `postino-testkit` and
+  run in CI. Property tests for the network parsers and fuzzing for MIME remain future work.
 
 ### Desktop OS seams (P6c)
 

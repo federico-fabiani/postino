@@ -23,9 +23,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use postino_core::{
-    AccountAdd, AccountRemove, AccountRequest, AccountTest, AccountView, AccountsList, Address, AppInfo, CredentialVault, DraftSave, DraftSend,
-    Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet,
-    MessageSummary, MessagesList, OpError, Provider, SearchResult, SyncNow, SyncReport, SyncStatusReport, VaultError,
+    AccountAdd, AccountRemove, AccountRequest, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo, CredentialVault, DraftSave,
+    DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag,
+    MessageGet, MessageSummary, MessagesList, OpError, OutboxAction, OutboxListResult, Provider, SearchResult, SendQueued, SmtpSetup, SyncNow,
+    SyncReport, SyncStatusReport, VaultError,
 };
 use postino_platform::Keyring;
 use serde::Serialize;
@@ -75,12 +76,12 @@ enum DraftCommand {
         /// Body text. Omit to keep it on update; pass --body "" to clear it.
         #[arg(long)]
         body: Option<String>,
-        /// Save the draft and move it to Sent in the same command (no SMTP is opened).
+        /// Save the draft and queue it for real submission in the same command.
         #[arg(long)]
         send: bool,
     },
-    /// Move an existing draft to Sent locally. No SMTP connection is opened in this build; real
-    /// submission arrives with M2. Use `draft save --send` to create and move a draft in one step.
+    /// Queue an existing draft for real SMTP submission. This is now the same as `postino send
+    /// --draft <id>`; the local-only move is gone.
     Send { id: String },
 }
 
@@ -129,6 +130,23 @@ enum AccountCommand {
         /// Only for provider custom: implicit or starttls. There is no plaintext mode.
         #[arg(long, value_parser = ["implicit", "starttls"], requires_all = ["host", "port"])]
         tls: Option<String>,
+        /// SMTP submission host. Known providers use their preset; custom accounts may omit the
+        /// whole endpoint and then read mail without sending.
+        #[arg(long)]
+        smtp_host: Option<String>,
+        /// SMTP submission port; required with --smtp-host and --smtp-tls.
+        #[arg(long, requires_all = ["smtp_host", "smtp_tls"])]
+        smtp_port: Option<u16>,
+        /// SMTP TLS mode: implicit or starttls.
+        #[arg(long, value_parser = ["implicit", "starttls"], requires_all = ["smtp_host", "smtp_port"])]
+        smtp_tls: Option<String>,
+        /// SMTP login when it differs from the address.
+        #[arg(long)]
+        smtp_username: Option<String>,
+        /// Read a separate SMTP password from one more stdin line. Without it the IMAP password is
+        /// used for submission too. Never a command-line value.
+        #[arg(long)]
+        smtp_password_stdin: bool,
         /// Read the password (or app password) from one stdin line instead of prompting. There is
         /// deliberately no --password argument: a password must not appear in argv or shell history.
         #[arg(long)]
@@ -138,6 +156,30 @@ enum AccountCommand {
     Test {
         /// Account id returned by `account list`.
         id: String,
+    },
+    /// Change where an existing account submits mail, without touching its IMAP settings or cache.
+    Update {
+        /// Account id returned by `account list`.
+        id: String,
+        /// SMTP host. Known providers use their preset when omitted.
+        #[arg(long)]
+        smtp_host: Option<String>,
+        /// SMTP port. Required with --smtp-host for a custom server.
+        #[arg(long)]
+        smtp_port: Option<u16>,
+        /// SMTP TLS mode: implicit or starttls.
+        #[arg(long, value_parser = ["implicit", "starttls"])]
+        smtp_tls: Option<String>,
+        /// SMTP login when it differs from the address.
+        #[arg(long)]
+        smtp_username: Option<String>,
+        /// Read a new SMTP password from one stdin line. Omit to keep the existing secret or the
+        /// IMAP fallback. Never a command-line value.
+        #[arg(long)]
+        smtp_password_stdin: bool,
+        /// Remove the SMTP endpoint and its separate credential (read-only account).
+        #[arg(long)]
+        clear_smtp: bool,
     },
     /// List accounts with their IMAP server and last sync status.
     List,
@@ -162,6 +204,36 @@ enum SyncCommand {
     Status {
         #[arg(long)]
         account: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OutboxCommand {
+    /// List the submission journal, states, attempts and errors.
+    List {
+        #[arg(long)]
+        account: Option<String>,
+        /// Rows per page, 1-500. The newest rows are first.
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+        /// Rows to skip, newest first, to read older history.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    /// Cancel a row that is still queued, before the worker leases it.
+    Cancel { id: String },
+    /// Retry a failed or uncertain row after an explicit confirmation.
+    Retry {
+        id: String,
+        /// Confirm the retry. An uncertain row may already have been delivered.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Mark an uncertain row as sent without contacting the server.
+    MarkSent {
+        id: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -244,6 +316,23 @@ enum Command {
         #[command(subcommand)]
         command: DraftCommand,
     },
+    /// Queue a draft for real SMTP submission, or show the exact bytes with --dry-run.
+    Send {
+        /// Draft id returned by `postino draft save`.
+        #[arg(long)]
+        draft: String,
+        /// Schedule the first attempt at this RFC 3339 instant instead of now + 5 seconds.
+        #[arg(long)]
+        at: Option<String>,
+        /// Return the exact RFC 822 bytes and envelope without queueing or connecting.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect or act on the outbox journal.
+    Outbox {
+        #[command(subcommand)]
+        command: OutboxCommand,
+    },
     /// Create, rename, delete, apply or remove local labels.
     Label {
         #[command(subcommand)]
@@ -257,8 +346,12 @@ enum Command {
         #[arg(value_name = "KEY=VALUE", trailing_var_arg = true)]
         params: Vec<String>,
     },
-    /// Run the MCP server on stdin/stdout (opt-in).
-    Mcp,
+    /// Run the MCP server on stdin/stdout (opt-in). Sending is disabled unless --allow-send.
+    Mcp {
+        /// Allow message_send, send_schedule and outbox_retry over MCP. Off by default.
+        #[arg(long)]
+        allow_send: bool,
+    },
 }
 
 /// Keyring scope the CLI uses for its store. A different scope is a different key and therefore a
@@ -294,6 +387,21 @@ impl CredentialVault for PlatformVault {
 
     fn delete_imap_password(&self, account_id: &str) -> Result<(), VaultError> {
         let scope = Self::scope(account_id)?;
+        self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn store_smtp_password(&self, account_id: &str, password: &[u8]) -> Result<(), VaultError> {
+        let scope = postino_platform::account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.store_secret(&scope, password).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn load_smtp_password(&self, account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+        let scope = postino_platform::account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.load_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError> {
+        let scope = postino_platform::account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
         self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
     }
 }
@@ -394,10 +502,11 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } => true,
         Command::Read { mark_read, .. } => !mark_read,
         Command::Label { command } => matches!(command, LabelCommand::List),
+        Command::Outbox { command } => matches!(command, OutboxCommand::List { .. }),
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
         // operation is refused before dispatch and must not create one either.
         Command::Run { op, .. } => postino_core::op_defs().iter().find(|def| def.name == op).is_none_or(|def| def.read_only || def.sensitive),
-        Command::Flag { .. } | Command::Draft { .. } | Command::Mcp => false,
+        Command::Flag { .. } | Command::Draft { .. } | Command::Send { .. } | Command::Mcp { .. } => false,
     }
 }
 
@@ -437,6 +546,8 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             | Command::Search { .. }
             | Command::Flag { .. }
             | Command::Draft { .. }
+            | Command::Send { .. }
+            | Command::Outbox { .. }
             | Command::Label { .. }
     );
     if needs_mail && engine.accounts().is_empty() {
@@ -498,7 +609,20 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             }
         }
         Command::Account { command } => match command {
-            AccountCommand::Add { provider, email, name, host, port, tls, password_stdin } => {
+            AccountCommand::Add {
+                provider,
+                email,
+                name,
+                host,
+                port,
+                tls,
+                smtp_host,
+                smtp_port,
+                smtp_tls,
+                smtp_username,
+                smtp_password_stdin,
+                password_stdin,
+            } => {
                 let provider =
                     Provider::parse(&provider).ok_or_else(|| usage(format!("provider {provider:?} is not valid; use aruba, gmail or custom")))?;
                 let tls = match tls {
@@ -507,15 +631,35 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                     }
                     None => None,
                 };
+                let smtp_tls = match smtp_tls {
+                    Some(value) => {
+                        Some(MailTls::parse(&value).ok_or_else(|| usage(format!("SMTP TLS mode {value:?} is not valid; use implicit or starttls")))?)
+                    }
+                    None => None,
+                };
                 // The engine validates everything that does not need the secret before stdin is
                 // touched, so a bad command or a store that cannot accept the account fails without
                 // consuming the password.
-                let request = AccountRequest { provider, email: email.clone(), name: name.clone(), host: host.clone(), port, tls };
+                let request = AccountRequest {
+                    provider,
+                    email: email.clone(),
+                    name: name.clone(),
+                    host: host.clone(),
+                    port,
+                    tls,
+                    smtp_host: smtp_host.clone(),
+                    smtp_port,
+                    smtp_tls,
+                    smtp_username: smtp_username.clone(),
+                };
                 engine.check_account_request(&request)?;
                 if password_stdin && interactive {
                     return Err(usage(
                         "stdin is a terminal: omit --password-stdin to use the no-echo prompt, or pipe the password from a file or script",
                     ));
+                }
+                if smtp_password_stdin && interactive {
+                    return Err(usage("stdin is a terminal: pipe the SMTP password from a file or script, or omit --smtp-password-stdin"));
                 }
                 let password = if password_stdin {
                     read_password_stdin(input)?
@@ -528,7 +672,24 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 } else {
                     return Err(usage("no terminal is available to prompt for the password; use --password-stdin and pipe one line into postino"));
                 };
-                let view = account_add(engine, AccountAddRequest { provider, email, name, host, port, tls, password })?;
+                let smtp_password = if smtp_password_stdin {
+                    Some(read_password_stdin(input)?)
+                } else if interactive {
+                    let separate = rpassword::prompt_password("La password SMTP è diversa da quella IMAP? [s/N]: ").unwrap_or_default();
+                    if matches!(separate.trim().to_ascii_lowercase().as_str(), "s" | "si" | "sì" | "y" | "yes") {
+                        let second = rpassword::prompt_password("Password SMTP: ").context("reading the SMTP password from the terminal")?;
+                        if second.is_empty() {
+                            return Err(usage("the SMTP password must not be empty"));
+                        }
+                        Some(Zeroizing::new(second))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let smtp = smtp_setup(provider, &email, &request, smtp_password)?;
+                let view = account_add(engine, AccountAddRequest { provider, email, name, host, port, tls, smtp, password })?;
                 if json_output {
                     print_json(&AccountAdd { account: view })?;
                 } else {
@@ -541,6 +702,25 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                     print_json(&result)?;
                 } else {
                     say(format_account_test(&result))?;
+                }
+            }
+            AccountCommand::Update { id, smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password_stdin, clear_smtp } => {
+                if smtp_password_stdin && interactive {
+                    return Err(usage("stdin is a terminal: pipe the SMTP password from a file or script, or omit --smtp-password-stdin"));
+                }
+                let smtp_tls = match smtp_tls {
+                    Some(value) => {
+                        Some(MailTls::parse(&value).ok_or_else(|| usage(format!("SMTP TLS mode {value:?} is not valid; use implicit or starttls")))?)
+                    }
+                    None => None,
+                };
+                let password = if smtp_password_stdin { Some(read_password_stdin(input)?) } else { None };
+                let args = account_update_args(engine, &id, smtp_host, smtp_port, smtp_tls, smtp_username, password, clear_smtp)?;
+                let updated: AccountUpdate = decode(call(engine, "account_update", args)?)?;
+                if json_output {
+                    print_json(&updated)?;
+                } else {
+                    say(format_account_update(&updated.account))?;
                 }
             }
             AccountCommand::List => {
@@ -661,24 +841,68 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 let saved: DraftSave = decode(call(engine, "draft_save", args)?)?;
                 let draft_id = saved.draft.summary.id.clone();
                 if send {
-                    let sent: DraftSend = decode(call(engine, "draft_send", json!({ "id": draft_id }))?)?;
-                    if json_output {
-                        print_json(&sent)?;
-                    } else {
-                        say(format!("{}\n{}", send_note(engine), format_summary(&sent.message)))?;
-                    }
+                    send_now(engine, &draft_id, None, json_output)?;
                 } else if json_output {
                     print_json(&saved)?;
                 } else {
                     say(format!("Bozza salvata: {}\n{}\n{}", draft_id, format_summary(&saved.draft.summary), draft_note(engine)))?;
                 }
             }
-            DraftCommand::Send { id } => {
-                let sent: DraftSend = decode(call(engine, "draft_send", json!({ "id": id }))?)?;
+            DraftCommand::Send { id } => send_now(engine, &id, None, json_output)?,
+        },
+        Command::Send { draft, at, dry_run } => {
+            if dry_run {
+                let result: DryRunResult = decode(call(engine, "send_dry_run", json!({ "draft": draft }))?)?;
                 if json_output {
-                    print_json(&sent)?;
+                    print_json(&result)?;
                 } else {
-                    say(format!("{}\n{}", send_note(engine), format_summary(&sent.message)))?;
+                    say(format!(
+                        "Dry run: {} byte, {} destinatari.\nDa: {}\nA: {}\nMessage-ID: {}\nNessuna riga in coda, nessuna connessione. I byte esatti sono nel JSON (--json, base64).",
+                        result.dry_run.bytes,
+                        result.dry_run.envelope.recipients.len(),
+                        result.dry_run.envelope.from,
+                        result.dry_run.envelope.recipients.join(", "),
+                        result.dry_run.message_id
+                    ))?;
+                }
+            } else {
+                send_now(engine, &draft, at.as_deref(), json_output)?;
+            }
+        }
+        Command::Outbox { command } => match command {
+            OutboxCommand::List { account, limit, offset } => {
+                let result: OutboxListResult = decode(call(engine, "outbox_list", json!({ "account": account, "limit": limit, "offset": offset }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format_outbox(&result))?;
+                }
+            }
+            OutboxCommand::Cancel { id } => {
+                let result: OutboxAction = decode(call(engine, "outbox_cancel", json!({ "id": id }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!(
+                        "Riga rimossa dalla coda: {} · {}\nLa bozza resta in Bozze e si può correggere.\n",
+                        result.outbox.id, result.outbox.subject
+                    ))?;
+                }
+            }
+            OutboxCommand::Retry { id, yes } => {
+                let result: OutboxAction = decode(call(engine, "outbox_retry", json!({ "id": id, "confirm": yes }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Invio rimesso in coda: {} · {}\n", result.outbox.id, result.outbox.subject))?;
+                }
+            }
+            OutboxCommand::MarkSent { id, yes } => {
+                let result: OutboxAction = decode(call(engine, "outbox_mark_sent", json!({ "id": id, "confirm": yes }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Segnato come inviato: {} · {}\n", result.outbox.id, result.outbox.subject))?;
                 }
             }
         },
@@ -759,7 +983,7 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             let result = call(engine, &op, object)?;
             print_json(&result)?;
         }
-        Command::Mcp => mcp::serve(engine)?,
+        Command::Mcp { allow_send } => mcp::serve(engine, allow_send)?,
     }
     Ok(())
 }
@@ -773,14 +997,42 @@ struct AccountAddRequest {
     host: Option<String>,
     port: Option<u16>,
     tls: Option<MailTls>,
+    smtp: Option<SmtpSetup>,
     password: Zeroizing<String>,
 }
 
-/// Dispatch `account_add` through the registry. The password travels in the request to the engine,
-/// which hands it to the keyring adapter after the login check; it is never printed here.
+/// Build the optional SMTP setup from the validated flags. Known providers use their preset; a
+/// custom account with no SMTP flags stays read-only. A separate password without an endpoint is a
+/// usage mistake, not a silent fallback.
+fn smtp_setup(provider: Provider, email: &str, request: &AccountRequest, password: Option<Zeroizing<String>>) -> Result<Option<SmtpSetup>> {
+    match provider.smtp_discovery() {
+        Some(discovery) => {
+            if password.is_none() {
+                // The engine applies the preset and uses the IMAP credential.
+                return Ok(None);
+            }
+            Ok(Some(SmtpSetup { host: discovery.host.to_owned(), port: discovery.port, tls: discovery.tls, username: email.to_owned(), password }))
+        }
+        None => {
+            let Some(host) = request.smtp_host.clone() else {
+                if password.is_some() {
+                    return Err(usage("--smtp-password-stdin needs --smtp-host, --smtp-port and --smtp-tls"));
+                }
+                return Ok(None);
+            };
+            let port = request.smtp_port.ok_or_else(|| usage("--smtp-host needs --smtp-port and --smtp-tls"))?;
+            let tls = request.smtp_tls.ok_or_else(|| usage("--smtp-host needs --smtp-port and --smtp-tls"))?;
+            let username = request.smtp_username.clone().unwrap_or_else(|| email.to_owned());
+            Ok(Some(SmtpSetup { host, port, tls, username, password }))
+        }
+    }
+}
+
+/// Dispatch `account_add` through the registry. The passwords travel in the request to the engine,
+/// which hands them to the keyring adapter after the login check; they are never printed here.
 fn account_add(engine: &mut Engine, request: AccountAddRequest) -> Result<AccountView> {
-    let AccountAddRequest { provider, email, name, host, port, tls, password } = request;
-    let args = json!({
+    let AccountAddRequest { provider, email, name, host, port, tls, smtp, password } = request;
+    let mut args = json!({
         "provider": provider,
         "email": email,
         "name": name,
@@ -789,12 +1041,71 @@ fn account_add(engine: &mut Engine, request: AccountAddRequest) -> Result<Accoun
         "port": port,
         "tls": tls,
     });
+    if let Some(smtp) = smtp
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert("smtp_host".to_owned(), json!(smtp.host));
+        object.insert("smtp_port".to_owned(), json!(smtp.port));
+        object.insert("smtp_tls".to_owned(), json!(smtp.tls));
+        object.insert("smtp_username".to_owned(), json!(smtp.username));
+        if let Some(password) = smtp.password {
+            object.insert("smtp_password".to_owned(), json!(password.as_str()));
+        }
+    }
     let added: AccountAdd = decode(call(engine, "account_add", args)?)?;
     Ok(added.account)
 }
 
-/// Read exactly one line from `reader` and strip its line ending. The raw line is zeroised before it
-/// is returned, so the password does not linger in two buffers.
+/// Build `account_update` arguments. A known provider fills its preset when the user gives no
+/// endpoint; a custom account has no default and must supply host, port and TLS together.
+#[allow(clippy::too_many_arguments)]
+fn account_update_args(
+    engine: &Engine,
+    id: &str,
+    host: Option<String>,
+    port: Option<u16>,
+    tls: Option<MailTls>,
+    username: Option<String>,
+    password: Option<Zeroizing<String>>,
+    clear_smtp: bool,
+) -> Result<Value> {
+    if clear_smtp {
+        if host.is_some() || port.is_some() || tls.is_some() || username.is_some() || password.is_some() {
+            return Err(usage("--clear-smtp cannot be combined with a new endpoint or password"));
+        }
+        return Ok(json!({ "id": id, "clear_smtp": true }));
+    }
+    let account = engine
+        .accounts()
+        .iter()
+        .find(|account| account.id == id)
+        .ok_or_else(|| usage(format!("unknown account {id:?}; run `postino account list`")))?;
+    let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
+    let (host, port, tls) = match (host, port, tls) {
+        (None, None, None) => match provider.smtp_discovery() {
+            Some(discovery) => (discovery.host.to_owned(), discovery.port, discovery.tls),
+            None => return Err(usage("a custom account needs --smtp-host, --smtp-port and --smtp-tls; omit --clear-smtp")),
+        },
+        (Some(host), Some(port), Some(tls)) => (host, port, tls),
+        _ => return Err(usage("--smtp-host, --smtp-port and --smtp-tls must be supplied together")),
+    };
+    let mut args = json!({
+        "id": id,
+        "smtp_host": host,
+        "smtp_port": port,
+        "smtp_tls": tls,
+        "smtp_username": username,
+    });
+    if let Some(password) = password
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert("smtp_password".to_owned(), json!(password.as_str()));
+    }
+    Ok(args)
+}
+
+/// Read exactly one line from `reader` and strip its line ending. The raw line is zeroised before
+/// it is returned, so the password does not linger in two buffers.
 fn read_password_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<Zeroizing<String>> {
     let mut line = Zeroizing::new(String::new());
     reader.read_line(&mut line).context("reading the password from stdin")?;
@@ -824,11 +1135,15 @@ fn format_account_line(view: &AccountView) -> String {
         Some(server) => format!("{}:{} ({})", server.host, server.port, server.tls.as_str()),
         None => "nessun server IMAP".to_owned(),
     };
+    let smtp = match view.server.as_ref().and_then(|server| server.smtp.as_ref()) {
+        Some(smtp) => format!("SMTP {}:{} ({})", smtp.host, smtp.port, smtp.tls.as_str()),
+        None => "senza SMTP".to_owned(),
+    };
     let sync = match &view.sync {
         Some(status) => format_sync_phase(status),
         None => "mai sincronizzato".to_owned(),
     };
-    format!("{:<28} {:<28} {:<8} {:<34} {}\n", view.account.id, view.account.email, view.account.provider, server, sync)
+    format!("{:<28} {:<28} {:<8} {:<34} {:<34} {}\n", view.account.id, view.account.email, view.account.provider, server, smtp, sync)
 }
 
 /// The CLI reports the id, the address, the provider, the endpoint and the folder count. It never
@@ -837,9 +1152,25 @@ fn format_account_add(view: &AccountView) -> String {
     let mut text = format!("Account aggiunto: {} <{}> ({})\n", view.account.id, view.account.email, view.account.provider);
     if let Some(server) = &view.server {
         text.push_str(&format!("Server: {}:{} ({}) · utente {}\n", server.host, server.port, server.tls.as_str(), server.username));
+        if let Some(smtp) = &server.smtp {
+            text.push_str(&format!("Invio: {}:{} ({}) · utente {}\n", smtp.host, smtp.port, smtp.tls.as_str(), smtp.username));
+        } else {
+            text.push_str("Invio: nessun server SMTP (l'account può leggere ma non inviare)\n");
+        }
     }
     text.push_str("La password è nel portachiavi del sistema, mai nel database. Le cartelle sono state lette dal server.\n");
     text
+}
+
+fn format_account_update(view: &AccountView) -> String {
+    let endpoint = view.server.as_ref().and_then(|server| server.smtp.as_ref()).map_or_else(
+        || "nessun server SMTP: l'account può leggere ma non inviare".to_owned(),
+        |smtp| format!("{}:{} ({}) · utente {}", smtp.host, smtp.port, smtp.tls.as_str(), smtp.username),
+    );
+    format!(
+        "Account aggiornato: {} <{}>\nInvio: {endpoint}\nLa password è nel portachiavi del sistema, mai nel database.\n",
+        view.account.id, view.account.email
+    )
 }
 
 fn format_account_test(result: &AccountTest) -> String {
@@ -954,15 +1285,139 @@ fn draft_note(engine: &Engine) -> &'static str {
     }
 }
 
-fn send_note(engine: &Engine) -> &'static str {
-    if engine.is_persistent() {
-        "Bozza spostata in Inviati (in locale, nessun SMTP): lo spostamento è salvato nel database cifrato. L'invio reale arriva con M2."
+/// Queue a draft and, when it is due now, wait for the undo window and run one outbox pass.
+///
+/// Only an explicit `--at` in the future leaves the row queued: there is no daemon in this build, so
+/// the CLI says when it will be attempted. A plain `postino send` always waits out the 5-second undo
+/// window and runs the pass; the undo window is not a scheduled time.
+fn send_now(engine: &mut Engine, draft: &str, at: Option<&str>, json_output: bool) -> Result<()> {
+    let (operation, args) = match at {
+        Some(at) => ("send_schedule", json!({ "draft": draft, "send_at": at })),
+        None => ("message_send", json!({ "draft": draft })),
+    };
+    let queued: SendQueued = decode(call(engine, operation, args)?)?;
+    let row = queued.queued.outbox.clone();
+    if !json_output {
+        let when = format_millis(row.send_at);
+        say(format!(
+            "Messaggio in coda: {} · {} destinatari · {}\nPrimo tentativo: {when}. Annulla con `postino outbox cancel {}`.",
+            row.subject, row.recipient_count, row.id, row.id
+        ))?;
+    }
+    let now = Utc::now().timestamp_millis();
+    let scheduled = at.is_some() && row.send_at > now.saturating_add(1_000);
+    if scheduled {
+        if json_output {
+            print_json(&queued)?;
+        } else {
+            say(
+                "Invio programmato: nessun tentativo è partito ora. La riga parte quando un processo della coda è aperto e l'ora è arrivata: lascia aperta l'app desktop, oppure lancia `postino send --draft <id>` quando è ora. `postino outbox list` è in sola lettura e non invia.",
+            )?;
+        }
+        return Ok(());
+    }
+    let wait_until = queued.queued.undo_until.unwrap_or(row.send_at).max(row.send_at);
+    let wait = wait_until.saturating_sub(now).clamp(0, 10_000);
+    if wait > 0 {
+        if !json_output {
+            say(format!("Finestra di annullamento: {} s…", (wait as f64 / 1000.0).ceil()))?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(u64::try_from(wait).unwrap_or(0)));
+    }
+    let report = engine.process_outbox(Utc::now().timestamp_millis())?;
+    if json_output {
+        print_json(&report)?;
     } else {
-        "Bozza spostata in Inviati (in locale, nessun SMTP): il motore demo è in memoria. L'invio reale arriva con M2."
+        say(format_outbox_run(&report))?;
+    }
+    match report.entries.iter().find(|entry| entry.id == row.id) {
+        Some(entry) if entry.state == postino_store::OutboxState::Sent => Ok(()),
+        Some(entry) if entry.state == postino_store::OutboxState::AppendPending => {
+            if !json_output {
+                say("Inviato: la copia nella cartella Inviati del server è ancora in corso e verrà ritentata da sola.")?;
+            }
+            Ok(())
+        }
+        Some(entry) if entry.state == postino_store::OutboxState::Uncertain => {
+            bail!(
+                "invio incerto: controlla la cartella Inviati del provider prima di riprovare. Usa `postino outbox retry {} --yes` o `postino outbox mark-sent {} --yes`.",
+                entry.id,
+                entry.id
+            )
+        }
+        Some(entry) if entry.state == postino_store::OutboxState::Failed => {
+            bail!(
+                "invio non riuscito: {}. Scarta la riga con `postino outbox cancel {}`, correggi la bozza e inviala di nuovo; in alternativa `postino outbox retry {} --yes` rimanda gli stessi byte.",
+                entry.last_error.as_deref().unwrap_or("errore sconosciuto"),
+                entry.id,
+                entry.id
+            )
+        }
+        Some(entry) if entry.state == postino_store::OutboxState::Cancelled => {
+            bail!("l'invio {} è stato annullato prima di partire; la bozza è ancora in Bozze.", entry.id)
+        }
+        Some(entry) if entry.state == postino_store::OutboxState::Sending => {
+            bail!("un altro processo sta inviando la riga {}; controlla `postino outbox list`.", entry.id)
+        }
+        Some(entry) => bail!(
+            "l'invio è ancora in coda ({}) e non è partito; riprova con `postino send --draft <id>` o lascia aperta l'app desktop.",
+            entry.state.as_str()
+        ),
+        None => bail!("la riga {} non è più nell'outbox; controlla `postino outbox list`.", row.id),
     }
 }
 
-/// Build `draft_save` arguments from the flags the user actually passed. Omitted flags stay absent,
+fn format_outbox(result: &OutboxListResult) -> String {
+    let mut text = String::new();
+    if result.outbox.entries.is_empty() {
+        text.push_str("Outbox vuota.\n");
+    }
+    for entry in &result.outbox.entries {
+        text.push_str(&format!(
+            "{:<20} {:<14} {:>2} tent.  {:>3} dest.  {:<44} {}\n",
+            entry.id,
+            entry.state.as_str(),
+            entry.attempts,
+            entry.recipient_count,
+            truncate(&entry.subject, 44),
+            format_millis(entry.send_at)
+        ));
+        if let Some(error) = &entry.last_error {
+            text.push_str(&format!("  errore: {error}\n"));
+        }
+    }
+    for halt in &result.outbox.halted {
+        text.push_str(&format!("! account {} fermato: {}\n", halt.account, halt.error));
+    }
+    for warning in &result.outbox.warnings {
+        text.push_str(&format!("! {warning}\n"));
+    }
+    text
+}
+
+fn format_outbox_run(report: &postino_core::OutboxRunReport) -> String {
+    let mut text = format!(
+        "Outbox: {} elaborati, {} inviati, {} in attesa di Inviati, {} riprogrammati, {} falliti, {} incerti.\n",
+        report.processed, report.sent, report.append_pending, report.retried, report.failed, report.uncertain
+    );
+    for error in &report.errors {
+        text.push_str(&format!("  ! {error}\n"));
+    }
+    for account in &report.halted {
+        text.push_str(&format!("  ! account {account} fermato\n"));
+    }
+    text
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut out = text.chars().take(limit.saturating_sub(1)).collect::<String>();
+    out.push('…');
+    out
+}
+
 /// which makes an update a patch; an explicitly empty flag (`--to ""`, `--subject ""`) is sent so it
 /// clears the field.
 fn draft_save_args(
@@ -1143,10 +1598,12 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     #[test]
-    fn cli_run_args_reach_the_draft_operations() {
+    fn cli_run_args_reach_the_draft_and_dry_run_operations() {
         let mut engine = Engine::demo();
         let args = parse_run_args(
             Some(
@@ -1162,9 +1619,11 @@ mod tests {
         .expect("run arguments");
         let saved = call(&mut engine, "draft_save", args).expect("draft_save through the CLI");
         let id = saved["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
-        let args = parse_run_args(Some(json!({ "id": id }).to_string()), Vec::new()).expect("send arguments");
-        call(&mut engine, "draft_send", args).expect("draft_send through the CLI");
-        assert!(engine.messages().iter().any(|message| message.summary.subject == "Bozza da CLI" && message.summary.folder_id == "sent"));
+        let args = parse_run_args(Some(json!({ "draft": id }).to_string()), Vec::new()).expect("dry-run arguments");
+        let dry = call(&mut engine, "send_dry_run", args).expect("send_dry_run through the CLI");
+        assert!(dry["raw_base64"].as_str().is_some_and(|raw| !raw.is_empty()));
+        assert!(dry["bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+        assert!(engine.call("message_send", json!({ "draft": id })).is_err(), "the demo engine has no SMTP endpoint and must refuse a real send");
     }
 
     #[test]
@@ -1459,6 +1918,31 @@ mod tests {
                     .expect("folder");
             }
         }
+
+        /// An account with an SMTP endpoint and both credentials. The IMAP port is deliberately
+        /// closed in the CLI send test: submission succeeds and the Sent append is retried.
+        fn seed_smtp_account(&self, id: &str, smtp_port: u16, vault: &crate::test_support::MemoryVault) {
+            self.seed_account(id, "Test", "user@example.com", "");
+            let store = self.open();
+            store
+                .upsert_account_server(&postino_store::AccountServer {
+                    account_id: id.to_owned(),
+                    host: "127.0.0.1".to_owned(),
+                    port: 1,
+                    tls: postino_store::AccountTls::Implicit,
+                    username: postino_testkit::USER.to_owned(),
+                    created_at: 1_700_000_000_000,
+                    smtp: Some(postino_store::SmtpServer {
+                        host: "localhost".to_owned(),
+                        port: smtp_port,
+                        tls: postino_store::AccountTls::Implicit,
+                        username: postino_testkit::SMTP_USER.to_owned(),
+                    }),
+                })
+                .expect("server with SMTP");
+            vault.set(id, postino_testkit::PASSWORD.as_bytes());
+            vault.store_smtp_password(id, postino_testkit::SMTP_PASSWORD.as_bytes()).expect("SMTP password");
+        }
     }
 
     #[test]
@@ -1583,20 +2067,20 @@ mod tests {
                         bcc: None,
                         subject: Some("Per B".to_owned()),
                         body: Some("Corpo".to_owned()),
-                        send: true,
+                        send: false,
                     },
                 }),
                 &mut engine,
             )
-            .expect("save and move from B");
+            .expect("save from B");
         }
 
         let store = fixture.open();
-        let sent = store.get_message("draft_1").expect("row").expect("sent message");
-        assert_eq!(sent.summary.account_id, "acc_b");
-        assert_eq!(sent.summary.folder_id, "acc_b_sent");
-        assert_eq!(store.get_folder("acc_a_sent").expect("A sent").expect("A sent").total, 0, "the CLI moved B's draft into A's Sent");
-        assert_eq!(store.get_folder("acc_b_sent").expect("B sent").expect("B sent").total, 1);
+        let draft = store.get_message("draft_1").expect("row").expect("draft");
+        assert_eq!(draft.summary.account_id, "acc_b");
+        assert_eq!(draft.summary.folder_id, "acc_b_drafts");
+        assert_eq!(store.get_folder("acc_a_drafts").expect("A drafts").expect("A drafts").total, 0, "the CLI routed B's draft into A");
+        assert_eq!(store.get_folder("acc_b_drafts").expect("B drafts").expect("B drafts").total, 1);
     }
 
     /// The `--store` path end to end: the key comes from the platform seam (a mock vault here,
@@ -1693,6 +2177,11 @@ mod tests {
                     host: Some("localhost".to_owned()),
                     port: Some(1),
                     tls: Some("implicit".to_owned()),
+                    smtp_host: None,
+                    smtp_port: None,
+                    smtp_tls: None,
+                    smtp_username: None,
+                    smtp_password_stdin: false,
                     password_stdin: true,
                 },
             }),
@@ -1718,6 +2207,11 @@ mod tests {
                     host: Some("localhost".to_owned()),
                     port: Some(1),
                     tls: Some("implicit".to_owned()),
+                    smtp_host: None,
+                    smtp_port: None,
+                    smtp_tls: None,
+                    smtp_username: None,
+                    smtp_password_stdin: false,
                     password_stdin: true,
                 },
             }),
@@ -1805,6 +2299,11 @@ mod tests {
                     host: Some("localhost".to_owned()),
                     port: Some(server.port()),
                     tls: Some("implicit".to_owned()),
+                    smtp_host: None,
+                    smtp_port: None,
+                    smtp_tls: None,
+                    smtp_username: None,
+                    smtp_password_stdin: false,
                     password_stdin: true,
                 },
             }),
@@ -1856,6 +2355,11 @@ mod tests {
                     host: Some("localhost".to_owned()),
                     port: Some(server.port()),
                     tls: Some("implicit".to_owned()),
+                    smtp_host: None,
+                    smtp_port: None,
+                    smtp_tls: None,
+                    smtp_username: None,
+                    smtp_password_stdin: false,
                     password_stdin: true,
                 },
             }),
@@ -1895,5 +2399,230 @@ mod tests {
         assert!(engine.accounts().is_empty());
         assert_eq!(vault.len(), 0);
         server.finish();
+    }
+
+    /// A one-shot SMTP server that accepts DATA once and records the bytes.
+    type SmtpFixture = (u16, postino_net::CertificateDer<'static>, Arc<Mutex<Vec<Vec<u8>>>>, std::thread::JoinHandle<()>);
+
+    fn one_shot_smtp() -> SmtpFixture {
+        let tls = postino_testkit::TlsFixture::generate();
+        let ca = tls.ca();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let handler_capture = captured.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            runtime.block_on(async move {
+                let server = postino_testkit::FakeSmtp::start_tls(&tls, move |mut conn| {
+                    let captured = handler_capture.clone();
+                    async move {
+                        conn.greet(&["SIZE 1024000", "AUTH PLAIN LOGIN"]).await;
+                        conn.auth_plain_ok(&postino_testkit::expected_smtp_sasl()).await;
+                        loop {
+                            let line = conn.read_line().await;
+                            if line == "DATA" {
+                                conn.send_line("354 go").await;
+                                let data = conn.read_data().await;
+                                captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(data);
+                                conn.send_line("250 queued").await;
+                                break;
+                            }
+                            conn.send_line("250 ok").await;
+                        }
+                        conn.expect("QUIT").await;
+                        conn.send_line("221 bye").await;
+                    }
+                })
+                .await;
+                sender.send(server.port()).expect("port");
+                server.finish().await;
+            });
+        });
+        let port = receiver.recv().expect("SMTP port");
+        (port, ca, captured, handle)
+    }
+
+    #[test]
+    fn cli_send_without_at_waits_the_undo_window_and_submits() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        let (smtp_port, ca, captured, smtp_thread) = one_shot_smtp();
+        fixture.seed_smtp_account("acc_cli", smtp_port, &vault);
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        engine.set_test_extra_roots(vec![ca]);
+        let saved: DraftSave = decode(
+            call(
+                &mut engine,
+                "draft_save",
+                json!({
+                    "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
+                    "subject": "Invio senza --at",
+                    "body_text": "Ciao Giulia"
+                }),
+            )
+            .expect("draft_save"),
+        )
+        .expect("draft");
+        let id = saved.draft.summary.id.clone();
+        // The plain command must wait the 5-second undo window and run the pass; the undo window is
+        // not a scheduled time.
+        run(cli(Command::Send { draft: id.clone(), at: None, dry_run: false }), &mut engine).expect("postino send without --at");
+        smtp_thread.join().expect("SMTP thread");
+        assert_eq!(captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(), 1, "a plain postino send left the row queued");
+        let rows = engine.outbox_list(None, 500, 0).expect("outbox after send");
+        assert_eq!(rows.entries[0].state, postino_store::OutboxState::AppendPending);
+        assert_eq!(rows.entries[0].subject, "Invio senza --at");
+    }
+
+    #[test]
+    fn cli_send_to_a_future_at_still_leaves_the_row_queued() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        fixture.seed_smtp_account("acc_cli", 1025, &vault);
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        let saved: DraftSave = decode(
+            call(
+                &mut engine,
+                "draft_save",
+                json!({
+                    "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
+                    "subject": "Domani",
+                    "body_text": "Ciao"
+                }),
+            )
+            .expect("draft_save"),
+        )
+        .expect("draft");
+        let at = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        run(cli(Command::Send { draft: saved.draft.summary.id.clone(), at: Some(at), dry_run: false }), &mut engine).expect("scheduled send");
+        let rows = engine.outbox_list(None, 500, 0).expect("outbox");
+        assert_eq!(rows.entries[0].state, postino_store::OutboxState::Queued, "a future --at must not submit now");
+    }
+
+    #[test]
+    fn cli_outbox_list_accepts_a_page() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        fixture.seed_smtp_account("acc_cli", 1025, &vault);
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        run(cli(Command::Outbox { command: OutboxCommand::List { account: None, limit: 10, offset: 0 } }), &mut engine)
+            .expect("outbox list with a page");
+    }
+
+    #[test]
+    fn cli_send_queues_submits_and_reports_a_pending_sent_append() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        let tls = postino_testkit::TlsFixture::generate();
+        let ca = tls.ca();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let handler_capture = captured.clone();
+        let smtp_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            runtime.block_on(async move {
+                let server = postino_testkit::FakeSmtp::start_tls(&tls, move |mut conn| {
+                    let captured = handler_capture.clone();
+                    async move {
+                        conn.greet(&["SIZE 1024000", "AUTH PLAIN LOGIN"]).await;
+                        conn.auth_plain_ok(&postino_testkit::expected_smtp_sasl()).await;
+                        loop {
+                            let line = conn.read_line().await;
+                            if line == "DATA" {
+                                conn.send_line("354 go").await;
+                                let data = conn.read_data().await;
+                                captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(data);
+                                conn.send_line("250 queued").await;
+                                break;
+                            }
+                            conn.send_line("250 ok").await;
+                        }
+                        conn.expect("QUIT").await;
+                        conn.send_line("221 bye").await;
+                    }
+                })
+                .await;
+                sender.send(server.port()).expect("port");
+                server.finish().await;
+            });
+        });
+        let smtp_port = receiver.recv().expect("SMTP port");
+        fixture.seed_smtp_account("acc_cli", smtp_port, &vault);
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        engine.set_test_extra_roots(vec![ca]);
+        let saved: DraftSave = decode(
+            call(
+                &mut engine,
+                "draft_save",
+                json!({
+                    "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
+                    "subject": "Invio da CLI",
+                    "body_text": "Ciao Giulia"
+                }),
+            )
+            .expect("draft_save"),
+        )
+        .expect("draft");
+        let id = saved.draft.summary.id.clone();
+        let dry: DryRunResult = decode(call(&mut engine, "send_dry_run", json!({ "draft": id })).expect("dry run")).expect("dry");
+        assert!(dry.dry_run.bytes > 0);
+        assert!(engine.outbox_list(None, 500, 0).expect("outbox").entries.is_empty(), "the dry run queued a row");
+
+        let now = Utc::now().to_rfc3339();
+        run(cli(Command::Send { draft: id.clone(), at: Some(now), dry_run: false }), &mut engine).expect("send from the CLI");
+        smtp_thread.join().expect("SMTP thread");
+        let captured = captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(captured.len(), 1, "the CLI did not submit exactly one message");
+        let rows = engine.outbox_list(None, 500, 0).expect("outbox after send");
+        assert_eq!(rows.entries[0].state, postino_store::OutboxState::AppendPending);
+        assert_eq!(rows.entries[0].subject, "Invio da CLI");
+    }
+
+    #[test]
+    fn the_cli_outbox_never_prints_server_text() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        let secret = postino_testkit::SMTP_PASSWORD.to_owned();
+        let body = "corpo che il server SMTP non deve dettare";
+        let recipient = "echo@example.com";
+        let smtp = crate::test_support::EchoingSmtp::start(format!("{secret} {body} {recipient}"));
+        crate::test_support::seed_smtp_account(&fixture.open(), &vault, "acc_cli", 1, smtp.port());
+        for (id, name, kind) in
+            [("fld_acc_cli_drafts", "Bozze", postino_store::FolderKind::Drafts), ("fld_acc_cli_sent", "Inviati", postino_store::FolderKind::Sent)]
+        {
+            fixture
+                .open()
+                .upsert_folder(&postino_store::Folder {
+                    id: id.to_owned(),
+                    account_id: "acc_cli".to_owned(),
+                    name: name.to_owned(),
+                    kind,
+                    unread: 0,
+                    total: 0,
+                    uid_validity: None,
+                    uid_next: None,
+                    last_sync_at: None,
+                })
+                .expect("folder");
+        }
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        engine.set_test_extra_roots(vec![smtp.ca()]);
+        let saved: DraftSave = decode(
+            call(&mut engine, "draft_save", json!({ "to": [{ "name": "", "email": recipient }], "subject": "Ostile", "body_text": body }))
+                .expect("draft_save"),
+        )
+        .expect("draft");
+        let id = saved.draft.summary.id.clone();
+        let queued = call(&mut engine, "message_send", json!({ "draft": id })).expect("queue");
+        let send_at = queued["outbox"]["send_at"].as_i64().or_else(|| queued["queued"]["outbox"]["send_at"].as_i64()).expect("send_at");
+        engine.process_outbox(send_at).expect("pass");
+        smtp.finish();
+        let result: OutboxListResult = decode(call(&mut engine, "outbox_list", json!({ "account": null })).expect("outbox_list")).expect("outbox");
+        let printed = format_outbox(&result);
+        assert!(printed.contains("550"), "the CLI must still say what happened: {printed}");
+        for forbidden in [secret.as_str(), body, recipient] {
+            assert!(!printed.contains(forbidden), "the CLI printed server text: {printed}");
+            assert!(!serde_json::to_string(&result.outbox).expect("JSON").contains(forbidden), "the JSON output kept server text");
+        }
     }
 }

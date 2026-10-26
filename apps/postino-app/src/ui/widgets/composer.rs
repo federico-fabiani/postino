@@ -19,9 +19,9 @@ use crate::ui::widgets::{Button, ButtonSize, IconButton, IconButtonSize, Section
 /// long enough that typing a sentence does not write on every key.
 pub const AUTOSAVE_DELAY: f64 = 1.2;
 
-/// Shown next to the Send button before the click, not only in the after-the-fact toast: this
-/// build opens no SMTP connection and the message stays in Sent on this computer.
-pub const SEND_NOTICE: &str = "Nessun invio SMTP: il messaggio resta in Inviati su questo computer.";
+/// Shown next to the Send button: sending is real and the undo window is short. The text never
+/// claims a local-only move.
+pub const SEND_NOTICE: &str = "Invio reale via SMTP. Puoi annullare entro 5 secondi.";
 
 /// Each composer gets a fresh text-edit id so undo history and cursor state cannot leak from a
 /// previous message.
@@ -241,12 +241,29 @@ pub struct ComposerResponse {
 pub struct Composer<'a> {
     state: &'a mut ComposerState,
     account: &'a Account,
+    send_available: bool,
+    demo: bool,
 }
 
 impl<'a> Composer<'a> {
     #[must_use]
     pub fn new(state: &'a mut ComposerState, account: &'a Account) -> Self {
-        Self { state, account }
+        Self { state, account, send_available: true, demo: true }
+    }
+
+    /// Whether this account can submit. The demo has no SMTP endpoint and must not pretend.
+    #[must_use]
+    pub fn send_available(mut self, available: bool) -> Self {
+        self.send_available = available;
+        self
+    }
+
+    /// Whether the mailbox is the synthetic demo. A real account without an SMTP endpoint gets its
+    /// own sentence: "demo" is not the reason it cannot send.
+    #[must_use]
+    pub fn demo(mut self, demo: bool) -> Self {
+        self.demo = demo;
+        self
     }
 
     pub fn show(self, ui: &mut Ui) -> ComposerResponse {
@@ -541,7 +558,7 @@ impl<'a> Composer<'a> {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(icons::icon(icons::PAPERCLIP, ui_size::ICON_SM, t.text_faint));
-                        ui.label(typography::text(Role::Caption, "Gli allegati reali arrivano con l'invio", t.text_faint));
+                        ui.label(typography::text(Role::Caption, "Gli allegati senza contenuto salvato bloccano l'invio", t.text_faint));
                     });
                 });
         }
@@ -585,18 +602,22 @@ impl<'a> Composer<'a> {
                     ui.add(egui::Label::new(typography::text(Role::Caption, text, color)).truncate());
                 },
                 |ui| {
-                    let send_reason = if !addresses_ok {
+                    let send_reason = if !self.send_available && self.demo {
+                        "La modalità demo non invia: usa un account reale con SMTP"
+                    } else if !self.send_available {
+                        "Questo account non ha un server SMTP: aggiungilo nelle impostazioni per inviare"
+                    } else if !addresses_ok {
                         "Controlla gli indirizzi: c'è un destinatario non valido"
                     } else if !send_ready {
                         "Aggiungi almeno un destinatario"
                     } else {
                         ""
                     };
-                    let send_label = "Invia (locale)";
+                    let send_label = "Invia";
                     let send = Button::primary(send_label)
                         .icon(icons::SEND)
                         .shortcut("Ctrl+Invio")
-                        .enabled(send_ready)
+                        .enabled(send_ready && self.send_available)
                         .disabled_reason(send_reason)
                         .show(ui);
                     #[cfg(test)]
@@ -605,9 +626,16 @@ impl<'a> Composer<'a> {
                         response.send = true;
                     }
                     ui.add_space(space::XS);
-                    let notice = IconButton::new(icons::INFO, SEND_NOTICE).size(IconButtonSize::Sm).show(ui);
+                    let notice_text = if self.send_available {
+                        SEND_NOTICE
+                    } else if self.demo {
+                        "Demo: nessun messaggio lascia il computer."
+                    } else {
+                        "Nessun server SMTP configurato: questo account può solo ricevere."
+                    };
+                    let notice = IconButton::new(icons::INFO, notice_text).size(IconButtonSize::Sm).show(ui);
                     #[cfg(test)]
-                    probe::send_notice(SEND_NOTICE, notice.rect);
+                    probe::send_notice(notice_text, notice.rect);
                     #[cfg(not(test))]
                     let _ = notice;
                     ui.add_space(space::XS);
@@ -730,26 +758,28 @@ pub fn compose_body(signature: &str, quoted: Option<String>) -> String {
 
 #[cfg(test)]
 mod probe {
-    use std::sync::Mutex;
+    use std::cell::RefCell;
 
     use eframe::egui::Rect;
 
-    static SEND_NOTICE: Mutex<Option<(&'static str, Rect)>> = Mutex::new(None);
+    thread_local! {
+        static SEND_NOTICE: RefCell<Option<(&'static str, Rect)>> = const { RefCell::new(None) };
+    }
 
     pub(super) fn send_notice(text: &'static str, rect: Rect) {
-        if let Ok(mut slot) = SEND_NOTICE.lock() {
-            *slot = Some((text, rect));
-        }
+        SEND_NOTICE.with(|slot| {
+            *slot.borrow_mut() = Some((text, rect));
+        });
     }
 
     pub(super) fn take_send_notice() -> Option<(&'static str, Rect)> {
-        SEND_NOTICE.lock().ok().and_then(|slot| *slot)
+        SEND_NOTICE.with(|slot| *slot.borrow())
     }
 
     pub(super) fn clear() {
-        if let Ok(mut slot) = SEND_NOTICE.lock() {
-            *slot = None;
-        }
+        SEND_NOTICE.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
     }
 }
 
@@ -804,7 +834,56 @@ mod tests {
 
         let (notice, rect) = probe::take_send_notice().expect("the composer did not draw the send notice next to Send");
         assert_eq!(notice, SEND_NOTICE);
-        assert_eq!(SEND_NOTICE, "Nessun invio SMTP: il messaggio resta in Inviati su questo computer.");
+        assert_eq!(SEND_NOTICE, "Invio reale via SMTP. Puoi annullare entro 5 secondi.");
         assert!(rect.width() > 0.0 && rect.height() > 0.0, "the notice has no clickable/tooltip surface: {rect:?}");
+    }
+
+    #[test]
+    fn a_demo_composer_disables_send_with_a_reason() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, false);
+        let account = Account {
+            id: "acc_demo".to_owned(),
+            name: "Federico".to_owned(),
+            email: "federico@example.it".to_owned(),
+            provider: "Aruba".to_owned(),
+            signature: String::new(),
+        };
+        let mut state = ComposerState::new(ComposeMode::New);
+        state.to = "giulia.ferri@example.com".to_owned();
+        probe::clear();
+        let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = Composer::new(&mut state, &account).send_available(false).show(ui);
+        });
+        output.textures_delta.clear();
+        let (notice, _) = probe::take_send_notice().expect("the demo notice");
+        assert!(notice.contains("nessun messaggio lascia il computer"), "{notice}");
+    }
+
+    #[test]
+    fn a_real_account_without_smtp_says_so_instead_of_blaming_the_demo() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, false);
+        let account = Account {
+            id: "acc_real".to_owned(),
+            name: "Federico".to_owned(),
+            email: "federico@example.it".to_owned(),
+            provider: "custom".to_owned(),
+            signature: String::new(),
+        };
+        let mut state = ComposerState::new(ComposeMode::New);
+        state.to = "giulia.ferri@example.com".to_owned();
+        probe::clear();
+        let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = Composer::new(&mut state, &account).send_available(false).demo(false).show(ui);
+        });
+        output.textures_delta.clear();
+        let (notice, _) = probe::take_send_notice().expect("the no-SMTP notice");
+        assert!(notice.contains("Nessun server SMTP"), "{notice}");
+        assert!(!notice.contains("Demo"), "a real read-only account is not the demo: {notice}");
     }
 }

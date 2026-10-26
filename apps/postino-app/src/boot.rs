@@ -224,6 +224,21 @@ impl CredentialVault for PlatformVault {
         let scope = Self::scope(account_id)?;
         self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
     }
+
+    fn store_smtp_password(&self, account_id: &str, password: &[u8]) -> Result<(), VaultError> {
+        let scope = postino_platform::account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.store_secret(&scope, password).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn load_smtp_password(&self, account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+        let scope = postino_platform::account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.load_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError> {
+        let scope = postino_platform::account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +275,24 @@ mod tests {
         fn delete_imap_password(&self, account_id: &str) -> Result<(), VaultError> {
             if let Ok(mut secrets) = self.secrets.lock() {
                 secrets.remove(account_id);
+            }
+            Ok(())
+        }
+
+        fn store_smtp_password(&self, account_id: &str, password: &[u8]) -> Result<(), VaultError> {
+            if let Ok(mut secrets) = self.secrets.lock() {
+                secrets.insert(format!("smtp:{account_id}"), password.to_vec());
+            }
+            Ok(())
+        }
+
+        fn load_smtp_password(&self, account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+            Ok(self.secrets.lock().ok().and_then(|secrets| secrets.get(&format!("smtp:{account_id}")).cloned()).map(Zeroizing::new))
+        }
+
+        fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError> {
+            if let Ok(mut secrets) = self.secrets.lock() {
+                secrets.remove(&format!("smtp:{account_id}"));
             }
             Ok(())
         }

@@ -11,7 +11,16 @@ use serde_json::{Value, json};
 
 const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub fn serve(engine: &mut Engine) -> Result<()> {
+/// Operations that can create a network submission or resolve a delivered one. They are listed but
+/// disabled unless the server was started with `--allow-send`; `outbox_retry` is included because it
+/// can send stored bytes, and `outbox_mark_sent` because it records a delivery decision that removes
+/// the uncertainty a person should resolve.
+const SEND_GATED: [&str; 4] = ["message_send", "send_schedule", "outbox_retry", "outbox_mark_sent"];
+
+const SEND_DISABLED_REASON: &str =
+    "sending is disabled: start `postino mcp --allow-send` to allow message_send, send_schedule, outbox_retry and outbox_mark_sent";
+
+pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
     let stdin = std::io::stdin();
     let lines = stdin.lock().lines();
     let mut stdout = std::io::stdout();
@@ -21,7 +30,7 @@ pub fn serve(engine: &mut Engine) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => handle(engine, &request),
+            Ok(request) => handle(engine, &request, allow_send),
             Err(error) => Some(error_response(Value::Null, -32700, &format!("parse error: {error}"))),
         };
         if let Some(response) = response {
@@ -32,7 +41,7 @@ pub fn serve(engine: &mut Engine) -> Result<()> {
     Ok(())
 }
 
-fn handle(engine: &mut Engine, request: &Value) -> Option<Value> {
+fn handle(engine: &mut Engine, request: &Value, allow_send: bool) -> Option<Value> {
     let id = request.get("id").cloned();
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return id.map(|id| error_response(id, -32600, "invalid request: missing method"));
@@ -43,8 +52,8 @@ fn handle(engine: &mut Engine, request: &Value) -> Option<Value> {
     let outcome = match method {
         "initialize" => Ok(initialize(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools_list(engine)),
-        "tools/call" => tools_call(engine, &params),
+        "tools/list" => Ok(tools_list(engine, allow_send)),
+        "tools/call" => tools_call(engine, &params, allow_send),
         "notifications/initialized" | "notifications/cancelled" => return None,
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -70,11 +79,11 @@ fn initialize(params: &Value) -> Value {
             "title": "Postino",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Postino is a local-first, agent-first mail client. Tools share the same operation registry as the desktop app and the CLI. This server is in M0 demo mode unless it was started against a configured store, so the mailbox is synthetic."
+        "instructions": "Postino is a local-first, agent-first mail client. Tools share the same operation registry as the desktop app and the CLI. The mailbox is the configured store when the server was started with one, otherwise it is synthetic demo data. message_send and send_schedule only queue a submission: the message leaves the machine when the desktop app (or `postino send`) runs the outbox pass, and this server never drains the queue itself. Use outbox_list to see the journal; outbox_cancel discards a queued or failed row; an uncertain row needs a person. Sending tools are refused unless the server was started with --allow-send."
     })
 }
 
-fn tools_list(engine: &Engine) -> Value {
+fn tools_list(engine: &Engine, allow_send: bool) -> Value {
     let tools = engine
         .tools()
         .into_iter()
@@ -82,24 +91,33 @@ fn tools_list(engine: &Engine) -> Value {
         // MCP; the CLI and the desktop app are the only clients that may pass a password.
         .filter(|def| !def.sensitive)
         .map(|def| {
-            json!({
+            let gated = SEND_GATED.contains(&def.name) && !allow_send;
+            let description = if gated { format!("{} DISABLED: {SEND_DISABLED_REASON}", def.description) } else { def.description.to_owned() };
+            let mut tool = json!({
                 "name": def.name,
                 "title": def.title,
-                "description": def.description,
+                "description": description,
                 "inputSchema": def.input_schema,
                 "annotations": {
                     "readOnlyHint": def.read_only,
                     "destructiveHint": def.destructive,
                     "idempotentHint": def.read_only || matches!(def.name, "message_flag" | "label_apply" | "label_update"),
-                    "openWorldHint": matches!(def.name, "account_test" | "sync_now")
+                    "openWorldHint": matches!(def.name, "account_test" | "sync_now" | "outbox_retry")
                 }
-            })
+            });
+            if let Some(object) = tool.as_object_mut() {
+                object.insert("enabled".to_owned(), json!(!gated));
+                if gated {
+                    object.insert("disabledReason".to_owned(), json!(SEND_DISABLED_REASON));
+                }
+            }
+            tool
         })
         .collect::<Vec<_>>();
     json!({ "tools": tools })
 }
 
-fn tools_call(engine: &mut Engine, params: &Value) -> Result<Value, (i64, String)> {
+fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).ok_or_else(|| (-32602, "tools/call needs a string `name`".to_owned()))?;
     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     if !arguments.is_object() {
@@ -107,6 +125,9 @@ fn tools_call(engine: &mut Engine, params: &Value) -> Result<Value, (i64, String
     }
     if engine.tools().into_iter().any(|def| def.name == name && def.sensitive) {
         return Ok(sensitive_refusal(name));
+    }
+    if SEND_GATED.contains(&name) && !allow_send {
+        return Ok(send_disabled_refusal(name));
     }
 
     match engine.call(name, arguments) {
@@ -122,6 +143,13 @@ fn tools_call(engine: &mut Engine, params: &Value) -> Result<Value, (i64, String
             "isError": true
         })),
     }
+}
+
+fn send_disabled_refusal(name: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": format!("operation {name:?} is disabled: {SEND_DISABLED_REASON}") }],
+        "isError": true
+    })
 }
 
 /// A readable refusal that does not repeat the arguments (which may contain a password).
@@ -141,7 +169,13 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::handle as raw_handle;
     use super::*;
+
+    /// Existing protocol tests exercise the normal, send-enabled server.
+    fn handle(engine: &mut Engine, request: &Value) -> Option<Value> {
+        raw_handle(engine, request, true)
+    }
 
     fn request(engine: &mut Engine, method: &str) -> Value {
         handle(engine, &json!({ "jsonrpc": "2.0", "id": 1, "method": method })).expect("response")
@@ -192,47 +226,38 @@ mod tests {
     }
 
     #[test]
-    fn draft_tools_are_exposed_and_the_local_send_works() {
+    fn send_tools_are_exposed_and_gated_by_allow_send() {
         let mut engine = Engine::demo();
         let tools = request(&mut engine, "tools/list");
         let definitions = tools["result"]["tools"].as_array().expect("tools");
-        let draft_send = definitions.iter().find(|tool| tool["name"] == "draft_send").expect("draft_send");
-        assert_eq!(draft_send["title"], "Move a draft to Sent (local)");
-        assert!(
-            draft_send["description"]
-                .as_str()
-                .is_some_and(|description| { description.contains("No SMTP") && description.contains("local and durable on a store") })
-        );
+        for name in ["message_send", "send_schedule", "outbox_list", "outbox_cancel", "outbox_retry", "outbox_mark_sent", "send_dry_run"] {
+            let tool = definitions.iter().find(|tool| tool["name"] == name).expect(name);
+            assert_eq!(tool["enabled"], json!(true), "{name} is enabled with --allow-send");
+        }
+        let send = definitions.iter().find(|tool| tool["name"] == "message_send").expect("message_send");
+        assert_eq!(send["annotations"]["openWorldHint"], json!(false), "queueing is a local write; the drain is the app or the CLI");
+        assert_eq!(send["annotations"]["destructiveHint"], json!(false), "sending is the product's purpose, not a destructive action");
 
-        let saved = handle(
+        let disabled = raw_handle(&mut engine, &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), false).expect("response");
+        let definitions = disabled["result"]["tools"].as_array().expect("tools");
+        let send = definitions.iter().find(|tool| tool["name"] == "message_send").expect("message_send");
+        assert_eq!(send["enabled"], json!(false));
+        assert!(send["description"].as_str().is_some_and(|text| text.contains("disabled")));
+        assert!(send["disabledReason"].as_str().is_some_and(|text| text.contains("--allow-send")));
+
+        let refused = raw_handle(
             &mut engine,
             &json!({
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": 3,
                 "method": "tools/call",
-                "params": {
-                    "name": "draft_save",
-                    "arguments": {
-                        "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
-                        "subject": "Bozza via MCP",
-                        "body_text": "Corpo"
-                    }
-                }
+                "params": { "name": "message_send", "arguments": { "draft": "draft_1" } }
             }),
+            false,
         )
         .expect("response");
-        let id = saved["result"]["structuredContent"]["draft"]["summary"]["id"].as_str().expect("id").to_owned();
-        let sent = handle(
-            &mut engine,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": { "name": "draft_send", "arguments": { "id": id } }
-            }),
-        )
-        .expect("response");
-        assert_eq!(sent["result"]["structuredContent"]["message"]["folder_id"], "sent");
+        assert_eq!(refused["result"]["isError"], json!(true));
+        assert!(refused["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("--allow-send")));
     }
 
     #[test]
@@ -347,11 +372,12 @@ mod tests {
         let names = tools["result"]["tools"].as_array().expect("tools").iter().filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>();
         assert!(!names.contains(&"account_add"), "account_add is sensitive and must not be listed");
         assert!(!names.contains(&"account_remove"), "account_remove is sensitive and must not be listed");
+        assert!(!names.contains(&"account_update"), "account_update is sensitive and must not be listed");
         for name in ["accounts_list", "account_test", "sync_now", "sync_status"] {
             assert!(names.contains(&name), "{name} must stay available over MCP");
         }
 
-        for name in ["account_add", "account_remove"] {
+        for name in ["account_add", "account_remove", "account_update"] {
             let response = handle(
                 &mut engine,
                 &json!({
@@ -401,6 +427,109 @@ mod tests {
         assert!(text.contains("listing folders"), "the phase is not named: {text}");
         assert!(!text.contains(postino_testkit::PASSWORD), "the server echo leaked into the MCP result: {text}");
         assert!(!text.contains("A0003 NO"), "the raw response leaked into the MCP result: {text}");
+    }
+
+    #[test]
+    fn outbox_mark_sent_is_gated_like_sending() {
+        let mut engine = Engine::demo();
+        let disabled = raw_handle(&mut engine, &json!({ "jsonrpc": "2.0", "id": 40, "method": "tools/list" }), false).expect("response");
+        let tools = disabled["result"]["tools"].as_array().expect("tools");
+        for name in ["message_send", "send_schedule", "outbox_retry", "outbox_mark_sent"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).expect(name);
+            assert_eq!(tool["enabled"], json!(false), "{name} must be gated by --allow-send");
+            assert!(tool["disabledReason"].as_str().is_some_and(|text| text.contains("--allow-send")));
+        }
+        // A row may be cancelled without the send toggle: it never contacts a server.
+        let cancel = tools.iter().find(|tool| tool["name"] == "outbox_cancel").expect("outbox_cancel");
+        assert_eq!(cancel["enabled"], json!(true));
+        let refused = raw_handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": { "name": "outbox_mark_sent", "arguments": { "id": "ob_1", "confirm": true } }
+            }),
+            false,
+        )
+        .expect("response");
+        assert_eq!(refused["result"]["isError"], json!(true));
+    }
+
+    #[test]
+    fn outbox_list_never_returns_server_text() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mail.db");
+        let mut key_bytes = [0u8; 32];
+        getrandom::fill(&mut key_bytes).expect("OS random source");
+        let store = postino_store::Store::open(&path, &postino_store::StoreKey::from_bytes(key_bytes)).expect("store");
+        let vault = crate::test_support::MemoryVault::new();
+        let secret = postino_testkit::SMTP_PASSWORD.to_owned();
+        let body = "il corpo che il server SMTP non deve dettare".to_owned();
+        let recipient = "echo@example.com";
+        let smtp = crate::test_support::EchoingSmtp::start(format!("{secret} {body} {recipient}"));
+        crate::test_support::seed_smtp_account(&store, &vault, "acc_mcp", 1, smtp.port());
+        for (id, name, kind) in
+            [("fld_acc_mcp_drafts", "Bozze", postino_store::FolderKind::Drafts), ("fld_acc_mcp_sent", "Inviati", postino_store::FolderKind::Sent)]
+        {
+            store
+                .upsert_folder(&postino_store::Folder {
+                    id: id.to_owned(),
+                    account_id: "acc_mcp".to_owned(),
+                    name: name.to_owned(),
+                    kind,
+                    unread: 0,
+                    total: 0,
+                    uid_validity: None,
+                    uid_next: None,
+                    last_sync_at: None,
+                })
+                .expect("folder");
+        }
+        let mut engine = Engine::open_with_vault(store, vault).expect("engine");
+        engine.set_test_extra_roots(vec![smtp.ca()]);
+        let saved = engine
+            .call(
+                "draft_save",
+                json!({
+                    "to": [{ "name": "", "email": recipient }],
+                    "subject": "Ostile",
+                    "body_text": body
+                }),
+            )
+            .expect("draft_save");
+        let draft = saved["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
+        engine.call("message_send", json!({ "draft": draft })).expect("queue");
+        let send_at = engine.outbox_list(None, 500, 0).expect("outbox").entries.first().expect("row").send_at;
+        let report = engine.process_outbox(send_at).expect("pass");
+        assert_eq!(report.failed, 1, "{report:?}");
+        smtp.finish();
+
+        let response = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": { "name": "outbox_list", "arguments": {} }
+            }),
+        )
+        .expect("response");
+        let encoded = serde_json::to_string(&response).expect("JSON");
+        assert!(encoded.contains("550"), "the row must still say what happened: {encoded}");
+        for forbidden in [secret.as_str(), body.as_str(), recipient] {
+            assert!(!encoded.contains(forbidden), "an MCP response contained server text: {encoded}");
+        }
+    }
+
+    #[test]
+    fn initialize_does_not_claim_a_demo_mailbox() {
+        let mut engine = Engine::demo();
+        let response = request(&mut engine, "initialize");
+        let instructions = response["result"]["instructions"].as_str().expect("instructions");
+        assert!(!instructions.contains("M0 demo mode"), "{instructions}");
+        assert!(instructions.contains("queue"), "the queue-only contract must be stated: {instructions}");
+        assert!(instructions.contains("--allow-send"), "{instructions}");
     }
 
     #[test]

@@ -1,9 +1,12 @@
 # Postino roadmap
 
-> **Current milestone:** M1 complete — read real mail · **Last updated:** 2026-10-25
+> **Current milestone:** M2 in progress — SMTP submission, the outbox and its closure are complete
+> (P7); compose attachments/signatures and full draft APPEND remain · **Last updated:** 2026-10-26
 >
 > M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
-> desktop app reads and syncs a real mailbox from the encrypted cache. M2 starts with SMTP.
+> desktop app reads and syncs a real mailbox from the encrypted cache. M2 has started with SMTP,
+> the journaled outbox and independent Sent APPEND. P7 still has no daemon: scheduled mail waits for
+> the app or `postino send`, and an APPEND that keeps failing has no terminal give-up state (P8/P9).
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.
@@ -44,8 +47,9 @@ interaction model before real mail makes them expensive to change. Full spec:
       table, palette with arrows/Enter/shortcuts, `?` sheet, context menus, batch bar, undo/toast,
       read-state policy, reading pane open/expand/Esc.
 - [x] **U0.4 Compose** — composer component, draft operations, autosave, reply/forward prefill,
-      local move to Sent, Drafts folder and counts. `draft_save` and `draft_send` are in the
-      CLI/MCP registry; attachments are metadata-only until M2. Screenshots: `docs/images/postino-u04.png`,
+      local move to Sent, Drafts folder and counts. `draft_save` is in the registry; `draft_send`
+      was the local placeholder and is replaced by `message_send` in P7. Attachments are
+      metadata-only until M2. Screenshots: `docs/images/postino-u04.png`,
       `postino-u04-compose.png`, `postino-u04-compose-dark.png`.
 - [x] **U0.5 Labels** — label registry with counts, create/rename/delete/apply/remove and filter in
       the engine, GUI, CLI and MCP; inline creation under the ETICHETTE header with a semantic colour
@@ -95,13 +99,35 @@ interaction model before real mail makes them expensive to change. Full spec:
 
 ## M2 — write real mail
 
-- [ ] SMTP submission with STARTTLS/implicit TLS, AUTH, SMTPUTF8, DSN.
-- [ ] Compose To/Cc/Bcc, subject, body, attachments, signatures per identity.
-- [ ] Reply/reply-all/forward with correct recipients and quoting.
-- [ ] Draft autosave with revisions, crash recovery, `APPEND` to Drafts.
-- [ ] Outbox with idempotency keys; `APPEND` to Sent; duplicate detection by `Message-ID`.
-- [ ] Verify: end-to-end to a test mailbox; RFC 822 golden files; header injection rejected;
-      crash between SMTP accept and Sent append does not send twice.
+- [x] SMTP submission with STARTTLS/implicit TLS, AUTH, SMTPUTF8, DSN, SIZE and 8BITMIME (P7):
+      `postino-net::smtp` with typed transient/permanent/uncertain errors, bounded lines/replies/
+      messages, dot-stuffing and a fake server covering each stage.
+- [ ] Compose To/Cc/Bcc, subject, body, attachments, signatures per identity. To/Cc/Bcc and body
+      exist; the GUI still stores attachment metadata only and signatures are a single account text.
+- [x] Reply/reply-all/forward prefill exists in the composer; header-level threading is still M3.
+- [ ] Draft autosave with revisions, crash recovery, `APPEND` to Drafts. Autosave/revisions and crash
+      recovery exist; the server-side Drafts APPEND is not implemented.
+- [x] Outbox with a stable per-revision idempotency key, a `draft_id` column with a partial unique
+      index over every active state, a `lease_at` epoch with guarded transitions, backoff, scheduled
+      send, undo, cancel/discard and an uncertain state; `APPEND` to Sent with `\Seen`, its own claim
+      and independent retries (P7). A duplicate `message_send` after a cancel is one row and one
+      delivery; a revived row is the newest by `created_at`; a submission never leaves the machine if
+      the draft changed after it was serialized (body, headers, last-saved instant and attachment set;
+      a stored reply linkage this build cannot serialize is refused). The local Sent copy carries the
+      generated `Message-ID`, and a sync adopts it instead of inserting a second copy, whether the local
+      copy or the server copy was written first; in the server-first order the merge adopts the cached
+      UID and skips the APPEND. A Sent copy moved back to Drafts is never adopted or deleted by a Sent
+      sync.
+- [x] Verify: crash between SMTP accept and Sent append does not send twice; a test seam fails after
+      the server's `250` and before the durable transition, and reopening proves `sending` →
+      `uncertain`, no connection and one DATA. The fake server proves the exact bytes/envelope across
+      a second boundary, Bcc only in RCPT, restarts at every point, a two-process live lease, a claimed
+      append a second pass leaves alone, a `mark_sent` that loses its race, a stale engine that cannot
+      overwrite another process's move, 25 MiB + 10 recipients, SIZE refusal, backoff/persist/auth-halt,
+      a damaged append envelope that is never `sent`, and that an uncertain row is never retried
+      automatically. The CLI suite proves plain `postino send` submits while a future `--at` only
+      queues.
+- [ ] Verify end-to-end to a real test mailbox (needs a provider account and app password).
 
 ## M3 — organize
 

@@ -268,8 +268,89 @@ impl Session {
         self.fetch_body_opt(uid).await?.ok_or_else(|| protocol("the server returned no BODY[] for the message"))
     }
 
-    /// `UID STORE`, always silent and always with `UID`.
+    /// `APPEND`: upload one message literal into a mailbox.
     ///
+    /// The command is written with an explicit literal size, the client waits for the server's `+`
+    /// continuation and only then sends the bytes plus CRLF, then the tagged reply. Nothing is
+    /// pipelined. `raw` is the exact RFC 5322 message; `flags` become the message's initial flags
+    /// (P7 uses `\Seen` for Sent). The size is capped by `Limits::max_literal`.
+    pub async fn append(&mut self, mailbox: &str, flags: &[Flag], raw: &[u8]) -> Result<(), NetError> {
+        if self.closed {
+            return Err(NetError::Closed { phase: "append" });
+        }
+        let name = astring(mailbox, "mailbox")?;
+        if raw.len() > self.config.limits.max_literal {
+            return Err(NetError::TooLarge { what: "literal", limit: self.config.limits.max_literal });
+        }
+        let flag_list = if flags.is_empty() {
+            String::new()
+        } else {
+            check_storable_flags(flags)?;
+            format!(" ({})", flags.iter().map(Flag::as_wire).collect::<Vec<_>>().join(" "))
+        };
+        let tag = self.next_tag();
+        let command = Zeroizing::new(format!("{tag} APPEND {name}{flag_list} {{{}}}\r\n", raw.len()));
+        log::debug!("imap: {tag} APPEND");
+        let deadline = self.deadline();
+        self.conn.write_all(command.as_bytes(), "append", deadline).await?;
+
+        let mut budget = self.budget();
+        let limit = self.config.limits.max_untagged;
+        let mut count = 0usize;
+        loop {
+            let segments = self.conn.read_response("append", deadline, &mut budget).await?;
+            match parse_response(&segments)? {
+                Response::Continuation(_) => break,
+                Response::Untagged(item) => {
+                    count += 1;
+                    if count > limit {
+                        return Err(NetError::TooLarge { what: "untagged responses", limit });
+                    }
+                    if is_bye(&item) {
+                        self.closed = true;
+                        return Err(NetError::Closed { phase: "append" });
+                    }
+                }
+                Response::Tagged { tag: got, response } => {
+                    self.check_tag(&got, &tag)?;
+                    return Err(response.into_error("APPEND"));
+                }
+            }
+        }
+
+        let mut literal = Zeroizing::new(Vec::with_capacity(raw.len().saturating_add(2)));
+        literal.extend_from_slice(raw);
+        literal.extend_from_slice(b"\r\n");
+        // A whole-buffer deadline would refuse a 25 MiB attachment on a slow uplink; each chunk gets
+        // its own timeout instead.
+        self.conn.write_all_chunked(literal.as_slice(), "append").await?;
+
+        loop {
+            let segments = self.conn.read_response("append", deadline, &mut budget).await?;
+            match parse_response(&segments)? {
+                Response::Untagged(item) => {
+                    count += 1;
+                    if count > limit {
+                        return Err(NetError::TooLarge { what: "untagged responses", limit });
+                    }
+                    if is_bye(&item) {
+                        self.closed = true;
+                        return Err(NetError::Closed { phase: "append" });
+                    }
+                }
+                Response::Continuation(text) => return Err(protocol(format!("unexpected continuation after APPEND: {text}"))),
+                Response::Tagged { tag: got, response } => {
+                    self.check_tag(&got, &tag)?;
+                    return match response.status {
+                        Status::Ok => Ok(()),
+                        _ => Err(response.into_error("APPEND")),
+                    };
+                }
+            }
+        }
+    }
+
+    /// `UID STORE`, always silent and always with `UID`.    ///
     /// [`FlagMode::Add`] writes `+FLAGS.SILENT`, [`FlagMode::Remove`] `-FLAGS.SILENT`, and
     /// [`FlagMode::Replace`] `FLAGS.SILENT`; the new flags are not needed locally because the sync
     /// layer already knows the intent.

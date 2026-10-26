@@ -9,6 +9,7 @@
 //! |---|---|
 //! | [`STORE_SCOPE`] (`default`) | the SQLCipher store key |
 //! | `account:<id>:imap` | one account's IMAP password or app password |
+//! | `account:<id>:smtp` | an optional, separate SMTP password; absent means the IMAP one is used |
 //!
 //! The store crate never reads a keyring: it only accepts bytes, which keeps the encrypted-store
 //! tests off the real vault. Account credentials never leave this crate except as a zeroising
@@ -61,8 +62,11 @@ pub const STORE_SCOPE: &str = "default";
 
 /// Prefix and suffix of the per-account IMAP credential scope.
 pub const ACCOUNT_SCOPE_PREFIX: &str = "account:";
-/// Suffix of the per-account IMAP credential scope. SMTP will get its own suffix.
+/// Suffix of the per-account IMAP credential scope.
 pub const ACCOUNT_SCOPE_SUFFIX: &str = ":imap";
+/// Suffix of the per-account SMTP credential scope. When it is absent the engine falls back to the
+/// IMAP credential, which is what Aruba and Gmail app passwords do in practice.
+pub const ACCOUNT_SMTP_SCOPE_SUFFIX: &str = ":smtp";
 
 /// Length of a store key in bytes (AES-256 for SQLCipher).
 const STORE_KEY_BYTES: usize = 32;
@@ -156,13 +160,25 @@ pub enum PlatformError {
 /// The id is restricted to ASCII letters, digits, `_` and `-`, so it can never introduce a `:` that
 /// makes two different accounts share a scope.
 pub fn account_scope(account_id: &str) -> Result<String, PlatformError> {
+    account_scoped(account_id, ACCOUNT_SCOPE_SUFFIX)
+}
+
+/// The credential scope of one account's SMTP password: `account:<id>:smtp`.
+///
+/// It uses the same validation as [`account_scope`]; a missing entry means the engine falls back to
+/// the IMAP credential and never copies one secret into the other's scope.
+pub fn account_smtp_scope(account_id: &str) -> Result<String, PlatformError> {
+    account_scoped(account_id, ACCOUNT_SMTP_SCOPE_SUFFIX)
+}
+
+fn account_scoped(account_id: &str, suffix: &str) -> Result<String, PlatformError> {
     let valid = !account_id.is_empty()
         && account_id.chars().count() <= MAX_ACCOUNT_ID_CHARS
         && account_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
     if !valid {
         return Err(PlatformError::InvalidAccount);
     }
-    let scope = format!("{ACCOUNT_SCOPE_PREFIX}{account_id}{ACCOUNT_SCOPE_SUFFIX}");
+    let scope = format!("{ACCOUNT_SCOPE_PREFIX}{account_id}{suffix}");
     validate_scope(&scope)?;
     Ok(scope)
 }
@@ -578,11 +594,14 @@ mod tests {
     #[test]
     fn account_scopes_are_bounded_and_unambiguous() {
         assert_eq!(account_scope("acc_0123456789abcdef").expect("scope"), "account:acc_0123456789abcdef:imap");
+        assert_eq!(account_smtp_scope("acc_0123456789abcdef").expect("scope"), "account:acc_0123456789abcdef:smtp");
         for id in ["", "a:b", "a/b", "a b", "a\nb", "../x"] {
             assert!(matches!(account_scope(id), Err(PlatformError::InvalidAccount)), "{id:?}");
+            assert!(matches!(account_smtp_scope(id), Err(PlatformError::InvalidAccount)), "{id:?}");
         }
         let long = "a".repeat(MAX_ACCOUNT_ID_CHARS + 1);
         assert!(matches!(account_scope(&long), Err(PlatformError::InvalidAccount)));
+        assert!(matches!(account_smtp_scope(&long), Err(PlatformError::InvalidAccount)));
     }
 
     #[test]

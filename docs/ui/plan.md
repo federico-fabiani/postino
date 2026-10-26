@@ -228,17 +228,18 @@ per action, no hidden mutation.
   subject, body, signature, attachments, formatting bar. Reply/forward open the same composer
   prefilled.
 - Drafts autosave to the engine on every pause; the Drafts folder shows them. `Esc` closes and keeps
-  the draft. `Ctrl+Enter` sends locally: this build opens no SMTP connection.
-- A send moves the draft to Sent and shows an undo toast. The Send button keeps the label
-  **Invia (locale)** and carries the notice `Nessun invio SMTP: il messaggio resta in Inviati su
-  questo computer.` next to it, so the honesty is visible before the click; real submission arrives
-  with M2.
+  the draft. `Ctrl+Enter` queues a real SMTP submission.
+- A send queue leaves the draft in Drafts for the 5-second undo window, then the send worker submits
+  it and moves the local copy to Sent. The toast offers **Annulla** only inside that window. The Send
+  button is labelled **Invia** and carries the notice `Invio reale via SMTP. Puoi annullare entro 5
+  secondi.`; the outbox dialog (`Ctrl+Shift+O`) shows every state, including **Invio incerto** with
+  the two explicit resolutions. The demo has no SMTP endpoint and disables Send with a reason.
 - The composer is a component, so the future HTML/Tailwind advanced mode can reuse its shell.
 
-Shipped in U0.4: `ComposerState` + `Composer` in `ui/widgets/composer.rs`, autosave after 1.2 s of
-inactivity, `draft_save`/`draft_send` in the registry, `Re:`/`Fwd:` prefills, signature from the
-account, drag-and-drop attachment metadata and a Markdown formatting bar. The base composer is
-plain text; HTML/Tailwind formatting remains a later milestone.
+Shipped in U0.4 and revised in P7: `ComposerState` + `Composer` in `ui/widgets/composer.rs`,
+autosave after 1.2 s of inactivity, `draft_save`/`message_send` in the registry, `Re:`/`Fwd:`
+prefills, signature from the account, drag-and-drop attachment metadata and a Markdown formatting
+bar. The base composer is plain text; HTML/Tailwind formatting remains a later milestone.
 
 The composer is a modal layer, not a window. At `>= 1000 × 700` it is a centred card of
 `min(640, available - 2*XXL)` by `min(600, available - 2*XL)`, always above the status bar. Below
@@ -341,14 +342,15 @@ searchable shortcut sheet. Reply/forward arrived in U0.4; labels arrived in U0.5
 
 ### U0.4 Compose and drafts — done
 
-- Composer component, draft ops in the engine, autosave, local move to Sent.
+- Composer component, draft ops in the engine, autosave, journaled real send (P7).
 - Reply/reply-all/forward prefill.
 - Drafts folder and counts.
 
 Shipped in `apps/postino-app/src/ui/widgets/composer.rs` and `apps/postino-app/src/app.rs`.
-`draft_save` creates a draft or patches one in place; `draft_send` moves the draft to Sent locally
-and is undoable. The Send button shows the notice `Nessun invio SMTP: il messaggio resta in Inviati
-su questo computer.` before the click. Attachments are metadata-only in M0, as is the send itself.
+`draft_save` creates a draft or patches one in place; `message_send` queues a submission with a
+5-second undo window and the outbox worker submits it. The Send button shows the notice `Invio reale
+via SMTP. Puoi annullare entro 5 secondi.` before the click. Attachments remain metadata-only in the
+composer until P8; an attachment without stored bytes is refused before queueing.
 
 ### U0.5 Labels — done
 
@@ -407,8 +409,8 @@ su questo computer.` before the click. Attachments are metadata-only in M0, as i
   one sentence and the version), `Pronto` or `Errore`; errors are one dismissable toast with a retry
   only for a list reload, and never a raw engine line. A loading line appears after 200 ms.
 - **One demo notice.** All milestone codes are gone from the product; the composer says
-  "Markdown", the drop zone "Gli allegati reali arrivano con l'invio", the label menu "Le etichette
-  sono locali", and `Invia (locale)` keeps its no-SMTP notice.
+  "Markdown", the drop zone "Gli allegati senza contenuto salvato bloccano l'invio", the label menu
+  "Le etichette sono locali", and the demo composer says "Demo: nessun messaggio lascia il computer."
 - **Preferences.** Theme, reading-pane fraction, last folder and reduced motion persist in
   `%APPDATA%\Postino\settings.json` (or the platform config directory); a missing or corrupt file
   falls back to the defaults, and no draft text or message content is ever written.

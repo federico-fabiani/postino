@@ -7,11 +7,11 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::types::{Type, Value};
-use rusqlite::{ErrorCode, OptionalExtension, Row, params, params_from_iter};
+use rusqlite::{ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter};
 
 use crate::model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags, Label,
-    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, SyncState, UidEntry,
+    LabelCount, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState, SyncState, UidEntry,
 };
 use crate::{SYNC_STATUS_KEY_PREFIX, Store, StoreError};
 
@@ -19,13 +19,14 @@ use crate::{SYNC_STATUS_KEY_PREFIX, Store, StoreError};
 const MAX_PAGE: u32 = 500;
 
 const ACCOUNT_COLUMNS: &str = "id, name, email, provider, signature, created_at";
-const SERVER_COLUMNS: &str = "account_id, imap_host, imap_port, imap_tls, imap_username, created_at";
+const SERVER_COLUMNS: &str = "account_id, imap_host, imap_port, imap_tls, imap_username, created_at, smtp_host, smtp_port, smtp_tls, smtp_username";
 const FOLDER_COLUMNS: &str = "id, account_id, name, kind, unread, total, uid_validity, uid_next, last_sync_at";
 const SUMMARY_COLUMNS: &str = "m.id, m.account_id, m.folder_id, m.thread_id, m.from_name, m.from_email, m.to_json, m.subject, m.snippet, m.date, m.unread, m.starred, m.has_attachments";
 const MESSAGE_DETAIL_COLUMNS: &str = "m.uid, m.message_id, m.cc_json, m.bcc_json, m.body_text, m.body_html, m.size";
 const LABEL_COLUMNS: &str = "l.id, l.account_id, l.name, l.color";
 const DRAFT_COLUMNS: &str = "id, account_id, revision, updated_at, body_text, to_json, cc_json, bcc_json, subject, in_reply_to";
 const ATTACHMENT_COLUMNS: &str = "id, filename, mime, size, blob_hash";
+const OUTBOX_COLUMNS: &str = "id, account_id, draft_id, idempotency_key, created_at, send_at, state, attempts, append_attempts, last_error, raw_blob_hash, envelope_json, lease_at";
 
 // ---------------------------------------------------------------------------------------------
 // Accounts and their IMAP server
@@ -116,6 +117,387 @@ impl Store {
         Ok(true)
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Outbox
+// ---------------------------------------------------------------------------------------------
+
+/// Largest number of outbox rows one list returns. The list is newest-first and is a history view,
+/// not a correctness input: every state decision uses a targeted query. A bound keeps a damaged
+/// store from turning a list into an allocation.
+pub const MAX_OUTBOX_ROWS: u32 = 500;
+
+impl Store {
+    /// Queue one submission row, or revive the cancelled row with the same idempotency key.
+    ///
+    /// The key is stable per draft content, so two processes that queue the same draft compute the
+    /// same key: the first inserts, the second gets [`StoreError::OutboxAlreadyActive`] instead of a
+    /// second row. The caller treats that as the idempotent answer (it re-reads the live row). A
+    /// cancelled row with the same key is reused, because a cancel is a discard of that content, not
+    /// a history entry that blocks a later attempt.
+    ///
+    /// The partial unique index `outbox_active_draft` is the last line of defence: even with a
+    /// different key (edited content racing a queue), a draft cannot have two `queued`/`sending`
+    /// rows, so one pass cannot submit it twice.
+    pub fn queue_outbox(&self, entry: &OutboxEntry) -> Result<OutboxEntry, StoreError> {
+        // Immediate: the key lookup and the insert must not interleave with another process.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        require_account(&tx, &entry.account_id)?;
+        if let Some((id, raw_state)) = tx
+            .query_row("SELECT id, state FROM outbox WHERE idempotency_key = ?1 ORDER BY rowid DESC LIMIT 1", [&entry.idempotency_key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()?
+        {
+            let state = parse_state(&raw_state)?;
+            if state == OutboxState::Cancelled {
+                tx.execute(
+                    "UPDATE outbox SET created_at = ?2, send_at = ?3, state = 'queued', attempts = 0, append_attempts = 0, last_error = NULL,
+                         raw_blob_hash = ?4, envelope_json = ?5, draft_id = ?6, lease_at = NULL
+                     WHERE id = ?1 AND state = 'cancelled'",
+                    params![id, entry.created_at, entry.send_at, entry.raw_blob_hash, entry.envelope_json, entry.draft_id.as_deref()],
+                )?;
+                let row = tx.query_row(&format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE id = ?1"), [&id], row_to_outbox).optional()?;
+                tx.commit()?;
+                return row.ok_or(StoreError::NotFound { entity: "outbox row", id });
+            }
+            tx.rollback()?;
+            return Err(StoreError::OutboxAlreadyActive { draft_id: entry.draft_id.clone().unwrap_or_default(), state });
+        }
+        let written = tx.execute(
+            "INSERT INTO outbox(id, account_id, draft_id, idempotency_key, created_at, send_at, state, attempts, append_attempts, last_error, raw_blob_hash, envelope_json, lease_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
+            params![
+                entry.id,
+                entry.account_id,
+                entry.draft_id.as_deref(),
+                entry.idempotency_key,
+                entry.created_at,
+                entry.send_at,
+                entry.state.as_str(),
+                i64::from(entry.attempts),
+                i64::from(entry.append_attempts),
+                entry.last_error,
+                entry.raw_blob_hash,
+                entry.envelope_json,
+            ],
+        );
+        if let Err(error) = written {
+            // A constraint here means another writer queued the same draft between our read and our
+            // write, or the active-draft index caught a different key for the same draft.
+            tx.rollback()?;
+            let state = match entry.draft_id.as_deref() {
+                Some(draft_id) => self.active_state_for_draft(draft_id)?,
+                None => None,
+            };
+            if let Some(state) = state {
+                return Err(StoreError::OutboxAlreadyActive { draft_id: entry.draft_id.clone().unwrap_or_default(), state });
+            }
+            return Err(error.into());
+        }
+        let row = tx.query_row(&format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE id = ?1"), [&entry.id], row_to_outbox).optional()?;
+        tx.commit()?;
+        row.ok_or(StoreError::NotFound { entity: "outbox row", id: entry.id.clone() })
+    }
+
+    pub fn get_outbox(&self, id: &str) -> Result<Option<OutboxEntry>, StoreError> {
+        self.conn
+            .query_row(&format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE id = ?1"), [id], row_to_outbox)
+            .optional()
+            .map_err(|error| corrupt_on_decode("outbox", error))
+    }
+
+    /// The newest row for one draft, whatever its state. `created_at` is the authority (a revival
+    /// updates it so the revived row becomes the newest); `rowid` only breaks a millisecond tie. This
+    /// is the only query the dedupe and the draft lock use: it never scans a capped list.
+    pub fn active_outbox_for_draft(&self, draft_id: &str) -> Result<Option<OutboxEntry>, StoreError> {
+        self.conn
+            .query_row(
+                &format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE draft_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1"),
+                [draft_id],
+                row_to_outbox,
+            )
+            .optional()
+            .map_err(|error| corrupt_on_decode("outbox", error))
+    }
+
+    /// The state of the row that occupies a draft's active slot, if any.
+    pub fn active_state_for_draft(&self, draft_id: &str) -> Result<Option<OutboxState>, StoreError> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM outbox
+                 WHERE draft_id = ?1 AND state IN ('queued', 'sending', 'append_pending', 'uncertain', 'failed')
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                [draft_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.as_deref().map(parse_state).transpose()
+    }
+
+    /// The newest `limit` journal rows, optionally for one account, newest first. `limit` is clamped
+    /// to 1..=[`MAX_OUTBOX_ROWS`]; `offset` skips that many rows for a second page.
+    pub fn list_outbox(&self, account_id: Option<&str>, limit: u32) -> Result<Vec<OutboxEntry>, StoreError> {
+        self.list_outbox_page(account_id, limit, 0)
+    }
+
+    /// One newest-first page of the journal. A history view never hides a new row behind old ones:
+    /// a row queued now is the first element even when the table already holds a thousand rows.
+    pub fn list_outbox_page(&self, account_id: Option<&str>, limit: u32, offset: u32) -> Result<Vec<OutboxEntry>, StoreError> {
+        let limit = i64::from(limit.clamp(1, MAX_OUTBOX_ROWS));
+        let offset = i64::from(offset);
+        let rows = match account_id {
+            Some(account) => {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {OUTBOX_COLUMNS} FROM outbox WHERE account_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2 OFFSET ?3"
+                ))?;
+                let rows = stmt.query_map(params![account, limit, offset], row_to_outbox)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("outbox", error))?
+            }
+            None => {
+                let mut stmt =
+                    self.conn.prepare(&format!("SELECT {OUTBOX_COLUMNS} FROM outbox ORDER BY created_at DESC, rowid DESC LIMIT ?1 OFFSET ?2"))?;
+                let rows = stmt.query_map(params![limit, offset], row_to_outbox)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|error| corrupt_on_decode("outbox", error))?
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Claim the earliest `append_pending` row whose Sent append is due and unowned — either never
+    /// claimed, or claimed by a worker whose lease expired — in one transaction.
+    ///
+    /// The claim writes `lease_at` and increments `append_attempts`, the counter the append backoff
+    /// uses. Two passes (the app and the CLI, or two app instances) can therefore never APPEND the
+    /// same row at the same time; the loser sees no claimable row. A crash during the append leaves
+    /// the lease behind and the row is claimable again after `lease_ms`, exactly like a submission
+    /// lease.
+    pub fn claim_outbox_append(&self, now_ms: i64, lease_ms: i64) -> Result<Option<OutboxEntry>, StoreError> {
+        let cutoff = now_ms.saturating_sub(lease_ms.max(0));
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let id = tx
+            .query_row(
+                "SELECT id FROM outbox
+                 WHERE state = 'append_pending' AND send_at <= ?1 AND (lease_at IS NULL OR lease_at <= ?2)
+                 ORDER BY send_at, rowid LIMIT 1",
+                params![now_ms, cutoff],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE outbox SET lease_at = ?2, append_attempts = append_attempts + 1
+             WHERE id = ?1 AND state = 'append_pending' AND (lease_at IS NULL OR lease_at <= ?3)",
+            params![id, now_ms, cutoff],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        let entry = tx.query_row(&format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE id = ?1"), [&id], row_to_outbox).optional()?;
+        tx.commit()?;
+        Ok(entry)
+    }
+
+    /// The instant at which the next pass could have work: a queued row's due time, an unowned append
+    /// row's due time, or a owned row's lease expiry. `None` when nothing is pending. One indexed
+    /// row, not a list.
+    pub fn next_outbox_wake(&self, lease_ms: i64) -> Result<Option<i64>, StoreError> {
+        let lease_ms = lease_ms.max(0);
+        Ok(self.conn.query_row(
+            "SELECT MIN(CASE WHEN state IN ('sending', 'append_pending') AND lease_at IS NOT NULL THEN lease_at + ?1 ELSE send_at END)
+             FROM outbox WHERE state IN ('queued', 'sending', 'append_pending')",
+            [lease_ms],
+            |row| row.get::<_, Option<i64>>(0),
+        )?)
+    }
+
+    /// Turn every `sending` row whose **lease** is older than `lease_ms` into `uncertain` and return
+    /// its id.
+    ///
+    /// The lease epoch is `lease_at`, written by [`Store::lease_next_outbox`]. A row scheduled for
+    /// 09:00 and leased at 10:00 is fresh for the whole window: `send_at` is user-visible and has no
+    /// bearing on ownership. A crash during `DATA` becomes uncertain after the window and is never
+    /// queued again. A row written by a build before the column existed falls back to `send_at`.
+    pub fn expire_stale_outbox(&self, now_ms: i64, lease_ms: i64) -> Result<Vec<String>, StoreError> {
+        let cutoff = now_ms.saturating_sub(lease_ms.max(0));
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let ids = {
+            let mut stmt = tx.prepare("SELECT id FROM outbox WHERE state = 'sending' AND COALESCE(lease_at, send_at) <= ?1 ORDER BY id")?;
+            let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !ids.is_empty() {
+            tx.execute(
+                "UPDATE outbox SET state = 'uncertain', last_error = ?1, lease_at = NULL
+                 WHERE state = 'sending' AND COALESCE(lease_at, send_at) <= ?2",
+                params![UNCERTAIN_AFTER_CRASH, cutoff],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Lease the earliest due `queued` row in one transaction and return it with `attempts` already
+    /// incremented. `None` when nothing is due. Only a `queued` row can be claimed; a cancelled,
+    /// failed, uncertain or already-sending row is never picked up. `lease_at` is the instant the
+    /// claim happened and the only epoch later expiry and transitions compare against.
+    pub fn lease_next_outbox(&self, now_ms: i64) -> Result<Option<OutboxEntry>, StoreError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let id = tx
+            .query_row(
+                "SELECT id FROM outbox WHERE state = 'queued' AND send_at <= ?1 ORDER BY send_at, created_at, rowid LIMIT 1",
+                [now_ms],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE outbox SET state = 'sending', lease_at = ?2, attempts = attempts + 1 WHERE id = ?1 AND state = 'queued'",
+            params![id, now_ms],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        let entry = tx.query_row(&format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE id = ?1"), [&id], row_to_outbox).optional()?;
+        tx.commit()?;
+        Ok(entry)
+    }
+
+    /// SMTP accepted the message: only the Sent append remains. This transition is durable before
+    /// the local Sent row or the network append is attempted. It is conditional on the caller still
+    /// owning the submission lease: a worker whose lease expired must not resurrect a row another
+    /// process is resolving. The append lease starts at the 250 (`append_lease`), so the worker that
+    /// submitted the message is also the one that appends it, and two passes cannot append it
+    /// concurrently. This is the first append attempt (`append_attempts = 1`); a retry increments it
+    /// when it claims the row.
+    pub fn mark_outbox_append_pending(&self, id: &str, lease_at: i64, append_lease: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'append_pending', last_error = NULL, lease_at = ?3, append_attempts = 1
+             WHERE id = ?1 AND state = 'sending' AND lease_at = ?2",
+            params![id, lease_at, append_lease],
+        )? > 0)
+    }
+
+    /// The Sent append succeeded. Only an `append_pending` row claimed by this worker can reach
+    /// `sent`; a second worker that lost the append claim cannot finish the first one's row.
+    pub fn finish_outbox_append(&self, id: &str, lease_at: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'sent', lease_at = NULL WHERE id = ?1 AND state = 'append_pending' AND lease_at = ?2",
+            params![id, lease_at],
+        )? > 0)
+    }
+
+    /// A person confirmed that an uncertain message did reach the server. No network call.
+    pub fn confirm_outbox_sent(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute("UPDATE outbox SET state = 'sent', lease_at = NULL WHERE id = ?1 AND state = 'uncertain'", [id])? > 0)
+    }
+
+    /// The submission outcome is unknown. Never auto-retried. Conditional on the lease.
+    pub fn mark_outbox_uncertain(&self, id: &str, error: &str, lease_at: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'uncertain', last_error = ?3, lease_at = NULL WHERE id = ?1 AND state = 'sending' AND lease_at = ?2",
+            params![id, lease_at, error],
+        )? > 0)
+    }
+
+    /// A permanent error (or the attempt ceiling) stopped this row. Conditional on the lease.
+    pub fn mark_outbox_failed(&self, id: &str, error: &str, lease_at: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'failed', last_error = ?3, lease_at = NULL WHERE id = ?1 AND state = 'sending' AND lease_at = ?2",
+            params![id, lease_at, error],
+        )? > 0)
+    }
+
+    /// Put a row back in the queue without spending an attempt. Used when the account is halted or
+    /// when a local pre-check stopped before any network call. Conditional on the lease.
+    pub fn release_outbox(&self, id: &str, send_at: i64, lease_at: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'queued', attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                 send_at = ?2, lease_at = NULL
+             WHERE id = ?1 AND state = 'sending' AND lease_at = ?3",
+            params![id, send_at, lease_at],
+        )? > 0)
+    }
+
+    /// Put a row back in the queue with a new due time. Used for exponential backoff. Conditional on
+    /// the lease.
+    pub fn reschedule_outbox(&self, id: &str, send_at: i64, error: Option<&str>, lease_at: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'queued', last_error = ?3, send_at = ?4, lease_at = NULL
+             WHERE id = ?1 AND state = 'sending' AND lease_at = ?2",
+            params![id, lease_at, error, send_at],
+        )? > 0)
+    }
+
+    /// Keep `append_pending` and make the append due later. The submission is never repeated.
+    /// Conditional on the append claim, and it releases the claim so the row is claimable again at
+    /// the new due time.
+    pub fn reschedule_outbox_append(&self, id: &str, send_at: i64, error: Option<&str>, lease_at: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET last_error = ?3, send_at = ?4, lease_at = NULL
+             WHERE id = ?1 AND state = 'append_pending' AND lease_at = ?2",
+            params![id, lease_at, error, send_at],
+        )? > 0)
+    }
+
+    /// Move a still-queued row's due time. The schedule editor and a test that models "the due time
+    /// passed while the app was closed" use it; a leased or finished row is refused.
+    pub fn set_outbox_due(&self, id: &str, send_at: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute("UPDATE outbox SET send_at = ?2 WHERE id = ?1 AND state = 'queued'", params![id, send_at])? > 0)
+    }
+
+    /// Discard a row that has not been delivered. `queued` is the undo window; `failed` is a
+    /// permanent refusal, so no delivery happened and throwing the journal row away is safe. A
+    /// `sending`, `append_pending`, `sent` or `uncertain` row is refused: it may have been delivered.
+    pub fn cancel_outbox(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'cancelled', last_error = NULL, lease_at = NULL WHERE id = ?1 AND state IN ('queued', 'failed')",
+            [id],
+        )? > 0)
+    }
+
+    /// Manual retry of a `failed` or `uncertain` row: reset the attempt budget and make it due now.
+    /// The caller owns the explicit confirmation; this method never decides policy. A failed row
+    /// whose bytes are already submitted never reaches here: an append failure stays
+    /// `append_pending`, which this method refuses.
+    pub fn retry_outbox(&self, id: &str, now_ms: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET state = 'queued', attempts = 0, send_at = ?2, last_error = NULL, lease_at = NULL
+             WHERE id = ?1 AND state IN ('failed', 'uncertain')",
+            params![id, now_ms],
+        )? > 0)
+    }
+
+    /// Delete at most `limit` terminal rows older than `retention_ms`, so the journal cannot grow
+    /// forever. Only `sent`, `cancelled` and `failed` rows are candidates: everything else is live
+    /// state or the record of a possible delivery.
+    pub fn prune_outbox(&self, now_ms: i64, retention_ms: i64, limit: u32) -> Result<u32, StoreError> {
+        let cutoff = now_ms.saturating_sub(retention_ms.max(0));
+        let limit = i64::from(limit.clamp(1, MAX_OUTBOX_ROWS));
+        let changed = self.conn.execute(
+            "DELETE FROM outbox WHERE rowid IN (
+                 SELECT rowid FROM outbox WHERE state IN ('sent', 'cancelled', 'failed') AND created_at < ?1
+                 ORDER BY created_at LIMIT ?2
+             )",
+            params![cutoff, limit],
+        )?;
+        Ok(u32::try_from(changed).unwrap_or(u32::MAX))
+    }
+}
+
+/// The fixed sentence written when a crash leaves a `sending` row behind. It never contains an
+/// address, a subject, a server name or server text.
+pub const UNCERTAIN_AFTER_CRASH: &str =
+    "Postino si è fermato durante l'invio; il messaggio potrebbe essere stato accettato. Controlla Inviati prima di riprovare.";
 
 // ---------------------------------------------------------------------------------------------
 // Folders
@@ -355,6 +737,47 @@ impl Store {
             .query_row("SELECT folder_id, unread, starred FROM messages WHERE id = ?1", [id], |row| {
                 Ok(MessageFlags { folder_id: row.get(0)?, unread: row.get(1)?, starred: row.get(2)? })
             })
+            .optional()
+            .map_err(|error| corrupt_on_decode("messages", error))
+    }
+
+    /// The id of a locally written Sent/Archive row in this account that carries `message_id` and no
+    /// UID yet.
+    ///
+    /// The submission path stores the generated Message-ID on the local Sent copy; a sync that fetches
+    /// the same message finds it here and updates it with the UID instead of inserting a second copy.
+    /// Account-wide (not folder-scoped) so a server copy that moved to Sent/Archive still reconciles,
+    /// but deliberately **not** Drafts or Trash: a Sent copy the user moved back to Drafts is being
+    /// edited, and a sync must neither move it back to Sent nor delete it. `uid IS NULL` is what makes
+    /// the lookup safe: a row already bound to a server UID uses the normal identity rules.
+    pub fn local_message_for_id(&self, account_id: &str, message_id: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id
+                 WHERE m.account_id = ?1 AND m.message_id = ?2 AND m.uid IS NULL
+                   AND f.kind IN ('sent', 'archive')
+                 ORDER BY m.id LIMIT 1",
+                params![account_id, message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| corrupt_on_decode("messages", error))
+    }
+
+    /// The id of a server-backed row in this folder with the same Message-ID, if any.
+    ///
+    /// The submission path calls this before writing the local Sent copy: a provider that auto-saved
+    /// the message (or a sync that ran between the server's `250` and the local move) has already
+    /// created the row, and writing a second one would show the message twice.
+    pub fn synced_message_for_id(&self, account_id: &str, folder_id: &str, message_id: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM messages
+                 WHERE account_id = ?1 AND folder_id = ?2 AND message_id = ?3 AND uid IS NOT NULL
+                 ORDER BY uid, id LIMIT 1",
+                params![account_id, folder_id, message_id],
+                |row| row.get::<_, String>(0),
+            )
             .optional()
             .map_err(|error| corrupt_on_decode("messages", error))
     }
@@ -761,17 +1184,73 @@ impl Store {
     /// Move a draft to Sent in one transaction. The draft row is deleted because the message is no
     /// longer a draft, but `draft_seq` is kept so a move back to Drafts and a new save continue the
     /// revision sequence instead of restarting at 1.
-    pub fn send_draft_message(&self, message: &Message) -> Result<(), StoreError> {
+    ///
+    /// `message.message_id` is the generated Message-ID. Storing it is what lets a later Sent sync
+    /// recognise this locally written row (`uid IS NULL`) as the same message instead of inserting a
+    /// second copy; the id itself stays stable.
+    ///
+    /// `merge_duplicate` names a server-backed row in the same folder with the same Message-ID (a
+    /// provider auto-save or a sync that ran before this move). That row is the message already on the
+    /// server, so the local row **adopts its UID** and the duplicate is removed in the same
+    /// transaction: one local row that keeps the server identity, and the caller can skip the APPEND
+    /// (the server copy already exists). The returned UID is `Some(uid)` when this happened.
+    pub fn send_draft_message(&self, message: &Message, merge_duplicate: Option<&str>) -> Result<Option<u32>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
+        let adopted_uid = match merge_duplicate {
+            Some(duplicate) if duplicate != message.summary.id => {
+                tx.query_row("SELECT uid FROM messages WHERE id = ?1", [duplicate], |row| row.get::<_, Option<u32>>(0)).optional()?.flatten()
+            }
+            _ => None,
+        };
         upsert_message_row(&tx, message, true)?;
+        if let Some(uid) = adopted_uid {
+            tx.execute("UPDATE messages SET uid = ?2 WHERE id = ?1", params![message.summary.id, uid])?;
+        }
         tx.execute("DELETE FROM drafts WHERE id = ?1", [&message.summary.id])?;
+        if let Some(duplicate) = merge_duplicate
+            && duplicate != message.summary.id
+        {
+            tx.execute("DELETE FROM messages WHERE id = ?1", [duplicate])?;
+        }
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
         tx.commit()?;
-        Ok(())
+        Ok(adopted_uid)
     }
 
     pub fn get_draft(&self, id: &str) -> Result<Option<Draft>, StoreError> {
         get_draft(&self.conn, id)
+    }
+
+    /// Allocate a readable, store-wide draft id (`draft_<n>`).
+    ///
+    /// One immediate transaction reads a `meta` high-water mark, seeds it once from the largest id a
+    /// build before this allocator already wrote (messages, drafts and the revision table), and
+    /// increments it. Two processes therefore never receive the same id; the id is the primary key of
+    /// both the message and the outbox `draft_id`, so a collision would overwrite a draft or conflate
+    /// two submissions. Existing drafts keep their ids and the sequence continues above them.
+    pub fn allocate_draft_id(&self) -> Result<String, StoreError> {
+        const KEY: &str = "draft_id_seq";
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let stored: Option<String> = tx.query_row("SELECT value FROM meta WHERE key = ?1", [KEY], |row| row.get(0)).optional()?;
+        let stored = stored.and_then(|raw| raw.parse::<i64>().ok()).unwrap_or(0);
+        let highest: Option<i64> = tx.query_row(
+            "SELECT MAX(n) FROM (
+                 SELECT CAST(substr(id, 7) AS INTEGER) AS n FROM messages WHERE id GLOB 'draft_[0-9]*'
+                 UNION ALL
+                 SELECT CAST(substr(id, 7) AS INTEGER) AS n FROM drafts WHERE id GLOB 'draft_[0-9]*'
+                 UNION ALL
+                 SELECT CAST(substr(message_id, 7) AS INTEGER) AS n FROM draft_seq WHERE message_id GLOB 'draft_[0-9]*'
+             ) WHERE n > 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let next = stored.max(highest.unwrap_or(0)).saturating_add(1);
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![KEY, next.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(format!("draft_{next}"))
     }
 
     /// Drafts for one account (or every draft), newest update first.
@@ -854,19 +1333,35 @@ fn upsert_account_row(conn: &rusqlite::Connection, account: &Account) -> Result<
     Ok(())
 }
 
-/// Upsert one IMAP server row. The caller owns the transaction boundary.
+/// Upsert one IMAP and SMTP server row. The caller owns the transaction boundary.
 fn upsert_account_server_row(conn: &rusqlite::Connection, server: &AccountServer) -> Result<(), StoreError> {
+    let smtp = server.smtp.as_ref();
     conn.execute(
         &format!(
-            "INSERT INTO account_servers({SERVER_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO account_servers({SERVER_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(account_id) DO UPDATE SET
                  imap_host = excluded.imap_host,
                  imap_port = excluded.imap_port,
                  imap_tls = excluded.imap_tls,
                  imap_username = excluded.imap_username,
-                 created_at = excluded.created_at"
+                 created_at = excluded.created_at,
+                 smtp_host = excluded.smtp_host,
+                 smtp_port = excluded.smtp_port,
+                 smtp_tls = excluded.smtp_tls,
+                 smtp_username = excluded.smtp_username"
         ),
-        params![server.account_id, server.host, i64::from(server.port), server.tls.as_str(), server.username, server.created_at],
+        params![
+            server.account_id,
+            server.host,
+            i64::from(server.port),
+            server.tls.as_str(),
+            server.username,
+            server.created_at,
+            smtp.map(|smtp| smtp.host.as_str()),
+            smtp.map(|smtp| i64::from(smtp.port)),
+            smtp.map(|smtp| smtp.tls.as_str()),
+            smtp.map(|smtp| smtp.username.as_str()),
+        ],
     )?;
     Ok(())
 }
@@ -1255,13 +1750,62 @@ fn row_to_account(row: &Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account { id: row.get(0)?, name: row.get(1)?, email: row.get(2)?, provider: row.get(3)?, signature: row.get(4)?, created_at: row.get(5)? })
 }
 
+fn row_to_outbox(row: &Row<'_>) -> rusqlite::Result<OutboxEntry> {
+    let raw: String = row.get(6)?;
+    let state = OutboxState::parse(&raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(std::io::Error::other(format!("unknown outbox state {raw:?}"))))
+    })?;
+    Ok(OutboxEntry {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        draft_id: row.get(2)?,
+        idempotency_key: row.get(3)?,
+        created_at: row.get(4)?,
+        send_at: row.get(5)?,
+        state,
+        attempts: get_u32(row, 7)?,
+        append_attempts: get_u32(row, 8)?,
+        last_error: row.get(9)?,
+        raw_blob_hash: row.get(10)?,
+        envelope_json: row.get(11)?,
+        lease_at: row.get(12)?,
+    })
+}
+
+fn parse_state(raw: &str) -> Result<OutboxState, StoreError> {
+    OutboxState::parse(raw).ok_or_else(|| StoreError::Corrupt { table: "outbox", detail: format!("unknown state {raw:?}") })
+}
+
 fn row_to_account_server(row: &Row<'_>) -> rusqlite::Result<AccountServer> {
     let raw: String = row.get(3)?;
     let tls = AccountTls::parse(&raw).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(std::io::Error::other(format!("unknown IMAP TLS mode {raw:?}"))))
     })?;
     let port = u16::try_from(get_u32(row, 2)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error)))?;
-    Ok(AccountServer { account_id: row.get(0)?, host: row.get(1)?, port, tls, username: row.get(4)?, created_at: row.get(5)? })
+    let smtp = row_to_smtp_server(row)?;
+    Ok(AccountServer { account_id: row.get(0)?, host: row.get(1)?, port, tls, username: row.get(4)?, created_at: row.get(5)?, smtp })
+}
+
+fn row_to_smtp_server(row: &Row<'_>) -> rusqlite::Result<Option<crate::model::SmtpServer>> {
+    let host: Option<String> = row.get(6)?;
+    let port: Option<i64> = row.get(7)?;
+    let tls: Option<String> = row.get(8)?;
+    let username: Option<String> = row.get(9)?;
+    let (host, port, tls, username) = match (host, port, tls, username) {
+        (None, None, None, None) => return Ok(None),
+        (Some(host), Some(port), Some(tls), Some(username)) => (host, port, tls, username),
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                6,
+                Type::Text,
+                Box::new(std::io::Error::other("an SMTP endpoint has only some of its four columns")),
+            ));
+        }
+    };
+    let port = u16::try_from(port).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error)))?;
+    let tls = AccountTls::parse(&tls)
+        .ok_or_else(|| rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(std::io::Error::other("unknown SMTP TLS mode"))))?;
+    Ok(Some(crate::model::SmtpServer { host, port, tls, username }))
 }
 
 fn row_to_folder(row: &Row<'_>) -> rusqlite::Result<Folder> {

@@ -1,8 +1,9 @@
 # postino-sync
 
-Reconcile one IMAP account into the encrypted local store. Layer: sync, above the foundation
-(`postino-store`) and the network (`postino-net`), below the engine. It opens no UI, registers no
-operation, runs no daemon and schedules nothing.
+Reconcile one IMAP account into the encrypted local store, and provide the submission serialization
+and Sent append that P7 uses. Layer: sync, above the foundation (`postino-store`) and the network
+(`postino-net`), below the engine. It opens no UI, registers no operation, runs no daemon and
+schedules nothing.
 
 ```rust
 let cancel = AtomicBool::new(false);
@@ -31,6 +32,25 @@ detached task. `read_status(&store, &account)` reads the last status without the
 | `sync_account` | the run; returns `Ok(SyncOutcome)` or `Err(SyncError)` |
 | `SyncError` | `Connect(NetError)`, `Auth(String)`, `Store(StoreError)`, `Cancelled`, `NoAccount(String)`, `Protocol(String)` |
 | `SyncStatus` / `SyncPhase` / `read_status` / `status_key` | the persisted `meta` record, `sync_status:<account_id>` |
+| `Submission` / `serialize_submission` | a composed message mapped to `postino-mime`: exact RFC 5322 bytes, envelope, Message-ID |
+| `submit` | one SMTP transaction with the typed `SmtpError` (P7) |
+| `verify_smtp` | the `account_add` probe: connect, authenticate, quit |
+| `append_sent` | discover the server's `\Sent` folder from `LIST` and `APPEND` the bytes with `\Seen` |
+
+## Submission helpers (P7)
+
+`postino-sync` is the only crate above `postino-net` that knows how a composed message becomes SMTP
+bytes. `Submission` is plain data (from, To/Cc/Bcc, subject, date, text/HTML, attachments, reply
+linkage); `serialize_submission` calls `postino-mime::serialize`, which validates and folds headers,
+encodes bodies/attachments and keeps Bcc out of the raw bytes, in the envelope only. The engine writes
+the returned bytes to the encrypted blob store before queueing.
+
+`submit` connects, authenticates, calls `SmtpClient::send` and quits on success. It returns the
+network client's `SmtpError` unchanged so the engine can distinguish transient, permanent and
+uncertain. `append_sent` opens IMAP, logs in, lists folders, finds the `\Sent` special-use folder and
+APPENDs the same bytes with `\Seen`; it raises the literal bound to the message size (hard ceiling
+64 MiB). It never submits. `verify_smtp` is used by `account_add` before any durable write. All three
+block the caller and own a private current-thread runtime; none logs a body, address or password.
 
 ## What one run does
 
@@ -60,7 +80,12 @@ MIME warnings (`ParsedMessage.warnings`) are mapped into the run warnings, prefi
 id and deduplicated: a part-limit or depth warning says the attachment list may be incomplete instead
 of letting a truncated message look whole.
 
-`BODY.PEEK[]` only: sync never sends `STORE`, `EXPUNGE`, `COPY`, `MOVE` or `APPEND`.
+`BODY.PEEK[]` only: `sync_account` never sends `STORE`, `EXPUNGE`, `COPY`, `MOVE` or `APPEND`. The
+submission helper `append_sent` (P7) is a separate call the engine makes after SMTP accepted a
+message; it APPENDs to `\Sent` and never submits. A synced Sent copy whose `Message-ID` matches a
+locally written row with no UID adopts that row instead of inserting a second one, account-wide (a
+server copy that moved to another folder still reconciles); when the server copy was cached *before*
+the local move, the finalize removes it in the same transaction.
 
 ## Reconciliation decisions
 
@@ -97,9 +122,10 @@ of letting a truncated message look whole.
 
 ## What is not synced
 
-Server-side filters/rules, flag push, expunge/delete on the server, `APPEND` of drafts or sent mail,
-`CONDSTORE`/`QRESYNC`, folder removal/rename reconciliation, full threading, FTS5 indexing, a
-scheduler/IDLE worker, and any operation, CLI, MCP tool or UI. Onboarding and those surfaces are P6.
+Server-side filters/rules, flag push, expunge/delete on the server, `APPEND` of drafts (Sent is
+written by the P7 submission helper, not by `sync_account`), `CONDSTORE`/`QRESYNC`, folder
+removal/rename reconciliation, full threading, FTS5 indexing, a scheduler/IDLE worker, and any
+operation, CLI, MCP tool or UI. Onboarding and those surfaces are P6.
 
 ## Tests
 

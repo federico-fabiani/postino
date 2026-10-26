@@ -1,8 +1,9 @@
 # Postino architecture
 
 > **Status:** M0 walking skeleton + U0 UI foundation + engine on the encrypted store (P3c/P3d) + MIME
-> crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) + sync into the store (P5b) ·
-> **Last updated:** 2026-10-25 ·
+> crate (P4a) + encrypted attachment blobs (P4b) + IMAP client (P5a) + sync into the store (P5b) +
+> accounts and credentials (P6a) + app on real mail (P6b/P6c) + SMTP submission and the outbox (P7) ·
+> **Last updated:** 2026-10-26 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
 ## 1. Shape today
@@ -14,10 +15,11 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/core` | Domain types, the engine (demo or store-backed), the operation registry and its JSON Schemas |
 | `crates/crypto` | HKDF-SHA256 subkeys and XChaCha20-Poly1305 sealing; the blob subkey (P4b) |
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
+| `crates/net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounds, typed errors |
 | `crates/platform` | OS seams: store key and account credentials in the OS keyring |
-| `crates/store` | SQLCipher schema v4, migrations, the repository and the encrypted blob store (P3b, P4b, P6a) |
-| `crates/sync` | One account from IMAP into the store: folders, UIDVALIDITY, incremental fetch, MIME, blobs, deletions, status (P5b) |
-| `crates/testkit` | Test-only fake IMAP server, TLS fixture, response builders and synthetic mail (dev-dependency only) |
+| `crates/store` | SQLCipher schema v5, migrations, the repository, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P7) |
+| `crates/sync` | One account from IMAP into the store, plus submission serialization and the Sent append (P5b, P7) |
+| `crates/testkit` | Test-only fake IMAP/SMTP servers, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
 | `apps/postino-cli` | `postino` command line and the opt-in MCP server |
 | `xtask` | `ci`, `layers`, `assets` |
@@ -31,8 +33,9 @@ The engine has two sources of truth, chosen at construction:
   reaches it with `--store <path>` or the default local path; the key comes from the OS keyring.
 
 The UI, CLI and MCP read both through the same `Engine::call(name, args)` door. The MCP server and
-the GUI never touch SQL directly. Mail is fetched from IMAP by `postino-sync`; nothing is sent yet:
-SMTP is P7.
+the GUI never touch SQL directly. Mail is fetched from IMAP by `postino-sync`; SMTP submission and
+the outbox are P7 (§4.9), with the desktop send worker and the CLI as the two schedulers until the
+daemon in M4.
 
 ## 2. The seam that matters: operations, not functions
 
@@ -58,12 +61,14 @@ pub struct OpDef {
 This is the same contract as the Crafting Apps, with one improvement: schemas are derived from
 types, so a handler and its public schema cannot drift.
 
-Current operations: `app_info`, `accounts_list`, `folders_list`, `messages_list`, `message_get`,
-`message_flag`, `message_move`, `draft_save`, `draft_send`, `search`, `labels_list`, `label_create`,
-`label_update`, `label_delete`, `label_apply`. They are enough to prove the path through all three
-clients. `draft_save` updates one draft in place and `draft_send` is a local demo until SMTP arrives
-in M2; neither opens a network connection. Labels are local metadata: in memory in the demo, in the
-encrypted store otherwise, and never synced to a server.
+Current operations: `app_info`, `accounts_list`, `account_add`, `account_update`, `account_test`,
+`account_remove`, `sync_now`, `sync_status`, `folders_list`, `messages_list`, `message_get`,
+`message_flag`, `message_move`, `draft_save`, `message_send`, `send_schedule`, `outbox_list`,
+`outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `labels_list`,
+`label_create`, `label_update`, `label_delete`, `label_apply`. They are enough to prove the path
+through all three clients. `draft_save` updates one draft in place; `message_send` queues it with the
+undo window; `send_dry_run` returns the exact bytes without a row. Labels are local metadata: in
+memory in the demo, in the encrypted store otherwise, and never synced to a server.
 
 ## 3. The target shape
 
@@ -108,8 +113,8 @@ decision and the migration path.
 | `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
 | `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 later |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
-| `postino-net` | IMAP4rev1 client (P5a): TLS, bounded responses, testable against a scripted server. SMTP submission, autodiscovery, QRESYNC later |
-| `postino-sync` | Reconciliation (P5b: folders, UIDVALIDITY, incremental UID fetch, MIME, blobs, deletions, status); outbox, scheduler, full threading later |
+| `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. Autodiscovery and QRESYNC later |
+| `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler and full threading later |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
 | `postino-rules` | local rules and Sieve generation |
 | `postino-ipc` | JSON-RPC over pipe/socket, token, versioning |
@@ -132,7 +137,7 @@ thread(id, account, subject_norm, last_date, unread, message_count)
 attachment(id, message, filename, mime, size, blob_hash)
 draft(id, account, revision, updated_at, blob_hash, in_reply_to)
 draft_seq(message_id, revision)
-outbox(id, account, idempotency_key, created_at, send_at, attempts, last_error)
+outbox(id, account, draft, idempotency_key, created_at, send_at, state, attempts, append_attempts, last_error, raw_blob_hash, envelope_json, lease_at)
 rule(id, account, priority, enabled, match_json, action_json)
 signature(id, account, identity, name, html)
 contact(id, account, display_name, email, vcard)
@@ -188,7 +193,8 @@ vault or `%LOCALAPPDATA%\Postino`.
 `PlatformError::Unsupported`: the store key and every account credential fail closed at the seam,
 there is no weaker file fallback, and there is no platform-equivalent default store yet. Native
 macOS/Linux keychains land with the packaging milestone. `postino-platform` owns both scopes:
-`default` for the store key and `account:<id>:imap` for an IMAP credential.
+`default` for the store key, `account:<id>:imap` for an IMAP credential and `account:<id>:smtp` for an
+optional separate submission credential.
 
 **Schema v3** (`crates/store/src/lib.rs`): v2 plus `draft_seq(message_id PRIMARY KEY, revision)`,
 which holds the draft revision high-water mark independently from the draft row. Migration v3 seeds
@@ -287,8 +293,8 @@ the daemon (M4). The repository returns folders and labels ordered by name; onbo
 server's folder tree in that order.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
-a store. **Still missing:** the onboarding UI (P6b) and its `sync_now` binding, FTS5 (P9), outbox
-(P7), the daemon (M4). The default store path, the account/sync operations and their CLI/MCP bindings
+a store. **Still missing:** the onboarding UI (P6b) and its `sync_now` binding, FTS5 (P9), the
+daemon scheduler (M4) and full threading (M3). The default store path, the account/sync operations and their CLI/MCP bindings
 landed in P6a (§4.7).
 
 ### 4.3 Implemented in P4a: the MIME crate
@@ -380,7 +386,7 @@ buffers. `ImapConfig`'s `Debug` keeps the transport and redacts the username as 
 address is personal data. Logs carry the tag and the command verb, never arguments, addresses,
 bodies or credentials. Server text in errors is cut to printable ASCII.
 
-**Not implemented.** Sync loops, store writes, engine operations, `APPEND`/`COPY`/`MOVE`/`EXPUNGE`,
+**Not implemented.** Sync loops, store writes, engine operations, `COPY`/`MOVE`/`EXPUNGE`,
 QRESYNC/CONDSTORE beyond reading `HIGHESTMODSEQ` when the server volunteers it, SORT/THREAD,
 METADATA, ACL, SIEVE, NOTIFY, ESEARCH, `BODYSTRUCTURE` and per-part fetches, OAuth/SASL XOAUTH2 and
 any mechanism other than PLAIN, SMTP, autodiscovery and MIME parsing. The fake server and its TLS
@@ -651,6 +657,7 @@ onboarding, the boot on the store and the background worker (§4.8).
 |---|---|---|
 | `default` | the 256-bit SQLCipher store key | `postino --store` / the default store |
 | `account:<id>:imap` | one account's IMAP password or app password | `account_add`, `account_test`, `sync_now`, `account_remove` |
+| `account:<id>:smtp` | optional separate SMTP password; absent means the IMAP one is used | `account_add`, `message_send`, `send_schedule`, `outbox_retry`, `account_remove` |
 
 `Keyring` is a handle with an explicit lock path: production uses `Keyring::system()` (the lock lives
 next to the app data), tests use `Keyring::at(temp)` and never take the real lock. Every read, write
@@ -788,6 +795,201 @@ consequences, and returns to onboarding when the last account goes.
 the full settings/licences surface and the remaining reading-pane affordances. SMTP, HTML rendering
 and OAuth remain later packages.
 
+### 4.9 Implemented in P7: SMTP submission and the outbox
+
+Postino now sends real mail. The desktop composer, the CLI and MCP all reach the same six-ish
+operations; the submission is a journaled transaction, not a call buried in the UI.
+
+**SMTP client (`postino-net::smtp`).** One TCP connection, implicit TLS or STARTTLS with the same OS
+verifier and extra-roots seam as IMAP, then `EHLO`, `AUTH PLAIN`/`LOGIN`, `MAIL FROM`, one `RCPT TO`
+per recipient, `DATA`, the dot-stuffed body and the final `.`, `RSET`, `NOOP`, `QUIT`. Capabilities
+parsed from `EHLO`: `SIZE` (refused locally before `MAIL`), `8BITMIME` (a body with 8-bit bytes is
+refused when it is absent), `SMTPUTF8` (only when the headers or envelope need it and the server
+advertises it), `DSN` (optional `RET`/`ENVID`/`NOTIFY`, used only when advertised) and `PIPELINING`
+(parsed, never used: every command waits for its reply). A response line is at most 8 KiB, a whole
+reply 64 KiB, a message 40 MiB, a transaction 100 recipients; every phase has a timeout. Data is
+CRLF-only, NUL is refused, and dot-stuffing is applied to the exact persisted bytes.
+
+**Typed failure and the one dangerous window.** `SmtpError` distinguishes `Connect`, `Tls`, `Auth`,
+`Rejected { code, stage, message }`, local `Transient`/`Permanent`, `Timeout`, `Closed`, `TooLarge`,
+`Unsupported`, `Protocol` and `Uncertain`. Before the final `.`, 4xx is transient and 5xx permanent;
+`Auth` is a credential stop whose reason is built locally (the server has just received the password
+and may echo it). Once the final `.` is written, every failure becomes `Uncertain`, including a 4xx/5xx
+reply: the server may have accepted the message even if its `250` never arrived, so the outbox never
+retries it automatically and a person resolves it.
+
+**No server text in the journal.** SMTP replies and IMAP `NO`/`BAD` text are never stored, printed or
+returned over MCP. `outbox.last_error` is a fixed typed sentence (stage + code only) and the APPEND
+failure stores a fixed sentence too; the CLI and the MCP `outbox_list` therefore carry exactly what the
+database holds. A hostile server that echoes the password, the body or the recipient list in a
+refusal cannot turn the outbox into a prompt-injection channel or a secret store; tests at RCPT, at
+DATA-end and at APPEND assert the absence of each.
+
+**Schema v5.** Additive from v4: nullable `smtp_host`, `smtp_port`, `smtp_tls`, `smtp_username` on
+`account_servers`, and
+
+```sql
+CREATE TABLE outbox(
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    draft_id TEXT,                    -- the local draft this submission came from
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    send_at INTEGER NOT NULL,         -- user-visible due time
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    append_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    raw_blob_hash TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    lease_at INTEGER                  -- written when a worker claims the row
+);
+CREATE INDEX outbox_due ON outbox(state, send_at);
+CREATE INDEX outbox_draft ON outbox(draft_id, created_at DESC);
+CREATE UNIQUE INDEX outbox_active_draft ON outbox(draft_id)
+    WHERE draft_id IS NOT NULL
+      AND state IN ('queued', 'sending', 'append_pending', 'uncertain', 'failed');
+```
+
+`draft_id` is a column, not only an envelope field: the newest row by `created_at` (a revival updates it)
+decides whether a queue is idempotent, and the partial unique index makes a second **active** row for
+one draft impossible — a failed row must be discarded before a new queue, an uncertain row is a possible
+delivery, and only `cancelled`/`sent` free the slot. `idempotency_key` is stable per draft revision and
+content (`draft:<draft_id>:<revision>:<raw_blob_hash[..16]>`), so two processes that queue the same
+unchanged draft are one row; a cancelled row with the same key is revived in place, which is what makes
+cancel → send again work without a duplicate, and an edited draft is a new key. `envelope_json` carries
+the sender, the deduplicated `To`+`Cc`+`Bcc` envelope, the subject, the generated `Message-ID`, the local
+draft id and the draft revision; it is encrypted with the database and never logged. `raw_blob_hash`
+names the exact RFC 5322 bytes in the encrypted blob store. The queue path writes the blob first and
+then inserts the row in one transaction: a crash between them leaves an unreferenced, deduplicated
+blob, never a row whose bytes are missing.
+
+**Deterministic bytes.** `send_dry_run` and `message_send` run the same serializer on the same draft
+snapshot, and the `Date` header is the draft's own last-saved instant, not the wall clock. The
+`Message-ID` is derived from a digest that includes that date, so the dry run, the queued blob and a
+resend after a cancel are byte-identical; a scheduled message carries the instant it was last edited.
+
+**State machine.** `queued -> sending -> append_pending -> sent`; `failed`, `cancelled` and
+`uncertain` are the other terminal or human-resolved states. A lease changes one due `queued` row to
+`sending`, writes `lease_at` and increments `attempts` in one immediate transaction. Each lease is
+stamped with the instant that row is actually claimed, never with the pass-start value, so a row
+leased after an earlier row spent half an hour in SMTP still gets a full window. `lease_at` — not the
+user-visible `send_at` — is the lease epoch: a row scheduled for 09:00 and leased at 10:00 is fresh
+for the whole window. The lease is **45 minutes**, strictly longer than the 30-minute body-transfer
+budget the network client enforces (`postino_net::MAX_BODY_TRANSFER`); a transfer slower than that is
+aborted by the client, so a *live* submission can never outlive its own lease and be expired as a
+crash. A `sending` row whose lease is older than `LEASE_MS` becomes `uncertain` on the next pass, with
+“Postino si è fermato durante l’invio; il messaggio potrebbe essere stato accettato. Controlla Inviati
+prima di riprovare.” Every post-lease transition (append_pending, sent, failed, uncertain, requeue,
+release) is conditional on `state = 'sending' AND lease_at = <the lease this worker holds>`: a worker
+whose lease expired records the outcome and never overwrites the next owner. Queueing also refuses a
+draft whose saved content no longer matches this engine's snapshot — body, headers, last-saved
+instant and the attachment set (ids, names, MIME types, sizes, blob hashes; a stored reply linkage
+this build cannot serialize is refused too) — and a submission is only sent while the draft still has
+the **revision stored in its envelope**: a stale connection (or a lock bypassed by an edit) fails the
+row with a fixed sentence instead of delivering old bytes and labelling the newer draft as delivered.
+The finalize repeats the same content check. Transient failures go back to `queued` with exponential
+backoff 30 s, 60 s, 2 min … capped at 1 h for at most eight attempts; permanent failures become
+`failed` with a fixed sentence; an authentication failure fails the current row and writes a
+per-account halt, so the rest of that account’s queue is not attempted. A manual retry requires
+`confirm: true`; an uncertain row can also be marked sent, but the conditional write is checked: if a
+concurrent retry changed the row first, the operation fails with “the outbox row changed state” and
+does **not** move the draft. A locally unreadable blob or missing credential fails that row and the
+pass continues.
+
+**Draft lock and the sent-row policy.** A journal row holds its message only while the message is still
+in Drafts and the row can still deliver it (`queued`, `sending`, `append_pending`, `uncertain`,
+`failed`). A Sent copy is ordinary mail: it can be moved, archived or deleted, and a batch over sent
+mail does not abort. A `failed` row (a permanent refusal, so no delivery happened) can be discarded with
+`outbox_cancel` — the CLI and the UI both offer it — which makes the draft editable again; `uncertain`
+keeps the strict policy and can only be retried or marked sent with explicit confirmation. A `sent` row
+never locks, so a Sent copy can be moved back to Drafts — but sending it again needs an **edit**: the
+engine compares the draft revision with the sent envelope and refuses an unedited copy (“already sent”),
+because that is exactly the state left by a crash between the server’s `250` and the local move. An
+edited draft is a new revision, gets a new idempotency key and is a deliberate resend. Any edit or move
+also verifies the store’s current folder for the id first: a stale engine whose row another process
+already sent is refused with “changed in another session” instead of overwriting the Sent copy.
+
+**Sent APPEND is independent and owned.** After the `250` the row becomes `append_pending` durably
+with a fresh append claim (`lease_at`) stamped at that instant, not at the pass start; the worker that
+submitted the message also appends it, so a long submission cannot leave the append claim already
+expired and two passes cannot APPEND the same row concurrently. A crashed append claim is claimable
+again after the same 45-minute window, and each claim increments a separate `append_attempts` counter.
+Then the draft moves to the local Sent folder, and the worker discovers the server’s `\Sent` folder
+from `LIST` special-use and APPENDs the same bytes with `\Seen`. A failed APPEND reschedules
+`append_pending` with its own exponential backoff (30 s, 60 s, 2 min … capped at 1 h) and never touches
+SMTP; a **damaged envelope** is a fixed failure with backoff, never a false `sent`. There is no
+terminal give-up state for an APPEND that keeps failing (an IMAP server without `\Sent`, or a
+credential that stays wrong): the row retries at the one-hour cap and the journal keeps saying the
+message was submitted and its server copy is missing. A manual “stop retrying” action is P8/P9 work;
+the row is safe either way because it can never resubmit over SMTP. A crash between `250` and the
+transition is `sending` and becomes `uncertain`, never a resend. A crash after `append_pending` retries
+only the APPEND. The IMAP APPEND has no client idempotency token, so a crash after the server accepted
+the literal but before its tagged `OK` can leave a duplicate Sent copy on the server (P8/P9 may remove
+it). Locally, the Sent copy carries the generated `Message-ID`; a sync adopts a local row with that
+Message-ID and no UID from **Sent or Archive** (never Drafts or Trash: a Sent copy moved back to Drafts
+is being edited), so a server copy that moved to Archive still reconciles instead of inserting a second
+one. In the other order, a provider auto-save (or a sync between the `250` and the local move) that
+already cached the server copy is removed in the same transaction as the local move; the surviving
+local row **adopts that copy’s UID** and the worker skips the APPEND, because the server already has
+the message. The folder therefore still holds one row, identified by the server's own UID even if the
+Sent cursor is already past it.
+
+**Credentials.** IMAP stays under `account:<id>:imap`. A separate SMTP password is stored under
+`account:<id>:smtp`; when that scope is absent the IMAP credential is used, which is the normal Aruba
+and Gmail app-password setup. `account_add` probes both servers before writing, stores the credentials
+only after both accept, deletes them again if the store transaction fails, and `account_remove`
+deletes both scopes after the cache. No password enters the database, the outbox, a log, an MCP
+result or argv. Aruba is `smtps.aruba.it:465 implicit`, Gmail `smtp.gmail.com:465 implicit`; a custom
+account may omit SMTP and then reads but does not send.
+
+**Operations, CLI, MCP, UI.** `message_send` queues with a 5 s undo window; `send_schedule` queues at
+an RFC 3339 instant; `outbox_list` is offline, read-only, newest-first and pageable (`limit` 1-500,
+`offset`); terminal rows older than **30 days** are pruned in bounded batches, so the history is bounded
+in time as well as by the page. `outbox_cancel` accepts `queued` and `failed` (a discard: no delivery
+happened); `outbox_retry` requires `confirm: true` for `failed`/`uncertain`; `outbox_mark_sent` resolves
+an uncertain row locally and refuses if the row changed first; `send_dry_run` returns base64 bytes and
+envelope without a row. `message_send` is not marked destructive: sending is the product’s purpose. MCP
+gates `message_send`, `send_schedule`, `outbox_retry` and `outbox_mark_sent` behind
+`postino mcp --allow-send`, lists them disabled with the reason otherwise, never exposes
+`account_add`/`account_remove`, and only queues: the MCP server does not drain the outbox. The CLI adds
+`postino send --draft <id> [--at …] [--dry-run]` and `postino outbox list [--limit N] [--offset N] |
+cancel|retry|mark-sent`; a plain `postino send` (no `--at`) waits out the 5-second undo window and runs
+one outbox pass, while only a future `--at` leaves the row queued because there is no daemon yet. The
+desktop app has a send worker on its own thread, a 5-second undo toast, and an outbox dialog
+(`Ctrl+Shift+O`, status-bar `Coda · N`) that shows every state, the fixed error sentence, the warnings,
+a “Scarta” action for a failed row and the two uncertain resolutions. The app polls the store every two
+seconds and caches the next wake-up time from one indexed query, so a row queued by the CLI or MCP after
+boot is sent when due; when the poll sees a row reach `sent`/`append_pending` (or a row disappear) it
+reloads the mailbox from the store (keeping every view state) instead of leaving the draft in Drafts and
+Sent stale. A “load older” control for the journal is P8/P9 work; the operation and the CLI already page.
+The demo mailbox has no SMTP endpoint, so Send is disabled with a reason and neither the button nor
+`Ctrl+Enter` attempts a submission; a real account without an SMTP endpoint gets its own sentence, not
+the demo copy.
+
+**Evidence.** The fake SMTP server covers greeting, `EHLO`, AUTH PLAIN/LOGIN success and failure,
+4xx/5xx per stage, `SIZE 0`, SIZE refusal, SMTPUTF8/8BITMIME, DSN, dot-stuffing, a bare CR refused,
+slow replies, a timeout and a drop after the final dot, STARTTLS and implicit TLS with the test CA, a
+wrong hostname refused, and a transcript with no plaintext password or body. The pipeline suite asserts
+the exact bytes and envelope (a dry run separated from the queue by more than a second is identical),
+Bcc only in RCPT, the `\Seen` Sent APPEND, a 25 MiB attachment with ten recipients, the recipient/SIZE
+caps, scheduled/cancel, dry run without a row, backoff, permanent/auth halts, cancel → queue → queue
+producing **one** row and one DATA, the R1/R2/revert revival where the newest row is the revived one and
+a stale revision is never submitted, the draft lock across a cancelled history, a failed row discarded,
+edited and resent, a sent row moved back to Drafts that needs an edit before a resend, a Sent copy moved
+and archived, 500 history rows not hiding a new one (plus `limit`/`offset` paging), the local Sent row
+carrying the Message-ID, a sync-before-finalize cache merged into one local row, a hostile
+RCPT/DATA/APPEND echo absent from the journal, CLI output and MCP output, three passes over a damaged
+append envelope that never report `sent`, and the crash windows: after queue, after `sending`, after the
+server's `250` and before the durable transition (a test seam fails there; reopening turns `sending`
+into `uncertain`, opens no connection and leaves one DATA total), and after APPEND. Two-process tests
+cover a live lease with an old `send_at` (the second process neither expires nor leases it), a claimed
+append that a second pass does not touch, a `mark_sent` that loses the race, a stale engine that cannot
+overwrite another process's move, a second process that reopens a crashed `sending` row, and two engines
+allocating distinct draft ids. The CLI suite proves that a plain `postino send` (no `--at`) submits and
+that a future `--at` only queues. The tests prove these windows; they do not prove atomicity IMAP and
+SMTP do not offer.
+
 ## 5. Synchronization
 
 IMAP is the synchronization protocol. There is no Postino server.
@@ -807,10 +1009,13 @@ The target loop, most of which does not exist yet:
   UID ranges and flag fetches (P5b implements the UID-range half, no QRESYNC).
 - Fetch envelopes and flags first; bodies on demand, with a bounded prefetch of recent mail. P5b
   downloads each body during the reconciliation pass; on-demand reads are P6.
-- Local intents (send, flag, move, draft save) are optimistic and queued in `outbox` with an
-  idempotency key. On reconnect, the daemon replays them and reconciles. Not implemented.
-- Sent mail is `APPEND`ed to the Sent folder, deduplicated by `Message-ID` when the provider also
-  saves it. Not implemented.
+- Send is optimistic and journaled in `outbox` with an idempotency key (P7); flags, moves and draft
+  saves are still local-only. The daemon will replay the remaining intents on reconnect (M4).
+- Sent mail is `APPEND`ed to the server's Sent folder with `\Seen` (P7) and retried independently of
+  submission. A local Sent row and the server copy with the same `Message-ID` are one row, including
+  the provider auto-save and Sent/Archive move orders; when the server copy was cached first, the local
+  row adopts its UID and the APPEND is skipped. A copy moved back to Drafts is a draft being edited and
+  is left alone by a Sent sync. Deduplicating two copies that the *server* already holds is P8/P9.
 - Drafts are appended with a stable client `Message-ID` and revision; IMAP has no atomic update, so
   two devices can briefly create two copies. This is a protocol limit, documented rather than
   hidden. Not implemented.
@@ -888,3 +1093,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-25 | minor | P4c: blob review closure — per-database-file blob namespace, authenticated dedup that heals a corrupt file, BLAKE3 verification on read, durable publish, size-preserving attachment patches, no echoed ids |
 | 2026-10-25 | major | P5a: `postino-net` speaks IMAP4rev1 over implicit TLS or STARTTLS with OS verification, bounded lines/literals/commands, typed errors and a scripted hostile-server corpus; the sync loop and store writes are still missing |
 | 2026-10-25 | major | P5b: `postino-testkit` moves the scripted server and TLS CA out of the net tests; `postino-sync` reconciles folders, UIDVALIDITY, incremental UID windows, MIME bodies, attachment blobs, deletions, flags and a persistent status with cancellation. No operation, CLI or UI calls it yet. |
+| 2026-10-26 | major | P7: SMTP submission over implicit TLS/STARTTLS, schema v5 outbox journal, exact-bytes-before-network queue, lease/backoff/auth-halt state machine, uncertain-after-DATA policy, independent Sent APPEND with `\Seen`, `message_send`/`send_schedule`/outbox operations, CLI send/outbox, MCP `--allow-send`, desktop worker and outbox dialog |

@@ -102,6 +102,37 @@ fn ids(values: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn draft_ids_are_allocated_by_the_store_and_never_collide() {
+    let fixture = Fixture::new();
+    let first_connection = fixture.open();
+    seed(&first_connection);
+    assert!(first_connection.list_drafts(None).expect("drafts").is_empty());
+
+    // Two connections, interleaved: the allocator is a store transaction, so no id is handed out twice.
+    let second_connection = fixture.open();
+    let a = first_connection.allocate_draft_id().expect("id a");
+    let b = second_connection.allocate_draft_id().expect("id b");
+    let c = first_connection.allocate_draft_id().expect("id c");
+    assert_eq!(a, "draft_1");
+    assert_eq!(b, "draft_2");
+    assert_eq!(c, "draft_3");
+    assert_ne!(a, b);
+    assert_ne!(b, c);
+
+    // An existing draft is kept and the sequence continues above it after a reopen.
+    let mut message = sample_message(&c, INBOX, "Bozza", "corpo", 1_700_000_200_000);
+    message.summary.unread = false;
+    first_connection.upsert_folder(&folder("drafts", "Bozze", FolderKind::Drafts)).expect("drafts folder");
+    message.summary.folder_id = "drafts".to_owned();
+    first_connection.save_draft_message(&message, &[]).expect("save");
+    drop(first_connection);
+    drop(second_connection);
+    let reopened = fixture.open();
+    assert_eq!(reopened.list_drafts(None).expect("drafts").len(), 1);
+    assert_eq!(reopened.allocate_draft_id().expect("after the reopen"), "draft_4");
+}
+
+#[test]
 fn round_trip_account_folder_message_attachment_and_labels() {
     let fixture = Fixture::new();
     let store = fixture.open();
@@ -532,7 +563,7 @@ fn send_keeps_the_draft_revision_sequence() {
     let mut sent = message.clone();
     sent.summary.folder_id = "sent".to_owned();
     sent.summary.date = 1_700_000_300_000;
-    store.send_draft_message(&sent).expect("send");
+    store.send_draft_message(&sent, None).expect("send");
     assert!(store.get_draft("drf_1").expect("draft row").is_none());
     assert_eq!(store.get_message("drf_1").expect("message").expect("sent message").summary.folder_id, "sent");
 

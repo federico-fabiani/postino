@@ -1,7 +1,8 @@
 # postino-net
 
-IMAP4rev1 client. Network layer, not a sync engine: it opens one connection, speaks TLS, exchanges
-commands and returns typed data. It opens no store, parses no MIME and runs no loop.
+IMAP4rev1 and SMTP submission clients. Network layer, not a sync engine: each opens one connection,
+speaks TLS, exchanges commands and returns typed data. It opens no store, parses no MIME and runs no
+loop.
 
 ```rust
 let config = ImapConfig::new("imap.example.com", 993, TlsMode::Implicit, "me@example.com", Secret::new(app_password));
@@ -31,6 +32,7 @@ session.logout().await?;
 | `store_flags` | `UID STORE <set> +FLAGS.SILENT (...)` / `-FLAGS.SILENT` / `FLAGS.SILENT` |
 | `noop` | `NOOP` |
 | `idle` | `IDLE`, continuation, untagged events for at most `wait`, `DONE`, tagged `OK` |
+| `append` | `APPEND "mailbox" (\Seen) {literal}` after the `+`, then the bytes and the tagged reply |
 | `logout` | best-effort `LOGOUT`, then close |
 
 Tags are `A0001`, `A0002`, ...; a response with any other tag is a `Protocol` error and closes the
@@ -50,6 +52,28 @@ server considers meaningful.
 `Envelope` is the IMAP `ENVELOPE` only. `references` and `list_id` are always empty here: RFC 3501's
 `ENVELOPE` has no slot for them, and fetching them needs a second `BODY.PEEK[HEADER.FIELDS ...]`
 that belongs to the sync package.
+
+## SMTP submission
+
+`SmtpClient` is the P7 sender. It connects with implicit TLS (465) or STARTTLS (587), reads the
+greeting, `EHLO`s, `AUTH PLAIN` or `LOGIN`s, then runs one transaction: `MAIL FROM`, one `RCPT TO` per
+recipient, `DATA`, the dot-stuffed body and the final `.`. `RSET`, `NOOP` and `QUIT` are available.
+`SmtpClient::verify` is the `account_add` probe (connect, authenticate, quit).
+
+Capabilities are parsed from the final `EHLO`: `SIZE` (checked before `MAIL`), `8BITMIME` (a body with
+8-bit bytes is refused when absent), `SMTPUTF8` (only when headers or envelope need it and the server
+advertises it), `DSN` (`RET`/`ENVID`/`NOTIFY`, only when advertised) and `PIPELINING` (parsed, never
+used: every command waits for its reply).
+
+`SmtpError` distinguishes `Connect`, `Tls`, `Auth`, `Rejected { code, stage, message }`, local
+`Transient`/`Permanent`, `Timeout`, `Closed`, `TooLarge`, `Unsupported`, `Protocol` and `Uncertain`.
+4xx is transient, 5xx permanent; everything after the final `.` is written is `Uncertain`, because the
+server may have accepted the message even if no `250` arrived. The outbox never retries it
+automatically.
+
+Bounds: 8 KiB per reply line, 64 KiB per reply, 40 MiB per message, 100 recipients, a per-phase
+timeout, CRLF-only data, no NUL, exact dot-stuffing. The password is a `Secret`, the SASL payloads
+live in `Zeroizing` buffers, and logs carry the stage only.
 
 ## TLS policy
 
@@ -132,12 +156,11 @@ production.
 
 ## Not implemented
 
-- Sync: this crate has no loop, no store writes and no reconciliation. `postino-sync` (P5b) is the
-  consumer; `APPEND`, `COPY`/`MOVE`/`EXPUNGE` and server-side flag pushes are still missing.
+- Sync: this crate has no loop and no store writes. `postino-sync` is the consumer; `COPY`/`MOVE`/
+  `EXPUNGE` and server-side flag pushes are still missing. `APPEND` exists for the P7 Sent copy.
+- SMTP `PIPELINING` and OAuth; `AUTH` mechanisms other than PLAIN and LOGIN; autodiscovery.
 - `QRESYNC`/`CONDSTORE` beyond parsing `HIGHESTMODSEQ` when the server reports it; no `VANISHED`.
 - `SORT`, `THREAD`, `METADATA`, `ACL`, `SIEVE`, `NOTIFY`, `ESEARCH`.
-- OAuth (SASL XOAUTH2) and `AUTHENTICATE` mechanisms other than PLAIN.
-- SMTP submission, autodiscovery, MIME parsing.
 - `BODYSTRUCTURE` and per-part fetches; bodies are whole messages at this layer.
 
 ## Build

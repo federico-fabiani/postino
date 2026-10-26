@@ -3,12 +3,11 @@
 **Layer:** foundation. Depends on `postino-crypto` (the blob subkey) and on no other workspace crate;
 no UI toolkit.
 
-The encrypted local store. One SQLCipher database with schema **v3**, a migration runner on
-`PRAGMA user_version`, a typed repository for the M1 mailbox, and a content-addressed encrypted blob
-store for attachment bytes. The engine drives it through `Engine::open` (P3c) and the attachment
-seam (P4b), and `postino-sync` (P5b) is the writer for received mail: folders, messages, attachment
-metadata/hashes and the per-folder sync cursor. The store stays independent of `postino-core` and
-never reads a keyring.
+The encrypted local store. One SQLCipher database with schema **v5**, a migration runner on
+`PRAGMA user_version`, a typed repository for the mailbox and outbox, and a content-addressed encrypted
+blob store for attachment bytes. The engine drives it through `Engine::open` (P3c), the attachment
+seam (P4b) and the outbox (P7); `postino-sync` (P5b) is the writer for received mail and P7's Sent
+serialization. The store stays independent of `postino-core` and never reads a keyring.
 
 `docs/architecture.md` §4.1-§4.5 describe the schema, key flow and blob format;
 `docs/store-spike.md` records why SQLCipher and how the blobs were added.
@@ -97,14 +96,18 @@ mail.db.blobs/<first two hex chars>/<64 lowercase hex>.blob
 - The blob directory has no garbage collector yet: deleting a message leaves its blob, because
   another message may reference the same content.
 
-## Schema v3
+## Schema v5
 
-v3 is additive from v2: it adds `draft_seq`, the draft revision high-water mark, and seeds it from
-`drafts.revision`, so an existing store keeps its revision numbers.
+v5 is additive from v4: nullable `smtp_host`, `smtp_port`, `smtp_tls`, `smtp_username` on
+`account_servers`, and the `outbox` journal with `outbox_due(state, send_at)`, `outbox_draft(draft_id,
+created_at DESC)` and the partial unique index `outbox_active_draft(draft_id) WHERE state IN
+('queued','sending','append_pending','uncertain','failed')`. There is still no password column: the
+IMAP and optional SMTP secrets live in the OS keyring.
 
 | Table | Purpose |
 |---|---|
 | `accounts` | id, name, email, provider, signature, created_at |
+| `account_servers` | IMAP endpoint, plus the nullable SMTP endpoint (P7) |
 | `folders` | account, name, kind, cached unread/total, `uid_validity`, `uid_next`, `last_sync_at` |
 | `messages` | envelope, JSON recipient lists, flags, body text/HTML, size, optional IMAP uid |
 | `attachments` | metadata: filename, mime, size, optional blob hash; the bytes live in `blobs/` |
@@ -112,13 +115,15 @@ v3 is additive from v2: it adds `draft_seq`, the draft revision high-water mark,
 | `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |
 | `drafts` | revision, updated_at, body, recipients, subject, in_reply_to |
 | `draft_seq` | message id → highest revision ever written; survives a send and a move back |
+| `outbox` | draft id, content-stable idempotency key, state, submission and append attempt counters, due time, lease epoch, fixed error, raw blob hash, envelope JSON (P7) |
 | `sync_state` | per-folder sync cursor: next UID to fetch, `highest_modseq`, `last_error` |
-| `meta` | key/value store from P3a; holds the `label_seq` high-water mark and `sync_status:<account>` |
+| `meta` | key/value store from P3a; holds `label_seq`, `draft_id_seq`, `sync_status:<account>` and `outbox_halt:<account>` |
 
 Indexes cover the hot reads: `messages(folder_id, date DESC)`, `messages(account_id, date DESC)`,
-`message_labels(label_id)`, `attachments(message_id)`, `drafts(updated_at DESC)` and
-`folders(account_id)`. `labels` has `UNIQUE(account_id, name)` plus a partial unique index on
-mailbox-wide names, because SQLite treats `NULL`s as distinct in a plain unique constraint.
+`message_labels(label_id)`, `attachments(message_id)`, `drafts(updated_at DESC)`,
+`folders(account_id)` and `outbox(state, send_at)`. `labels` has `UNIQUE(account_id, name)` plus a
+partial unique index on mailbox-wide names, because SQLite treats `NULL`s as distinct in a plain
+unique constraint.
 
 ## Repository
 
@@ -153,8 +158,31 @@ Plain data structs in `model.rs` (no `postino-core` dependency), methods in `rep
 - orphan repair: `list_orphan_drafts` finds `drafts` rows with no message row;
   `repair_orphan_drafts` materialises them in one transaction, and `Engine::open` runs that repair
   before hydration so a crash from an older build cannot leave a ghost draft.
-- meta: `get_meta`, `set_meta`. `label_seq` is the label id high-water mark; `draft_seq` lives in
-  its own table because it is per draft.
+- outbox: `queue_outbox` (insert, or revive a cancelled row with the same revision/content key),
+  `get_outbox`, `active_outbox_for_draft` (newest by `created_at`, then `rowid`),
+  `active_state_for_draft`, `list_outbox` / `list_outbox_page` (newest first, bounded, pageable),
+  `claim_outbox_append`, `next_outbox_wake`, `lease_next_outbox`, `expire_stale_outbox`,
+  `mark_outbox_append_pending` (writes the append claim), `finish_outbox_append`,
+  `mark_outbox_uncertain`, `mark_outbox_failed`, `reschedule_outbox`, `reschedule_outbox_append`,
+  `release_outbox`, `set_outbox_due`, `cancel_outbox`, `retry_outbox`, `confirm_outbox_sent` and
+  `prune_outbox`. Every read-modify-write is `BEGIN IMMEDIATE`; `lease_at` is the epoch for both a
+  submission and a claimed Sent append (never `send_at`), and every post-lease transition is
+  conditional on the state and the caller's lease, so a worker whose lease expired cannot overwrite the
+  next owner, and two passes cannot append the same row. A claim is stamped with the instant the row is
+  leased / the append starts, not with a pass-start value. `attempts` counts submissions and
+  `append_attempts` counts Sent appends: `mark_outbox_append_pending` sets the latter to 1 and each
+  `claim_outbox_append` increments it, so the two backoffs are independent. `cancel_outbox` updates a
+  `queued` or `failed` row and never a leased one, so a cancel and a lease cannot both win.
+- drafts: `allocate_draft_id` hands out `draft_<n>` from one immediate transaction seeded from the
+  largest existing id, so two processes never collide; `local_message_for_id` (account-wide across
+  **Sent/Archive** rows with `uid IS NULL`; never Drafts or Trash) and `synced_message_for_id` (folder,
+  with a UID) are the two reconciliation lookups, and `send_draft_message` can remove a server-backed
+  duplicate in the same transaction as the local move, transferring the duplicate's UID to the surviving
+  row (the caller then skips the APPEND).
+- meta: `get_meta`, `set_meta`. `label_seq` is the label id high-water mark, `draft_id_seq` the draft
+  id allocator; `draft_seq` lives in its own table because it is per draft. The engine adds
+  `outbox_halt:<account>` for an account whose
+  queue stopped on an authentication failure.
 
 Folder `unread`/`total` are a cache maintained from `messages` on every mutation; `recount_folder`
 repairs them after a bulk import. List totals describe the filtered scope before pagination.
@@ -192,8 +220,8 @@ cargo test -p postino-store
 
 ## Not here yet
 
-Desktop-app wiring (P6 onboarding), FTS5, body/raw-message blobs (P9), outbox (P7), daemon (M4),
-key rotation and blob garbage collection. `sync_state` and the sync-status `meta` key have writers
+Desktop-app wiring (P6 onboarding), FTS5, body/raw-message blobs (P9), daemon (M4), key rotation and
+blob garbage collection. `sync_state` and the sync-status `meta` key have writers
 now: `postino-sync` (P5b) is the client of this crate for received mail. Parsing MIME is not here:
 sync parses and hands over rows and blob hashes. The engine (P3c, P4b) is another client; this crate
 never depends on it.

@@ -8,6 +8,7 @@ Postino exposes the same operation registry as the app and the CLI through an op
 postino mcp
 postino --demo mcp
 postino --store <path> mcp
+postino --store <path> mcp --allow-send
 ```
 
 - Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout.
@@ -17,7 +18,9 @@ postino --store <path> mcp
   `%LOCALAPPDATA%\Postino\mail.db` on Windows. Windows Credential Manager is the only keyring backend
   in this build; macOS and Linux fail at the platform seam until their native keychains land with
   packaging, so there is no platform-equivalent default store yet. `--store` picks another database;
-  one process owns it. `--demo` stays synthetic and never touches the store.
+  the app's workers open their own connections and the outbox lease coordinates concurrent passes, but
+  do not point two clients at the same file expecting independent mailboxes. `--demo` stays synthetic
+  and never touches the store.
 - The process needs the store key from the OS keyring. It never prints it.
 
 Client configuration:
@@ -63,7 +66,13 @@ agent can read the message and recover.
 | `message_flag` | no | Set read/unread and/or starred |
 | `message_move` | no | Move a message to a regular folder |
 | `draft_save` | no | Create a draft or patch one in place |
-| `draft_send` | no | Move a draft to Sent locally; no SMTP connection in this build |
+| `message_send` | no | Queue a draft for SMTP submission with a 5 s undo window; disabled unless `--allow-send` |
+| `send_schedule` | no | Queue a draft at an RFC 3339 `send_at`; disabled unless `--allow-send` |
+| `outbox_list` | yes | Journal rows newest-first with state, attempts, a fixed error, recipient count and subject; `limit`/`offset` page the history; offline |
+| `outbox_cancel` | no | Discard a still-queued or permanently failed row; the draft stays in Drafts |
+| `outbox_retry` | no | Retry a failed/uncertain row with `confirm: true`; disabled unless `--allow-send` |
+| `outbox_mark_sent` | no | Resolve an uncertain row locally without contacting the server; disabled unless `--allow-send` |
+| `send_dry_run` | yes | Exact RFC 822 bytes (base64) and envelope without queueing |
 | `search` | yes | Case-insensitive search over subjects, people and bodies, with optional folder and label filters |
 | `labels_list` | yes | Labels with mailbox-wide total and unread counts |
 | `label_create` | no | Create a local label with a semantic colour |
@@ -71,26 +80,56 @@ agent can read the message and recover.
 | `label_delete` | no | Delete a label, detach it from every message, return the affected count |
 | `label_apply` | no | Apply or remove one label on 1–500 messages; idempotent |
 
+## Sending over MCP
+
+Sending is an explicit opt-in:
+
+```sh
+postino mcp --allow-send
+```
+
+Without the flag, `message_send`, `send_schedule`, `outbox_retry` and `outbox_mark_sent` are still
+listed (so an agent can see why they are unavailable) but carry `"enabled": false` with a
+`disabledReason`, and `tools/call` refuses them before parsing the arguments. `outbox_list`,
+`outbox_cancel` and `send_dry_run` stay available: a dry run writes nothing and a cancel discards a
+queued or permanently failed submission without sending. `outbox_retry` is gated because it can send
+stored bytes, and `outbox_mark_sent` because it resolves an uncertainty a person should resolve.
+
+**MCP only queues.** The server has no timer and never runs the outbox pass. A `message_send` or
+`send_schedule` call writes the journal row and returns; the message leaves the machine when the
+desktop app (which polls the store every two seconds) or `postino send` processes it. `outbox_list`
+therefore shows `queued` until one of those runs, and `outbox list` from the CLI is read-only — it does
+not drain either.
+
+`message_send` is **not** marked destructive: sending is the product's purpose, and the annotation
+would mislead an agent that treats destructive as "deletes data". The guardrail is the server flag,
+the recipient/message caps, the outbox row and the explicit confirmation on retry/mark-sent.
+
 ## Sensitive operations
 
-`account_add` and `account_remove` are marked `sensitive` in the operation registry. They are **not**
-in `tools/list`, and `tools/call` refuses them before it parses the arguments, with a readable
-`isError` result that never repeats the arguments. The reason is structural, not a policy: MCP cannot
-see or set a password, and it cannot create or remove an account. The same registry entries remain
-available to the CLI (`postino account add|remove`), whose password path is a no-echo prompt or one
-`--password-stdin` line; there is deliberately no `--password` argv flag, and `postino run` refuses
-sensitive operations so generic JSON arguments cannot carry a password into shell history.
-`account_test` is not sensitive because it never receives a password: it uses the credential already
-in the OS keyring.
+`account_add`, `account_update` and `account_remove` are marked `sensitive` in the operation registry.
+They are **not** in `tools/list`, and `tools/call` refuses them before it parses the arguments, with
+a readable `isError` result that never repeats the arguments. The reason is structural, not a policy:
+MCP cannot see or set a password, and it cannot create, reconfigure or remove an account. The same
+registry entries remain available to the CLI (`postino account add|update|remove`), whose password
+path is a no-echo prompt or one `--password-stdin` / `--smtp-password-stdin` line; there is
+deliberately no `--password` argv flag, and `postino run` refuses sensitive operations so generic JSON
+arguments cannot carry a password into shell history. `account_test` is not sensitive because it never
+receives a password: it uses the credential already in the OS keyring.
 
 Annotations:
 
-- `readOnlyHint`: true for `accounts_list`, `account_test`, `sync_status` and every read.
+- `readOnlyHint`: true for `accounts_list`, `account_test`, `sync_status`, `outbox_list`,
+  `send_dry_run` and every read.
 - `destructiveHint`: true for `account_remove` (it deletes the local cache for one account). Sending
-  and message deletion will be marked destructive in later milestones.
-- `idempotentHint`: true for reads, `message_flag`, `label_apply` and `label_update`.
-- `openWorldHint`: true for `account_test` and `sync_now`, which open a connection to the user's own
-  IMAP server. Everything else is local.
+  and message deletion are not marked destructive: `message_send` is the product's purpose and
+  `outbox_cancel` discards a queued submission, not mail.
+- `idempotentHint`: true for reads, `message_flag`, `label_apply`, `label_update` and `outbox_list`.
+  It is false for `outbox_cancel`: a second cancel finds the row already `cancelled` and returns an
+  error, not "no change".
+- `openWorldHint`: true for `account_test`, `sync_now` and `outbox_retry`, which open a connection to
+  the user's own server. `message_send` and `send_schedule` only queue, so they are local; the drain
+  that opens SMTP is the app or the CLI. Everything else is local.
 
 `labels_list`, `label_create`, `label_update`, `label_delete` and `label_apply` are backed by the
 same registry the app and the CLI use. Labels are local metadata: in memory in the demo, in the
@@ -112,17 +151,31 @@ field (`to`, `cc`, `bcc`, `subject`, `body_text`, `attachments`) is optional; om
 its current value and sending it — even as an empty list or empty string — replaces it. On create,
 omitted fields are empty, and `account` chooses the account; it is required when more than one
 account exists. The app sends the full content on every autosave, which is equivalent to replacing
-every field. `draft_send` requires at least one recipient, moves the draft to the Sent folder of its
-own account, and opens no connection: the move is local and durable on a `--store` database, and
-real submission arrives with M2.
+every field.
+
+`message_send` requires at least one recipient and a configured SMTP endpoint; it serializes the
+draft, stores the exact bytes, inserts an outbox row and returns the row with its 5-second undo
+window. A draft with a live journal row cannot be edited or moved; a permanently failed row can be
+discarded with `outbox_cancel` to make the draft editable again, and a Sent copy is ordinary mail.
+`send_schedule` does the same at an RFC 3339 instant. `send_dry_run` uses the same serializer and
+returns the exact bytes and envelope (identical to what a later send produces) without writing a row or
+opening a connection; the `Date` header is the draft's last-saved instant, so a draft sent later carries
+that edit date. `outbox_list` reports every state, attempts, a **fixed** error sentence (stage and
+code, never server text: a hostile SMTP/IMAP server can echo the password or the body), recipient count
+and subject, plus any account stopped by an authentication failure. `limit` (1-500) and `offset` page
+the newest-first history; terminal rows older than 30 days are pruned.
+
+The old `draft_send` local move is gone from the registry. The CLI keeps `postino draft send <id>` as
+an alias of `postino send --draft <id>`, and both now submit for real.
 
 ## Safety
 
 - The server is opt-in and stdio-only; there is no network listener.
 - The daemon pipe (M4) will be same-user and token-authenticated.
-- `draft_send` never opens a connection and is honestly labelled "Move a draft to Sent (local)".
-  The real M2 send tool will add `dry_run`, idempotency keys, a rate limit and an audit log;
-  recipient caps and header-injection checks are already in place. See `docs/threat-model.md`.
+- Sending is off unless `postino mcp --allow-send`; `message_send`, `send_schedule`, `outbox_retry` and
+  `outbox_mark_sent` are refused before the arguments are read. The server never runs the outbox pass:
+  it only queues. An uncertain submission is never retried automatically; a manual retry requires
+  `confirm: true`.
 - Tool arguments are validated against `deny_unknown_fields`; typos are rejected rather than
   ignored.
 - Account credentials live only in the OS keyring. They are never in the database, a tool result, a

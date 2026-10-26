@@ -13,17 +13,21 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
-use postino_net::{CertificateDer, ImapConfig, NetError, Secret};
-use postino_store::{FlagUpdate, Store};
+use postino_net::{CertificateDer, ImapConfig, NetError, Secret, SmtpConfig, SmtpEnvelope, SmtpError, SmtpLimits};
+use postino_store::{FlagUpdate, OutboxEntry, OutboxState, Store};
 use postino_sync::{SyncError, SyncLimits};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::model::{
     Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
-    Provider, snippet,
+    Provider, SmtpSettings, snippet,
 };
 use crate::ops::{self, OpDef};
+use crate::outbox::{
+    APPEND_LEASE_MS, BACKOFF_MAX_MS, LEASE_MS, MAX_ATTEMPTS, MAX_SUBMISSION_BYTES, OUTBOX_RETENTION_MS, OutboxEnvelope, OutboxList, OutboxRunReport,
+    OutboxView, SendDryRun, SendEnvelope, SendQueued, UNDO_MS, backoff_ms, clear_halt, read_halt, view, write_halt,
+};
 use crate::store_map;
 use crate::vault::CredentialVault;
 
@@ -39,6 +43,17 @@ pub(crate) fn unknown_folder(id: &str) -> OpError {
 
 pub(crate) fn unknown_message(id: &str) -> OpError {
     OpError::InvalidArgs(format!("unknown message {id:?}; use an id returned by messages_list"))
+}
+
+/// The one sentence for a draft held by its own journal row. It names the state and the two ways
+/// out, and it never suggests cancelling a row that cannot be cancelled.
+fn outbox_lock_message(what: &str, id: &str, state: OutboxState, action: &str) -> String {
+    let exit = match state {
+        OutboxState::Failed => "scartala dalla coda e riprova",
+        OutboxState::Uncertain => "risolvila dalla coda: potrebbe essere già stata consegnata",
+        _ => "attendi l'invio, oppure annullala finché è in coda",
+    };
+    format!("{what} {id:?} è nella coda ({state}) e non può essere {action}: {exit}")
 }
 
 pub(crate) fn unknown_label(id: &str) -> OpError {
@@ -76,6 +91,19 @@ pub enum OpError {
     Failed(String),
 }
 
+/// What a successful submission's local finalize did.
+enum FinalizeOutcome {
+    /// The draft moved to Sent and carries the delivered Message-ID. `server_uid` is `Some` when a
+    /// server copy with that Message-ID was already cached and its UID was adopted: the caller must
+    /// not APPEND a second copy.
+    Moved { server_uid: Option<u32> },
+    /// The draft was already moved or deleted: a repeated finalize after a crash is a no-op.
+    NotADraft,
+    /// The draft was edited after it was serialized. The message was delivered, but the newer draft
+    /// must not be labelled with the delivered Message-ID; the server copy arrives with the sync.
+    SnapshotChanged,
+}
+
 /// Everything `account_add` needs, including the password.
 ///
 /// The operation registry builds this from [`crate::ops::AccountAddArgs`]; callers that are not the
@@ -92,8 +120,22 @@ pub struct AccountSetup {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub tls: Option<MailTls>,
+    /// The submission endpoint. Known providers get their preset when this is absent; custom
+    /// accounts may omit it and then can read but not send. The password inside is optional: absent
+    /// means "use the IMAP credential".
+    pub smtp: Option<SmtpSetup>,
     /// Extra certificate authorities. Empty in production; tests pass the fake server's CA.
     pub extra_roots: Vec<CertificateDer<'static>>,
+}
+
+/// A submission endpoint and, optionally, a separate password.
+pub struct SmtpSetup {
+    pub host: String,
+    pub port: u16,
+    pub tls: MailTls,
+    pub username: String,
+    /// `None` means the IMAP credential is used for SMTP too.
+    pub password: Option<Zeroizing<String>>,
 }
 
 /// Everything `account_add` needs **except** the password.
@@ -109,6 +151,10 @@ pub struct AccountRequest {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub tls: Option<MailTls>,
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_tls: Option<MailTls>,
+    pub smtp_username: Option<String>,
 }
 
 /// A fully validated account request, before the password is read or the server is contacted.
@@ -120,6 +166,26 @@ struct ResolvedAccount {
     host: String,
     port: u16,
     tls: MailTls,
+    smtp: Option<SmtpSettings>,
+}
+
+/// Change an existing account's SMTP endpoint without touching its IMAP settings.
+///
+/// This is deliberately a separate request from [`AccountSetup`]: adding an account probes both
+/// servers and writes the whole tree, while updating submission settings must not replace cached
+/// mail, labels or the IMAP credential. The operation is sensitive because it can carry a password.
+#[derive(Clone)]
+pub struct AccountUpdateRequest {
+    pub id: String,
+    /// Set the endpoint. `None` is a caller mistake unless `clear_smtp` is true.
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_tls: Option<MailTls>,
+    pub smtp_username: Option<String>,
+    /// A new SMTP password, or `None` to keep the existing SMTP secret / fall back to IMAP.
+    pub smtp_password: Option<Zeroizing<String>>,
+    /// Remove the submission endpoint and its separate credential.
+    pub clear_smtp: bool,
 }
 
 pub struct Engine {
@@ -138,6 +204,19 @@ pub struct Engine {
     /// [`Engine::set_test_extra_roots`] to trust the fake server's throwaway CA; this can only add
     /// anchors and never disables verification.
     extra_roots: Vec<CertificateDer<'static>>,
+    /// Test seam: stop right after the server's `250` and before the durable
+    /// `append_pending` transition, as a process death would. Only a debug/test build has it; a
+    /// release build compiles the field and the check out.
+    #[cfg(debug_assertions)]
+    crash_after_accept: bool,
+    /// Test seam: run once between reading an outbox row and its conditional write, so a test can
+    /// model a concurrent process without a timing race. Debug/test builds only.
+    #[cfg(debug_assertions)]
+    test_after_outbox_read: Option<Box<dyn FnOnce() + Send>>,
+    /// Test clock: when present, the engine reads it instead of the wall clock for every claim. A
+    /// test advances it while a fake server is inside a long transfer. Debug/test builds only.
+    #[cfg(debug_assertions)]
+    test_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// Attachment id → BLAKE3 hex hash of its stored blob bytes, for attachments that have bytes.
     ///
     /// Core's `Attachment` deliberately carries no `blob_hash`: it is part of the `message_get`
@@ -160,6 +239,12 @@ impl Engine {
             store: None,
             vault: None,
             extra_roots: Vec::new(),
+            #[cfg(debug_assertions)]
+            crash_after_accept: false,
+            #[cfg(debug_assertions)]
+            test_after_outbox_read: None,
+            #[cfg(debug_assertions)]
+            test_clock: None,
             blob_hashes: HashMap::new(),
         }
     }
@@ -206,6 +291,59 @@ impl Engine {
     /// operation, so no caller can set it from JSON. Production builds leave it empty.
     pub fn set_test_extra_roots(&mut self, roots: Vec<CertificateDer<'static>>) {
         self.extra_roots = roots;
+    }
+
+    /// Stop after the SMTP server accepted the message and before the durable `append_pending`
+    /// transition, as a process death at the narrowest crash window would.
+    ///
+    /// This is a test seam, not an operation: it can only make a pass stop earlier. The row stays
+    /// `sending`, so the next pass after the lease turns it `uncertain` and never resubmits. The
+    /// caller sees a failed pass and a journal that says the outcome is unknown.
+    /// Stop after the SMTP server accepted the message and before the durable `append_pending`
+    /// transition, as a process death at the narrowest crash window would.
+    ///
+    /// This is a test seam, not an operation: it can only make a pass stop earlier. The row stays
+    /// `sending`, so the next pass after the lease turns it `uncertain` and never resubmits. The
+    /// caller sees a failed pass and a journal that says the outcome is unknown. It exists only in a
+    /// debug/test build (`debug_assertions`); a release build does not contain the field or the check.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn set_test_crash_after_accept(&mut self, enabled: bool) {
+        self.crash_after_accept = enabled;
+    }
+
+    /// Test seam: run `hook` once between reading an outbox row and its conditional write. A test
+    /// uses it to model a second process changing the row at exactly that instant without a timing
+    /// race. Debug/test builds only.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn set_test_after_outbox_read(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.test_after_outbox_read = Some(Box::new(hook));
+    }
+
+    /// Test seam: drive the engine's claim clock from a test, so a fake server can advance time
+    /// while it holds a transfer open. Debug/test builds only.
+    #[doc(hidden)]
+    #[cfg(debug_assertions)]
+    pub fn set_test_clock(&mut self, clock: Arc<std::sync::atomic::AtomicI64>) {
+        self.test_clock = Some(clock);
+    }
+
+    /// The current instant for a claim. In a test with an injected clock it is exactly that value;
+    /// otherwise it is the wall clock.
+    fn clock_now(&self) -> i64 {
+        #[cfg(debug_assertions)]
+        if let Some(clock) = &self.test_clock {
+            return clock.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        Utc::now().timestamp_millis()
+    }
+
+    /// The instant to stamp on a lease/claim: never earlier than the caller's pass start, so a test
+    /// that processes at a synthetic time keeps working, but a long transfer inside the pass is
+    /// stamped with the time it actually happened, not with the pass start.
+    fn claim_now(&self, pass_start: i64) -> i64 {
+        self.clock_now().max(pass_start)
     }
 
     fn open_inner(store: Store, vault: Option<Arc<dyn CredentialVault>>) -> Result<Self, OpError> {
@@ -257,6 +395,12 @@ impl Engine {
             store,
             vault: None,
             extra_roots: Vec::new(),
+            #[cfg(debug_assertions)]
+            crash_after_accept: false,
+            #[cfg(debug_assertions)]
+            test_after_outbox_read: None,
+            #[cfg(debug_assertions)]
+            test_clock: None,
             blob_hashes: HashMap::new(),
         };
         engine.recount();
@@ -394,6 +538,14 @@ impl Engine {
         let email = validate_account_email(&request.email)?;
         let name = validate_account_name(request.name.as_deref(), &email)?;
         let (host, port, tls) = resolve_server(request.provider, request.host.as_deref(), request.port, request.tls)?;
+        let smtp = resolve_smtp(
+            request.provider,
+            request.smtp_host.as_deref(),
+            request.smtp_port,
+            request.smtp_tls,
+            request.smtp_username.as_deref(),
+            &email,
+        )?;
         self.require_store("account_add")?;
         self.require_vault("account_add")?;
         if let Some(existing) = self.accounts.iter().find(|account| account.email.eq_ignore_ascii_case(&email)) {
@@ -408,7 +560,7 @@ impl Engine {
                 "account id {id:?} is already taken by a different address; remove that account before adding {email:?}"
             )));
         }
-        Ok(ResolvedAccount { id, provider: request.provider, email, name, host, port, tls })
+        Ok(ResolvedAccount { id, provider: request.provider, email, name, host, port, tls, smtp })
     }
 
     /// Add an IMAP account: validate, prove the login on the real server, store the credential,
@@ -427,18 +579,22 @@ impl Engine {
             host: setup.host.clone(),
             port: setup.port,
             tls: setup.tls,
+            smtp_host: setup.smtp.as_ref().map(|smtp| smtp.host.clone()),
+            smtp_port: setup.smtp.as_ref().map(|smtp| smtp.port),
+            smtp_tls: setup.smtp.as_ref().map(|smtp| smtp.tls),
+            smtp_username: setup.smtp.as_ref().map(|smtp| smtp.username.clone()),
         };
         let resolved = self.resolve_account(&request)?;
         validate_account_password(&setup.password)?;
         let store = self.require_store("account_add")?;
         let vault = self.require_vault("account_add")?;
-        let ResolvedAccount { id, provider, email, name, host, port, tls } = resolved;
+        let ResolvedAccount { id, provider, email, name, host, port, tls, smtp } = resolved;
 
         let mut config = ImapConfig::new(host.clone(), port, store_map::net_tls(tls), email.clone(), Secret::new(setup.password.as_str().to_owned()));
         let mut extra_roots = self.extra_roots.clone();
-        extra_roots.extend(setup.extra_roots);
-        for root in extra_roots {
-            config = config.with_extra_root(root);
+        extra_roots.extend(setup.extra_roots.clone());
+        for root in &extra_roots {
+            config = config.with_extra_root(root.clone());
         }
         let probe = postino_sync::probe(&config).map_err(|error| {
             account_error(
@@ -459,6 +615,37 @@ impl Engine {
         if planned.is_empty() {
             return Err(OpError::Failed(format!("the server {host} listed no usable folder; nothing was written")));
         }
+
+        // The submission endpoint is probed before anything is written, exactly like IMAP. This is
+        // the difference between a queue that fails on every attempt and a queue that works.
+        let mut smtp_password = None;
+        if let Some(smtp) = &smtp {
+            let password = match setup.smtp.as_ref().and_then(|setup| setup.password.as_ref()) {
+                Some(password) => password.clone(),
+                None => setup.password.clone(),
+            };
+            validate_account_password(&password)?;
+            let mut smtp_config = postino_net::SmtpConfig::new(
+                smtp.host.clone(),
+                smtp.port,
+                store_map::net_tls(smtp.tls),
+                smtp.username.clone(),
+                Secret::new(password.as_str().to_owned()),
+            );
+            for root in &extra_roots {
+                smtp_config = smtp_config.with_extra_root(root.clone());
+            }
+            postino_sync::verify_smtp(smtp_config).map_err(|error| {
+                OpError::Auth(format!(
+                    "the SMTP server {}:{} did not accept the credential ({}). Nothing was written; check the SMTP password, host, port and TLS mode.",
+                    smtp.host,
+                    smtp.port,
+                    smtp_failure_reason(&error)
+                ))
+            })?;
+            smtp_password = setup.smtp.as_ref().and_then(|setup| setup.password.clone());
+        }
+
         let created_at = Utc::now().timestamp_millis();
         let account_row = postino_store::Account {
             id: id.clone(),
@@ -473,26 +660,54 @@ impl Engine {
             host: host.clone(),
             port,
             tls: store_map::account_tls(tls),
-            username: email,
+            username: email.clone(),
             created_at,
+            smtp: smtp.as_ref().map(|smtp| postino_store::SmtpServer {
+                host: smtp.host.clone(),
+                port: smtp.port,
+                tls: store_map::account_tls(smtp.tls),
+                username: smtp.username.clone(),
+            }),
         };
         let folder_rows = planned.into_iter().map(|folder| folder.row).collect::<Vec<_>>();
 
         if let Err(error) = vault.store_imap_password(&id, setup.password.as_bytes()) {
             return Err(OpError::Failed(format!("the IMAP credential could not be stored in the OS keyring: {error}. Nothing was written.")));
         }
+        let smtp_credential = match smtp_password.as_ref() {
+            Some(password) => vault.store_smtp_password(&id, password.as_bytes()).map_err(|error| {
+                let cleanup = vault.delete_imap_password(&id);
+                let mut sentence = format!("the SMTP credential could not be stored in the OS keyring: {error}.");
+                if cleanup.is_ok() {
+                    sentence.push_str(" The IMAP credential was removed again; nothing was written.");
+                } else {
+                    sentence.push_str(" The IMAP credential could not be removed again; delete it in the OS credential manager.");
+                }
+                OpError::Failed(sentence)
+            }),
+            // A separate SMTP secret that used to exist would shadow the IMAP fallback, so remove
+            // it. Deleting a missing entry is a no-op.
+            None => vault.delete_smtp_password(&id).map_err(|error| {
+                let _ = vault.delete_imap_password(&id);
+                OpError::Failed(format!(
+                    "the old SMTP credential could not be removed from the OS keyring ({error}); the IMAP credential was removed again and nothing was written."
+                ))
+            }),
+        };
+        smtp_credential?;
         if let Err(error) = store.save_account(&account_row, &server_row, &folder_rows) {
-            let cleanup = vault.delete_imap_password(&id);
-            let outcome = match cleanup {
-                Ok(()) => "The credential was removed again and nothing was written.".to_owned(),
-                Err(cleanup) => format!(
-                    "The credential could not be removed again from the OS keyring ({cleanup}); a retry with the same address overwrites it, or delete it in the OS credential manager."
-                ),
+            let imap_cleanup = vault.delete_imap_password(&id);
+            let smtp_cleanup = vault.delete_smtp_password(&id);
+            let outcome = match (imap_cleanup, smtp_cleanup) {
+                (Ok(()), Ok(())) => "The credentials were removed again and nothing was written.".to_owned(),
+                _ => "One or both credentials could not be removed again from the OS keyring; a retry with the same address overwrites them, or delete them in the OS credential manager.".to_owned(),
             };
             return Err(OpError::Failed(format!("the local store refused the account: {error}. {outcome}")));
         }
 
-        // Durable writes are done; only now does memory change.
+        // Durable writes are done; only now does memory change. A re-add with a fresh password also
+        // clears a previous authentication halt: the user has just proved the credential works.
+        let _ = clear_halt(store, &id);
         let account = store_map::account(account_row);
         self.accounts.push(account.clone());
         self.folders.extend(folder_rows.iter().cloned().map(store_map::folder));
@@ -500,8 +715,127 @@ impl Engine {
         self.account_view(&account)
     }
 
-    /// Log in with the stored credential, list folders and return the count and capabilities.
+    /// Change an account's SMTP endpoint. The IMAP settings, cached mail and labels are untouched.
     ///
+    /// Setting an endpoint probes it with the new password when one is supplied, otherwise with the
+    /// existing SMTP secret or the IMAP credential. Clearing it removes the endpoint and the separate
+    /// SMTP secret. A failed probe writes nothing.
+    pub fn update_account(&mut self, request: AccountUpdateRequest) -> Result<AccountView, OpError> {
+        let account = self.find_account(&request.id)?.clone();
+        let store = self.require_store("account_update")?;
+        let vault = self.require_vault("account_update")?;
+        let mut server = store
+            .get_account_server(&account.id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::Failed(format!("account {:?} has no server configuration; remove it and add it again", account.id)))?;
+        if request.clear_smtp {
+            // Every endpoint field is checked: a direct operation call must not silently ignore a
+            // port or a login that was meant for the endpoint being removed.
+            if request.smtp_host.is_some()
+                || request.smtp_port.is_some()
+                || request.smtp_tls.is_some()
+                || request.smtp_username.is_some()
+                || request.smtp_password.is_some()
+            {
+                return Err(OpError::InvalidArgs("clear_smtp cannot be combined with a new SMTP endpoint, login or password".to_owned()));
+            }
+            server.smtp = None;
+            store.upsert_account_server(&server).map_err(store_map::write_error)?;
+            let cleanup = vault.delete_smtp_password(&account.id);
+            let _ = clear_halt(store, &account.id);
+            if let Err(error) = cleanup {
+                return Err(OpError::Failed(format!(
+                    "the SMTP endpoint was removed, but its credential could not be deleted from the OS keyring: {error}"
+                )));
+            }
+            return self.account_view(&account);
+        }
+        if request.smtp_host.is_none() && request.smtp_port.is_none() && request.smtp_tls.is_none() && request.smtp_username.is_none() {
+            return Err(OpError::InvalidArgs("provide the SMTP endpoint fields or clear_smtp: true".to_owned()));
+        }
+        let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
+        let smtp = resolve_smtp(
+            provider,
+            request.smtp_host.as_deref(),
+            request.smtp_port,
+            request.smtp_tls,
+            request.smtp_username.as_deref(),
+            &account.email,
+        )?
+        .ok_or_else(|| OpError::InvalidArgs("provide smtp_host, smtp_port and smtp_tls together".to_owned()))?;
+        let new_password = request.smtp_password.is_some();
+        let password = match request.smtp_password {
+            Some(password) => {
+                validate_account_password(&password)?;
+                password
+            }
+            None => {
+                let bytes = vault
+                    .load_smtp_password(&account.id)
+                    .map_err(|error| OpError::Failed(format!("the OS keyring could not provide the SMTP credential: {error}")))?
+                    .or_else(|| vault.load_imap_password(&account.id).ok().flatten())
+                    .ok_or_else(|| OpError::Failed(format!("account {:?} has no SMTP or IMAP credential; supply a new SMTP password", account.id)))?;
+                let text = std::str::from_utf8(bytes.as_slice())
+                    .map_err(|_| OpError::Failed(format!("the stored SMTP credential for account {:?} is not valid UTF-8", account.id)))?;
+                Zeroizing::new(text.to_owned())
+            }
+        };
+        let mut config = postino_net::SmtpConfig::new(
+            smtp.host.clone(),
+            smtp.port,
+            store_map::net_tls(smtp.tls),
+            smtp.username.clone(),
+            Secret::new(password.as_str().to_owned()),
+        );
+        for root in &self.extra_roots {
+            config = config.with_extra_root(root.clone());
+        }
+        postino_sync::verify_smtp(config).map_err(|error| {
+            OpError::Auth(format!(
+                "the SMTP server {}:{} did not accept the credential ({}). Nothing was written; check the SMTP password, host, port and TLS mode.",
+                smtp.host,
+                smtp.port,
+                smtp_failure_reason(&error)
+            ))
+        })?;
+        // Keep the previous secret so a failed row write can put it back: the endpoint must never
+        // end up paired with a password the server has not accepted.
+        let previous_secret = if new_password { vault.load_smtp_password(&account.id).ok().flatten().map(|bytes| bytes.to_vec()) } else { None };
+        if new_password && let Err(error) = vault.store_smtp_password(&account.id, password.as_bytes()) {
+            return Err(OpError::Failed(format!(
+                "the SMTP credential could not be stored in the OS keyring: {error}. The endpoint was not changed."
+            )));
+        }
+        let previous = server.smtp.clone();
+        server.smtp = Some(postino_store::SmtpServer {
+            host: smtp.host.clone(),
+            port: smtp.port,
+            tls: store_map::account_tls(smtp.tls),
+            username: smtp.username.clone(),
+        });
+        if let Err(error) = store.upsert_account_server(&server) {
+            server.smtp = previous;
+            let _ = store.upsert_account_server(&server);
+            let detail = if new_password {
+                let rollback = match previous_secret {
+                    Some(secret) => vault.store_smtp_password(&account.id, &secret),
+                    None => vault.delete_smtp_password(&account.id),
+                };
+                if rollback.is_ok() {
+                    " The previous credential was restored."
+                } else {
+                    " The previous credential could not be restored; set it again from the settings."
+                }
+            } else {
+                ""
+            };
+            return Err(OpError::Failed(format!("{}{detail}", store_map::write_error(error))));
+        }
+        let _ = clear_halt(store, &account.id);
+        self.account_view(&account)
+    }
+
+    /// Log in with the stored credential, list folders and return the count and capabilities.    ///
     /// Read-only: nothing is written, no mailbox is selected and no message is fetched. A broken
     /// credential is an [`OpError::Auth`] that names the provider and the likely cause and leaves the
     /// account and its cache exactly as they were.
@@ -517,6 +851,30 @@ impl Engine {
         let probe = postino_sync::probe(&config).map_err(|error| {
             account_error(error, provider, &account.id, &server.host, "checking the connection", "The account and its cached mail are unchanged.")
         })?;
+        // A configured submission endpoint is checked too: after an SMTP password change "credentials
+        // valid" must not be true while sending fails. Fixed sentences only: this server holds the
+        // password and may echo it.
+        if let Some(smtp) = server.smtp.clone() {
+            let smtp_password = self.load_smtp_password(&account.id, "account_test")?;
+            let mut smtp_config = SmtpConfig::new(
+                smtp.host.clone(),
+                smtp.port,
+                store_map::net_tls(store_map::mail_tls(smtp.tls)),
+                smtp.username.clone(),
+                Secret::new(smtp_password.as_str().to_owned()),
+            );
+            for root in &self.extra_roots {
+                smtp_config = smtp_config.with_extra_root(root.clone());
+            }
+            if let Err(error) = postino_sync::verify_smtp(smtp_config) {
+                let reason = smtp_failure_reason(&error);
+                let sentence = format!(
+                    "the SMTP server {}:{} did not accept the submission credential ({reason}). The account and its cached mail are unchanged.",
+                    smtp.host, smtp.port
+                );
+                return Err(if error.is_authentication() { OpError::Auth(sentence) } else { OpError::Network(sentence) });
+            }
+        }
         let folders = u32::try_from(probe.folders.iter().filter(|folder| folder.is_selectable()).count()).unwrap_or(u32::MAX);
         Ok(crate::ops::AccountTest { account: account.id.clone(), folders, capabilities: probe.capabilities })
     }
@@ -541,20 +899,40 @@ impl Engine {
         if !store.delete_account(&account.id).map_err(store_map::write_error)? {
             return Err(OpError::Failed(format!("the local store no longer has account {:?}; nothing was changed", account.id)));
         }
-        let credential = vault.delete_imap_password(&account.id);
+        let imap_credential = vault.delete_imap_password(&account.id);
+        let smtp_credential = vault.delete_smtp_password(&account.id);
         let folder_ids =
             self.folders.iter().filter(|folder| folder.account_id == account.id).map(|folder| folder.id.clone()).collect::<BTreeSet<_>>();
         self.accounts.retain(|candidate| candidate.id != account.id);
         self.folders.retain(|folder| folder.account_id != account.id);
         self.messages.retain(|message| !folder_ids.contains(&message.summary.folder_id));
         self.recount();
-        match credential {
-            Ok(()) => Ok(view),
-            Err(error) => Err(OpError::Failed(format!(
-                "account {:?} and its cached mail were removed, but the OS keyring refused to delete the credential: {error}. The credential is now unreferenced; adding this address again overwrites it, or delete it in the OS credential manager.",
-                account.id
+        match (imap_credential, smtp_credential) {
+            (Ok(()), Ok(())) => Ok(view),
+            (imap, smtp) => Err(OpError::Failed(format!(
+                "account {:?} and its cached mail were removed, but the OS keyring refused to delete a credential (IMAP: {}; SMTP: {}). The credential is now unreferenced; adding this address again overwrites it, or delete it in the OS credential manager.",
+                account.id,
+                credential_outcome(&imap),
+                credential_outcome(&smtp)
             ))),
         }
+    }
+
+    fn load_smtp_password(&self, account_id: &str, operation: &str) -> Result<Zeroizing<String>, OpError> {
+        let vault = self.require_vault(operation)?;
+        let bytes = vault
+            .load_smtp_password(account_id)
+            .map_err(|error| OpError::Failed(format!("the OS keyring could not provide the SMTP credential for account {account_id:?}: {error}")))?
+            .or_else(|| vault.load_imap_password(account_id).ok().flatten());
+        let Some(bytes) = bytes else {
+            return Err(OpError::Failed(format!(
+                "account {account_id:?} has no SMTP or IMAP credential in the OS keyring; add the account again with its password"
+            )));
+        };
+        let text = std::str::from_utf8(bytes.as_slice()).map_err(|_| {
+            OpError::Failed(format!("the stored SMTP credential for account {account_id:?} is not valid UTF-8; add the account again"))
+        })?;
+        Ok(Zeroizing::new(text.to_owned()))
     }
 
     /// Run one IMAP sync for one account (or the only account) and refresh memory from the store.
@@ -842,14 +1220,31 @@ impl Engine {
 
     /// Move one message to a regular folder. Virtual folders such as `starred` are views, not
     /// destinations.
+    ///
+    /// Only a message that is still in Drafts and has a journal row that can still deliver it is
+    /// held back: a Sent copy (including the one a submission created) stays movable, archivable
+    /// and deletable, and a cancelled or sent row never locks anything.
     pub fn move_message(&mut self, id: &str, folder_id: &str) -> Result<MessageSummary, OpError> {
         let target = self.folders.iter().find(|folder| folder.id == folder_id).ok_or_else(|| unknown_folder(folder_id))?;
         if target.kind.is_virtual() {
             return Err(OpError::InvalidArgs(format!("folder {folder_id:?} is virtual and cannot receive messages")));
         }
         let target_id = target.id.clone();
-        if !self.messages.iter().any(|message| message.summary.id == id) {
-            return Err(unknown_message(id));
+        let current = self.messages.iter().find(|message| message.summary.id == id).ok_or_else(|| unknown_message(id))?;
+        let current_kind = self.folders.iter().find(|folder| folder.id == current.summary.folder_id).map(|folder| folder.kind);
+        if let Some(store) = &self.store {
+            // The store, not this engine's snapshot, says where the message is. A stale view must not
+            // move a row another process already sent, and a vanished row is not a movable message.
+            let row = store
+                .get_message(id)
+                .map_err(store_map::read_error)?
+                .ok_or_else(|| OpError::InvalidArgs(format!("message {id:?} no longer exists; refresh the mailbox")))?;
+            if row.summary.folder_id != current.summary.folder_id {
+                return Err(OpError::InvalidArgs(format!("message {id:?} changed in another session; refresh the mailbox before moving it")));
+            }
+        }
+        if let Some(state) = self.outbox_lock_for(id, current_kind)? {
+            return Err(OpError::InvalidArgs(outbox_lock_message("message", id, state, "spostato")));
         }
         if let Some(store) = &self.store {
             store.move_messages(&[id.to_owned()], &target_id).map_err(store_map::write_error)?;
@@ -888,6 +1283,23 @@ impl Engine {
                 let kind = self.folders.iter().find(|folder| folder.id == self.messages[index].summary.folder_id).map(|folder| folder.kind);
                 if kind != Some(FolderKind::Drafts) {
                     return Err(OpError::InvalidArgs(format!("message {id:?} is not a draft")));
+                }
+                if let Some(state) = self.outbox_lock_for(id, Some(FolderKind::Drafts))? {
+                    return Err(OpError::InvalidArgs(outbox_lock_message("draft", id, state, "modificata")));
+                }
+                // The store is the authority on where the row is now: another process may have sent
+                // or moved it since this engine loaded it. A stale Drafts copy must not overwrite the
+                // Sent copy (it would move it back and clear its Message-ID).
+                if let Some(store) = &self.store {
+                    let row = store
+                        .get_message(id)
+                        .map_err(store_map::read_error)?
+                        .ok_or_else(|| OpError::InvalidArgs(format!("draft {id:?} no longer exists; refresh the mailbox")))?;
+                    if row.summary.folder_id != self.messages[index].summary.folder_id {
+                        return Err(OpError::InvalidArgs(format!(
+                            "message {id:?} changed in another session (it is no longer in this folder); refresh the mailbox before editing it"
+                        )));
+                    }
                 }
                 Some(index)
             }
@@ -928,7 +1340,12 @@ impl Engine {
 
         let message_id = match (index, id) {
             (Some(_), Some(id)) => id.to_owned(),
-            _ => self.next_id("draft")?,
+            _ => match &self.store {
+                // A store-wide transactional allocator: two processes never receive `draft_1`.
+                Some(store) => store.allocate_draft_id().map_err(store_map::write_error)?,
+                // The demo has no store and no second writer.
+                None => self.next_id("draft")?,
+            },
         };
         let attachments = draft
             .attachments
@@ -980,7 +1397,7 @@ impl Engine {
         };
 
         let persisted = if let Some(store) = &self.store {
-            let row = store_map::message_row(&saved, &account.id);
+            let row = store_map::message_row(&saved, &account.id, None);
             store.save_draft_message(&row, &store_map::attachment_rows(&saved.attachments)).map_err(store_map::write_error)?;
             // The repository keeps the stored hash *and size* of an attachment whose id survived the
             // replacement. Mirror those rows, or memory would cap a 2 MiB blob at a stale size of 0
@@ -1041,11 +1458,793 @@ impl Engine {
         }
     }
 
-    /// Local submission: move a draft to the Sent folder of its own account and record the current
-    /// timestamp. No SMTP connection is opened in this build; the operation description and the UI
-    /// say the move is local and that real submission arrives with M2. A store-backed engine
-    /// persists the move, and keeps the draft revision sequence for a later move back.
+    /// Queue a draft for immediate submission, with the undo window.
+    ///
+    /// The draft is serialized and its exact bytes are persisted in the encrypted blob store before
+    /// the outbox row exists. The draft stays in Drafts while the row is queued, so Undo is a
+    /// cancellation rather than a restore; a queued draft cannot be edited or moved until it is
+    /// cancelled or resolved.
+    pub fn message_send(&mut self, draft_id: &str) -> Result<SendQueued, OpError> {
+        let now = Utc::now().timestamp_millis();
+        self.queue_send(draft_id, now.saturating_add(UNDO_MS), now)
+    }
+
+    /// Queue a draft at an explicit instant. A time in the past is treated as "now".
+    pub fn send_schedule(&mut self, draft_id: &str, send_at: chrono::DateTime<Utc>) -> Result<SendQueued, OpError> {
+        let now = Utc::now().timestamp_millis();
+        self.queue_send(draft_id, send_at.timestamp_millis().max(now), now)
+    }
+
+    /// Serialize a draft and return the exact bytes without touching the outbox.
+    ///
+    /// The same builder as a real send, so a dry run proves what would leave the machine. No network
+    /// call and no row.
+    pub fn send_dry_run(&self, draft_id: &str) -> Result<SendDryRun, OpError> {
+        let (serialized, _account, _message) = self.submission_for_draft(draft_id)?;
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &serialized.raw);
+        Ok(SendDryRun {
+            raw_base64: encoded,
+            bytes: serialized.raw.len(),
+            envelope: SendEnvelope { from: serialized.envelope.from.clone(), recipients: serialized.envelope.recipients.clone() },
+            subject: _message.summary.subject.clone(),
+            message_id: serialized.message_id.clone(),
+        })
+    }
+
+    fn queue_send(&mut self, draft_id: &str, send_at: i64, now: i64) -> Result<SendQueued, OpError> {
+        let store = self.require_store("message_send")?;
+        let (serialized, account, _message) = self.submission_for_draft(draft_id)?;
+        let server = store
+            .get_account_server(&account.id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::Failed(format!("account {:?} has no server configuration; remove it and add it again", account.id)))?;
+        if server.smtp.is_none() {
+            return Err(OpError::Failed(format!(
+                "account {:?} has no SMTP endpoint, so it can read but not send. Remove it and add it again with an SMTP host, or edit the account configuration.",
+                account.id
+            )));
+        }
+        // The draft revision is the submission snapshot: it changes on every save and never goes
+        // backwards, so "the revision is still this one" means "the draft has not been edited since
+        // it was serialized". It is also part of the idempotency key, which makes a deliberate
+        // resend of an edited, moved-back draft a new row instead of a collision with the sent row.
+        let draft_row = store.get_draft(draft_id).map_err(store_map::read_error)?;
+        let revision = draft_row.as_ref().map(|draft| draft.revision);
+        // The serialized bytes come from this engine's snapshot. If another process saved the draft
+        // after this engine loaded it, the revision would describe the other process's content while
+        // the bytes describe ours; refuse and let the caller reload. Compare the whole serialized
+        // snapshot (body, headers, Date and attachment set), not a timestamp: two saves can land in
+        // the same millisecond.
+        if let Some(draft) = &draft_row
+            && !self.draft_snapshot_matches(&_message, draft, store)?
+        {
+            return Err(OpError::InvalidArgs(format!("draft {draft_id:?} changed in another session; refresh the mailbox before sending it")));
+        }
+        // The newest row for this draft decides, and it is one indexed lookup, never a history scan.
+        if let Some(existing) = store.active_outbox_for_draft(draft_id).map_err(store_map::read_error)? {
+            match existing.state {
+                OutboxState::Queued => {
+                    // The same queue operation was retried before the undo window expired: return
+                    // the existing row instead of inserting a duplicate submission.
+                    let (view, _warning) = view(&existing);
+                    return Ok(SendQueued { outbox: view, undo_until: Some(existing.send_at) });
+                }
+                OutboxState::Cancelled => {}
+                OutboxState::Sending => {
+                    return Err(OpError::InvalidArgs(format!("draft {draft_id:?} is being submitted right now; watch it in the outbox")));
+                }
+                OutboxState::AppendPending => {
+                    return Err(OpError::InvalidArgs(format!(
+                        "draft {draft_id:?} was already submitted and is waiting for the Sent copy; it cannot be queued again"
+                    )));
+                }
+                OutboxState::Sent => {
+                    // A sent row is the record of a delivery. It blocks the draft state that was
+                    // delivered: the crash window where the local move did not run, and a Sent copy
+                    // the user moved back to Drafts without editing. A draft edited since the send
+                    // (a new revision) is a deliberate resend, so it may queue as a new revision.
+                    let sent_revision = OutboxEnvelope::decode(&existing.envelope_json).and_then(|envelope| envelope.draft_revision);
+                    let edited_since = matches!((sent_revision, revision), (Some(sent), Some(current)) if sent != current);
+                    if !edited_since {
+                        return Err(OpError::InvalidArgs(format!(
+                            "draft {draft_id:?} was already sent; edit it (a new revision) or create a new draft to send it again"
+                        )));
+                    }
+                }
+                OutboxState::Uncertain => {
+                    return Err(OpError::InvalidArgs(format!(
+                        "draft {draft_id:?} has an uncertain submission; resolve it from the outbox (mark it sent or retry manually) before queueing it again"
+                    )));
+                }
+                OutboxState::Failed => {
+                    return Err(OpError::InvalidArgs(format!(
+                        "draft {draft_id:?} has a failed submission; discard that row with outbox_cancel or retry it from the outbox instead of queueing a second copy"
+                    )));
+                }
+            }
+        }
+        let raw_hash = store.blobs().put(&serialized.raw).map_err(store_map::blob_write_error)?;
+        // Stable per draft revision and content: a second process that queues the same unchanged
+        // draft computes the same key, and the unique index makes the second insert a no-op instead
+        // of a delivery.
+        let revision_key = revision.map_or_else(|| "0".to_owned(), |revision| revision.to_string());
+        let idempotency_key = format!("draft:{draft_id}:{revision_key}:{}", raw_hash.get(..16).unwrap_or(raw_hash.as_str()));
+        let id = {
+            let digest = blake3::hash(idempotency_key.as_bytes()).to_hex();
+            format!("ob_{}", digest.as_str().get(..16).unwrap_or(digest.as_str()))
+        };
+        let payload = OutboxEnvelope {
+            from: serialized.envelope.from.clone(),
+            recipients: serialized.envelope.recipients.clone(),
+            subject: _message.summary.subject.clone(),
+            message_id: serialized.message_id.clone(),
+            draft_id: draft_id.to_owned(),
+            draft_revision: revision,
+        };
+        let envelope_json = payload.encode().map_err(|error| OpError::Failed(format!("could not encode the envelope: {error}")))?;
+        let entry = OutboxEntry {
+            id,
+            account_id: account.id.clone(),
+            draft_id: Some(draft_id.to_owned()),
+            idempotency_key,
+            created_at: now,
+            send_at,
+            state: OutboxState::Queued,
+            attempts: 0,
+            append_attempts: 0,
+            last_error: None,
+            raw_blob_hash: raw_hash,
+            envelope_json,
+            lease_at: None,
+        };
+        match store.queue_outbox(&entry) {
+            Ok(row) => {
+                let (view, _warning) = view(&row);
+                Ok(SendQueued { outbox: view, undo_until: Some(row.send_at) })
+            }
+            Err(postino_store::StoreError::OutboxAlreadyActive { state, .. }) => {
+                // Another process queued the same draft between our lookup and our insert. The
+                // idempotent answer is that row, never a second submission.
+                let existing = store
+                    .active_outbox_for_draft(draft_id)
+                    .map_err(store_map::read_error)?
+                    .ok_or_else(|| OpError::Failed(format!("draft {draft_id:?} was queued concurrently and its row is not readable")))?;
+                if state == OutboxState::Queued {
+                    let (view, _warning) = view(&existing);
+                    return Ok(SendQueued { outbox: view, undo_until: Some(existing.send_at) });
+                }
+                Err(OpError::InvalidArgs(format!("draft {draft_id:?} changed state while queueing ({state}); refresh the outbox")))
+            }
+            Err(error) => Err(store_map::write_error(error)),
+        }
+    }
+
+    /// Build the exact RFC 5322 bytes for one draft. Attachment bytes come from the encrypted blob
+    /// store; a metadata-only attachment is refused before any network or queue row.
+    ///
+    /// The `Date` header is the draft's own last-saved instant, not the wall clock. That is what makes
+    /// `send_dry_run` and `message_send` produce the same bytes even a second apart: the dry run,
+    /// the queued blob and a resend after a cancel all serialize the same draft state the same way.
+    /// The Message-ID is derived from that digest, so it is stable too. A scheduled message therefore
+    /// carries the instant it was last edited; the header dates the message, not the queue.
+    fn submission_for_draft(&self, draft_id: &str) -> Result<(postino_sync::SerializedSubmission, Account, Message), OpError> {
+        let current = self.messages.iter().find(|message| message.summary.id == draft_id).cloned().ok_or_else(|| unknown_message(draft_id))?;
+        let folder = self
+            .folders
+            .iter()
+            .find(|folder| folder.id == current.summary.folder_id)
+            .ok_or_else(|| OpError::Failed(format!("draft {draft_id:?} lives in an unknown folder")))?;
+        if folder.kind != FolderKind::Drafts {
+            return Err(OpError::InvalidArgs(format!("message {draft_id:?} is not a draft")));
+        }
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.id == folder.account_id)
+            .cloned()
+            .ok_or_else(|| OpError::Failed(format!("draft {draft_id:?} belongs to unknown account {:?}", folder.account_id)))?;
+        if current.summary.to.is_empty() && current.cc.is_empty() && current.bcc.is_empty() {
+            return Err(OpError::InvalidArgs("a message needs at least one recipient".to_owned()));
+        }
+        let mut attachments = Vec::with_capacity(current.attachments.len());
+        for attachment in &current.attachments {
+            let data = self.attachment_bytes(&attachment.id).map_err(|error| {
+                OpError::Failed(format!(
+                    "attachment {:?} has no stored bytes ({error}); attachments without content cannot be sent. Remove it or re-attach the file.",
+                    attachment.filename
+                ))
+            })?;
+            attachments.push(postino_sync::SubmissionAttachment {
+                filename: attachment.filename.clone(),
+                mime: attachment.mime.clone(),
+                data,
+                content_id: None,
+            });
+        }
+        let submission = postino_sync::Submission {
+            from: postino_sync::SubmissionMailbox { name: Some(account.name.clone()), address: account.email.clone() },
+            to: current.summary.to.iter().map(mailbox).collect(),
+            cc: current.cc.iter().map(mailbox).collect(),
+            bcc: current.bcc.iter().map(mailbox).collect(),
+            subject: current.summary.subject.clone(),
+            date: current.summary.date,
+            text: current.body_text.clone(),
+            html: current.body_html.clone(),
+            attachments,
+            in_reply_to: None,
+            references: Vec::new(),
+            message_id: None,
+        };
+        let serialized = postino_sync::serialize_submission(&submission)
+            .map_err(|error| OpError::InvalidArgs(format!("the message cannot be serialized: {error}")))?;
+        if serialized.raw.len() as u64 > MAX_SUBMISSION_BYTES {
+            return Err(OpError::InvalidArgs(format!(
+                "the message is {} bytes; this build submits at most {MAX_SUBMISSION_BYTES} bytes",
+                serialized.raw.len()
+            )));
+        }
+        if serialized.envelope.recipients.is_empty() {
+            return Err(OpError::InvalidArgs("the message has no valid recipient".to_owned()));
+        }
+        if serialized.envelope.recipients.len() > 100 {
+            return Err(OpError::InvalidArgs(format!(
+                "the message has {} recipients; this build accepts at most 100",
+                serialized.envelope.recipients.len()
+            )));
+        }
+        Ok((serialized, account, current))
+    }
+
+    /// The outbox state that holds this message back, or `None` when it may be edited or moved.
+    ///
+    /// Only a message that is still in Drafts can be held: the journal row exists to deliver that
+    /// draft. A Sent copy, including the one a successful submission created, is ordinary mail and
+    /// must stay movable and archivable. The partial unique index guarantees at most one active row
+    /// per draft, so this is a direct state query, not a list scan.
+    fn outbox_lock_for(&self, id: &str, folder_kind: Option<FolderKind>) -> Result<Option<OutboxState>, OpError> {
+        if folder_kind != Some(FolderKind::Drafts) {
+            return Ok(None);
+        }
+        match &self.store {
+            Some(store) => store.active_state_for_draft(id).map_err(store_map::read_error).map(|state| state.filter(|state| state.blocks_draft())),
+            None => Ok(None),
+        }
+    }
+
+    /// The instant at which the outbox next has work for a worker: a queued or Sent-append row's due
+    /// time, or a `sending` row's lease expiry. `None` when nothing is pending. One indexed query,
+    /// so a scheduler never has to hold the journal in memory or trust a cached list.
+    pub fn next_outbox_wake(&self) -> Result<Option<i64>, OpError> {
+        match &self.store {
+            Some(store) => store.next_outbox_wake(LEASE_MS).map_err(store_map::read_error),
+            None => Ok(None),
+        }
+    }
+
+    /// One page of journal rows and the accounts whose queue is stopped. A demo engine has no outbox
+    /// and says so; a damaged envelope is a warning, never a listing failure. `limit` is clamped to
+    /// 1..=500 and `offset` pages backwards (newest first); terminal rows older than 30 days are
+    /// pruned, so the history is bounded in time as well as by the page.
+    pub fn outbox_list(&self, account: Option<&str>, limit: u32, offset: u32) -> Result<OutboxList, OpError> {
+        let Some(store) = &self.store else {
+            return Ok(OutboxList {
+                entries: Vec::new(),
+                halted: Vec::new(),
+                warnings: vec!["la casella demo non ha una coda: l'invio reale richiede un account su archivio (postino --store <path>)".to_owned()],
+            });
+        };
+        if let Some(account) = account {
+            self.find_account(account)?;
+        }
+        let limit = limit.clamp(1, postino_store::MAX_OUTBOX_ROWS);
+        let rows = store.list_outbox_page(account, limit, offset).map_err(store_map::read_error)?;
+        let mut warnings = Vec::new();
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let (entry, warning) = view(row);
+            entries.push(entry);
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+        }
+        let mut halted = Vec::new();
+        let mut accounts = rows.iter().map(|row| row.account_id.clone()).collect::<BTreeSet<_>>();
+        if let Some(account) = account {
+            accounts.insert(account.to_owned());
+        }
+        for account in accounts {
+            match read_halt(store, &account) {
+                Ok(Some(halt)) => halted.push(halt),
+                Ok(None) => {}
+                Err(error) => warnings.push(format!("lo stato di fermo per l'account {account:?} non è leggibile: {error}")),
+            }
+        }
+        Ok(OutboxList { entries, halted, warnings })
+    }
+
+    /// Cancel a row that has not been leased yet, or discard a permanently failed one.
+    ///
+    /// A `failed` row is a permanent refusal: no delivery happened, so the journal row can go and the
+    /// draft becomes editable again. After `sending`, `append_pending` or `uncertain` only the
+    /// uncertain policy applies, because the message may have been delivered.
+    pub fn outbox_cancel(&mut self, id: &str) -> Result<OutboxView, OpError> {
+        let store = self.require_store("outbox_cancel")?;
+        let entry = store
+            .get_outbox(id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::InvalidArgs(format!("unknown outbox row {id:?}; use an id returned by outbox_list")))?;
+        if !matches!(entry.state, OutboxState::Queued | OutboxState::Failed) {
+            return Err(OpError::InvalidArgs(format!("outbox row {id:?} is {}, not queued or failed; it cannot be discarded", entry.state.as_str())));
+        }
+        if !store.cancel_outbox(id).map_err(store_map::write_error)? {
+            return Err(OpError::Failed(format!("outbox row {id:?} could not be discarded; it may have just been leased")));
+        }
+        let entry = store.get_outbox(id).map_err(store_map::read_error)?.unwrap_or(entry);
+        let (view, _warning) = view(&entry);
+        Ok(view)
+    }
+
+    /// Manual retry of a failed or uncertain row. `confirm` is mandatory; an uncertain row may have
+    /// been delivered, so the caller has to say so explicitly.
+    pub fn outbox_retry(&mut self, id: &str, confirm: bool) -> Result<OutboxView, OpError> {
+        let store = self.require_store("outbox_retry")?;
+        let entry = store
+            .get_outbox(id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::InvalidArgs(format!("unknown outbox row {id:?}; use an id returned by outbox_list")))?;
+        if !matches!(entry.state, OutboxState::Failed | OutboxState::Uncertain) {
+            return Err(OpError::InvalidArgs(format!(
+                "outbox row {id:?} is {}, not failed or uncertain; only those states can be retried",
+                entry.state.as_str()
+            )));
+        }
+        if !confirm {
+            let warning = if entry.state == OutboxState::Uncertain {
+                "this submission may already have reached the server; retrying could send it twice. Pass confirm: true only after checking Sent."
+            } else {
+                "retrying sends the stored bytes again. Pass confirm: true to proceed."
+            };
+            return Err(OpError::InvalidArgs(warning.to_owned()));
+        }
+        clear_halt(store, &entry.account_id).map_err(store_map::write_error)?;
+        if !store.retry_outbox(id, Utc::now().timestamp_millis()).map_err(store_map::write_error)? {
+            return Err(OpError::Failed(format!("outbox row {id:?} changed state before the retry; refresh the outbox")));
+        }
+        let entry = store.get_outbox(id).map_err(store_map::read_error)?.unwrap_or(entry);
+        let (view, _warning) = view(&entry);
+        Ok(view)
+    }
+
+    /// Resolve an uncertain row as delivered without contacting the server. `confirm` is mandatory.
+    pub fn outbox_mark_sent(&mut self, id: &str, confirm: bool) -> Result<OutboxView, OpError> {
+        let Some(store) = self.store.take() else {
+            return Err(OpError::Failed(
+                "the demo mailbox has no outbox; real submission needs a store-backed account (postino --store <path>)".to_owned(),
+            ));
+        };
+        let result = (|| {
+            let entry = store
+                .get_outbox(id)
+                .map_err(store_map::read_error)?
+                .ok_or_else(|| OpError::InvalidArgs(format!("unknown outbox row {id:?}; use an id returned by outbox_list")))?;
+            if entry.state != OutboxState::Uncertain {
+                return Err(OpError::InvalidArgs(format!(
+                    "outbox row {id:?} is {}, not uncertain; only an uncertain submission can be marked sent",
+                    entry.state.as_str()
+                )));
+            }
+            if !confirm {
+                return Err(OpError::InvalidArgs(
+                    "marking the row sent records a local decision and never contacts the server; pass confirm: true to proceed".to_owned(),
+                ));
+            }
+            // A test can model a concurrent process changing the row at this exact instant.
+            #[cfg(debug_assertions)]
+            if let Some(hook) = self.test_after_outbox_read.take() {
+                hook();
+            }
+            if !store.confirm_outbox_sent(id).map_err(store_map::write_error)? {
+                // A concurrent retry (or another resolver) changed the row between the read and the
+                // confirm. Moving the draft now would label a queued or otherwise live submission as
+                // delivered; leave everything alone and tell the caller to refresh.
+                return Err(OpError::Failed("the outbox row changed state before it could be marked sent; refresh the outbox".to_owned()));
+            }
+            if let Some(envelope) = OutboxEnvelope::decode(&entry.envelope_json) {
+                let _ = self.finalize_outbox_draft(&envelope.draft_id, Some(&envelope.message_id), envelope.draft_revision, &store);
+            }
+            let entry = store.get_outbox(id).map_err(store_map::read_error)?.unwrap_or(entry);
+            let (view, _warning) = view(&entry);
+            Ok(view)
+        })();
+        self.store = Some(store);
+        result
+    }
+
+    /// Process every due row once: expire stale leases, submit `queued` rows, append `append_pending`
+    /// rows. The caller decides when to run it; the desktop worker and the CLI both use this method.
+    ///
+    /// A crash during `DATA` becomes `uncertain` after [`LEASE_MS`]; it is never retried
+    /// automatically. An authentication failure stops the account's queue with an actionable halt.
+    pub fn process_outbox(&mut self, now_ms: i64) -> Result<OutboxRunReport, OpError> {
+        let Some(store) = self.store.take() else {
+            return Err(OpError::Failed(
+                "the demo mailbox has no outbox; real submission needs a store-backed account (postino --store <path>)".to_owned(),
+            ));
+        };
+        let result = self.process_outbox_inner(&store, now_ms);
+        self.store = Some(store);
+        result
+    }
+
+    fn process_outbox_inner(&mut self, store: &Store, now_ms: i64) -> Result<OutboxRunReport, OpError> {
+        let mut report = OutboxRunReport::default();
+        let pass_start = now_ms;
+        let stale = store.expire_stale_outbox(pass_start, LEASE_MS).map_err(store_map::write_error)?;
+        for id in stale {
+            report.uncertain = report.uncertain.saturating_add(1);
+            report.errors.push(format!("outbox row {id:?}: {}.", postino_store::UNCERTAIN_AFTER_CRASH));
+        }
+        // Terminal history is real history, not live state: keep a bounded window and delete only
+        // rows old enough to be irrelevant. A queued, sending, append_pending or uncertain row is
+        // never a candidate.
+        let _ = store.prune_outbox(pass_start, OUTBOX_RETENTION_MS, 200);
+        let mut halted = BTreeSet::new();
+        for _ in 0..20 {
+            // Each lease is stamped with the instant the row is actually claimed. A row leased after
+            // another row spent 30 minutes in SMTP must not carry the pass-start time; otherwise a
+            // concurrent pass at pass_start + LEASE + 1 expires a transfer that is still running.
+            let leased_at = self.claim_now(pass_start);
+            let Some(entry) = store.lease_next_outbox(leased_at).map_err(store_map::read_error)? else {
+                break;
+            };
+            let lease = entry.lease_at.unwrap_or(leased_at);
+            if let Ok(Some(halt)) = read_halt(store, &entry.account_id) {
+                halted.insert(halt.account.clone());
+                let now = self.claim_now(pass_start);
+                store.release_outbox(&entry.id, now.saturating_add(60_000), lease).map_err(store_map::write_error)?;
+                report.errors.push(format!("account {:?} fermato: {}", halt.account, halt.error));
+                continue;
+            }
+            report.processed = report.processed.saturating_add(1);
+            self.process_outbox_entry(store, &entry, lease, pass_start, &mut report)?;
+        }
+        // The Sent append is independent of submission. A row in append_pending is never leased as
+        // queued, so it can never be submitted twice here. Each append is claimed (its lease and its
+        // attempt count are written) before the network: a second process cannot append the same row
+        // concurrently, and a crash leaves a claim that expires.
+        for _ in 0..100 {
+            let claimed_at = self.claim_now(pass_start);
+            let Some(entry) = store.claim_outbox_append(claimed_at, APPEND_LEASE_MS).map_err(store_map::read_error)? else {
+                break;
+            };
+            let lease = entry.lease_at.unwrap_or(claimed_at);
+            let now = self.claim_now(pass_start);
+            report.processed = report.processed.saturating_add(1);
+            match self.append_entry(store, &entry, lease, now) {
+                Ok(()) => report.sent = report.sent.saturating_add(1),
+                Err(error) => {
+                    report.append_pending = report.append_pending.saturating_add(1);
+                    report.errors.push(error);
+                }
+            }
+        }
+        report.halted = halted.into_iter().collect();
+        let rows = store.list_outbox(None, 500).map_err(store_map::read_error)?;
+        report.entries = rows.iter().map(|row| view(row).0).collect();
+        Ok(report)
+    }
+
+    /// One leased submission. `lease` is the epoch the row was claimed with: every transition below
+    /// is conditional on it, so a worker whose lease expired cannot overwrite the next owner.
+    ///
+    /// Every sentence this writes is fixed. A hostile SMTP server has just received the password and
+    /// the body; its reply text never becomes a journal field, a CLI line or an MCP result.
+    fn process_outbox_entry(
+        &mut self,
+        store: &Store,
+        entry: &OutboxEntry,
+        lease: i64,
+        pass_start: i64,
+        report: &mut OutboxRunReport,
+    ) -> Result<(), OpError> {
+        let Some(envelope) = OutboxEnvelope::decode(&entry.envelope_json) else {
+            return self.fail_leased(store, entry, lease, "l'inviluppo salvato non è leggibile", report);
+        };
+        // The submission snapshot: the draft must still be the one that was serialized. A stale
+        // connection (or a lock bypassed by an edit) must not deliver old bytes and then label the
+        // newer draft as the delivered message.
+        if let Some(reason) = stale_submission_reason(store, &envelope)? {
+            return self.fail_leased(store, entry, lease, reason, report);
+        }
+        let server = match store.get_account_server(&entry.account_id) {
+            Ok(Some(server)) => server,
+            Ok(None) => return self.fail_leased(store, entry, lease, "l'account non è più configurato", report),
+            Err(error) => return Err(store_map::read_error(error)),
+        };
+        let Some(smtp) = server.smtp.clone() else {
+            return self.fail_leased(store, entry, lease, "l'account non ha un endpoint SMTP", report);
+        };
+        // A local read failure happens before any network call: it is a failure, not an uncertain
+        // submission, and it must not stop the rest of the pass.
+        let raw = match store.blobs().get(&entry.raw_blob_hash, MAX_SUBMISSION_BYTES.saturating_add(1024 * 1024)) {
+            Ok(raw) => raw,
+            Err(_) => return self.fail_leased(store, entry, lease, "i byte salvati del messaggio non sono leggibili", report),
+        };
+        let smtp_password = match self.load_smtp_password(&entry.account_id, "sending") {
+            Ok(password) => password,
+            Err(_) => return self.fail_leased(store, entry, lease, "la credenziale SMTP non è disponibile", report),
+        };
+        let mut config = SmtpConfig::new(
+            smtp.host.clone(),
+            smtp.port,
+            store_map::net_tls(store_map::mail_tls(smtp.tls)),
+            smtp.username.clone(),
+            Secret::new(smtp_password.as_str().to_owned()),
+        );
+        config.limits = SmtpLimits { max_message: usize::try_from(MAX_SUBMISSION_BYTES).unwrap_or(usize::MAX), ..SmtpLimits::default() };
+        for root in self.extra_roots.clone() {
+            config = config.with_extra_root(root);
+        }
+        let message = SmtpEnvelope { from: envelope.from.clone(), recipients: envelope.recipients.clone() };
+        match postino_sync::submit(config, &message, raw.as_slice()) {
+            Ok(_delivery) => {
+                #[cfg(debug_assertions)]
+                if self.crash_after_accept {
+                    // Test seam: the process dies after the server's 250 and before the durable
+                    // transition. Nothing below may run; the row stays `sending`.
+                    return Err(OpError::Failed(format!(
+                        "test crash after the server accepted outbox row {:?}; the journal still says sending",
+                        entry.id
+                    )));
+                }
+                // The append claim starts when the server actually accepted the message, not when the
+                // pass started: a 30-minute submission must not leave its APPEND with an almost
+                // expired claim.
+                let append_claim = self.claim_now(pass_start);
+                if !store.mark_outbox_append_pending(&entry.id, lease, append_claim).map_err(store_map::write_error)? {
+                    report.errors.push(format!(
+                        "la riga {:?} è stata inviata ma un altro processo l'ha presa in carico; lo stato non è stato toccato",
+                        entry.id
+                    ));
+                    return Ok(());
+                }
+                let already_on_server = match self.finalize_outbox_draft(
+                    &envelope.draft_id,
+                    Some(&envelope.message_id),
+                    envelope.draft_revision,
+                    store,
+                ) {
+                    Ok(FinalizeOutcome::Moved { server_uid: Some(_) }) => true,
+                    Ok(FinalizeOutcome::Moved { server_uid: None } | FinalizeOutcome::NotADraft) => false,
+                    Ok(FinalizeOutcome::SnapshotChanged) => {
+                        report.errors.push(format!(
+                            "la riga {:?} è stata inviata ma la bozza è cambiata nel frattempo: resta in Bozze, la copia in Inviati arriverà con la sincronizzazione",
+                            entry.id
+                        ));
+                        false
+                    }
+                    Err(error) => {
+                        report.errors.push(format!("la riga {:?} è stata inviata ma la copia locale in Inviati non è riuscita: {error}", entry.id));
+                        false
+                    }
+                };
+                if already_on_server {
+                    // A provider auto-save (or a sync before this move) already put the message in
+                    // Sent, and the local row now carries that UID. Appending again would duplicate
+                    // the server copy, so finish the row locally.
+                    if store.finish_outbox_append(&entry.id, append_claim).map_err(store_map::write_error)? {
+                        report.sent = report.sent.saturating_add(1);
+                    } else {
+                        report.errors.push(format!("la riga {:?} è già sul server ma il suo stato è cambiato; aggiorna la coda", entry.id));
+                    }
+                    return Ok(());
+                }
+                let updated = store.get_outbox(&entry.id).map_err(store_map::read_error)?.unwrap_or_else(|| entry.clone());
+                let append_now = self.claim_now(pass_start);
+                // This worker owns the append claim it just wrote.
+                match self.append_entry(store, &updated, append_claim, append_now) {
+                    Ok(()) => report.sent = report.sent.saturating_add(1),
+                    Err(error) => {
+                        report.append_pending = report.append_pending.saturating_add(1);
+                        report.errors.push(error);
+                    }
+                }
+            }
+            Err(error) => {
+                let sentence = smtp_error_sentence(&error);
+                let now = self.claim_now(pass_start);
+                if error.is_uncertain() {
+                    if store.mark_outbox_uncertain(&entry.id, &sentence, lease).map_err(store_map::write_error)? {
+                        report.uncertain = report.uncertain.saturating_add(1);
+                        report.errors.push(format!("outbox row {:?}: {sentence}", entry.id));
+                    } else {
+                        report.errors.push(lost_lease_sentence(entry));
+                    }
+                } else if error.is_authentication() {
+                    let halt = "l'autenticazione SMTP è stata rifiutata: aggiorna la password dell'account e riprova la riga della coda";
+                    store.mark_outbox_failed(&entry.id, halt, lease).map_err(store_map::write_error)?;
+                    write_halt(store, &entry.account_id, halt, now).map_err(store_map::write_error)?;
+                    report.failed = report.failed.saturating_add(1);
+                    report.errors.push(format!("account {:?} fermato: {halt}", entry.account_id));
+                } else if error.is_transient() && entry.attempts < MAX_ATTEMPTS {
+                    let delay = backoff_ms(entry.attempts);
+                    if !store
+                        .reschedule_outbox(&entry.id, now.saturating_add(delay).min(now.saturating_add(BACKOFF_MAX_MS)), Some(&sentence), lease)
+                        .map_err(store_map::write_error)?
+                    {
+                        report.errors.push(lost_lease_sentence(entry));
+                        return Ok(());
+                    }
+                    report.retried = report.retried.saturating_add(1);
+                } else {
+                    if store.mark_outbox_failed(&entry.id, &sentence, lease).map_err(store_map::write_error)? {
+                        report.failed = report.failed.saturating_add(1);
+                        report.errors.push(format!("outbox row {:?} failed: {sentence}", entry.id));
+                    } else {
+                        report.errors.push(lost_lease_sentence(entry));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail one leased row with a fixed sentence and keep the pass going.
+    fn fail_leased(&self, store: &Store, entry: &OutboxEntry, lease: i64, reason: &str, report: &mut OutboxRunReport) -> Result<(), OpError> {
+        if store.mark_outbox_failed(&entry.id, reason, lease).map_err(store_map::write_error)? {
+            report.failed = report.failed.saturating_add(1);
+            report.errors.push(format!("riga {:?} non riuscita: {reason}.", entry.id));
+        } else {
+            report.errors.push(lost_lease_sentence(entry));
+        }
+        Ok(())
+    }
+
+    /// One claimed Sent append. `lease` is the append claim this worker wrote; every state change is
+    /// conditional on it. A damaged envelope is a fixed failure with backoff, never a false `sent`.
+    fn append_entry(&mut self, store: &Store, entry: &OutboxEntry, lease: i64, now_ms: i64) -> Result<(), String> {
+        let Some(envelope) = OutboxEnvelope::decode(&entry.envelope_json) else {
+            let sentence = "l'inviluppo salvato non è leggibile";
+            let _ = store.reschedule_outbox_append(&entry.id, now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))), Some(sentence), lease);
+            return Err(format!("riga {:?}: {sentence}; la copia in Inviati resta da fare.", entry.id));
+        };
+        let server = match store.get_account_server(&entry.account_id) {
+            Ok(Some(server)) => server,
+            Ok(None) => {
+                let _ = store.reschedule_outbox_append(
+                    &entry.id,
+                    now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                    Some("l'account non è più configurato"),
+                    lease,
+                );
+                return Err(format!("outbox row {:?}: l'account non è più configurato.", entry.id));
+            }
+            Err(_) => return Err(format!("outbox row {:?}: la configurazione dell'account non è leggibile.", entry.id)),
+        };
+        let raw = match store.blobs().get(&entry.raw_blob_hash, MAX_SUBMISSION_BYTES.saturating_add(1024 * 1024)) {
+            Ok(raw) => raw,
+            Err(_) => {
+                let _ = store.reschedule_outbox_append(
+                    &entry.id,
+                    now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                    Some("i byte salvati del messaggio non sono leggibili"),
+                    lease,
+                );
+                return Err(format!("outbox row {:?}: i byte salvati del messaggio non sono leggibili.", entry.id));
+            }
+        };
+        let password = match self.load_password(&entry.account_id, "the Sent append") {
+            Ok(password) => password,
+            Err(_) => {
+                let _ = store.reschedule_outbox_append(
+                    &entry.id,
+                    now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                    Some("la credenziale IMAP non è disponibile"),
+                    lease,
+                );
+                return Err(format!("outbox row {:?}: la credenziale IMAP non è disponibile.", entry.id));
+            }
+        };
+        let mut config = imap_config(&server, &password, self.extra_roots.clone());
+        config.limits.max_literal = config.limits.max_literal.max(raw.len().saturating_add(1024)).min(postino_net::Limits::HARD_MAX_LITERAL);
+        if postino_sync::append_sent(&config, raw.as_slice()).is_err() {
+            // No server text: the IMAP server holds the password and can echo it in a `NO`.
+            let sentence = "la copia in Inviati non è stata salvata; il messaggio è già stato inviato e non viene rinviato";
+            let _ = store.reschedule_outbox_append(&entry.id, now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))), Some(sentence), lease);
+            return Err(format!("outbox row {:?}: {sentence}.", entry.id));
+        }
+        if !store.finish_outbox_append(&entry.id, lease).map_err(|_| format!("outbox row {:?}: lo stato non è aggiornabile.", entry.id))? {
+            return Err(format!("la riga {:?} è cambiata mentre la copia in Inviati veniva salvata; stato lasciato com'è.", entry.id));
+        }
+        let _ = self.finalize_outbox_draft(&envelope.draft_id, Some(&envelope.message_id), envelope.draft_revision, store);
+        Ok(())
+    }
+
+    /// Whether this engine's draft still serializes to the same bytes as the saved draft row.
+    ///
+    /// The `drafts` row carries the body, headers, revision and updated-at, but not the attachments;
+    /// the attachment rows carry the metadata and stored blob hashes. The `updated_at` check catches
+    /// any save by another engine (including an attachment-only one); the attachment rows are
+    /// compared too because two saves can land in the same millisecond. `in_reply_to` is compared by
+    /// refusing a stored linkage: this milestone's composer has no reply field and
+    /// `submission_for_draft` never serializes one, so sending such a row would silently drop the
+    /// linkage. Refusing is the honest result until the composer owns the field.
+    fn draft_snapshot_matches(&self, message: &Message, draft: &postino_store::Draft, store: &Store) -> Result<bool, OpError> {
+        if draft.in_reply_to.is_some() || !draft_matches_row(message, draft) || message.summary.date.timestamp_millis() != draft.updated_at {
+            return Ok(false);
+        }
+        let rows = store.attachments(&message.summary.id).map_err(store_map::read_error)?;
+        let mut stored = rows.into_iter().map(|row| (row.id, row.filename, row.mime, row.size, row.blob_hash)).collect::<Vec<_>>();
+        let mut memory = message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                (
+                    attachment.id.clone(),
+                    attachment.filename.clone(),
+                    attachment.mime.clone(),
+                    attachment.size,
+                    self.blob_hashes.get(&attachment.id).cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        stored.sort();
+        memory.sort();
+        Ok(stored == memory)
+    }
+
+    /// Move a draft to Sent only after the submission was accepted. A draft that is gone or already
+    /// moved is a no-op, so this is safe to repeat after a crash. `message_id` is the generated
+    /// Message-ID, carried into the Sent row so a later sync reconciles instead of duplicating.
+    ///
+    /// `expected_revision` is the draft revision that was serialized. If the draft changed after the
+    /// (already successful) submission, the current message is not moved and not labelled with the
+    /// delivered Message-ID: the server copy will arrive with the next sync, and the newer draft stays
+    /// a draft. `store` is the connection the caller holds while [`Engine::store`] is temporarily
+    /// taken.
+    fn finalize_outbox_draft(
+        &mut self,
+        draft_id: &str,
+        message_id: Option<&str>,
+        expected_revision: Option<u32>,
+        store: &Store,
+    ) -> Result<FinalizeOutcome, OpError> {
+        let Some(message) = self.messages.iter().find(|message| message.summary.id == draft_id) else {
+            return Ok(FinalizeOutcome::NotADraft);
+        };
+        let Some(folder) = self.folders.iter().find(|folder| folder.id == message.summary.folder_id) else {
+            return Ok(FinalizeOutcome::NotADraft);
+        };
+        if folder.kind != FolderKind::Drafts {
+            return Ok(FinalizeOutcome::NotADraft);
+        }
+        if let Some(expected) = expected_revision {
+            match store.get_draft(draft_id).map_err(store_map::read_error)? {
+                Some(draft) if draft.revision == expected && self.draft_snapshot_matches(message, &draft, store)? => {}
+                _ => return Ok(FinalizeOutcome::SnapshotChanged),
+            }
+        }
+        let (_, server_uid) = self.finish_draft(draft_id, message_id, Some(store))?;
+        Ok(FinalizeOutcome::Moved { server_uid })
+    }
+
+    /// Local move of a submitted draft to the Sent folder of its own account.
+    ///
+    /// This is deliberately not an operation any more: `message_send` queues and submits, and the
+    /// worker calls this only after the server accepted the message. A store-backed engine persists
+    /// the move and keeps the draft revision sequence for a later move back.
+    ///
+    /// Without a Message-ID (the demo) the row keeps its id. The submission path calls
+    /// [`Engine::finish_draft`] with the generated id so the Sent row can adopt the sync identity.
+    /// `persist` overrides the engine's own connection; the outbox pass holds the store outside
+    /// `self` while it runs, so a finalize there must write through that handle, not skip the disk.
     pub fn send_draft(&mut self, id: &str) -> Result<MessageSummary, OpError> {
+        self.finish_draft(id, None, None).map(|(summary, _)| summary)
+    }
+
+    /// Move the draft to Sent. Returns the summary and, when a server copy with the same Message-ID
+    /// was already cached, the UID it adopted (which means the server already has this message).
+    fn finish_draft(&mut self, id: &str, message_id: Option<&str>, persist: Option<&Store>) -> Result<(MessageSummary, Option<u32>), OpError> {
         let index =
             self.messages.iter().position(|message| message.summary.id == id).ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}")))?;
         let Some(current) = self.messages.get(index) else {
@@ -1081,22 +2280,51 @@ impl Engine {
         message.summary.starred = false;
         message.summary.snippet = snippet(&message.body_text);
         message.summary.has_attachments = !message.attachments.is_empty();
+        // Store the Message-ID in the same normalised form a sync writes, so the reconciliation
+        // compares equal strings.
+        let stored_message_id = message_id.and_then(postino_sync::normalised_message_id);
 
-        if let Some(store) = &self.store {
+        // The pass holds the connection outside `self`, so it is passed in explicitly.
+        let store = persist.or(self.store.as_ref());
+        let mut merged_duplicate = None;
+        let mut adopted_uid = None;
+        if let Some(store) = store {
+            // A provider can auto-save the submitted message, or a sync can fetch it between the
+            // server's 250 and this move. If the same Message-ID is already in this Sent folder with
+            // a UID, that row is the delivered message: keep the local copy (it is the composed
+            // version), adopt the server UID and remove the duplicate in the same transaction
+            // instead of showing it twice.
+            let duplicate = match stored_message_id.as_deref() {
+                Some(message_id) => {
+                    store.synced_message_for_id(&account_id, &message.summary.folder_id, message_id).map_err(store_map::read_error)?
+                }
+                None => None,
+            };
             // One transaction: move the display row to Sent and drop the draft row. `draft_seq` is
-            // deliberately kept, so a move back to Drafts continues the revision sequence.
-            let row = store_map::message_row(&message, &account_id);
-            store.send_draft_message(&row).map_err(store_map::write_error)?;
+            // deliberately kept, so a move back to Drafts continues the revision sequence. The
+            // generated Message-ID travels with the row so a later Sent sync recognises it.
+            let row = store_map::message_row(&message, &account_id, stored_message_id.as_deref());
+            adopted_uid = store.send_draft_message(&row, duplicate.as_deref()).map_err(store_map::write_error)?;
+            merged_duplicate = duplicate;
+        }
+        if let Some(duplicate) = &merged_duplicate {
+            self.messages.retain(|message| message.summary.id != *duplicate);
+            let prefix = format!("att_{duplicate}_");
+            self.blob_hashes.retain(|attachment_id, _| !attachment_id.starts_with(&prefix));
         }
 
-        let Some(slot) = self.messages.get_mut(index) else {
+        let Some(slot) = self.messages.iter_mut().find(|message| message.summary.id == id) else {
             return Err(OpError::Failed(format!("unknown draft {id:?}")));
         };
         *slot = message;
-        let summary =
-            self.messages.get(index).map(|message| message.summary.clone()).ok_or_else(|| OpError::Failed(format!("unknown draft {id:?}")))?;
+        let summary = self
+            .messages
+            .iter()
+            .find(|message| message.summary.id == id)
+            .map(|message| message.summary.clone())
+            .ok_or_else(|| OpError::Failed(format!("unknown draft {id:?}")))?;
         self.recount();
-        Ok(summary)
+        Ok((summary, adopted_uid))
     }
 
     /// Call any operation by name with JSON arguments. This is the only door a frontend uses.
@@ -1331,6 +2559,144 @@ fn validate_host(raw: &str) -> Result<String, OpError> {
     Ok(host.to_owned())
 }
 
+/// Resolve the SMTP endpoint from the provider table and the caller's fields.
+///
+/// Known providers own their endpoint and login: a caller may omit everything and get the preset.
+/// `custom` has no default; supplying only part of the endpoint is an error instead of a guess.
+fn resolve_smtp(
+    provider: Provider,
+    host: Option<&str>,
+    port: Option<u16>,
+    tls: Option<MailTls>,
+    username: Option<&str>,
+    email: &str,
+) -> Result<Option<SmtpSettings>, OpError> {
+    match provider.smtp_discovery() {
+        Some(discovery) => {
+            let differs = host.is_some_and(|host| !host.trim().eq_ignore_ascii_case(discovery.host))
+                || port.is_some_and(|port| port != discovery.port)
+                || tls.is_some_and(|tls| tls != discovery.tls);
+            if differs {
+                return Err(OpError::InvalidArgs(format!(
+                    "provider {} submits through {}:{} with {} TLS; omit smtp_host, smtp_port and smtp_tls, or use provider custom",
+                    provider.as_str(),
+                    discovery.host,
+                    discovery.port,
+                    discovery.tls.as_str()
+                )));
+            }
+            if let Some(username) = username
+                && !username.trim().eq_ignore_ascii_case(email)
+            {
+                return Err(OpError::InvalidArgs(format!(
+                    "provider {} uses the account address as its SMTP login; omit smtp_username or pass {email:?}",
+                    provider.as_str()
+                )));
+            }
+            Ok(Some(SmtpSettings { host: discovery.host.to_owned(), port: discovery.port, tls: discovery.tls, username: email.to_owned() }))
+        }
+        None => {
+            if host.is_none() && port.is_none() && tls.is_none() {
+                return Ok(None);
+            }
+            let host =
+                host.ok_or_else(|| OpError::InvalidArgs("a custom SMTP endpoint requires smtp_host, smtp_port and smtp_tls together".to_owned()))?;
+            let port =
+                port.ok_or_else(|| OpError::InvalidArgs("a custom SMTP endpoint requires smtp_host, smtp_port and smtp_tls together".to_owned()))?;
+            let tls =
+                tls.ok_or_else(|| OpError::InvalidArgs("a custom SMTP endpoint requires smtp_host, smtp_port and smtp_tls together".to_owned()))?;
+            if port == 0 {
+                return Err(OpError::InvalidArgs("smtp_port must be between 1 and 65535".to_owned()));
+            }
+            let username = username.unwrap_or(email).trim().to_owned();
+            if username.is_empty() || username.len() > 320 || username.chars().any(char::is_control) {
+                return Err(OpError::InvalidArgs("smtp_username must be 1-320 characters with no control characters".to_owned()));
+            }
+            Ok(Some(SmtpSettings { host: validate_host(host)?, port, tls, username }))
+        }
+    }
+}
+
+fn mailbox(address: &Address) -> postino_sync::SubmissionMailbox {
+    postino_sync::SubmissionMailbox { name: (!address.name.trim().is_empty()).then(|| address.name.clone()), address: address.email.clone() }
+}
+
+/// Reduce an SMTP failure to a bounded, fixed sentence for the outbox row, the CLI and the UI.
+///
+/// **No server text, ever.** The server has just received the password and the whole body, so a
+/// `550`, a `451` or a `535` may echo either one; the sentence names the stage, the code and what a
+/// person can do, and nothing the peer chose. The same rule applies to [`SmtpError::Auth`], whose
+/// reason is built by the network client without server text.
+fn smtp_error_sentence(error: &SmtpError) -> String {
+    match error {
+        SmtpError::Uncertain { .. } => "l'esito è sconosciuto: controlla Inviati prima di riprovare".to_owned(),
+        SmtpError::Auth { .. } => "il server ha rifiutato la credenziale SMTP; aggiorna la password e riprova".to_owned(),
+        SmtpError::TooLarge { .. } => "il messaggio è più grande di quanto il server accetti".to_owned(),
+        SmtpError::Unsupported { .. } => "il server non offre un'estensione SMTP necessaria".to_owned(),
+        SmtpError::Timeout { .. } => "il server non ha risposto in tempo".to_owned(),
+        SmtpError::Closed { .. } => "la connessione si è chiusa prima della conferma del server".to_owned(),
+        SmtpError::Tls { .. } => "la connessione TLS con il server SMTP è fallita".to_owned(),
+        SmtpError::Dns { .. } => "il nome del server SMTP non è stato risolto".to_owned(),
+        SmtpError::Connect { .. } => "il server SMTP non è raggiungibile".to_owned(),
+        SmtpError::Rejected { code, stage, .. } => format!("il server ha rifiutato la fase {stage} con il codice {code}"),
+        SmtpError::Transient { stage, .. } => format!("la fase {stage} è fallita in modo temporaneo"),
+        SmtpError::Permanent { stage, .. } => format!("la fase {stage} è fallita in modo definitivo"),
+        SmtpError::Protocol { .. } => "lo scambio SMTP non può proseguire".to_owned(),
+    }
+}
+
+/// The sentence for a worker that lost its lease: another process owns the row now.
+/// The sentence for a worker that lost its lease: another process owns the row now.
+fn lost_lease_sentence(entry: &OutboxEntry) -> String {
+    format!("la riga {:?} è cambiata in un altro processo; questo passaggio non l'ha sovrascritta.", entry.id)
+}
+
+/// Why a leased submission must not leave the machine: the draft it was built from is gone or has a
+/// different store revision. `None` when the row predates the snapshot field or still matches.
+fn stale_submission_reason(store: &Store, envelope: &OutboxEnvelope) -> Result<Option<&'static str>, OpError> {
+    let Some(expected) = envelope.draft_revision else {
+        return Ok(None);
+    };
+    match store.get_draft(&envelope.draft_id).map_err(store_map::read_error)? {
+        None => Ok(Some("la bozza non esiste più; il messaggio non è stato inviato")),
+        Some(draft) if draft.revision != expected => Ok(Some("la bozza è cambiata dopo l'accodamento; il messaggio non è stato inviato")),
+        Some(_) => Ok(None),
+    }
+}
+
+/// Whether this engine's draft snapshot still matches the saved draft row's content. `false` means
+/// another process saved the draft after this engine loaded it.
+fn draft_matches_row(message: &Message, draft: &postino_store::Draft) -> bool {
+    fn same_addresses(engine: &[Address], row: &[postino_store::Address]) -> bool {
+        engine.len() == row.len() && engine.iter().zip(row).all(|(left, right)| left.name == right.name && left.email == right.email)
+    }
+    message.body_text == draft.body_text
+        && message.summary.subject == draft.subject
+        && same_addresses(&message.summary.to, &draft.to)
+        && same_addresses(&message.cc, &draft.cc)
+        && same_addresses(&message.bcc, &draft.bcc)
+}
+
+/// A fixed sentence for an SMTP probe failure. Server-supplied text is never forwarded: a hostile
+/// server has just received the password and can echo it.
+fn smtp_failure_reason(error: &postino_net::SmtpError) -> &'static str {
+    match error {
+        postino_net::SmtpError::Auth { .. } => "the server rejected the password",
+        postino_net::SmtpError::Tls { .. } => "TLS verification failed",
+        postino_net::SmtpError::Dns { .. } => "the host could not be resolved",
+        postino_net::SmtpError::Connect { .. } => "the connection was refused",
+        postino_net::SmtpError::Timeout { .. } => "the server did not answer in time",
+        postino_net::SmtpError::Unsupported { .. } => "the server does not offer a required extension",
+        postino_net::SmtpError::Rejected { .. } => "the server refused the login",
+        postino_net::SmtpError::Closed { .. } => "the connection closed",
+        postino_net::SmtpError::TooLarge { .. } => "the server's limits are too small",
+        postino_net::SmtpError::Uncertain { .. } => "the outcome is unknown",
+        postino_net::SmtpError::Transient { .. } | postino_net::SmtpError::Permanent { .. } | postino_net::SmtpError::Protocol { .. } => {
+            "the exchange could not be completed"
+        }
+    }
+}
+
 fn imap_config(server: &postino_store::AccountServer, password: &Zeroizing<String>, extra_roots: Vec<CertificateDer<'static>>) -> ImapConfig {
     let mut config = ImapConfig::new(
         server.host.clone(),
@@ -1352,6 +2718,15 @@ fn imap_config(server: &postino_store::AccountServer, password: &Zeroizing<Strin
 /// can repeat it (or the SASL payload) in a tagged `NO`/`BAD` or a malformed response; the sentence
 /// names the provider, account id, configured host and a fixed phase instead. `Auth` keeps the
 /// provider advice but not the server's reason.
+/// A redacted phrase for a keyring cleanup result: `Ok`, or the adapter's sentence (which never
+/// contains secret bytes).
+fn credential_outcome(result: &Result<(), crate::vault::VaultError>) -> String {
+    match result {
+        Ok(()) => "removed".to_owned(),
+        Err(error) => format!("not removed: {error}"),
+    }
+}
+
 fn account_error(error: SyncError, provider: Provider, account_id: &str, host: &str, phase: &'static str, tail: &str) -> OpError {
     match error {
         SyncError::Auth(_) => OpError::Auth(format!(
@@ -1471,7 +2846,7 @@ fn repair_orphan_drafts(store: &Store, accounts: &[Account], folders: &[Folder])
                 OpError::Failed(format!("the local store has draft {:?} but no Drafts folder for account {:?}", draft.id, draft.account_id))
             })?;
         let message = store_map::draft_message(&draft, account, &folder_id)?;
-        messages.push(store_map::message_row(&message, &account.id));
+        messages.push(store_map::message_row(&message, &account.id, None));
     }
     store.repair_orphan_drafts(&messages).map_err(store_map::repair_error)?;
     Ok(())

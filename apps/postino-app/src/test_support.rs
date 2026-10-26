@@ -59,6 +59,24 @@ impl CredentialVault for MemoryVault {
         }
         Ok(())
     }
+
+    fn store_smtp_password(&self, account_id: &str, password: &[u8]) -> Result<(), VaultError> {
+        if let Ok(mut secrets) = self.secrets.lock() {
+            secrets.insert(format!("smtp:{account_id}"), password.to_vec());
+        }
+        Ok(())
+    }
+
+    fn load_smtp_password(&self, account_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+        Ok(self.secrets.lock().ok().and_then(|secrets| secrets.get(&format!("smtp:{account_id}")).cloned()).map(Zeroizing::new))
+    }
+
+    fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError> {
+        if let Ok(mut secrets) = self.secrets.lock() {
+            secrets.remove(&format!("smtp:{account_id}"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -239,6 +257,7 @@ pub fn seed_account(store: &Store, vault: &MemoryVault, id: &str, port: u16) {
             tls: AccountTls::Implicit,
             username: USER.to_owned(),
             created_at: 1_700_000_000_000,
+            smtp: None,
         })
         .expect("server");
     vault.set(id, postino_testkit::PASSWORD.as_bytes());
@@ -256,6 +275,94 @@ pub fn three_folders() -> Vec<TestFolder> {
             .with_messages(vec![postino_testkit::TestMessage::synthetic(postino_testkit::synthetic_message(3))]),
         TestFolder::new("Trash", 30).with_special_use("\\Trash"),
     ]
+}
+
+/// Seed both endpoints, so the app's send worker can submit through a fake SMTP server.
+pub fn seed_smtp_account(store: &Store, vault: &MemoryVault, id: &str, imap_port: u16, smtp_port: u16) {
+    seed_account(store, vault, id, imap_port);
+    let server = store.get_account_server(id).expect("server").expect("row");
+    store
+        .upsert_account_server(&AccountServer {
+            smtp: Some(postino_store::SmtpServer {
+                host: "localhost".to_owned(),
+                port: smtp_port,
+                tls: AccountTls::Implicit,
+                username: postino_testkit::SMTP_USER.to_owned(),
+            }),
+            ..server
+        })
+        .expect("server with SMTP");
+    vault.store_smtp_password(id, postino_testkit::SMTP_PASSWORD.as_bytes()).expect("SMTP password");
+}
+
+/// A fake SMTP server that accepts one message and records its DATA bytes.
+pub struct RunningSmtp {
+    port: u16,
+    ca: CertificateDer<'static>,
+    bytes: Arc<Mutex<Vec<Vec<u8>>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunningSmtp {
+    pub fn start(connections: usize) -> Self {
+        let tls = postino_testkit::TlsFixture::generate();
+        let ca = tls.ca();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = bytes.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("SMTP runtime");
+            runtime.block_on(async move {
+                let server = postino_testkit::FakeSmtp::start_tls_many(&tls, connections, move |_index, mut conn| {
+                    let recorded = recorded.clone();
+                    async move {
+                        conn.greet(&["SIZE 52428800", "8BITMIME", "AUTH PLAIN LOGIN"]).await;
+                        conn.auth_plain_ok(&postino_testkit::expected_smtp_sasl()).await;
+                        conn.expect_prefix("MAIL FROM:").await;
+                        conn.send_line("250 2.1.0 ok").await;
+                        loop {
+                            let line = conn.read_line().await;
+                            if line == "DATA" {
+                                break;
+                            }
+                            conn.send_line("250 2.1.5 ok").await;
+                        }
+                        conn.send_line("354 go ahead").await;
+                        let data = conn.read_data().await;
+                        recorded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(data);
+                        conn.send_line("250 2.0.0 queued as 1").await;
+                        conn.expect("QUIT").await;
+                        conn.send_line("221 bye").await;
+                    }
+                })
+                .await;
+                sender.send(server.port()).expect("SMTP port");
+                server.finish().await;
+            });
+        });
+        let port = receiver.recv().expect("SMTP port");
+        Self { port, ca, bytes, handle: Some(handle) }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn ca(&self) -> CertificateDer<'static> {
+        self.ca.clone()
+    }
+
+    pub fn submitted(&self) -> Vec<Vec<u8>> {
+        self.bytes.lock().map(|bytes| bytes.clone()).unwrap_or_default()
+    }
+
+    pub fn finish(mut self) {
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            panic!("the fake SMTP thread panicked");
+        }
+    }
 }
 
 /// A private test directory for P6c files. Nothing outside it may be removed.

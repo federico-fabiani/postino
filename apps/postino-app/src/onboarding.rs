@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use eframe::egui::{self, Align, Key, Layout, Margin, Modifiers, Rect, ScrollArea, Sides, Stroke, Ui, Vec2};
-use postino_core::{AccountSetup, MailTls, Provider};
+use postino_core::{AccountSetup, MailTls, Provider, SmtpSetup};
 use postino_net::{CertificateDer, ImapConfig, NetError, Secret, TlsMode};
 use postino_store::FolderKind;
 use postino_sync::SyncError;
@@ -20,7 +20,7 @@ use crate::theme::{self, Tokens};
 use crate::ui::icons;
 use crate::ui::tokens::{inset, radius, size as ui_size, space, type_size};
 use crate::ui::typography::{self, Role};
-use crate::ui::widgets::{Button, ButtonSize, TextField};
+use crate::ui::widgets::{Button, ButtonSize, SectionHeader, TextField};
 
 /// The visible stages. `Done` is the mailbox, so it is not a card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +123,9 @@ pub enum FocusField {
     Password,
     Host,
     Port,
+    SmtpHost,
+    SmtpPort,
+    SmtpPassword,
     Primary,
     Back,
 }
@@ -216,6 +219,14 @@ pub struct Onboarding {
     host: String,
     port: String,
     tls: TlsChoice,
+    /// Custom SMTP endpoint. Empty host means "read only"; known providers use their preset.
+    smtp_host: String,
+    smtp_port: String,
+    smtp_tls: TlsChoice,
+    smtp_username: String,
+    /// Reuse the IMAP password for submission (the common Aruba/Gmail app-password setup).
+    smtp_same_password: bool,
+    smtp_password: Zeroizing<String>,
     name: String,
     email: String,
     password: Zeroizing<String>,
@@ -256,6 +267,12 @@ impl Onboarding {
             host: String::new(),
             port: "993".to_owned(),
             tls: TlsChoice::Implicit,
+            smtp_host: String::new(),
+            smtp_port: "465".to_owned(),
+            smtp_tls: TlsChoice::Implicit,
+            smtp_username: String::new(),
+            smtp_same_password: true,
+            smtp_password: Zeroizing::new(String::new()),
             name: String::new(),
             email: String::new(),
             password: Zeroizing::new(String::new()),
@@ -444,6 +461,7 @@ impl Onboarding {
         self.stage = self.stage.previous();
         if self.stage == Stage::Welcome || self.stage == Stage::Provider {
             self.password.zeroize();
+            self.smtp_password.zeroize();
         }
         self.focus = Some(FocusField::Primary);
         Action::None
@@ -451,11 +469,17 @@ impl Onboarding {
 
     pub fn cancel(&mut self) -> Action {
         self.password.zeroize();
+        self.smtp_password.zeroize();
         Action::Cancel
     }
 
     fn is_dirty(&self) -> bool {
-        !self.name.trim().is_empty() || !self.email.trim().is_empty() || !self.password.is_empty() || !self.host.trim().is_empty()
+        !self.name.trim().is_empty()
+            || !self.email.trim().is_empty()
+            || !self.password.is_empty()
+            || !self.host.trim().is_empty()
+            || !self.smtp_host.trim().is_empty()
+            || !self.smtp_password.is_empty()
     }
 
     fn server_error(&self) -> Option<(FocusField, String)> {
@@ -475,8 +499,46 @@ impl Onboarding {
         }
     }
 
+    /// Validate the optional custom SMTP endpoint. An empty host means read-only, which is allowed;
+    /// a partial endpoint or a separate password without one is not.
+    fn smtp_error(&self) -> Option<(FocusField, String)> {
+        if self.provider != ProviderChoice::Custom {
+            return None;
+        }
+        let host = self.smtp_host.trim();
+        if host.is_empty() {
+            if !self.smtp_same_password || !self.smtp_password.is_empty() {
+                return Some((FocusField::SmtpHost, "Inserisci il server SMTP o riusa la password IMAP e lascia vuoto l'invio.".to_owned()));
+            }
+            return None;
+        }
+        if host.len() > 255 || host.chars().any(|character| character.is_control() || character.is_whitespace()) || host.contains(['/', '@']) {
+            return Some((FocusField::SmtpHost, "Il server SMTP non può contenere spazi, barre o @.".to_owned()));
+        }
+        match self.smtp_port.trim().parse::<u16>() {
+            Ok(1..=65535) => {}
+            _ => return Some((FocusField::SmtpPort, "La porta SMTP deve essere tra 1 e 65535.".to_owned())),
+        }
+        let username = self.smtp_username.trim();
+        if username.len() > 320 || username.chars().any(char::is_control) {
+            return Some((FocusField::SmtpHost, "L'utente SMTP non è valido.".to_owned()));
+        }
+        if !self.smtp_same_password {
+            if self.smtp_password.is_empty() {
+                return Some((FocusField::SmtpPassword, "Inserisci la password SMTP o riusa quella IMAP.".to_owned()));
+            }
+            if self.smtp_password.len() > 1024 || self.smtp_password.chars().any(char::is_control) {
+                return Some((FocusField::SmtpPassword, "La password SMTP non è valida.".to_owned()));
+            }
+        }
+        None
+    }
+
     fn credentials_error(&self) -> Option<(FocusField, String)> {
         if let Some(error) = self.server_error() {
+            return Some(error);
+        }
+        if let Some(error) = self.smtp_error() {
             return Some(error);
         }
         let name = self.name.trim();
@@ -522,6 +584,28 @@ impl Onboarding {
                 },
             ),
             None => (self.host.trim().to_owned(), self.port.trim().parse::<u16>().unwrap_or(993), self.tls),
+        }
+    }
+
+    /// The submission endpoint, if this account has one. Known providers get their preset; a custom
+    /// account with an empty SMTP host is read-only.
+    fn smtp_settings(&self) -> Option<(String, u16, TlsChoice)> {
+        match self.provider.provider().smtp_discovery() {
+            Some(discovery) => Some((
+                discovery.host.to_owned(),
+                discovery.port,
+                match discovery.tls {
+                    MailTls::Implicit => TlsChoice::Implicit,
+                    MailTls::StartTls => TlsChoice::StartTls,
+                },
+            )),
+            None => {
+                let host = self.smtp_host.trim();
+                if host.is_empty() {
+                    return None;
+                }
+                Some((host.to_owned(), self.smtp_port.trim().parse::<u16>().unwrap_or(465), self.smtp_tls))
+            }
         }
     }
 
@@ -575,12 +659,14 @@ impl Onboarding {
         self.sync = SyncStage::Finished;
         self.adding = false;
         self.password.zeroize();
+        self.smtp_password.zeroize();
     }
 
     pub fn sync_failed(&mut self, message: String, cancelled: bool) {
         self.sync = if cancelled { SyncStage::Cancelled } else { SyncStage::Failed(message) };
         self.adding = false;
         self.password.zeroize();
+        self.smtp_password.zeroize();
     }
 
     pub fn account_created(&mut self, id: &str, email: &str) {
@@ -592,6 +678,7 @@ impl Onboarding {
         self.sync = SyncStage::Idle;
         self.focus = Some(FocusField::Primary);
         self.password.zeroize();
+        self.smtp_password.zeroize();
     }
 
     pub fn account_failed(&mut self, message: String) {
@@ -621,6 +708,13 @@ impl Onboarding {
         };
         self.adding = true;
         self.add_error = None;
+        let smtp = self.smtp_settings().map(|(host, port, tls)| SmtpSetup {
+            host,
+            port,
+            tls: tls.mail_tls(),
+            username: if self.smtp_username.trim().is_empty() { self.email.trim().to_owned() } else { self.smtp_username.trim().to_owned() },
+            password: (!self.smtp_same_password).then(|| self.smtp_password.clone()),
+        });
         Some(AccountSetup {
             provider: self.provider.provider(),
             email: self.email.trim().to_owned(),
@@ -629,6 +723,7 @@ impl Onboarding {
             host,
             port,
             tls,
+            smtp,
             extra_roots,
         })
     }
@@ -883,6 +978,79 @@ impl Onboarding {
             });
             ui.add_space(space::XS);
             ui.label(typography::text(Role::Caption, format!("{} · {}", self.tls.label(), "nessun testo in chiaro"), t.text_faint));
+
+            ui.add_space(space::LG);
+            SectionHeader::new("INVIO (SMTP)").show(ui);
+            ui.add_space(space::XS);
+            let smtp_error = self.smtp_error().map(|(_, message)| message);
+            let smtp_host = TextField::new(&mut self.smtp_host, "smtp.example.com").label("Server SMTP").icon(icons::SEND).error("").show(ui);
+            if smtp_host.changed() {
+                self.preview = None;
+            }
+            ui.add_space(space::SM);
+            ui.horizontal(|ui| {
+                let port = TextField::new(&mut self.smtp_port, "465").label("Porta SMTP").width(120.0).show(ui);
+                if port.changed() {
+                    self.preview = None;
+                }
+                ui.add_space(space::MD);
+                ui.vertical(|ui| {
+                    ui.label(typography::text(Role::Meta, "Sicurezza SMTP", t.text_muted));
+                    ui.horizontal(|ui| {
+                        for tls in [TlsChoice::Implicit, TlsChoice::StartTls] {
+                            if Button::new(if tls == TlsChoice::Implicit { "TLS implicito" } else { "STARTTLS" })
+                                .size(ButtonSize::Sm)
+                                .selected(self.smtp_tls == tls)
+                                .show(ui)
+                                .clicked()
+                            {
+                                self.smtp_tls = tls;
+                                if tls == TlsChoice::StartTls && self.smtp_port.trim() == "465" {
+                                    self.smtp_port = "587".to_owned();
+                                } else if tls == TlsChoice::Implicit && self.smtp_port.trim() == "587" {
+                                    self.smtp_port = "465".to_owned();
+                                }
+                                self.preview = None;
+                            }
+                        }
+                    });
+                });
+            });
+            ui.add_space(space::SM);
+            let username =
+                TextField::new(&mut self.smtp_username, "utente SMTP (facoltativo)").label("Utente SMTP").icon(icons::USER).error("").show(ui);
+            if username.changed() {
+                self.preview = None;
+            }
+            ui.add_space(space::SM);
+            if Button::new("Usa la stessa password dell'IMAP").icon(icons::LOCK).selected(self.smtp_same_password).show(ui).clicked() {
+                self.smtp_same_password = !self.smtp_same_password;
+                if self.smtp_same_password {
+                    self.smtp_password.zeroize();
+                }
+            }
+            if !self.smtp_same_password {
+                ui.add_space(space::SM);
+                let password = TextField::new(&mut self.smtp_password, "Password SMTP")
+                    .label("Password SMTP")
+                    .icon(icons::LOCK)
+                    .password(true)
+                    .error("")
+                    .show(ui);
+                if password.changed() {
+                    self.preview = None;
+                }
+            }
+            if let Some(error) = smtp_error {
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Caption, error, t.danger));
+            }
+            ui.add_space(space::XS);
+            ui.label(typography::text(
+                Role::Caption,
+                "Senza server SMTP l'account può leggere ma non inviare. Le password restano nel portachiavi, mai nel database.",
+                t.text_faint,
+            ));
         }
     }
 

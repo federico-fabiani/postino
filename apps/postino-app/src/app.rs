@@ -10,11 +10,11 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
-    RichText, Sense, Stroke, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
+    RichText, ScrollArea, Sense, Stroke, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
-    Account, Address, Attachment, DraftSave, DraftSend, Engine, FolderKind, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary,
-    LabelUpdate, Message, MessageSummary, MessagesList, SearchResult, SyncPhase,
+    Account, Address, Attachment, DraftSave, Engine, FolderKind, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate,
+    Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView, SearchResult, SendQueued, SyncPhase,
 };
 use postino_net::CertificateDer;
 use serde_json::json;
@@ -26,6 +26,7 @@ use crate::seams::{
     CancellingFileSaver, FileSaver, FolderOpener, LinkOpener, RfdFileSaver, SystemFolderOpener, SystemLinkOpener, UnavailableFolderOpener,
     UnavailableLinkOpener,
 };
+use crate::send_worker::{SendEvent, SendWorker, StoreSendBackend};
 use crate::settings::Settings;
 use crate::sync_worker::{SyncEvent, SyncProgress, SyncRequest, SyncWorker};
 use crate::theme::{self, GOLD, IVORY, Tokens};
@@ -66,6 +67,7 @@ pub enum ScreenshotState {
     ReadingAttachments,
     LinkConfirm,
     Settings,
+    Outbox,
 }
 
 impl ScreenshotState {
@@ -93,10 +95,11 @@ impl ScreenshotState {
             "reading_attachments" => Ok(Self::ReadingAttachments),
             "link_confirm" => Ok(Self::LinkConfirm),
             "settings" => Ok(Self::Settings),
+            "outbox" => Ok(Self::Outbox),
             other => Err(format!(
                 "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
                  empty_unread, empty_attachments, empty_label_unread, onboarding_welcome, onboarding_provider, onboarding_form, onboarding_error, \
-                 onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, link_confirm, settings"
+                 onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, link_confirm, settings, outbox"
             )),
         }
     }
@@ -134,6 +137,9 @@ const READING_PANE_MIN_WIDTH: f32 = 1000.0;
 /// The pane opens at 52% of the content width *after* the 240 pt sidebar, resizes between 420 px
 /// and 62%, and stops shrinking the list below 460 px whenever the geometry allows it.
 const READING_PANE_DEFAULT_RATIO: f32 = 0.52;
+/// How often the tick asks the store whether the outbox has work. The app is the only scheduler in
+/// this build, and a row can be written by another process.
+const OUTBOX_POLL_SECONDS: f64 = 2.0;
 const READING_PANE_MAX_RATIO: f32 = 0.62;
 const READING_PANE_MIN_SIZE: f32 = 420.0;
 /// The message list shows avatars only when its column is at least this wide (`docs/ui/plan.md`).
@@ -162,6 +168,16 @@ pub struct PostinoApp {
     onboarding: Option<Onboarding>,
     sync_worker: Option<SyncWorker>,
     sync_view: SyncView,
+    /// The outbox thread and the last read of the journal. Both are absent/empty in the demo.
+    send_worker: Option<SendWorker>,
+    outbox: OutboxList,
+    outbox_open: bool,
+    outbox_confirm: Option<OutboxConfirm>,
+    outbox_loaded: bool,
+    /// The last time the tick polled the store for outbox work, in egui seconds.
+    last_outbox_poll: f64,
+    /// The instant the next queued row becomes due, in Unix milliseconds.
+    pending_send: Option<i64>,
     /// The account the running worker was asked to sync. Used to ignore late events from an account
     /// the user has switched away from.
     sync_account: Option<String>,
@@ -341,6 +357,7 @@ impl PostinoApp {
         let store_path = store.as_ref().map(|handle| handle.path().to_path_buf());
         let sync_worker =
             store.as_ref().map(|handle| SyncWorker::start(Box::new(crate::sync_worker::StoreSyncBackend::new(handle.clone(), extra_roots.clone()))));
+        let send_worker = store.as_ref().map(|handle| SendWorker::start(Box::new(StoreSendBackend::new(handle.clone(), extra_roots.clone()))));
         Self {
             engine,
             folder,
@@ -353,6 +370,13 @@ impl PostinoApp {
             onboarding,
             sync_worker,
             sync_view,
+            send_worker,
+            outbox: empty_outbox(),
+            outbox_open: false,
+            outbox_confirm: None,
+            outbox_loaded: false,
+            last_outbox_poll: 0.0,
+            pending_send: None,
             sync_account: None,
             add_account_job: None,
             last_sync,
@@ -678,6 +702,12 @@ impl PostinoApp {
                 self.store_path = Some(PathBuf::from("C:/Users/demo/AppData/Local/Postino/mail.db"));
                 self.show_accounts_dialog = true;
                 self.settings_focus_pending = false;
+                self.status.clear();
+            }
+            ScreenshotState::Outbox => {
+                self.outbox = demo_outbox(self.now_utc.timestamp_millis());
+                self.outbox_open = true;
+                self.outbox_loaded = true;
                 self.status.clear();
             }
         }
@@ -2377,15 +2407,11 @@ impl PostinoApp {
                     }
                 }
             }
-            UndoAction::Send(id) => {
-                let account =
-                    self.engine.message(&id).and_then(|message| self.folder(&message.summary.folder_id)).map(|folder| folder.account_id.clone());
-                if let Some(drafts) = account.as_deref().and_then(|account| self.folder_for_kind_in(account, FolderKind::Drafts)) {
-                    if self.engine.call("message_move", json!({ "id": id, "folder": drafts })).is_err() {
-                        failed = true;
-                    }
-                } else {
+            UndoAction::CancelSend(id) => {
+                if self.engine.call("outbox_cancel", json!({ "id": id })).is_err() {
                     failed = true;
+                } else {
+                    self.refresh_outbox();
                 }
             }
             UndoAction::Labels(changes) => {
@@ -2597,6 +2623,7 @@ impl PostinoApp {
         let mut forward = false;
         let mut labels = false;
         let mut rename_label = false;
+        let mut outbox = false;
         // Only a real text field may swallow the single-key map. `egui_wants_keyboard_input()`
         // is also true for a focused row or button, and clicking a label left the app deaf to
         // F2/L/J/K/? until Esc.
@@ -2628,6 +2655,7 @@ impl PostinoApp {
             forward = !typing && !input.modifiers.command && input.key_pressed(Key::F);
             labels = !typing && !input.modifiers.command && input.key_pressed(Key::L);
             rename_label = !typing && !input.modifiers.command && input.key_pressed(Key::F2);
+            outbox = !typing && input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::O);
         });
         if palette {
             self.show_palette = !self.show_palette;
@@ -2657,6 +2685,9 @@ impl PostinoApp {
                 ctx.memory_mut(|memory| memory.stop_text_input());
             } else if self.show_about {
                 self.show_about = false;
+            } else if self.outbox_open {
+                self.outbox_open = false;
+                self.outbox_confirm = None;
             } else if typing {
                 ctx.memory_mut(|memory| memory.stop_text_input());
             } else if self.reading_full && !reading_overlay(ctx.content_rect().width()) {
@@ -2675,6 +2706,10 @@ impl PostinoApp {
         }
         if focus_search {
             self.focus_search = true;
+        }
+        if outbox {
+            self.refresh_outbox();
+            self.outbox_open = true;
         }
         if compose {
             self.compose_new();
@@ -2922,6 +2957,12 @@ impl PostinoApp {
         if !self.composer.open {
             return;
         }
+        // The Send button, Ctrl+Enter and the composer's own enabled rule must agree: a demo or an
+        // account without an SMTP endpoint has no path to a submission, so the shortcut must not
+        // attempt one and fail later.
+        if !self.send_allowed_for_active_account() {
+            return;
+        }
         if !self.save_composer(true) {
             return;
         }
@@ -2929,24 +2970,152 @@ impl PostinoApp {
             self.composer.mark_failed("Aggiungi almeno un destinatario prima di inviare", self.now);
             return;
         };
-        match self.engine.call("draft_send", json!({ "id": id })) {
-            Ok(value) => match serde_json::from_value::<DraftSend>(value) {
-                Ok(sent) => {
+        match self.engine.call("message_send", json!({ "draft": id })) {
+            Ok(value) => match serde_json::from_value::<SendQueued>(value) {
+                Ok(queued) => {
+                    let row = queued.queued.outbox;
+                    let until = queued.queued.undo_until;
                     self.composer = ComposerState::closed();
-                    self.status = format!(
-                        "Messaggio spostato in {} (in locale, nessun SMTP)",
-                        self.engine
-                            .folders()
-                            .iter()
-                            .find(|folder| folder.id == sent.message.folder_id)
-                            .map_or("Inviati", |folder| folder.name.as_str())
+                    self.status = "Messaggio in coda: puoi annullarlo entro pochi secondi".to_owned();
+                    self.pending_send = Some(row.send_at);
+                    let seconds = until.map_or(5, |at| ((at - self.now_utc.timestamp_millis()).max(0) as f64 / 1000.0).ceil() as u64);
+                    self.push_send_toast(
+                        format!("Messaggio in coda. Invio tra {seconds} secondi."),
+                        UndoAction::CancelSend(row.id),
+                        until.map_or(self.now + 5.0, |at| self.now + ((at - self.now_utc.timestamp_millis()).max(0) as f64 / 1000.0)),
                     );
-                    self.push_toast("Bozza spostata in Inviati: nessun messaggio è stato inviato", UndoAction::Send(id));
+                    self.refresh_outbox();
                 }
-                Err(_) => self.composer.mark_failed("Non è stato possibile inviare la bozza.", self.now),
+                Err(_) => self.composer.mark_failed("Non è stato possibile leggere la coda di invio.", self.now),
             },
-            Err(_) => self.composer.mark_failed("Non è stato possibile inviare la bozza.", self.now),
+            Err(error) => {
+                let message = send_error_message(&error.to_string(), self.demo);
+                self.composer.mark_failed(message, self.now);
+            }
         }
+    }
+
+    /// Queue the due rows on the worker thread. The undo window has already elapsed when the caller
+    /// asks; a second request while a pass runs is ignored.
+    fn request_send(&mut self) {
+        let Some(worker) = self.send_worker.as_mut() else {
+            return;
+        };
+        if worker.request(self.now_utc.timestamp_millis()) {
+            self.pending_send = None;
+        }
+    }
+
+    fn handle_send_events(&mut self) {
+        let Some(worker) = self.send_worker.as_mut() else {
+            return;
+        };
+        let events = worker.poll();
+        if events.is_empty() {
+            return;
+        }
+        let mut failed = None;
+        let mut moved = false;
+        for event in events {
+            match event {
+                SendEvent::Finished(report) => {
+                    // A submitted message is moved to Sent even when the server APPEND is still
+                    // pending, so both counts mean "the local draft may have moved".
+                    moved |= report.sent > 0 || report.append_pending > 0;
+                    self.after_outbox_run(&report);
+                }
+                SendEvent::Failed(message) => failed = Some(message),
+            }
+        }
+        if moved {
+            // The worker wrote through its own connection: the draft moved to Sent and the Sent row
+            // carries the Message-ID. Reload the mailbox (keeping every view state) or the UI keeps
+            // showing a draft that no longer exists and a Sent folder that is missing the copy.
+            self.reload_engine_after_sync(false);
+            self.labels_cache = self.engine.label_summaries();
+        }
+        self.refresh_outbox();
+        if let Some(message) = failed {
+            self.push_info_toast(message, ToastKind::Error);
+        }
+        if let Some(next) = self.next_outbox_due() {
+            self.pending_send = Some(next);
+        }
+    }
+
+    fn after_outbox_run(&mut self, report: &OutboxRunReport) {
+        if report.sent > 0 {
+            self.status = "Messaggio inviato".to_owned();
+        }
+        if report.uncertain > 0 {
+            self.push_info_toast("Invio incerto: controlla la cartella Inviati del provider prima di riprovare.", ToastKind::Error);
+        } else if report.failed > 0 {
+            let reason = report.errors.first().cloned().unwrap_or_else(|| "L'invio non è riuscito.".to_owned());
+            self.push_info_toast(reason, ToastKind::Error);
+        } else if !report.halted.is_empty() {
+            self.push_info_toast("L'invio è fermo per un account: controlla le credenziali nella coda.", ToastKind::Error);
+        } else if report.sent > 0 {
+            self.push_info_toast("Messaggio inviato", ToastKind::Success);
+        }
+    }
+
+    /// Refresh the cached journal. Returns whether a row reached a delivered state or vanished since
+    /// the previous refresh: another process may have sent a draft or marked an uncertain row sent,
+    /// and the mailbox (not only the journal) must be reloaded.
+    fn refresh_outbox(&mut self) -> bool {
+        if self.demo {
+            return false;
+        }
+        let Ok(outbox) = self.engine.outbox_list(None, 500, 0) else {
+            return false;
+        };
+        let previous = std::mem::replace(&mut self.outbox, empty_outbox());
+        let delivered =
+            |state: postino_store::OutboxState| matches!(state, postino_store::OutboxState::Sent | postino_store::OutboxState::AppendPending);
+        let transitioned = outbox
+            .entries
+            .iter()
+            .any(|entry| delivered(entry.state) && previous.entries.iter().find(|old| old.id == entry.id).is_none_or(|old| !delivered(old.state)));
+        let vanished = previous.entries.iter().any(|old| !outbox.entries.iter().any(|entry| entry.id == old.id));
+        self.outbox = outbox;
+        transitioned || vanished
+    }
+
+    /// One scheduler tick: refresh the journal, reload the mailbox if another process delivered
+    /// something, then cache the next wake time and ask the worker if it is due. The 2 s poll (and
+    /// the cached `pending_send`) is the only scheduler; no per-frame database query.
+    fn poll_outbox(&mut self) {
+        if self.refresh_outbox() {
+            // Keep every view state: the existing post-sync reload repairs the selection and folder.
+            self.reload_engine_after_sync(false);
+            self.labels_cache = self.engine.label_summaries();
+            self.refresh_outbox();
+        }
+        self.pending_send = self.next_outbox_due();
+        self.pump_outbox();
+    }
+
+    fn next_outbox_due(&self) -> Option<i64> {
+        // The store answers directly: a queued or unowned append row's due time, or a leased row's
+        // lease expiry. The cached list is a display surface, never the scheduler.
+        self.engine.next_outbox_wake().ok().flatten()
+    }
+
+    /// Queue and process a send from a worker when the cached wake time is due. Used by launch
+    /// recovery, by the undo deadline and by the 2 s poll.
+    fn pump_outbox(&mut self) {
+        if self.send_worker.as_ref().is_some_and(|worker| worker.is_running()) {
+            return;
+        }
+        let now = self.now_utc.timestamp_millis();
+        if self.pending_send.is_some_and(|at| at <= now) {
+            self.request_send();
+        }
+    }
+
+    fn push_send_toast(&mut self, message: impl Into<String>, undo: UndoAction, until: f64) {
+        self.failure = None;
+        self.toast = Some(ToastState { message: message.into(), undo: Some(undo), until, kind: ToastKind::Info });
     }
 
     fn close_composer(&mut self) {
@@ -3024,6 +3193,13 @@ impl PostinoApp {
         }
         if self.sync_worker.as_ref().is_some_and(SyncWorker::is_running) || matches!(self.sync_view, SyncView::Running(_)) {
             ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if self.send_worker.as_ref().is_some_and(SendWorker::is_running) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        if let Some(at) = self.pending_send {
+            let seconds = ((at - self.now_utc.timestamp_millis()).max(0) as f64 / 1000.0).max(0.0);
+            ctx.request_repaint_after(Duration::from_secs_f64(seconds.min(1.0)));
         }
         if self.add_account_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -4820,6 +4996,30 @@ impl PostinoApp {
         }
     }
 
+    /// Whether an account has a submission endpoint. The demo never does, and a store account is
+    /// read-only until SMTP is configured; the composer disables Send with a reason instead of
+    /// queueing a row that cannot leave.
+    fn smtp_available_for(&self, account_id: &str) -> bool {
+        if self.demo {
+            return false;
+        }
+        self.engine
+            .account_views()
+            .ok()
+            .and_then(|views| views.into_iter().find(|view| view.account.id == account_id))
+            .and_then(|view| view.server)
+            .is_some_and(|server| server.smtp.is_some())
+    }
+
+    /// Whether the active account can submit at all. The composer, its Send button and Ctrl+Enter
+    /// all read this one rule. A failed account lookup is a "no" with the same visible reason.
+    fn send_allowed_for_active_account(&self) -> bool {
+        if self.demo {
+            return false;
+        }
+        self.account().is_some_and(|account| self.smtp_available_for(&account.id))
+    }
+
     fn account_last_sync(&self, account_id: &str) -> Option<i64> {
         self.engine
             .account_views()
@@ -4842,6 +5042,278 @@ impl PostinoApp {
         }
         if let Err(error) = self.folder_opener.open(&directory) {
             self.push_info_toast(format!("Non è stato possibile aprire la cartella: {error}"), ToastKind::Error);
+        }
+    }
+
+    /// The submission journal. Rows are the product's honesty surface: every state is named, a
+    /// failure keeps the server's sentence, and an uncertain row never offers a silent retry.
+    fn outbox_dialog(&mut self, ui: &mut Ui) {
+        if !self.outbox_open {
+            return;
+        }
+        let t = theme::tokens(self.dark);
+        let window = ui.ctx().content_rect();
+        let width = (window.width() - 2.0 * space::HUGE).clamp(560.0, 780.0);
+        let height = (window.height() - 120.0).clamp(320.0, 560.0);
+        let mut close = false;
+        let mut action = None;
+        let response = egui::Modal::new(Id::new("postino-outbox"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(width);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.horizontal(|ui| {
+                            ui.label(typography::strong(Role::Section, "Coda di invio", t.text));
+                            if self.demo {
+                                Badge::new("Dati demo").kind(BadgeKind::Accent).show(ui);
+                            }
+                        });
+                        ui.label(typography::text(
+                            Role::Meta,
+                            "Il messaggio è salvato prima di partire. Puoi annullare finché è in coda; dopo l'invio la copia in Inviati viene ritentata da sola.",
+                            t.text_faint,
+                        ));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if Button::ghost("Chiudi").show(ui).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(space::SM);
+                if !self.outbox.halted.is_empty() {
+                    for halt in self.outbox.halted.clone() {
+                        Frame::new()
+                            .fill(t.danger.gamma_multiply(0.12))
+                            .stroke(Stroke::new(1.0, t.danger))
+                            .corner_radius(radius::CONTROL)
+                            .inner_margin(Margin::symmetric(inset::LG, inset::SM))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(icons::icon(icons::WARNING, ui_size::ICON_SM, t.danger));
+                                    ui.vertical(|ui| {
+                                        ui.label(typography::strong(Role::BodySmall, format!("Invio fermo per {}", halt.account), t.danger));
+                                        ui.label(typography::text(Role::Caption, halt.error.as_str(), t.text_muted));
+                                    });
+                                });
+                            });
+                        ui.add_space(space::XS);
+                    }
+                }
+                if self.outbox.entries.is_empty() {
+                    ui.add_space(space::LG);
+                    ui.vertical_centered(|ui| {
+                        ui.label(icons::icon(icons::SEND, 28.0, t.text_faint));
+                        ui.add_space(space::SM);
+                        ui.label(typography::strong(Role::Emphasis, "Nessun messaggio in coda", t.text));
+                        ui.label(typography::text(Role::BodySmall, "Le bozze restano in Bozze finché non scegli Invia.", t.text_muted));
+                    });
+                    ui.add_space(space::LG);
+                } else {
+                    ScrollArea::vertical().id_salt("outbox-scroll").max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.spacing_mut().scroll = crate::ui::tokens::scroll_style();
+                        for entry in self.outbox.entries.clone() {
+                            Self::outbox_row(ui, &t, &entry, self.now_utc.timestamp_millis(), self.now_utc, &mut action);
+                            ui.add_space(space::XS);
+                        }
+                    });
+                }
+                // A damaged row is shown with "Senza oggetto" and no explanation unless its warning
+                // reaches the screen; the CLI prints these, so the journal must too.
+                for warning in self.outbox.warnings.clone() {
+                    ui.add_space(space::XS);
+                    ui.horizontal(|ui| {
+                        ui.label(icons::icon(icons::WARNING, ui_size::ICON_SM, t.text_muted));
+                        ui.label(typography::text(Role::Caption, warning, t.text_muted));
+                    });
+                }
+                ui.add_space(space::SM);
+                ui.horizontal(|ui| {
+                    ui.label(typography::text(Role::Caption, "Ctrl+Shift+O apre questa coda · Esc chiude", t.text_faint));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if Button::ghost("Aggiorna").icon(icons::SYNC).show(ui).clicked() {
+                            self.outbox_loaded = false;
+                        }
+                    });
+                });
+            });
+        if close || response.should_close() {
+            self.outbox_open = false;
+            self.outbox_confirm = None;
+            ui.ctx().memory_mut(|memory| memory.stop_text_input());
+        }
+        match action {
+            Some(OutboxUiAction::Cancel(id)) => match self.engine.call("outbox_cancel", json!({ "id": id })) {
+                Ok(_) => {
+                    self.refresh_outbox();
+                    self.push_info_toast("Invio annullato: la bozza resta in Bozze.", ToastKind::Success);
+                }
+                Err(_) => self.push_info_toast("Non è stato possibile annullare: l'invio potrebbe essere già partito.", ToastKind::Error),
+            },
+            Some(OutboxUiAction::Discard(id)) => match self.engine.call("outbox_cancel", json!({ "id": id })) {
+                Ok(_) => {
+                    self.refresh_outbox();
+                    self.push_info_toast("Riga scartata: la bozza resta in Bozze e si può correggere.", ToastKind::Success);
+                }
+                Err(_) => self.push_info_toast("Non è stato possibile scartare la riga: aggiorna la coda.", ToastKind::Error),
+            },
+            Some(OutboxUiAction::Retry { id, subject, uncertain }) => {
+                self.outbox_confirm = Some(OutboxConfirm::Retry { id, subject, uncertain });
+            }
+            Some(OutboxUiAction::MarkSent { id, subject }) => {
+                self.outbox_confirm = Some(OutboxConfirm::MarkSent { id, subject });
+            }
+            None => {}
+        }
+    }
+
+    fn outbox_row(
+        ui: &mut Ui,
+        t: &crate::theme::Tokens,
+        entry: &OutboxView,
+        now_ms: i64,
+        now_utc: DateTime<Utc>,
+        action: &mut Option<OutboxUiAction>,
+    ) {
+        let (label, kind) = outbox_state_label(entry.state);
+        Frame::new()
+            .fill(t.panel_alt)
+            .stroke(Stroke::new(1.0, if entry.state == postino_store::OutboxState::Uncertain { t.danger } else { t.border }))
+            .corner_radius(radius::CONTROL)
+            .inner_margin(Margin::symmetric(inset::LG, inset::SM))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            let subject = if entry.subject.trim().is_empty() { "Senza oggetto" } else { entry.subject.as_str() };
+                            ui.add(egui::Label::new(typography::strong(Role::BodySmall, subject, t.text)).truncate());
+                            Badge::new(label).kind(kind).show(ui);
+                        });
+                        let recipients = plural(entry.recipient_count, "destinatario", "destinatari");
+                        let when = if entry.state == postino_store::OutboxState::Queued && entry.send_at > now_ms {
+                            format!("parte {}", format_millis(entry.send_at, now_utc))
+                        } else {
+                            format_millis(entry.send_at, now_utc)
+                        };
+                        ui.label(typography::text(Role::Caption, format!("{recipients} · {} · tentativi {}", when, entry.attempts), t.text_faint));
+                        if !entry.message_id.is_empty() {
+                            ui.add(egui::Label::new(typography::mono(entry.message_id.as_str(), type_size::CAPTION, t.text_faint)).truncate());
+                        }
+                        if let Some(error) = &entry.last_error {
+                            ui.add_space(space::XS);
+                            ui.label(typography::text(Role::Caption, error.as_str(), t.danger));
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| match entry.state {
+                        postino_store::OutboxState::Queued => {
+                            if Button::ghost("Annulla").size(ButtonSize::Sm).show(ui).clicked() {
+                                *action = Some(OutboxUiAction::Cancel(entry.id.clone()));
+                            }
+                        }
+                        postino_store::OutboxState::Uncertain => {
+                            if Button::danger("Riprova manualmente").size(ButtonSize::Sm).show(ui).clicked() {
+                                *action = Some(OutboxUiAction::Retry { id: entry.id.clone(), subject: entry.subject.clone(), uncertain: true });
+                            }
+                            if Button::ghost("Segna come inviato").size(ButtonSize::Sm).show(ui).clicked() {
+                                *action = Some(OutboxUiAction::MarkSent { id: entry.id.clone(), subject: entry.subject.clone() });
+                            }
+                        }
+                        postino_store::OutboxState::Failed => {
+                            let clicked = Button::primary("Riprova").size(ButtonSize::Sm).show(ui).clicked();
+                            if clicked {
+                                *action = Some(OutboxUiAction::Retry { id: entry.id.clone(), subject: entry.subject.clone(), uncertain: false });
+                            }
+                            if Button::ghost("Scarta").size(ButtonSize::Sm).show(ui).clicked() {
+                                *action = Some(OutboxUiAction::Discard(entry.id.clone()));
+                            }
+                        }
+                        _ => {}
+                    });
+                });
+            });
+    }
+
+    fn outbox_confirm_dialog(&mut self, ui: &mut Ui) {
+        let Some(confirm) = self.outbox_confirm.clone() else {
+            return;
+        };
+        let t = theme::tokens(self.dark);
+        let (title, body, confirm_label, dangerous) = match &confirm {
+            OutboxConfirm::Retry { uncertain, subject, .. } => (
+                "Riprovare l'invio?",
+                if *uncertain {
+                    format!(
+                        "«{subject}» ha un esito incerto: il server potrebbe averlo già accettato. Riprovare può consegnarlo due volte. Controlla prima la cartella Inviati del provider."
+                    )
+                } else {
+                    format!("«{subject}» verrà rimesso in coda con gli stessi byte salvati. Il server potrebbe rifiutarlo di nuovo.")
+                },
+                "Riprova",
+                *uncertain,
+            ),
+            OutboxConfirm::MarkSent { subject, .. } => (
+                "Segnare come inviato?",
+                format!(
+                    "«{subject}» verrà marcato come inviato senza contattare il server. Postino non può dimostrare che sia arrivato: controlla la cartella Inviati del provider."
+                ),
+                "Segna come inviato",
+                false,
+            ),
+        };
+        let mut close = false;
+        let mut accept = false;
+        let response = egui::Modal::new(Id::new("postino-outbox-confirm"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(440.0);
+                ui.label(typography::strong(Role::Section, title, t.text));
+                ui.add_space(space::SM);
+                ui.label(typography::text(Role::BodySmall, body, t.text_muted));
+                ui.add_space(space::LG);
+                ui.horizontal(|ui| {
+                    if Button::ghost("Annulla").show(ui).clicked() {
+                        close = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = confirm_label;
+                        let button = if dangerous { Button::danger(label) } else { Button::primary(label) };
+                        if button.show(ui).clicked() {
+                            accept = true;
+                        }
+                    });
+                });
+            });
+        if close || response.should_close() {
+            self.outbox_confirm = None;
+            return;
+        }
+        if !accept {
+            return;
+        }
+        let result = match &confirm {
+            OutboxConfirm::Retry { id, .. } => self.engine.call("outbox_retry", json!({ "id": id, "confirm": true })),
+            OutboxConfirm::MarkSent { id, .. } => self.engine.call("outbox_mark_sent", json!({ "id": id, "confirm": true })),
+        };
+        self.outbox_confirm = None;
+        let marked_sent = matches!(confirm, OutboxConfirm::MarkSent { .. });
+        match result {
+            Ok(_) => {
+                if marked_sent {
+                    // `outbox_mark_sent` moves the local draft to Sent; the UI engine still has it in
+                    // Drafts until the mailbox is reloaded from the store.
+                    self.reload_engine_after_sync(false);
+                    self.labels_cache = self.engine.label_summaries();
+                }
+                self.refresh_outbox();
+                self.outbox_loaded = false;
+                self.pending_send = self.next_outbox_due();
+                self.push_info_toast("Coda aggiornata.", ToastKind::Success);
+            }
+            Err(_) => self.push_info_toast("Non è stato possibile aggiornare la coda.", ToastKind::Error),
         }
     }
 
@@ -5279,6 +5751,37 @@ impl PostinoApp {
                         ui.add_space(space::MD);
                         ui.add(egui::Label::new(typography::text(Role::Meta, self.status.as_str(), t.text_muted)).truncate());
                     }
+                    let active_outbox = self
+                        .outbox
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry.state,
+                                postino_store::OutboxState::Queued
+                                    | postino_store::OutboxState::Sending
+                                    | postino_store::OutboxState::AppendPending
+                                    | postino_store::OutboxState::Uncertain
+                                    | postino_store::OutboxState::Failed
+                            )
+                        })
+                        .count();
+                    if active_outbox > 0 {
+                        ui.add_space(space::SM);
+                        let uncertain = self.outbox.entries.iter().any(|entry| entry.state == postino_store::OutboxState::Uncertain);
+                        let label = format!("Coda · {active_outbox}");
+                        let button = if uncertain {
+                            Button::danger(label.as_str()).size(ButtonSize::Sm).show(ui)
+                        } else {
+                            Button::ghost(label.as_str()).size(ButtonSize::Sm).show(ui)
+                        };
+                        #[cfg(test)]
+                        probe::outbox_button(ui, button.rect);
+                        if button.clicked() {
+                            self.refresh_outbox();
+                            self.outbox_open = true;
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let hint = if self.composer.open {
                             "Ctrl+Invio invia · Esc chiude e conserva"
@@ -5316,9 +5819,13 @@ impl PostinoApp {
         // backdrop swallows every click and no title bar can be dragged over the toolbar.
         let id = Id::new("postino-composer");
         let area = egui::Modal::default_area(id).anchor(Align2::LEFT_TOP, card.min - window.min).constrain(false);
+        let smtp_available = self.smtp_available_for(&account.id);
         let response = egui::Modal::new(id).area(area).backdrop_color(theme::scrim(self.dark)).frame(frame).show(ui.ctx(), |ui| {
             ui.set_min_size(inner.size());
-            ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| Composer::new(&mut self.composer, &account).show(ui)).inner
+            ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
+                Composer::new(&mut self.composer, &account).send_available(smtp_available).demo(self.demo).show(ui)
+            })
+            .inner
         });
         let action = response.inner;
         if action.discard {
@@ -5728,6 +6235,11 @@ impl PostinoApp {
                 }
             }
             "send" => self.send_composer(),
+            "outbox" => {
+                self.refresh_outbox();
+                self.outbox_open = true;
+                self.status.clear();
+            }
             "open" => {
                 if let Some(message) = self.selected.clone() {
                     self.open_message(message);
@@ -5902,6 +6414,17 @@ impl PostinoApp {
         }
         self.poll_add_account();
         self.handle_sync_events();
+        self.handle_send_events();
+        // The desktop app is the only scheduler this build has, and a row can be created by the CLI,
+        // by MCP or by another instance. Poll the store every two seconds so a row queued after boot
+        // is seen when it becomes due, and reload the mailbox when another process delivered a row.
+        if !self.outbox_loaded || self.now - self.last_outbox_poll >= OUTBOX_POLL_SECONDS {
+            self.outbox_loaded = true;
+            self.last_outbox_poll = self.now;
+            self.poll_outbox();
+        } else {
+            self.pump_outbox();
+        }
         let composer_was_open = self.composer.open;
         self.capture_screenshot(ui.ctx());
         self.tick(ui.ctx());
@@ -5953,6 +6476,8 @@ impl PostinoApp {
         self.label_delete_dialog(ui);
         self.account_menu(ui);
         self.accounts_dialog(ui);
+        self.outbox_dialog(ui);
+        self.outbox_confirm_dialog(ui);
         self.account_remove_dialog(ui);
         self.link_confirmation(ui);
         self.attachment_warning_dialog(ui);
@@ -6301,11 +6826,123 @@ struct ToastState {
     kind: ToastKind,
 }
 
+/// A pending resolution of one outbox row. The dialog states the consequence before the call.
+#[derive(Clone, Debug)]
+enum OutboxConfirm {
+    Retry { id: String, subject: String, uncertain: bool },
+    MarkSent { id: String, subject: String },
+}
+
+enum OutboxUiAction {
+    Cancel(String),
+    Retry {
+        id: String,
+        subject: String,
+        uncertain: bool,
+    },
+    MarkSent {
+        id: String,
+        subject: String,
+    },
+    /// Throw away a permanently failed journal row. No delivery happened, so the draft becomes
+    /// editable again. Never offered for an uncertain row.
+    Discard(String),
+}
+
+fn outbox_state_label(state: postino_store::OutboxState) -> (&'static str, BadgeKind) {
+    use postino_store::OutboxState;
+    match state {
+        OutboxState::Queued => ("In coda", BadgeKind::Neutral),
+        OutboxState::Sending => ("Invio in corso", BadgeKind::Accent),
+        OutboxState::Sent => ("Inviato", BadgeKind::Neutral),
+        OutboxState::AppendPending => ("Copia in Inviati", BadgeKind::Accent),
+        OutboxState::Uncertain => ("Invio incerto", BadgeKind::Danger),
+        OutboxState::Failed => ("Non riuscito", BadgeKind::Danger),
+        OutboxState::Cancelled => ("Annullato", BadgeKind::Neutral),
+    }
+}
+
+fn empty_outbox() -> OutboxList {
+    OutboxList { entries: Vec::new(), halted: Vec::new(), warnings: Vec::new() }
+}
+
+/// A deterministic journal for the docs screenshot and the headless render test. It is never shown
+/// as real mail: the dialog carries the "Dati demo" badge.
+fn demo_outbox(now: i64) -> OutboxList {
+    use postino_store::OutboxState;
+    OutboxList {
+        entries: vec![
+            OutboxView {
+                id: "ob_demo_1".to_owned(),
+                account: "acc_demo".to_owned(),
+                state: OutboxState::Uncertain,
+                created_at: now - 90_000,
+                send_at: now - 80_000,
+                attempts: 1,
+                last_error: Some(
+                    "Postino si è fermato durante l'invio; il messaggio potrebbe essere stato accettato. Controlla Inviati prima di riprovare."
+                        .to_owned(),
+                ),
+                recipient_count: 2,
+                subject: "Preventivo sito web — bozza finale".to_owned(),
+                message_id: "<demo-uncertain@example.it>".to_owned(),
+                draft_id: Some("draft_1".to_owned()),
+                undo_until: None,
+            },
+            OutboxView {
+                id: "ob_demo_2".to_owned(),
+                account: "acc_demo".to_owned(),
+                state: OutboxState::Queued,
+                created_at: now - 30_000,
+                send_at: now + 3_000,
+                attempts: 0,
+                last_error: None,
+                recipient_count: 3,
+                subject: "Riunione di lunedì".to_owned(),
+                message_id: "<demo-queued@example.it>".to_owned(),
+                draft_id: Some("draft_2".to_owned()),
+                undo_until: Some(now + 3_000),
+            },
+            OutboxView {
+                id: "ob_demo_3".to_owned(),
+                account: "acc_demo".to_owned(),
+                state: OutboxState::Failed,
+                created_at: now - 3_600_000,
+                send_at: now - 3_500_000,
+                attempts: 2,
+                last_error: Some("Il server ha rifiutato rcpt con 550: casella inesistente.".to_owned()),
+                recipient_count: 1,
+                subject: "Fattura 2026-041".to_owned(),
+                message_id: "<demo-failed@example.it>".to_owned(),
+                draft_id: None,
+                undo_until: None,
+            },
+            OutboxView {
+                id: "ob_demo_4".to_owned(),
+                account: "acc_demo".to_owned(),
+                state: OutboxState::Sent,
+                created_at: now - 7_200_000,
+                send_at: now - 7_100_000,
+                attempts: 1,
+                last_error: None,
+                recipient_count: 2,
+                subject: "Riepilogo settimanale".to_owned(),
+                message_id: "<demo-sent@example.it>".to_owned(),
+                draft_id: None,
+                undo_until: None,
+            },
+        ],
+        halted: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
 enum UndoAction {
     Unread(Vec<(String, bool)>),
     Starred(Vec<(String, bool)>),
     Move(Vec<(String, String)>),
-    Send(String),
+    /// Cancel a queued submission during its undo window.
+    CancelSend(String),
     /// `(message id, label id, whether the label was applied before the action)`.
     Labels(Vec<(String, String, bool)>),
     LabelDelete {
@@ -6428,7 +7065,8 @@ const COMMANDS: &[Command] = &[
     Command { id: "reply_all", label: "Rispondi a tutti", icon: icons::REPLY_ALL, shortcut: "A", rule: CommandRule::Message, in_palette: true },
     Command { id: "forward", label: "Inoltra", icon: icons::FORWARD, shortcut: "F", rule: CommandRule::Message, in_palette: true },
     Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", rule: CommandRule::Message, in_palette: false },
-    Command { id: "send", label: "Invia (locale)", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
+    Command { id: "send", label: "Invia", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
+    Command { id: "outbox", label: "Coda di invio", icon: icons::SEND, shortcut: "Ctrl+Shift+O", rule: CommandRule::Always, in_palette: true },
     Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", rule: CommandRule::Message, in_palette: true },
     Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", rule: CommandRule::Message, in_palette: true },
     Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", rule: CommandRule::Message, in_palette: true },
@@ -6791,6 +7429,35 @@ fn messages_text(count: usize) -> String {
 
 fn unread_text(unread: usize) -> String {
     plural(unread, "non letto", "non letti")
+}
+
+/// Translate an engine send failure into Italian copy. The raw sentence never reaches the shell.
+fn send_error_message(raw: &str, demo: bool) -> String {
+    if demo || raw.contains("demo mailbox") {
+        return "La modalità demo non invia messaggi: aggiungi un account reale con un server SMTP.".to_owned();
+    }
+    if raw.contains("no SMTP endpoint") {
+        return "Questo account non ha un server di invio (SMTP): rimuovilo e aggiungilo con i dati SMTP.".to_owned();
+    }
+    if raw.contains("no stored bytes") || raw.contains("attachments without content") {
+        return "Un allegato non ha contenuto salvato: rimuovilo e riprova ad allegare il file.".to_owned();
+    }
+    if raw.contains("at least one recipient") {
+        return "Aggiungi almeno un destinatario prima di inviare.".to_owned();
+    }
+    if raw.contains("100") && raw.contains("recipients") {
+        return "Il messaggio ha troppi destinatari: il limite è 100.".to_owned();
+    }
+    if raw.contains("failed submission") {
+        return "L'ultimo invio di questa bozza è stato rifiutato: scartalo dalla coda e correggi la bozza.".to_owned();
+    }
+    if raw.contains("already sent") {
+        return "Questa bozza è già stata inviata: crea una nuova bozza per inviarla di nuovo.".to_owned();
+    }
+    if raw.contains("queued") || raw.contains("outbox") {
+        return "La bozza è già in coda: annulla l'invio dalla coda oppure attendi l'esito.".to_owned();
+    }
+    "Non è stato possibile mettere il messaggio in coda. Riprova.".to_owned()
 }
 
 /// Translate the engine's English label errors into UI copy. A duplicate name is the common case;
@@ -7326,10 +7993,17 @@ pub(crate) mod probe {
         ctx.data(|data| data.get_temp(id("composer-card")))
     }
 
+    pub fn outbox_button(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("outbox-button"), rect));
+    }
+
+    pub fn outbox_button_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("outbox-button")))
+    }
+
     pub fn composer_send(ui: &Ui, rect: Rect) {
         ui.ctx().data_mut(|data| data.insert_temp(id("composer-send"), rect));
     }
-
     pub fn composer_send_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("composer-send")))
     }
@@ -7726,7 +8400,9 @@ mod tests {
     use postino_store::{Message as StoreMessage, MessageSummary as StoreMessageSummary};
 
     use crate::boot::{BootStage, KeySource};
-    use crate::test_support::{MemoryVault, RecordingFileSaver, RecordingFolderOpener, RecordingLinkOpener, RunningServer, directory, three_folders};
+    use crate::test_support::{
+        MemoryVault, RecordingFileSaver, RecordingFolderOpener, RecordingLinkOpener, RunningServer, RunningSmtp, directory, three_folders,
+    };
 
     use super::*;
 
@@ -8093,7 +8769,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_enter_sends_from_the_composer() {
+    fn ctrl_enter_in_the_demo_does_not_claim_a_submission() {
         let (ctx, mut app) = ready_app();
         frame(&ctx, &mut app, vec![]);
         app.compose_new();
@@ -8102,10 +8778,13 @@ mod tests {
         app.composer.body = "Corpo".to_owned();
         app.composer.touch(0.0);
         frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::COMMAND), key(Key::Enter, Modifiers::COMMAND)]);
-        assert!(!app.composer.open, "Ctrl+Enter sends and closes the composer");
+        assert!(app.composer.open, "the demo must keep the composer open instead of pretending the message left");
+        // The shortcut reads the same enabled rule as the button: it does not attempt a send the
+        // button would refuse, so there is no error to show.
+        assert!(app.composer.save_error.is_none(), "the shortcut attempted a disabled send: {:?}", app.composer.save_error);
         assert!(
-            app.engine.messages().iter().any(|message| message.summary.subject == "Invio da tastiera" && message.summary.folder_id == "sent"),
-            "the demo send moves the message to Sent"
+            !app.engine.messages().iter().any(|message| message.summary.subject == "Invio da tastiera" && message.summary.folder_id == "sent"),
+            "the demo moved the message to Sent without a submission"
         );
     }
 
@@ -8170,7 +8849,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_keeps_the_draft_and_sending_moves_it_to_sent() {
+    fn closing_keeps_the_draft_and_the_demo_send_is_refused_honestly() {
         let mut app = PostinoApp::demo(true);
         app.compose_new();
         app.composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
@@ -8190,9 +8869,8 @@ mod tests {
 
         app.edit_draft(&id);
         app.send_composer();
-        assert!(!app.composer.open);
-        assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("sent"));
-        app.undo_last();
+        assert!(app.composer.open, "the demo send must not close the composer as if the message left");
+        assert!(app.composer.save_error.is_none(), "the demo attempted a submission the button refuses: {:?}", app.composer.save_error);
         assert_eq!(app.engine.message(&id).map(|message| message.summary.folder_id.as_str()), Some("drafts"));
     }
 
@@ -9794,6 +10472,7 @@ mod tests {
                     tls: AccountTls::Implicit,
                     username: email.to_owned(),
                     created_at: 1_700_000_000_000,
+                    smtp: None,
                 })
                 .expect("server row");
         }
@@ -10958,6 +11637,237 @@ mod tests {
         assert!(app.save_composer(false));
         let draft = app.composer.draft_id.clone().expect("the reply draft");
         assert_eq!(app.engine.message(&draft).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_b_drafts"));
+    }
+
+    #[test]
+    fn the_outbox_renders_every_state_at_980x600_light_and_dark() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            crate::theme::apply(&ctx, dark);
+            let mut app = PostinoApp::demo_at(true, Utc::now());
+            app.outbox = demo_outbox(app.now_utc.timestamp_millis());
+            app.outbox_open = true;
+            app.outbox_loaded = true;
+            frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), Vec::new());
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            for expected in ["Coda di invio", "Invio incerto", "Non riuscito", "Dati demo", "In coda", "Inviato"] {
+                assert!(text.iter().any(|line| line.contains(expected)), "the outbox is missing {expected:?}: {text:?}");
+            }
+        }
+    }
+
+    /// A store-backed app with an SMTP endpoint and the two folders a send needs. The IMAP port is
+    /// closed, so the Sent APPEND fails and the row stays `append_pending`: that is exactly the state
+    /// the UI must still reflect (the message was submitted, its server copy is pending).
+    fn smtp_app(name: &str, smtp_port: u16, ca: CertificateDer<'static>) -> PostinoApp {
+        let (path, key, vault) = fresh_store(name);
+        {
+            let store = postino_store::Store::open(&path, key.as_ref()).expect("seed store");
+            crate::test_support::seed_smtp_account(&store, &vault, "acc_smtp", 1, smtp_port);
+            for (suffix, display, kind) in
+                [("drafts", "Bozze", postino_store::FolderKind::Drafts), ("sent", "Inviati", postino_store::FolderKind::Sent)]
+            {
+                store
+                    .upsert_folder(&postino_store::Folder {
+                        id: format!("fld_acc_smtp_{suffix}"),
+                        account_id: "acc_smtp".to_owned(),
+                        name: display.to_owned(),
+                        kind,
+                        unread: 0,
+                        total: 0,
+                        uid_validity: None,
+                        uid_next: None,
+                        last_sync_at: None,
+                    })
+                    .expect("folder");
+            }
+        }
+        let vault_dyn: Arc<dyn CredentialVault> = vault;
+        let booted =
+            boot::boot(Launch::Store(Some(path.clone())), KeySource::Fixed { key: key.clone(), vault: vault_dyn }, Utc::now()).expect("boot");
+        PostinoApp::from_booted(booted, true, Utc::now(), Launch::Store(Some(path)), vec![ca])
+    }
+
+    fn app_draft(app: &mut PostinoApp, body: &str) -> String {
+        let content = postino_core::DraftContent {
+            to: vec![postino_core::Address::new("", "one@example.com")],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Prova".to_owned(),
+            body_text: body.to_owned(),
+            attachments: Vec::new(),
+        };
+        app.engine.save_draft(None, None, content).expect("draft").summary.id
+    }
+
+    /// Advance the app's clock to `now_ms`, ask the worker for a pass and wait for its event.
+    fn run_send_at(app: &mut PostinoApp, now_ms: i64) {
+        app.now_utc = chrono::DateTime::<Utc>::from_timestamp_millis(now_ms).expect("instant");
+        app.request_send();
+        for _ in 0..600 {
+            app.handle_send_events();
+            if !app.send_worker.as_ref().is_some_and(SendWorker::is_running) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the send worker did not finish");
+    }
+
+    #[test]
+    fn ctrl_enter_respects_the_send_enabled_rule() {
+        let (ctx, mut app) = ready_app();
+        let wide = Vec2::new(1280.0, 720.0);
+        app.compose_new();
+        app.composer.to = "giulia@example.com".to_owned();
+        app.composer.subject = "Scorciatoia".to_owned();
+        app.composer.body = "corpo".to_owned();
+        app.composer.touch(0.0);
+        frame_at(&ctx, &mut app, wide, Vec::new());
+        // The demo has no SMTP endpoint: the button is disabled, so the shortcut must do nothing.
+        assert!(!app.send_allowed_for_active_account());
+        frame_at(&ctx, &mut app, wide, vec![egui::Event::ModifiersChanged(Modifiers::COMMAND), key(Key::Enter, Modifiers::COMMAND)]);
+        assert!(app.composer.open, "Ctrl+Enter closed the composer without sending");
+        assert!(app.composer.save_error.is_none(), "Ctrl+Enter attempted a send the button would refuse");
+    }
+
+    #[test]
+    fn a_successful_send_reloads_the_mailbox_and_the_draft_leaves_drafts() {
+        let smtp = RunningSmtp::start(1);
+        let mut app = smtp_app("p7-app-send-reload", smtp.port(), smtp.ca());
+        let draft_id = app_draft(&mut app, "corpo");
+        let queued = app.engine.message_send(&draft_id).expect("queue");
+        run_send_at(&mut app, queued.outbox.send_at);
+
+        // The worker wrote through its own connection; the app reloaded the mailbox from the store.
+        let sent = app.engine.message(&draft_id).expect("the Sent copy");
+        assert_eq!(sent.summary.folder_id, "fld_acc_smtp_sent", "the stale draft is still in Drafts");
+        assert_eq!(app.engine.messages().iter().filter(|message| message.summary.folder_id == "fld_acc_smtp_sent").count(), 1);
+        assert!(!app.engine.messages().iter().any(|message| message.summary.folder_id == "fld_acc_smtp_drafts"), "a draft survived a send");
+        // The old draft id is a Sent message now: sending it again must fail.
+        assert!(app.engine.message_send(&draft_id).is_err(), "a stale draft could be sent again");
+        assert_eq!(app.outbox.entries.iter().filter(|row| row.state == postino_store::OutboxState::AppendPending).count(), 1);
+        let submitted = smtp.submitted();
+        smtp.finish();
+        assert_eq!(submitted.len(), 1);
+    }
+
+    #[test]
+    fn a_row_queued_by_another_process_is_sent_when_due() {
+        let smtp = RunningSmtp::start(1);
+        let mut app = smtp_app("p7-app-external-row", smtp.port(), smtp.ca());
+        let draft_id = app_draft(&mut app, "da un altro processo");
+        // The row is created by a second process (the CLI) after the app booted; the app's cached
+        // outbox is empty and knows nothing about it.
+        let queued = {
+            let mut cli = app.store.as_ref().expect("a store-backed app").open_engine().expect("cli engine");
+            cli.message_send(&draft_id).expect("queue")
+        };
+        app.outbox = empty_outbox();
+        app.outbox_loaded = true;
+        assert!(app.next_outbox_due().is_some(), "the store query cannot see a row the cache does not have");
+        app.now_utc = chrono::DateTime::<Utc>::from_timestamp_millis(queued.outbox.send_at).expect("instant");
+        app.poll_outbox();
+        assert!(app.send_worker.as_ref().is_some_and(SendWorker::is_running), "the scheduler did not wake for an external row");
+        for _ in 0..600 {
+            app.handle_send_events();
+            if !app.send_worker.as_ref().is_some_and(SendWorker::is_running) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let submitted = smtp.submitted();
+        smtp.finish();
+        assert_eq!(submitted.len(), 1, "the externally queued row was not submitted");
+        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_smtp_sent"));
+    }
+
+    #[test]
+    fn a_send_from_another_process_reloads_the_app_mailbox() {
+        let smtp = RunningSmtp::start(1);
+        let mut app = smtp_app("p7-app-external-send", smtp.port(), smtp.ca());
+        let draft_id = app_draft(&mut app, "inviata da un altro processo");
+        // The CLI (a second engine and store connection) queues and submits it.
+        let queued = {
+            let mut cli = app.store.as_ref().expect("a store-backed app").open_engine().expect("cli engine");
+            cli.set_test_extra_roots(vec![smtp.ca()]);
+            let queued = cli.message_send(&draft_id).expect("queue");
+            let report = cli.process_outbox(queued.outbox.send_at).expect("send");
+            // The IMAP port is closed, so the server copy is pending; the submission happened.
+            assert_eq!(report.sent, 0, "{report:?}");
+            assert_eq!(report.append_pending, 1, "{report:?}");
+            queued
+        };
+        // Before the poll the app still believes the draft is in Drafts; the engine guard refuses to
+        // let that stale copy overwrite the Sent row.
+        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_smtp_drafts"));
+        let stale = postino_core::DraftContent {
+            to: vec![postino_core::Address::new("", "one@example.com")],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Prova".to_owned(),
+            body_text: "una modifica arrivata tardi".to_owned(),
+            attachments: Vec::new(),
+        };
+        let refused = app.engine.save_draft(None, Some(&draft_id), stale).expect_err("a stale Drafts save must be refused");
+        assert!(
+            refused.to_string().contains("changed in another session") || refused.to_string().contains("coda ("),
+            "a stale save was not refused with a state reason: {refused}"
+        );
+        let stored = app.store.as_ref().expect("store").open_store().expect("store").get_message(&draft_id).expect("message").expect("row");
+        assert_eq!(stored.summary.folder_id, "fld_acc_smtp_sent", "the stale save overwrote the Sent row");
+        // The next scheduler tick sees the delivered row and reloads the whole mailbox.
+        app.now_utc = chrono::DateTime::<Utc>::from_timestamp_millis(queued.outbox.send_at).expect("instant");
+        app.poll_outbox();
+        assert_eq!(app.engine.message(&draft_id).map(|message| message.summary.folder_id.as_str()), Some("fld_acc_smtp_sent"));
+        assert_eq!(app.outbox.entries.iter().filter(|row| row.state == postino_store::OutboxState::AppendPending).count(), 1);
+        let submitted = smtp.submitted();
+        smtp.finish();
+        assert_eq!(submitted.len(), 1);
+    }
+
+    #[test]
+    fn the_outbox_dialog_offers_a_discard_and_shows_warnings() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, false);
+        let mut app = PostinoApp::demo_at(true, Utc::now());
+        app.outbox = demo_outbox(app.now_utc.timestamp_millis());
+        app.outbox.warnings.push("una riga della coda è danneggiata".to_owned());
+        app.outbox_open = true;
+        app.outbox_loaded = true;
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("Scarta")), "a failed row has no discard action: {text:?}");
+        assert!(text.iter().any(|line| line.contains("danneggiata")), "a warning never reached the journal: {text:?}");
+    }
+
+    #[test]
+    fn the_status_bar_outbox_button_opens_the_journal() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply(&ctx, false);
+        let mut app = PostinoApp::demo_at(true, Utc::now());
+        app.outbox = demo_outbox(app.now_utc.timestamp_millis());
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), Vec::new());
+        let button = probe::outbox_button_rect(&ctx).expect("the status bar has no outbox button when rows are active");
+        assert!(button.width() > 0.0 && button.height() > 0.0);
+        app.execute_command("outbox", &ctx);
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), Vec::new());
+        assert!(app.outbox_open);
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("Riprova manualmente")), "the uncertain row offers no manual retry: {text:?}");
+        assert!(text.iter().any(|line| line.contains("Segna come inviato")), "the uncertain row offers no resolution: {text:?}");
+    }
+
+    #[test]
+    fn send_failures_are_italian_and_never_raw_engine_text() {
+        assert!(send_error_message("invalid arguments: draft is already queued", false).contains("già in coda"));
+        assert!(send_error_message("account \"acc_1\" has no SMTP endpoint", false).contains("SMTP"));
+        assert!(send_error_message("the demo mailbox has no outbox", true).contains("demo"));
+        assert!(send_error_message("attachment \"x.pdf\" has no stored bytes", false).contains("allegato"));
+        assert!(send_error_message("draft \"d\" has a failed submission; discard that row", false).contains("rifiutato"));
+        assert!(!send_error_message("some internal sentence", false).contains("internal"));
     }
 
     fn label_unread(app: &PostinoApp, id: &str) -> Option<u32> {

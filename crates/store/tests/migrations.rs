@@ -52,15 +52,15 @@ fn upgrades_a_v1_database_additively() {
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v1 to v4");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        let store = Store::open(&path, &key).expect("upgrade v1 to v5");
+        assert_eq!(store.schema_version().expect("version"), 5);
         assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v1"), "the upgrade lost meta data");
         store.upsert_account(&account("acc_1")).expect("the v2 tables exist");
         store.set_meta("schema", "v4").expect("write");
     }
 
     let store = Store::open(&path, &key).expect("reopen");
-    assert_eq!(store.schema_version().expect("version"), 4);
+    assert_eq!(store.schema_version().expect("version"), 5);
     assert!(store.get_account("acc_1").expect("account").is_some());
     assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v4"));
 }
@@ -83,19 +83,19 @@ fn upgrades_a_v2_database_and_seeds_the_draft_sequence() {
     };
 
     {
-        let store = Store::open(&path, &key).expect("open v4");
+        let store = Store::open(&path, &key).expect("open v5");
         store.upsert_account(&account("acc_1")).expect("account");
         store.save_draft(&draft("prima")).expect("draft");
         store.save_draft(&draft("seconda")).expect("second revision");
         // Make the file look like the shipped v2 schema: the migration had not created draft_seq
         // or the v4 server table.
         let connection = raw_open(&path, &key);
-        connection.execute_batch("DROP TABLE draft_seq; DROP TABLE account_servers; PRAGMA user_version = 2;").expect("forge v2");
+        connection.execute_batch("DROP TABLE draft_seq; DROP TABLE account_servers; DROP TABLE outbox; PRAGMA user_version = 2;").expect("forge v2");
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v2 to v4");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        let store = Store::open(&path, &key).expect("upgrade v2 to v5");
+        assert_eq!(store.schema_version().expect("version"), 5);
         let saved = store.save_draft(&draft("terza")).expect("the seeded sequence must continue");
         assert_eq!(saved.revision, 3, "the v2 draft revision did not seed draft_seq");
     }
@@ -145,18 +145,18 @@ fn upgrades_a_v3_database_and_keeps_its_mail() {
     };
 
     {
-        let store = Store::open(&path, &key).expect("open v4");
+        let store = Store::open(&path, &key).expect("open v5");
         store.upsert_account(&account("acc_1")).expect("account");
         store.upsert_folder(&folder).expect("folder");
         store.upsert_synced_message(&message, &[]).expect("message");
         // Make the file look like the shipped v3 schema: the v4 table did not exist yet.
         let connection = raw_open(&path, &key);
-        connection.execute_batch("DROP TABLE account_servers; PRAGMA user_version = 3;").expect("forge v3");
+        connection.execute_batch("DROP TABLE account_servers; DROP TABLE outbox; PRAGMA user_version = 3;").expect("forge v3");
     }
 
     {
-        let store = Store::open(&path, &key).expect("upgrade v3 to v4");
-        assert_eq!(store.schema_version().expect("version"), 4);
+        let store = Store::open(&path, &key).expect("upgrade v3 to v5");
+        assert_eq!(store.schema_version().expect("version"), 5);
         assert_eq!(store.list_all_messages().expect("messages").len(), 1, "the upgrade lost mail");
         assert_eq!(store.get_folder("fld_inbox").expect("folder").expect("row").total, 1);
         assert_eq!(store.get_account_server("acc_1").expect("server"), None, "a v3 store starts with no server row");
@@ -168,9 +168,54 @@ fn upgrades_a_v3_database_and_keeps_its_mail() {
                 tls: AccountTls::Implicit,
                 username: "me@example.com".to_owned(),
                 created_at: 1_700_000_000_000,
+                smtp: None,
             })
             .expect("the v4 table accepts a server");
     }
+}
+
+#[test]
+fn the_v5_outbox_columns_arrive_with_the_migration() {
+    use postino_store::{OutboxEntry, OutboxState};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("store.db");
+    let key = random_key();
+    {
+        let connection = raw_open(&path, &key);
+        connection
+            .execute_batch(
+                "CREATE TABLE meta(
+                     key   TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 PRAGMA user_version = 1;",
+            )
+            .expect("create v1");
+    }
+    let store = Store::open(&path, &key).expect("v1 to the current schema");
+    store.upsert_account(&account("acc_1")).expect("account");
+    let row = |id: &str, key: &str| OutboxEntry {
+        id: id.to_owned(),
+        account_id: "acc_1".to_owned(),
+        draft_id: Some("draft_1".to_owned()),
+        idempotency_key: key.to_owned(),
+        created_at: 1_000,
+        send_at: 1_000,
+        state: OutboxState::Queued,
+        attempts: 0,
+        append_attempts: 0,
+        last_error: None,
+        raw_blob_hash: "a".repeat(64),
+        envelope_json: "{}".to_owned(),
+        lease_at: None,
+    };
+    store.queue_outbox(&row("ob_1", "draft:1:hash")).expect("the migrated table takes a row with a draft id");
+    let duplicate = store.queue_outbox(&row("ob_2", "draft:1:other")).expect_err("the active-draft index arrived with the migration");
+    assert!(matches!(duplicate, StoreError::OutboxAlreadyActive { .. }), "{duplicate}");
+    let leased = store.lease_next_outbox(1_000).expect("lease").expect("row");
+    assert_eq!(leased.draft_id.as_deref(), Some("draft_1"));
+    assert_eq!(leased.lease_at, Some(1_000), "the lease epoch column arrived with the migration");
 }
 
 #[test]
@@ -181,7 +226,7 @@ fn reopening_does_not_run_a_migration_twice() {
 
     for round in 0..3 {
         let store = Store::open(&path, &key).unwrap_or_else(|error| panic!("open round {round}: {error}"));
-        assert_eq!(store.schema_version().expect("version"), 4);
+        assert_eq!(store.schema_version().expect("version"), 5);
         store.set_meta("rounds", &round.to_string()).expect("write");
         // Dropping the store closes the connection and checkpoints the WAL.
     }
@@ -197,7 +242,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     let key = random_key();
 
     {
-        let store = Store::open(&path, &key).expect("open v4");
+        let store = Store::open(&path, &key).expect("open v5");
         store.set_meta("canary", "still here").expect("write");
     }
     {
@@ -206,7 +251,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     }
 
     let error = Store::open(&path, &key).err().expect("a newer schema must not be opened");
-    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 4 }), "{error}");
+    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 5 }), "{error}");
 }
 
 #[test]

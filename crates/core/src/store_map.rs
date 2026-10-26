@@ -10,7 +10,9 @@ use postino_store as store;
 use postino_store::StoreError;
 
 use crate::engine::OpError;
-use crate::model::{Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, MailTls, Message, MessageSummary, ServerSettings, snippet};
+use crate::model::{
+    Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, MailTls, Message, MessageSummary, ServerSettings, SmtpSettings, snippet,
+};
 
 /// Unix milliseconds: the store's only date format (see the `postino-store` crate docs).
 pub(crate) fn millis(date: DateTime<Utc>) -> i64 {
@@ -97,10 +99,16 @@ pub(crate) fn account(row: store::Account) -> Account {
     Account { id: row.id, name: row.name, email: row.email, provider: row.provider, signature: row.signature }
 }
 
-/// The public view of an IMAP endpoint. The store row's `created_at` is storage detail and stays
-/// out of the operation surface.
+/// The public view of an IMAP and SMTP endpoint. The store row's `created_at` is storage detail and
+/// stays out of the operation surface.
 pub(crate) fn server_settings(row: store::AccountServer) -> ServerSettings {
-    ServerSettings { host: row.host, port: row.port, tls: mail_tls(row.tls), username: row.username }
+    ServerSettings {
+        host: row.host,
+        port: row.port,
+        tls: mail_tls(row.tls),
+        username: row.username,
+        smtp: row.smtp.map(|smtp| SmtpSettings { host: smtp.host, port: smtp.port, tls: mail_tls(smtp.tls), username: smtp.username }),
+    }
 }
 
 pub(crate) fn account_tls(tls: MailTls) -> store::AccountTls {
@@ -177,8 +185,9 @@ pub(crate) fn message(row: store::Message, attachments: Vec<store::Attachment>) 
 }
 
 /// Build a store row from a core message. `account_id` is not on the core summary; the caller
-/// knows it from the folder the message lives in.
-pub(crate) fn message_row(message: &Message, account_id: &str) -> store::Message {
+/// knows it from the folder the message lives in. `message_id` is the generated RFC 5322
+/// `Message-ID` for a locally submitted message; `None` for a draft that has never left the machine.
+pub(crate) fn message_row(message: &Message, account_id: &str, message_id: Option<&str>) -> store::Message {
     store::Message {
         summary: store::MessageSummary {
             id: message.summary.id.clone(),
@@ -196,7 +205,7 @@ pub(crate) fn message_row(message: &Message, account_id: &str) -> store::Message
             labels: message.summary.labels.clone(),
         },
         uid: None,
-        message_id: None,
+        message_id: message_id.map(str::to_owned),
         cc: message.cc.iter().map(store_address).collect(),
         bcc: message.bcc.iter().map(store_address).collect(),
         body_text: message.body_text.clone(),

@@ -196,6 +196,18 @@ impl Provider {
         }
     }
 
+    /// The offline SMTP submission endpoint of a known provider, or `None` for `custom`.
+    ///
+    /// Aruba and Gmail both submit over implicit TLS on 465 with the same app password used for
+    /// IMAP. OAuth for Gmail remains a later milestone.
+    pub fn smtp_discovery(self) -> Option<Discovery> {
+        match self {
+            Self::Aruba => Some(Discovery { host: "smtps.aruba.it", port: 465, tls: MailTls::Implicit }),
+            Self::Gmail => Some(Discovery { host: "smtp.gmail.com", port: 465, tls: MailTls::Implicit }),
+            Self::Custom => None,
+        }
+    }
+
     /// The likely cause of a rejected login, for an actionable auth error. Never includes a secret.
     pub fn login_advice(self) -> &'static str {
         match self {
@@ -244,6 +256,19 @@ impl MailTls {
 /// Where an account's mail comes from, as reported back to a caller. There is no password field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSettings {
+    pub host: String,
+    pub port: u16,
+    pub tls: MailTls,
+    pub username: String,
+    /// The submission endpoint, when the account has one. `None` means "read only": sending answers
+    /// with an actionable error instead of inventing a server.
+    #[serde(default)]
+    pub smtp: Option<SmtpSettings>,
+}
+
+/// Where an account submits mail, as reported back to a caller. Never a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmtpSettings {
     pub host: String,
     pub port: u16,
     pub tls: MailTls,
@@ -444,8 +469,13 @@ mod tests {
         assert_eq!((aruba.host, aruba.port, aruba.tls), ("imaps.aruba.it", 993, MailTls::Implicit));
         let gmail = Provider::Gmail.discovery().expect("gmail is known");
         assert_eq!((gmail.host, gmail.port, gmail.tls), ("imap.gmail.com", 993, MailTls::Implicit));
+        let aruba = Provider::Aruba.smtp_discovery().expect("aruba submits mail");
+        assert_eq!((aruba.host, aruba.port, aruba.tls), ("smtps.aruba.it", 465, MailTls::Implicit));
+        let gmail = Provider::Gmail.smtp_discovery().expect("gmail submits mail");
+        assert_eq!((gmail.host, gmail.port, gmail.tls), ("smtp.gmail.com", 465, MailTls::Implicit));
         assert!(Provider::Gmail.login_advice().contains("app password"));
         assert!(Provider::Custom.discovery().is_none());
+        assert!(Provider::Custom.smtp_discovery().is_none());
         for provider in [Provider::Aruba, Provider::Gmail, Provider::Custom] {
             assert_eq!(Provider::parse(provider.as_str()), Some(provider));
             assert_eq!(serde_json::to_value(provider).expect("provider JSON"), serde_json::json!(provider.as_str()));

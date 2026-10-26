@@ -1,8 +1,8 @@
 # Postino threat model
 
 > **Status:** M0 + M1 MIME parser (P4a) + encrypted attachment blobs (P4b) + IMAP sync into the store
-> (P5b) · **Last updated:** 2026-10-25 · **Review:** before every release that touches networking,
-> storage, HTML rendering or MCP.
+> (P5b) + SMTP submission and the outbox (P7) · **Last updated:** 2026-10-26 · **Review:** before every
+> release that touches networking, storage, HTML rendering or MCP.
 
 ## 1. What we protect
 
@@ -49,8 +49,10 @@
 9. **The server is authoritative.** The client never deletes mail from the server unless the user
    asks; a sync bug must not be able to empty a mailbox.
 10. **MCP cannot listen.** Stdio only. The daemon pipe is local, same-user and token-authenticated.
-11. **Sending is auditable.** Every send records account, identity, recipients count, message id,
-    time and the tool that requested it. Bodies are not logged.
+11. **Sending is explicit and auditable.** Every submission has an outbox row (account, recipient
+    count, state, attempts, Message-ID and timestamps); bodies are not logged. MCP sending is off
+    unless the server is started with `--allow-send`. An uncertain outcome is never retried
+    automatically.
 12. **Fail closed.** A missing keyring, unreadable store, invalid root or malformed config stops the
     operation with an error; it never falls back to plaintext or an unconfined path.
 
@@ -116,25 +118,29 @@
   lines and SASL payloads live in `Zeroizing` buffers. Logs carry tags and command verbs, never
   arguments, credentials, addresses or bodies. Authentication errors say what failed, never echo
   the password.
-- **Keyring scopes (P6a).** Service `postino`; scope `default` holds the store key and
-  `account:<id>:imap` holds one account's IMAP credential. `postino-platform` owns every read,
-  write and delete, takes the shared keyring lock for the whole operation, reads a written value
-  back before reporting success and returns `Zeroizing<Vec<u8>>`. The account id is restricted to
+- **Keyring scopes (P6a/P7).** Service `postino`; scope `default` holds the store key,
+  `account:<id>:imap` holds one account's IMAP credential and `account:<id>:smtp` an optional separate
+  SMTP credential. `postino-platform` owns every read, write and delete, takes the shared keyring lock
+  for the whole operation, reads a written value back before reporting success and returns
+  `Zeroizing<Vec<u8>>`. When the SMTP scope is absent the engine uses the IMAP credential for
+  submission and never copies one secret into the other's scope. The account id is restricted to
   ASCII letters, digits, `_` and `-`, so a crafted id cannot merge two scopes with a `:`.
 - **No password in the database, logs or MCP.** `account_servers` has no password column; the
   operation result `AccountView` has no secret; `SyncStatus` carries a fixed error sentence, counts
-  and timestamps only. `account_add` and `account_remove` are `sensitive`: the MCP server filters
-  them out of `tools/list` and refuses `tools/call` before parsing arguments, so a password in a
-  crafted call is never echoed. The CLI reads the password from a no-echo prompt or one
-  `--password-stdin` line; there is no `--password` argv flag, and the generic `postino run` refuses
-  a sensitive operation so JSON arguments cannot put a password in shell history. The JSON bridge
-  inside the engine keeps one transient copy of the password for the duration of the call; it is
-  dropped immediately and never formatted, but it is not zeroised (see the swap/crash-dump entry).
-- **Account add writes nothing on failure.** The login and `LIST` run before any durable write. The
-  credential is stored first and the account, server and folders commit in one transaction; if that
-  transaction fails, the credential is deleted again. The remaining window is an orphan credential,
-  which a retry with the same address reuses, not an account that can never authenticate.
-- **Account remove order.** The local cache is deleted first and the keyring entry second. The only
+  and timestamps only. `account_add`, `account_update` and `account_remove` are `sensitive`: the MCP
+  server filters them out of `tools/list` and refuses `tools/call` before parsing arguments, so a
+  password in a crafted call is never echoed. The CLI reads the password from a no-echo prompt or one
+  `--password-stdin` / `--smtp-password-stdin` line; there is no `--password` argv flag, and the
+  generic `postino run` refuses a sensitive operation so JSON arguments cannot put a password in
+  shell history. The JSON bridge inside the engine keeps one transient copy of the password for the
+  duration of the call; it is dropped immediately and never formatted, but it is not zeroised (see
+  the swap/crash-dump entry).
+- **Account add writes nothing on failure.** The IMAP login and `LIST` and the optional SMTP login run
+  before any durable write. The credentials are stored first and the account, server and folders
+  commit in one transaction; if that transaction fails, both credentials are deleted again. The
+  remaining window is an orphan credential, which a retry with the same address reuses, not an account
+  that can never authenticate.
+- **Account remove order.** The local cache is deleted first and both keyring entries second. The only
   failure window leaves an orphan credential, reported and overwritable by adding the same address
   again; it never leaves cached mail whose password is gone. `confirm: true` is required, and a failed
   cache delete aborts before the keyring, leaving the account usable.
@@ -208,12 +214,13 @@ crash-dump entry above.
 
 ### 4.4 Malicious agent
 
-- MCP is opt-in. The default posture is read + draft; sending requires an explicit server flag and
-  is recorded.
-- `dry_run` returns the exact RFC 822 bytes and the envelope recipients.
-- Idempotency keys make retries safe. A per-call recipient cap and a configurable rate limit prevent
-  a runaway loop.
-- `postino pause` / `--no-send` stops the server from sending without killing sync.
+- MCP is opt-in. The default posture is read + draft; `message_send`, `send_schedule`,
+  `outbox_retry` and `outbox_mark_sent` are listed as disabled and refused unless
+  `postino mcp --allow-send`. The server only queues: it never runs the outbox pass.
+- `send_dry_run` returns the exact RFC 822 bytes and the envelope recipients without queueing.
+- Idempotency keys make a retried queue operation safe: the key is stable per draft content and a
+  partial unique index makes a second queued/sending row for one draft impossible. The outbox and the
+  100-recipient/40 MiB caps bound a runaway loop; a per-call rate limit and audit log are M6 work.
 - The agent never receives credentials; it receives operations. `account_add` and `account_remove`
   are `sensitive`: they are absent from `tools/list` and `tools/call` refuses them before parsing the
   arguments, so an agent can neither create an account nor ask for a password to be stored.
@@ -233,7 +240,9 @@ crash-dump entry above.
 ### 4.6 Data loss
 
 - Saves are atomic: write a temp file, fsync it, then publish (rename or hard link).
-- The outbox is a journal; a crash replays idempotently.
+- The outbox is a journal: the exact bytes are stored before the network, a lease/attempts record
+  survives a crash, and an uncertain outcome is surfaced rather than replayed. The Sent APPEND is
+  retried independently and never resubmits.
 - Drafts keep revisions and recover after restart.
 - A sync bug must never delete server mail. Expunge is explicit. `postino-sync` never issues a
   mutating command; its deletion pass only removes rows from the local cache after a complete UID
@@ -242,6 +251,72 @@ crash-dump entry above.
   so a crash re-fetches one message at most. A `UIDVALIDITY` change discards that folder's cache but
   keeps local drafts, which were never on the server.
 - Backups are the user's responsibility, but export/import is a first-class feature.
+
+### 4.7 SMTP submission and the outbox (P7)
+
+- **TLS is mandatory.** SMTP uses implicit TLS or STARTTLS with the same OS verifier and no skip
+  switch. A STARTTLS mode whose server does not advertise the extension fails with `Unsupported`;
+  plaintext bytes buffered after the `220` are refused as a command-injection attempt. A wrong
+  hostname fails certificate verification, proved by a test that connects to `127.0.0.1` with a
+  `localhost` certificate.
+- **The password is never in the message.** `SmtpConfig`'s `Debug` redacts host identity and password,
+  `Secret` zeroises on drop and prints `[redacted]`, the SASL payload and `AUTH LOGIN` lines live in
+  `Zeroizing` buffers, and no log line carries a command argument. The fake-server transcript test
+  asserts the plaintext password appears in no command line and no body line is recorded as a command.
+- **Bounds.** 8 KiB per reply line, 64 KiB per reply, 40 MiB per message, 100 recipients, a timeout
+  for every phase, no bare LF and no bare CR (a `\r` must begin a CRLF), no NUL, dot-stuffing exactly
+  once. `SIZE 0` is "no fixed maximum" per RFC 1870, not a zero-byte ceiling. The body and the APPEND
+  literal are written in chunks with one 30 s timeout per chunk, so a dead connection is caught
+  quickly, and the whole transfer has a 30-minute budget (`MAX_BODY_TRANSFER`), so a trickle is bounded
+  too. A hostile server cannot make the client allocate an unbounded reply or body.
+- **A live transfer can never be expired as a crash.** The submission lease and the append claim are
+  both 45 minutes, strictly longer than the 30-minute body budget: a transfer that would exceed the
+  budget is aborted by the client, so the journal never marks a *running* submission `uncertain` (which
+  would invite a duplicate manual retry). Each lease and each append claim is stamped with the instant
+  it is taken, not with the start of the pass: a later row in a batch and an APPEND that follows a long
+  submission each get a full window. A 40 MiB message needs about 23 KiB/s to fit.
+- **No server text is stored.** A permanent or transient failure stores a fixed typed sentence (stage
+  and code only) in the encrypted outbox row; the APPEND failure does the same, and `SmtpError::Auth`
+  and `SmtpError::Rejected` themselves carry no server text. A hostile SMTP or IMAP server has received
+  the password (and, at DATA, the whole body) and can echo either in a `NO`/`550`: none of that text
+  reaches `outbox.last_error`, `outbox_list`, the CLI stdout or an MCP result. Tests at RCPT, DATA-end
+  and APPEND assert the password, the body and the recipient list are absent from every one of them.
+- **The uncertain window.** Once the final `.` is written, a refusal, a timeout, a close or a
+  malformed reply is `Uncertain`: the server has the bytes, so the client never guesses. The row is
+  never retried automatically; the UI says “Invio incerto: controlla in Inviati” and offers a manual
+  retry (which may send twice) or “Segna come inviato” (a local decision that proves nothing). This is
+  the deliberate trade for never silently duplicating a message or losing one without a record.
+- **Concurrent processes cannot duplicate a delivery or a Sent copy.** The `draft_id` partial unique
+  index plus a content/revision idempotency key make a second active row for one draft impossible; a
+  lease change is conditional on the owner; the Sent append has its own claim, stamped when the `250`
+  arrives, so two passes cannot APPEND the same row at once; `outbox_mark_sent` refuses if a concurrent
+  retry changed the row first. A stale engine also cannot overwrite a Sent copy: an edit or move
+  verifies the store's current folder for the id and is refused with “changed in another session”, and
+  a Sent copy moved back to Drafts is never adopted by a Sent sync (only Sent/Archive uid-null rows
+  are).
+- **Crash windows.** A row is leased to `sending` with its own `lease_at` in a transaction before any
+  network call; a crash leaves `sending`, and after the 45-minute lease it becomes `uncertain`, never
+  queued. Every post-lease transition is conditional on the lease still being the worker's, so two
+  processes cannot overwrite each other. A crash between the server's `250` and the durable
+  `append_pending` write is the narrow window that a test seam fails on: reopening turns the row
+  `uncertain` and opens no connection. A crash after `append_pending` retries only the APPEND. The IMAP
+  APPEND itself has no idempotency token: a crash after the server stored the literal but before its
+  tagged `OK` can leave a duplicate server copy. P7 documents that protocol limit; it does not claim
+  atomic APPEND.
+- **Credentials.** IMAP under `account:<id>:imap`; optional separate SMTP under `account:<id>:smtp`;
+  absent SMTP falls back to the IMAP credential. Both are in the OS keyring only. `account_add`
+  probes both servers before writing and deletes both on a failed store transaction; `account_remove`
+  deletes both after the cache. The database has no password column, and the outbox has no envelope
+  address list beyond the encrypted JSON.
+- **MCP send toggle.** `message_send`, `send_schedule`, `outbox_retry` and `outbox_mark_sent` are
+  refused and listed as disabled unless `postino mcp --allow-send` was passed at start. `send_dry_run`,
+  `outbox_list` and `outbox_cancel` stay available; a dry run is read-only and a cancel discards a
+  queued or permanently failed submission without sending. The MCP server only queues: it never runs
+  the outbox pass, so a queued message leaves only when the desktop app or `postino send` processes it.
+  There is still no rate limit or audit log beyond the outbox row: M6 adds the audit log and a compact
+  tool mode, and P8/P9 add richer guardrails.
+- **Demo is honest.** The demo mailbox has no SMTP endpoint; Send is disabled with a visible reason
+  and `message_send` refuses. A demo send never claims to leave the machine.
 
 ## 5. Out of scope
 

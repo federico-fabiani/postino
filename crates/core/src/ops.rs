@@ -62,7 +62,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "accounts_list",
             "List accounts",
-            "Every configured account with its IMAP provider, address, server host/port/TLS and last sync status. A damaged sync_status value is reported as null with a warning, never as a listing failure. Never includes a password or a credential: account_add and account_remove are sensitive operations available only from the CLI and the desktop app.",
+            "Every configured account with its IMAP provider, address, server host/port/TLS, optional SMTP submission endpoint and last sync status. A damaged sync_status value is reported as null with a warning, never as a listing failure. Never includes a password or a credential: account_add and account_remove are sensitive operations available only from the CLI and the desktop app.",
             AccountsListArgs,
             true,
             false
@@ -102,11 +102,59 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
-            "draft_send",
-            "Move a draft to Sent (local)",
-            "Move a draft to the Sent folder of its own account and record the current timestamp. No SMTP connection is opened in this build: the move is local and durable on a store, and real submission arrives with M2. At least one To, Cc or Bcc recipient is required.",
-            DraftSendArgs,
+            "message_send",
+            "Send a draft",
+            "Queue a draft for submission through the account's SMTP server, with a 5-second undo window before the first attempt. The exact RFC 5322 bytes and the SMTP envelope are persisted before any network call; a draft with a live outbox row cannot be edited or moved until it is sent, discarded or cancelled. The draft stays in Drafts while queued. Sending leaves the machine: the desktop worker or `postino send` processes the queue; the MCP server only queues and this build has no daemon. A failed submission keeps its typed state and a fixed error sentence in the outbox.",
+            MessageSendArgs,
             false,
+            false
+        ),
+        def!(
+            "send_schedule",
+            "Schedule a draft",
+            "Queue a draft for submission at `send_at` (RFC 3339 with a timezone). The bytes and envelope are persisted now; editing the draft afterwards is refused until the row is cancelled or sent. A time in the past is treated as now. The MCP server only queues: the desktop worker or `postino send` submits it when due.",
+            SendScheduleArgs,
+            false,
+            false
+        ),
+        def!(
+            "outbox_list",
+            "List the outbox",
+            "Journal rows, newest first, with state (queued, sending, append_pending, sent, uncertain, failed, cancelled), attempts, a fixed last-error sentence (stage and code, never server text), recipient count, subject and message id, plus the accounts whose queue is stopped by an authentication failure. `limit` (1-500, default 500) and `offset` page through the history; terminal rows older than 30 days are pruned. Read-only and offline. Never includes a password or a message body.",
+            OutboxListArgs,
+            true,
+            false
+        ),
+        def!(
+            "outbox_cancel",
+            "Cancel or discard a send",
+            "Discard a row that is still `queued` before the worker leases it, or a `failed` row (a permanent refusal, so no delivery happened); the draft stays in Drafts and becomes editable again. After `sending`, `append_pending` or `uncertain` the only resolutions are the uncertain policy (`outbox_retry` or `outbox_mark_sent`), because the message may already have been delivered.",
+            OutboxCancelArgs,
+            false,
+            false
+        ),
+        def!(
+            "outbox_retry",
+            "Retry a failed send",
+            "Manually retry one `failed` or `uncertain` row with `confirm: true`. An uncertain row may already have reached the server, so retrying can deliver it twice; check Sent first. Clears an account authentication halt. Never retried automatically.",
+            OutboxRetryArgs,
+            false,
+            false
+        ),
+        def!(
+            "outbox_mark_sent",
+            "Mark an uncertain send as sent",
+            "Resolve one `uncertain` row as delivered without contacting the server, with `confirm: true`. This records the user's decision and moves the local draft to Sent; it never submits again and never proves delivery.",
+            OutboxMarkSentArgs,
+            false,
+            false
+        ),
+        def!(
+            "send_dry_run",
+            "Dry-run a send",
+            "Return the exact RFC 5322 bytes (base64), the SMTP envelope including Bcc, the byte count, subject and Message-ID that a send would use, without writing a queue row or opening a connection. The serializer uses the draft's own saved date, so these bytes are identical to what a later send submits. Read-only.",
+            SendDryRunArgs,
+            true,
             false
         ),
         def!(
@@ -159,9 +207,18 @@ pub fn op_defs() -> Vec<OpDef> {
         ),
         def!(
             "account_add",
-            "Add an IMAP account",
-            "Sensitive: the password is read from the caller, used once for the login check and stored in the OS keyring, never logged or written to the database. Known providers are offline: aruba uses imaps.aruba.it:993 implicit; gmail uses imap.gmail.com:993 implicit and needs 2-Step Verification plus an app password (OAuth arrives in P12); custom requires host, port and tls. The server is contacted and its folders listed before anything is written, so a failed login writes nothing. Returns the account with its server and sync state; never the credential.",
+            "Add an account",
+            "Sensitive: the IMAP password and an optional separate SMTP password are read from the caller, used once for the login checks and stored in the OS keyring (`account:<id>:imap` and `account:<id>:smtp`), never logged or written to the database. Known providers are offline: aruba uses imaps.aruba.it:993 and smtps.aruba.it:465 implicit; gmail uses imap.gmail.com:993 and smtp.gmail.com:465 implicit and needs 2-Step Verification plus an app password (OAuth arrives in P12); custom requires IMAP host/port/tls and may add SMTP host/port/tls. Both servers are contacted before anything is written, so a failed login writes nothing. When no separate SMTP password is supplied, the IMAP credential is used for submission. Returns the account with its endpoints and sync state; never the credentials.",
             AccountAddArgs,
+            false,
+            false,
+            true
+        ),
+        def!(
+            "account_update",
+            "Update an account's SMTP endpoint",
+            "Sensitive: change where an existing account submits mail without touching its IMAP settings, cached mail or labels. Supply smtp_host, smtp_port and smtp_tls (known providers accept only their preset), optionally smtp_username and a new smtp_password; omit the password to keep the existing SMTP secret or fall back to the IMAP credential. clear_smtp: true removes the endpoint and its separate credential. The SMTP server is probed before anything is written. Available only from the CLI and the desktop app, never over MCP.",
+            AccountUpdateArgs,
             false,
             false,
             true
@@ -288,7 +345,7 @@ pub struct DraftSaveArgs {
     /// Body text. Omit to keep the current body on update; an empty string clears it.
     pub body_text: Option<String>,
     /// Attachment metadata. Omit to keep the current attachments on update; an empty list clears
-    /// them. M0 stores the name, MIME type and size; the bytes arrive in M2.
+    /// them. The bytes are stored through the encrypted attachment seam; sending requires them.
     pub attachments: Option<Vec<DraftAttachment>>,
 }
 
@@ -299,14 +356,69 @@ pub struct DraftAttachment {
     pub id: Option<String>,
     pub filename: String,
     pub mime: String,
+    /// Declared size. The exact stored size is read back from the encrypted blob after a write.
     pub size: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct DraftSendArgs {
+pub struct MessageSendArgs {
     /// Draft id returned by draft_save.
+    pub draft: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SendScheduleArgs {
+    /// Draft id returned by draft_save.
+    pub draft: String,
+    /// RFC 3339 instant with a timezone, for example `2026-10-26T18:30:00+01:00`.
+    pub send_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxListArgs {
+    /// Account id; omit for every account.
+    pub account: Option<String>,
+    /// Rows per page, 1-500. Defaults to 500.
+    pub limit: Option<u32>,
+    /// Rows to skip, newest first. Defaults to 0.
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxCancelArgs {
+    /// Outbox row id returned by message_send, send_schedule or outbox_list.
     pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxRetryArgs {
+    /// Outbox row id.
+    pub id: String,
+    /// Must be true. An uncertain row may already have been delivered.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxMarkSentArgs {
+    /// Outbox row id.
+    pub id: String,
+    /// Must be true: this records a local decision and never proves delivery.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SendDryRunArgs {
+    /// Draft id returned by draft_save.
+    pub draft: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -364,7 +476,7 @@ pub struct LabelApplyArgs {
 }
 
 /// Add an account. Sensitive: never exposed over MCP.
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountAddArgs {
     /// Offline provider: aruba, gmail or custom.
@@ -382,6 +494,38 @@ pub struct AccountAddArgs {
     pub port: Option<u16>,
     /// Only for provider custom: implicit or starttls. There is no plaintext mode.
     pub tls: Option<MailTls>,
+    /// SMTP submission host. Known providers use their preset; custom accounts may omit the whole
+    /// endpoint and then read mail without being able to send.
+    pub smtp_host: Option<String>,
+    /// SMTP submission port; required together with smtp_host and smtp_tls for a custom endpoint.
+    pub smtp_port: Option<u16>,
+    /// SMTP TLS mode: implicit or starttls. There is no plaintext mode.
+    pub smtp_tls: Option<MailTls>,
+    /// SMTP login when it differs from the address. Known providers use the address.
+    pub smtp_username: Option<String>,
+    /// SMTP password when it differs from the IMAP one. When omitted, the IMAP credential is used
+    /// for submission too; the value is never logged or written to the database.
+    pub smtp_password: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountUpdateArgs {
+    /// Account id returned by accounts_list.
+    pub id: String,
+    /// SMTP submission host. Known providers accept only their preset; omit it with clear_smtp.
+    pub smtp_host: Option<String>,
+    /// SMTP submission port.
+    pub smtp_port: Option<u16>,
+    /// SMTP TLS mode: implicit or starttls.
+    pub smtp_tls: Option<MailTls>,
+    /// SMTP login when it differs from the address.
+    pub smtp_username: Option<String>,
+    /// A new SMTP password. Omit it to keep the existing SMTP secret or the IMAP fallback.
+    pub smtp_password: Option<String>,
+    /// Remove the SMTP endpoint and its separate credential.
+    #[serde(default)]
+    pub clear_smtp: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -476,8 +620,26 @@ pub struct DraftSave {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DraftSend {
-    pub message: MessageSummary,
+pub struct SendQueued {
+    #[serde(flatten)]
+    pub queued: crate::outbox::SendQueued,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxAction {
+    pub outbox: crate::outbox::OutboxView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxListResult {
+    #[serde(flatten)]
+    pub outbox: crate::outbox::OutboxList,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DryRunResult {
+    #[serde(flatten)]
+    pub dry_run: crate::outbox::SendDryRun,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +679,11 @@ pub struct LabelApply {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountAdd {
+    pub account: AccountView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountUpdate {
     pub account: AccountView,
 }
 
@@ -619,9 +786,36 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let content = draft_content(engine, args)?;
             value(DraftSave { draft: content })
         }
-        "draft_send" => {
-            let args: DraftSendArgs = parse(args)?;
-            value(DraftSend { message: engine.send_draft(&args.id)? })
+        "message_send" => {
+            let args: MessageSendArgs = parse(args)?;
+            value(SendQueued { queued: engine.message_send(&args.draft)? })
+        }
+        "send_schedule" => {
+            let args: SendScheduleArgs = parse(args)?;
+            let send_at = chrono::DateTime::parse_from_rfc3339(args.send_at.trim())
+                .map_err(|error| OpError::InvalidArgs(format!("send_at is not an RFC 3339 instant: {error}")))?
+                .with_timezone(&chrono::Utc);
+            value(SendQueued { queued: engine.send_schedule(&args.draft, send_at)? })
+        }
+        "outbox_list" => {
+            let args: OutboxListArgs = parse(args)?;
+            value(OutboxListResult { outbox: engine.outbox_list(args.account.as_deref(), args.limit.unwrap_or(500), args.offset.unwrap_or(0))? })
+        }
+        "outbox_cancel" => {
+            let args: OutboxCancelArgs = parse(args)?;
+            value(OutboxAction { outbox: engine.outbox_cancel(&args.id)? })
+        }
+        "outbox_retry" => {
+            let args: OutboxRetryArgs = parse(args)?;
+            value(OutboxAction { outbox: engine.outbox_retry(&args.id, args.confirm)? })
+        }
+        "outbox_mark_sent" => {
+            let args: OutboxMarkSentArgs = parse(args)?;
+            value(OutboxAction { outbox: engine.outbox_mark_sent(&args.id, args.confirm)? })
+        }
+        "send_dry_run" => {
+            let args: SendDryRunArgs = parse(args)?;
+            value(DryRunResult { dry_run: engine.send_dry_run(&args.draft)? })
         }
         "search" => {
             let args: SearchArgs = parse(args)?;
@@ -651,6 +845,17 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "account_add" => {
             let args: AccountAddArgs = parse(args)?;
+            let smtp = if args.smtp_host.is_some() || args.smtp_port.is_some() || args.smtp_tls.is_some() || args.smtp_username.is_some() {
+                Some(crate::engine::SmtpSetup {
+                    host: args.smtp_host.unwrap_or_default(),
+                    port: args.smtp_port.unwrap_or(0),
+                    tls: args.smtp_tls.unwrap_or(MailTls::Implicit),
+                    username: args.smtp_username.unwrap_or_default(),
+                    password: args.smtp_password.map(Zeroizing::new),
+                })
+            } else {
+                None
+            };
             let setup = AccountSetup {
                 provider: args.provider,
                 email: args.email,
@@ -659,9 +864,23 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
                 host: args.host,
                 port: args.port,
                 tls: args.tls,
+                smtp,
                 extra_roots: Vec::new(),
             };
             value(AccountAdd { account: engine.add_account(setup)? })
+        }
+        "account_update" => {
+            let args: AccountUpdateArgs = parse(args)?;
+            let request = crate::engine::AccountUpdateRequest {
+                id: args.id,
+                smtp_host: args.smtp_host,
+                smtp_port: args.smtp_port,
+                smtp_tls: args.smtp_tls,
+                smtp_username: args.smtp_username,
+                smtp_password: args.smtp_password.map(Zeroizing::new),
+                clear_smtp: args.clear_smtp,
+            };
+            value(AccountUpdate { account: engine.update_account(request)? })
         }
         "account_test" => {
             let args: AccountTestArgs = parse(args)?;
@@ -943,6 +1162,26 @@ mod tests {
     }
 
     #[test]
+    fn send_operations_have_the_documented_surface() {
+        let defs = super::op_defs();
+        let find = |name: &str| defs.iter().find(|def| def.name == name).unwrap_or_else(|| panic!("{name} is missing"));
+        for name in ["message_send", "send_schedule", "outbox_cancel", "outbox_retry", "outbox_mark_sent"] {
+            let def = find(name);
+            assert!(!def.read_only, "{name} is a write");
+            assert!(!def.destructive, "{name} must not claim to be destructive");
+            assert!(!def.sensitive, "{name} takes no password");
+        }
+        for name in ["outbox_list", "send_dry_run"] {
+            assert!(find(name).read_only, "{name} must be read-only");
+        }
+        let send = find("message_send");
+        assert!(send.input_schema["properties"]["draft"].is_object(), "message_send schema has no draft field");
+        let dry = find("send_dry_run");
+        assert!(dry.description.contains("without writing a queue row"), "{}", dry.description);
+        assert!(!defs.iter().any(|def| def.name == "draft_send"), "the local-only draft_send operation must be gone");
+    }
+
+    #[test]
     fn table_is_well_formed() {
         let defs = super::op_defs();
         let mut names = std::collections::HashSet::new();
@@ -1081,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_save_and_send_work_through_the_registry() {
+    fn draft_save_and_local_sent_move_work() {
         let mut engine = Engine::demo();
         let saved = call(
             &mut engine,
@@ -1094,8 +1333,9 @@ mod tests {
         );
         let id = saved["draft"]["summary"]["id"].as_str().expect("draft id").to_owned();
         assert_eq!(saved["draft"]["summary"]["folder_id"], "drafts");
-        let sent = call(&mut engine, "draft_send", json!({ "id": id }));
-        assert_eq!(sent["message"]["folder_id"], "sent");
+        assert!(engine.call("message_send", json!({ "draft": id })).is_err(), "the demo engine has no SMTP account and must not claim a submission");
+        let sent = engine.send_draft(&id).expect("local sent move");
+        assert_eq!(sent.folder_id, "sent");
         let drafts = call(&mut engine, "messages_list", json!({ "folder": "drafts" }));
         assert!(!drafts["messages"].as_array().expect("rows").iter().any(|row| row["id"] == json!(id)));
     }

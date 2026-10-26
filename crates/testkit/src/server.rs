@@ -150,15 +150,18 @@ impl Conn {
     }
 
     /// Assert the next client line is exactly `expected`.
-    pub async fn expect(&mut self, expected: &str) {
+    /// Assert the next client line is exactly `expected` and return it.
+    pub async fn expect(&mut self, expected: &str) -> String {
         let line = self.read_line().await;
         assert_eq!(line, expected);
+        line
     }
 
-    /// Assert the next client line starts with `prefix`.
-    pub async fn expect_prefix(&mut self, prefix: &str) {
+    /// Assert the next client line starts with `prefix` and return it.
+    pub async fn expect_prefix(&mut self, prefix: &str) -> String {
         let line = self.read_line().await;
         assert!(line.starts_with(prefix), "expected a line starting with {prefix:?}, got {line:?}");
+        line
     }
 
     /// Write a string exactly as given.
@@ -181,6 +184,23 @@ impl Conn {
     /// Wait before the next step.
     pub async fn delay(&mut self, duration: Duration) {
         tokio::time::sleep(duration).await;
+    }
+
+    /// Read exactly `size` bytes from the stream, for an IMAP literal after `+`.
+    pub async fn read_exact_bytes(&mut self, size: usize) -> Vec<u8> {
+        while self.buffer.len().saturating_sub(self.position) < size {
+            if !self.fill().await {
+                panic!("client closed a literal early; lines so far: {:?}", self.received);
+            }
+        }
+        let end = self.position.saturating_add(size);
+        let bytes = self.buffer.get(self.position..end).unwrap_or_default().to_vec();
+        self.position = end;
+        if self.position == self.buffer.len() {
+            self.buffer.clear();
+            self.position = 0;
+        }
+        bytes
     }
 
     /// Complete the server side of a TLS handshake. Returns `false` when the client rejected the

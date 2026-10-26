@@ -9,6 +9,7 @@ mod boot;
 mod onboarding;
 mod reading;
 mod seams;
+mod send_worker;
 mod settings;
 mod sync_worker;
 #[cfg(test)]

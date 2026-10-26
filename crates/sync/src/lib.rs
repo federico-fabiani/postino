@@ -20,8 +20,10 @@
 //!   together, and the per-folder cursor advances only after that commit. A crash or a dropped
 //!   connection resumes from the last committed UID without a gap; re-fetching one message is
 //!   harmless because upserts are idempotent.
-//! - `BODY.PEEK[]` only. A read never sets `\Seen` and sync never sends `STORE`, `EXPUNGE`, `COPY`,
-//!   `MOVE` or `APPEND`: the server is read, never changed.
+//! - `BODY.PEEK[]` only. A read never sets `\Seen` and [`sync_account`] never sends `STORE`,
+//!   `EXPUNGE`, `COPY`, `MOVE` or `APPEND`: the server is read, never changed. The P7 submission
+//!   helper [`append_sent`] is a separate call the engine makes after SMTP accepted a message, and it
+//!   never submits.
 //! - Bodies are parsed by `postino-mime` with the sync limits; HTML is sanitized there, remote
 //!   content is removed and a hostile part becomes a warning, not a failed run.
 //! - Attachment bytes are written through the encrypted blob seam only when the part is complete and
@@ -52,6 +54,7 @@ mod folder;
 mod ids;
 mod ingest;
 mod status;
+mod submit;
 mod warnings;
 
 use std::collections::{HashMap, HashSet};
@@ -64,6 +67,27 @@ use thiserror::Error;
 
 pub use folder::{PlannedFolder, plan_folders};
 pub use status::{STATUS_KEY_PREFIX, SyncPhase, SyncStatus, read_status, read_status_for, status_key};
+pub use submit::{
+    MimeError, SerializedSubmission, Submission, SubmissionAttachment, SubmissionEnvelope, SubmissionMailbox, append_sent, serialize_submission,
+    smtp_secret, store_raw, submit, verify_smtp,
+};
+
+/// The stable id this crate would give a message that carries `message_id` in `account_id`.
+///
+/// A locally submitted Sent copy uses it, so the server copy a later sync fetches has the same id and
+/// updates that row with its UID instead of inserting a second one. `None` when the Message-ID is
+/// unusable, in which case the local copy keeps its own id.
+#[must_use]
+pub fn local_message_id(account_id: &str, message_id: &str) -> Option<String> {
+    ids::normalise_message_id(message_id).map(|normalised| ids::message_id(account_id, "", 1, 1, Some(&normalised)))
+}
+
+/// The normalised `Message-ID` (one pair of angle brackets removed) this crate stores, or `None`
+/// when the value is unusable. A locally submitted message stores the same form a sync would.
+#[must_use]
+pub fn normalised_message_id(raw: &str) -> Option<String> {
+    ids::normalise_message_id(raw)
+}
 
 /// UIDs requested per liveness/flags window. The network client caps untagged responses at 10 000;
 /// 1 000 keeps every window small and a 50 000-message folder to fifty round trips.

@@ -13,7 +13,7 @@ use postino_testkit::{
     FailPoint, MailboxScript, TestFolder, TestMessage, fetch_body_response, serve_mailbox, synthetic_html_message, synthetic_message,
     synthetic_message_with_attachment,
 };
-use support::{ACCOUNT_ID, Harness, RunningServer, account, assert_consistent, folder, message_by_header, run, seeded, sync};
+use support::{ACCOUNT_ID, Harness, RunningServer, account, assert_consistent, folder, message_by_header, messages_in, run, seeded, sync};
 
 const ATTACHMENT_BYTES: &[u8] = b"postino attachment bytes, stored encrypted";
 
@@ -537,4 +537,236 @@ fn the_testkit_body_builder_keeps_its_wire_shape() {
     let response = fetch_body_response(1, 7, b"abc");
     assert!(response.starts_with(b"* 1 FETCH (UID 7 BODY[] {3}\r\nabc"));
     assert!(response.ends_with(b")\r\n"));
+}
+
+#[test]
+fn a_synced_sent_copy_adopts_the_locally_written_row() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    // The first sync only creates the Sent folder row, as onboarding would have.
+    let server = RunningServer::start(vec![TestFolder::new("Sent", 20).with_special_use("\\Sent")]);
+    sync(&store, &server).expect("first sync");
+    server.finish();
+    let sent = folder(&store, "Sent");
+
+    // The submission path wrote the Sent copy locally with the generated Message-ID and no UID.
+    let local = postino_store::Message {
+        summary: postino_store::MessageSummary {
+            id: "draft_7".to_owned(),
+            account_id: ACCOUNT_ID.to_owned(),
+            folder_id: sent.id.clone(),
+            thread_id: "thr_draft_7".to_owned(),
+            from: postino_store::Address::new("Studio Verdi", "studio@example.com"),
+            to: vec![postino_store::Address::new("", "one@example.com")],
+            subject: "Inviata".to_owned(),
+            snippet: "corpo".to_owned(),
+            date: 1_700_000_000_000,
+            unread: false,
+            starred: false,
+            has_attachments: false,
+            labels: Vec::new(),
+        },
+        uid: None,
+        message_id: Some("submitted@example.com".to_owned()),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        body_text: "corpo".to_owned(),
+        body_html: None,
+        size: None,
+    };
+    store.upsert_message(&local).expect("the local Sent copy");
+
+    // The server now lists the same message in Sent, with a UID and the same Message-ID.
+    let server = RunningServer::start(vec![
+        TestFolder::new("Sent", 20)
+            .with_special_use("\\Sent")
+            .with_messages(vec![TestMessage::synthetic(synthetic_message(7)).with_message_id("<submitted@example.com>")]),
+    ]);
+    sync(&store, &server).expect("second sync");
+    server.finish();
+
+    let rows = messages_in(&store, &sent.id);
+    assert_eq!(rows.len(), 1, "the sync inserted a second copy of the locally sent message: {rows:?}");
+    assert_eq!(rows[0].id, "draft_7", "the local row was replaced instead of adopted");
+    let stored = store.get_message("draft_7").expect("message").expect("row");
+    assert_eq!(stored.uid, Some(7), "the adopted row did not receive the server UID");
+    assert_eq!(stored.message_id.as_deref(), Some("submitted@example.com"));
+    assert_consistent(&store);
+}
+
+#[test]
+fn a_local_sent_copy_that_moved_to_archive_is_adopted_by_a_sent_sync() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let server = RunningServer::start(vec![
+        TestFolder::new("Archive", 30).with_special_use("\\Archive"),
+        TestFolder::new("Sent", 20).with_special_use("\\Sent"),
+    ]);
+    sync(&store, &server).expect("first sync");
+    server.finish();
+    let archive = folder(&store, "Archive");
+    let sent = folder(&store, "Sent");
+    let local = postino_store::Message {
+        summary: postino_store::MessageSummary {
+            id: "draft_9".to_owned(),
+            account_id: ACCOUNT_ID.to_owned(),
+            folder_id: archive.id.clone(),
+            thread_id: "thr_draft_9".to_owned(),
+            from: postino_store::Address::new("Studio Verdi", "studio@example.com"),
+            to: vec![postino_store::Address::new("", "one@example.com")],
+            subject: "Spostata".to_owned(),
+            snippet: "corpo".to_owned(),
+            date: 1_700_000_000_000,
+            unread: false,
+            starred: false,
+            has_attachments: false,
+            labels: Vec::new(),
+        },
+        uid: None,
+        message_id: Some("moved@example.com".to_owned()),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        body_text: "corpo".to_owned(),
+        body_html: None,
+        size: None,
+    };
+    store.upsert_message(&local).expect("the local Sent copy in Archive");
+    let server = RunningServer::start(vec![
+        TestFolder::new("Sent", 20)
+            .with_special_use("\\Sent")
+            .with_messages(vec![TestMessage::synthetic(synthetic_message(9)).with_message_id("<moved@example.com>")]),
+    ]);
+    sync(&store, &server).expect("second sync");
+    server.finish();
+    let rows = messages_in(&store, &sent.id);
+    assert_eq!(rows.len(), 1, "the sync created a second row instead of adopting the local copy: {rows:?}");
+    assert_eq!(rows[0].id, "draft_9");
+    let stored = store.get_message("draft_9").expect("message").expect("row");
+    assert_eq!(stored.uid, Some(9));
+    assert_eq!(stored.summary.folder_id, sent.id, "the adopted row did not move with the message");
+    assert!(messages_in(&store, &archive.id).is_empty());
+    assert_consistent(&store);
+}
+
+/// A local row the engine wrote, in the shape a draft or a local Sent copy has (no UID).
+fn local_row(folder_id: &str, id: &str, message_id: &str) -> postino_store::Message {
+    postino_store::Message {
+        summary: postino_store::MessageSummary {
+            id: id.to_owned(),
+            account_id: ACCOUNT_ID.to_owned(),
+            folder_id: folder_id.to_owned(),
+            thread_id: format!("thr_{id}"),
+            from: postino_store::Address::new("Studio Verdi", "studio@example.com"),
+            to: vec![postino_store::Address::new("", "one@example.com")],
+            subject: "Inviata".to_owned(),
+            snippet: "corpo".to_owned(),
+            date: 1_700_000_000_000,
+            unread: false,
+            starred: false,
+            has_attachments: false,
+            labels: Vec::new(),
+        },
+        uid: None,
+        message_id: Some(message_id.to_owned()),
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        body_text: "corpo".to_owned(),
+        body_html: None,
+        size: None,
+    }
+}
+
+#[test]
+fn a_sent_copy_moved_back_to_drafts_is_not_hijacked_by_a_sent_sync() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let server = RunningServer::start(vec![
+        TestFolder::new("Drafts", 10).with_special_use("\\Drafts"),
+        TestFolder::new("Sent", 20).with_special_use("\\Sent"),
+    ]);
+    sync(&store, &server).expect("first sync");
+    server.finish();
+    let drafts = folder(&store, "Drafts");
+    let sent = folder(&store, "Sent");
+
+    // M2-a: a Sent copy can be moved back to Drafts before the Sent sync runs, then edited. It is a
+    // draft being edited, not a local Sent copy waiting for its UID.
+    let local = local_row(&drafts.id, "draft_moved_back", "moved-back@example.com");
+    store.save_draft_message(&local, &[]).expect("the local draft");
+    let mut sent_copy = local.clone();
+    sent_copy.summary.folder_id = sent.id.clone();
+    assert_eq!(store.send_draft_message(&sent_copy, None).expect("the local send"), None);
+    store.move_messages(&["draft_moved_back".to_owned()], &drafts.id).expect("move it back to Drafts");
+    let mut edited = store.get_message("draft_moved_back").expect("message").expect("row");
+    edited.summary.subject = "Inviata, corretta".to_owned();
+    store.save_draft_message(&edited, &[]).expect("edit the moved-back copy");
+
+    let server = RunningServer::start(vec![
+        TestFolder::new("Drafts", 10).with_special_use("\\Drafts"),
+        TestFolder::new("Sent", 20)
+            .with_special_use("\\Sent")
+            .with_messages(vec![TestMessage::synthetic(synthetic_message(9)).with_message_id("<moved-back@example.com>")]),
+    ]);
+    let outcome = sync(&store, &server).expect("second sync");
+    server.finish();
+    assert_eq!(outcome.removed, 0, "the sync removed a row: {outcome:?}");
+
+    let draft_row = store.get_message("draft_moved_back").expect("message").expect("the Drafts row was deleted or moved");
+    assert_eq!(draft_row.summary.folder_id, drafts.id, "the Sent sync moved the Drafts copy back to Sent");
+    assert_eq!(draft_row.uid, None, "the Drafts copy took the server UID");
+    assert!(store.get_draft("draft_moved_back").expect("draft row").is_some(), "the sync deleted the draft revision");
+    let sent_rows = messages_in(&store, &sent.id);
+    assert_eq!(sent_rows.len(), 1, "the Sent copy was not inserted separately: {sent_rows:?}");
+    assert_ne!(sent_rows[0].id, "draft_moved_back", "the Sent row reused the Drafts id");
+    let sent_row = store.get_message(&sent_rows[0].id).expect("message").expect("row");
+    assert_eq!(sent_row.uid, Some(9));
+    assert_consistent(&store);
+}
+
+#[test]
+fn a_merged_sent_row_with_a_uid_survives_a_sync_past_its_uid() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    // The server copy is already cached with UID 7, so the cursor is 8 before the local send.
+    let server = RunningServer::start(vec![
+        TestFolder::new("Drafts", 10).with_special_use("\\Drafts"),
+        TestFolder::new("Sent", 20)
+            .with_special_use("\\Sent")
+            .with_messages(vec![TestMessage::synthetic(synthetic_message(7)).with_message_id("<submitted@example.com>")]),
+    ]);
+    sync(&store, &server).expect("first sync");
+    server.finish();
+    let drafts = folder(&store, "Drafts");
+    let sent = folder(&store, "Sent");
+    assert_eq!(store.get_sync_state(&sent.id).expect("state").expect("row").uid_next, 8);
+    let cached = messages_in(&store, &sent.id)[0].id.clone();
+
+    // The submission: the local draft row moves to Sent and adopts the cached server copy's UID in
+    // one transaction, exactly as `finish_draft` does after the 250.
+    store.save_draft_message(&local_row(&drafts.id, "draft_7", "submitted@example.com"), &[]).expect("the local draft");
+    let mut submitted = local_row(&sent.id, "draft_7", "submitted@example.com");
+    submitted.uid = None;
+    let adopted = store.send_draft_message(&submitted, Some(&cached)).expect("merge the cached copy");
+    assert_eq!(adopted, Some(7), "the merge did not adopt the cached UID");
+    assert!(store.get_message(&cached).expect("duplicate").is_none(), "the cached duplicate survived the merge");
+    let merged = store.get_message("draft_7").expect("message").expect("row");
+    assert_eq!(merged.uid, Some(7));
+    assert_eq!(merged.summary.folder_id, sent.id);
+
+    // The next sync starts at UID 8 and never fetches UID 7 again; the merged row must keep it.
+    let server = RunningServer::start(vec![
+        TestFolder::new("Drafts", 10).with_special_use("\\Drafts"),
+        TestFolder::new("Sent", 20)
+            .with_special_use("\\Sent")
+            .with_messages(vec![TestMessage::synthetic(synthetic_message(7)).with_message_id("<submitted@example.com>")]),
+    ]);
+    let outcome = sync(&store, &server).expect("second sync");
+    server.finish();
+    assert_eq!(outcome.removed, 0, "the sync deleted the merged row: {outcome:?}");
+    let rows = messages_in(&store, &sent.id);
+    assert_eq!(rows.len(), 1, "the sync duplicated the merged row: {rows:?}");
+    assert_eq!(rows[0].id, "draft_7");
+    let stored = store.get_message("draft_7").expect("message").expect("row");
+    assert_eq!(stored.uid, Some(7), "the adopted UID was lost on the next sync");
+    assert_consistent(&store);
 }

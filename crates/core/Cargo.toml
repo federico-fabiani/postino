@@ -10,6 +10,7 @@ description = "Postino domain model, operations and the agent-first operation re
 postino-net.workspace = true
 postino-store.workspace = true
 postino-sync.workspace = true
+base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true
 directories.workspace = true
