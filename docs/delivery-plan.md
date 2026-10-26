@@ -83,8 +83,8 @@ Status: `todo` · `active` · `review` · `done`.
 | P6d | M1 remote-content count | schema v6 `messages.remote_images`, carry `remote_images_blocked` MIME→sync→store, render stored truth | done |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | done |
 | P8 | M2 compose | attachment bytes, signatures per identity, reply/forward recipients and headers, size caps | done |
-| P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, v7 inert tables | review |
-| P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | todo |
+| P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, v7 inert tables | done |
+| P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | active |
 | P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | todo |
 | P10 | M4 daemon | `postino-daemon`, named pipe/UDS + token, tray, autostart, clients | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
@@ -98,10 +98,11 @@ ordering, a damaged append envelope, live-lease expiry, append ownership, Sent d
 refresh, draft-id collisions and append backoff were all fixed before the squash merge. P6d is done
 (schema v6 carries the parsed remote-image count through sync and the reading pane). P8 is merged
 after its blind review closure: real attachment bytes, per-account signatures, reply/reply-all/forward
-headers and the 20/25 MiB caps, with no schema change. M2 is complete. P9a lands the M3 search work on
-schema v7 after v6: the body-free read path, FTS5 query language, operations, UI and 100k evidence. The
-search first-page target is met; open misses its target and RSS is unverified, both stated in the
-architecture table. P9b/P9c inherit the inert v7 tables and need no migration.
+headers and the 20/25 MiB caps, with no schema change. M2 is complete. P9a is done after its review
+closure: schema v7, the body-free read path, FTS5 query language, operations, UI and 100k evidence.
+The search first-page target is met (51 ms P50 at 100k); open misses its 150 ms target and RSS is
+unverified, both stated in the architecture table. P9b/P9c inherit the inert v7 tables and need no
+migration.
 
 ## 5. Delighters backlog
 
