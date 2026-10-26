@@ -83,7 +83,9 @@ Status: `todo` · `active` · `review` · `done`.
 | P6d | M1 remote-content count | carry `remote_images_blocked` from MIME through sync/store after schema v5; render it only from stored truth | todo |
 | P7 | M2 SMTP | submission, outbox, idempotency, Sent append, crash safety | active |
 | P8 | M2 compose | attachments bytes, signatures per identity, scheduled send, undo send | todo |
-| P9 | M3 organize | threads, FTS5 search, rules, label mapping, attachment preview/save | todo |
+| P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, saved search model | todo |
+| P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | todo |
+| P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | todo |
 | P10 | M4 daemon | `postino-daemon`, named pipe/UDS + token, tray, autostart, clients | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
