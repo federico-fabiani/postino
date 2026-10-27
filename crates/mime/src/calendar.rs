@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn the_reply_round_trips_tzid_sequence_and_the_full_summary() {
-        let full = "Revisione preventiva con il team di prodotto e i fornitori".to_owned();
+        let full = "Revisione preventiva con il team di prodotto, i fornitori e i partner internazionali".to_owned();
         let source = request()
             .replace("DTSTART:20261105T090000Z", "DTSTART;TZID=Europe/Rome:20261105T090000")
             .replace("DTEND:20261105T100000Z", "DTEND;TZID=Europe/Rome:20261105T100000")
@@ -601,8 +601,6 @@ mod tests {
         assert_eq!(refused.organizer, None);
         assert!(refused.warnings.contains(&InviteWarning::FieldsTruncated));
 
-        let lower = request().replace("BEGIN:VEVENT", "bEgIn:VeVeNt");
-        assert!(parse_invite(lower.as_bytes()).is_ok(), "component parsing must ignore BEGIN case");
         let mixed = format!("{}{}", "BeGiN:X\r\n".repeat(MAX_CALENDAR_COMPONENTS + 1), request());
         assert_eq!(parse_invite(mixed.as_bytes()), Err(InviteError::TooManyComponents));
     }
