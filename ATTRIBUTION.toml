@@ -517,7 +517,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "925f5c8d14a078d862d900bf9b5d4e55e187c8cb363c890597372b8de5ed1fae"
+sha256 = "89e2e608b1e6562081bf2f4cff61bb1ad38c91c197589a8b76586e227d11ded5"
 usage = "Documentation screenshot of the settings dialog at the minimum window"
 
 [[asset]]
