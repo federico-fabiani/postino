@@ -23,6 +23,7 @@
 #![deny(missing_docs)]
 
 mod blocks;
+mod calendar;
 mod encode;
 mod error;
 mod headers;
@@ -38,6 +39,10 @@ pub use blocks::{
     Block, Body, BodyView, HeadingLevel, Image, Inline, Link, List, MAX_ALT_BYTES, MAX_BLOCKS, MAX_BODY_BYTES, MAX_DEPTH, MAX_LINK_BYTES,
     MAX_LIST_ITEMS, MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, MAX_TEXT_CHARS, Style, Table, TableCell, TableRow, TextFallback, TextReason, TextRun,
     render_body,
+};
+pub use calendar::{
+    CalendarInvite, InviteError, InviteWarning, MAX_CALENDAR_BYTES, MAX_CALENDAR_COMPONENTS, MAX_INVITE_ATTENDEES, MAX_INVITE_FIELD_CHARS,
+    parse_invite, reply_calendar,
 };
 pub use error::MimeError;
 pub use headers::Headers;

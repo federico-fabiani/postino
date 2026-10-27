@@ -9,6 +9,7 @@ description = "MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serial
 [dependencies]
 ammonia.workspace = true
 chrono.workspace = true
+icalendar.workspace = true
 mail-parser.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

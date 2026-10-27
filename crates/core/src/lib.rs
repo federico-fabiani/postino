@@ -29,9 +29,9 @@ pub use engine::{
     MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup, ThreadDetailResult, ThreadFlagResult, ThreadListRequest, ThreadPageResult,
 };
 pub use model::{
-    Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
-    Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect, RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings,
-    SmtpSettings, ThreadSummary,
+    Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
+    MailTls, Message, MessageSummary, Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect, RulePreviewRow, RuleRun, RuleRunScope,
+    SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
 };
 pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{

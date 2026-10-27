@@ -345,6 +345,25 @@ mod tests {
     }
 
     #[test]
+    fn the_invite_tools_expose_the_registry_schemas_and_annotations() {
+        let mut engine = Engine::demo();
+        let response = request(&mut engine, "tools/list");
+        let tools = response["result"]["tools"].as_array().expect("tools");
+        let read = tools.iter().find(|tool| tool["name"] == "message_invite").expect("message_invite is listed");
+        assert_eq!(read["annotations"]["readOnlyHint"], json!(true));
+        assert_eq!(read["annotations"]["destructiveHint"], json!(false));
+        assert_eq!(read["inputSchema"]["required"], json!(["id"]));
+        assert!(read["inputSchema"]["properties"]["id"].is_object());
+
+        let write = tools.iter().find(|tool| tool["name"] == "invite_reply_draft").expect("invite_reply_draft is listed");
+        assert_eq!(write["annotations"]["readOnlyHint"], json!(false), "it writes a draft");
+        assert_eq!(write["annotations"]["destructiveHint"], json!(false));
+        assert_eq!(write["inputSchema"]["required"], json!(["message", "response"]));
+        assert!(write["description"].as_str().is_some_and(|description| description.contains("organizer")));
+        assert!(!tools.iter().any(|tool| tool["name"] == "account_add"), "invite tools are not a credential path");
+    }
+
+    #[test]
     fn tools_call_returns_text_and_structured_content() {
         let mut engine = Engine::demo();
         let response = handle(

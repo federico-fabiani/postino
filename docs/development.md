@@ -382,6 +382,7 @@ cargo run -p postino-app -- --screenshot reading_attachments --out docs/images/p
 cargo run -p postino-app -- --screenshot reading_attachments --size 980x600 --out docs/images/postino-p6c-reading-attachments-980.png
 cargo run -p postino-app -- --screenshot link_confirm --out docs/images/postino-p6c-link-confirm.png
 cargo run -p postino-app -- --screenshot link_confirm --size 980x600 --out docs/images/postino-p6c-link-confirm-980.png
+cargo run -p postino-app -- --screenshot reading_invite --size 980x600 --out docs/images/postino-p12d-invite-980.png
 cargo run -p postino-app -- --screenshot settings --out docs/images/postino-p6c-settings.png
 cargo run -p postino-app -- --screenshot settings --dark --out docs/images/postino-p6c-settings-dark.png
 cargo run -p postino-app -- --screenshot settings --size 980x600 --out docs/images/postino-p6c-settings-980.png
@@ -425,7 +426,8 @@ syntax help), `search_error` (an invalid query with the positional error and no 
 with a seeded updated-at state), `offline` (a cached message open under the offline banner),
 `reading_attachments` (a deterministic sanitized message with one stored blocked remote image, a safe
 link and one PDF attachment in the pinned strip), `link_confirm` (the same message under the
-full-destination sheet, which shows the host/recipient line as well as the exact URL), `settings`
+full-destination sheet, which shows the host/recipient line as well as the exact URL), `reading_invite`
+(a 980×600 invite card with organizer, timezone warning and the three draft-only replies), `settings`
 (the full settings dialog), `settings_signature` (the same dialog with the per-account Firma editor
 open and a seeded signature), `threads` (the demo inbox grouped by conversation), `conversation`
 (the preventivo thread open with one expanded card), `saved_searches` (three saved searches with

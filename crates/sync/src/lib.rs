@@ -66,7 +66,10 @@ use postino_store as store;
 use thiserror::Error;
 
 pub use folder::{PlannedFolder, plan_folders};
-pub use postino_mime::{Limits, parse};
+pub use postino_mime::{
+    CalendarInvite, InviteError, InviteWarning, Limits, MAX_CALENDAR_BYTES, MAX_CALENDAR_COMPONENTS, MAX_INVITE_ATTENDEES, MAX_INVITE_FIELD_CHARS,
+    parse, parse_invite, reply_calendar,
+};
 pub use status::{STATUS_KEY_PREFIX, SyncPhase, SyncStatus, read_status, read_status_for, status_key};
 pub use submit::{
     MimeError, SerializedSubmission, Submission, SubmissionAttachment, SubmissionEnvelope, SubmissionMailbox, append_sent, mime_for_filename,

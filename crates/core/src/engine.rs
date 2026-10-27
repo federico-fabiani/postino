@@ -21,8 +21,8 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::model::{
-    Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
-    Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
+    Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
+    MailTls, Message, MessageSummary, Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::outbox::{
@@ -3642,6 +3642,107 @@ impl Engine {
         }
     }
 
+    /// The invite card for one message, or `None` when it has no readable `text/calendar` part.
+    ///
+    /// The part is located by declared type or `.ics` filename, its size is capped before any read,
+    /// and the bytes go through the existing hash-checked blob seam. A malformed or hostile
+    /// calendar falls back to a normal attachment: it is not an error and it never panics.
+    pub fn message_invite(&self, id: &str) -> Result<Option<CalendarInviteView>, OpError> {
+        Ok(self.read_invite(id)?.as_ref().map(invite_view))
+    }
+
+    fn read_invite(&self, id: &str) -> Result<Option<postino_sync::CalendarInvite>, OpError> {
+        let message = self.message_result(id)?.ok_or_else(|| unknown_message(id))?;
+        let Some(attachment) = message.attachments.iter().find(|attachment| is_calendar_part(attachment)) else {
+            return Ok(None);
+        };
+        if attachment.size > postino_sync::MAX_CALENDAR_BYTES as u64 {
+            return Ok(None);
+        }
+        let Ok(bytes) = self.attachment_bytes(&attachment.id) else {
+            return Ok(None);
+        };
+        if bytes.len() > postino_sync::MAX_CALENDAR_BYTES {
+            return Ok(None);
+        }
+        let Some(mut invite) = postino_sync::parse_invite(&bytes).ok() else {
+            return Ok(None);
+        };
+        // A copy in Sent or Drafts is an outgoing record, not an invitation to answer: the card stays
+        // readable and the three actions stay disabled.
+        if self
+            .folders
+            .iter()
+            .find(|folder| folder.id == message.summary.folder_id)
+            .is_some_and(|folder| matches!(folder.kind, FolderKind::Sent | FolderKind::Drafts))
+        {
+            invite.can_reply = false;
+        }
+        Ok(Some(invite))
+    }
+
+    /// Create a draft that answers an invite. It is intentionally narrow: only the organizer is a
+    /// recipient, nothing is sent, and no calendar is updated. The person still edits and sends it.
+    pub fn invite_reply_draft(&mut self, message_id: &str, response: InviteResponse) -> Result<Message, OpError> {
+        let message = self.message_result(message_id)?.ok_or_else(|| unknown_message(message_id))?;
+        let invite = self.read_invite(message_id)?.ok_or_else(|| {
+            OpError::InvalidArgs(format!(
+                "message {message_id:?} has no readable text/calendar invite; the attachment stays available and no reply is drafted"
+            ))
+        })?;
+        if !invite.valid {
+            let reason = invite.invalid_reason.as_deref().unwrap_or("the event is not valid");
+            return Err(OpError::InvalidArgs(format!("the invite cannot be answered: {reason}")));
+        }
+        let outgoing = self
+            .folders
+            .iter()
+            .find(|folder| folder.id == message.summary.folder_id)
+            .is_some_and(|folder| matches!(folder.kind, FolderKind::Sent | FolderKind::Drafts));
+        if outgoing {
+            return Err(OpError::InvalidArgs("only a received invitation can be answered; a copy in Sent or Drafts is informational".to_owned()));
+        }
+        if invite.cancelled || invite.method != "REQUEST" {
+            return Err(OpError::InvalidArgs(
+                "only a valid METHOD:REQUEST with an organizer can be answered; CANCEL and REPLY are informational".to_owned(),
+            ));
+        }
+        let organizer =
+            invite.organizer.clone().ok_or_else(|| OpError::InvalidArgs("the invite has no organizer; there is nobody to answer".to_owned()))?;
+        if !invite.can_reply {
+            return Err(OpError::InvalidArgs(
+                "only a valid METHOD:REQUEST with an organizer can be answered; CANCEL and REPLY are informational".to_owned(),
+            ));
+        }
+        let account = self
+            .folders
+            .iter()
+            .find(|folder| folder.id == message.summary.folder_id)
+            .and_then(|folder| self.accounts.iter().find(|account| account.id == folder.account_id))
+            .cloned()
+            .ok_or_else(|| OpError::Failed(format!("message {message_id:?} is not in a folder of a known account")))?;
+        let parent = self.reply_target(message_id)?.parent_message_id;
+        let subject = format!("{}: {}", response.subject_prefix(), invite.summary);
+        let body = invite_reply_body(&invite, response);
+        let draft = DraftContent {
+            to: vec![Address { name: String::new(), email: organizer }],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject,
+            body_text: body,
+            attachments: Vec::new(),
+            in_reply_to: parent,
+        };
+        let saved = self.save_draft(Some(&account.id), None, draft)?;
+        // The reply part needs a store blob. The demo engine has synthetic mail only, so it keeps the
+        // text draft; a stored account always gets the METHOD:REPLY attachment.
+        if self.store.is_some() {
+            let calendar = postino_sync::reply_calendar(&invite, &account.email, response.partstat(), Utc::now());
+            return self.add_draft_attachment(&saved.summary.id, "invito.ics", Some("text/calendar"), calendar.as_bytes());
+        }
+        Ok(saved)
+    }
+
     /// Add one attachment with its exact bytes to a draft.
     ///
     /// The filename is sanitized with the same rule as the serializer, a duplicate is renamed
@@ -4489,6 +4590,64 @@ fn normalize_draft_attachment_names(mut draft: DraftContent) -> DraftContent {
     }
     draft.attachments = normalized;
     draft
+}
+
+/// One attachment that can be read as a calendar invite. The MIME type is authoritative; a bare
+/// `.ics` name is accepted only for the generic types a scanner or a sender may attach.
+fn is_calendar_part(attachment: &Attachment) -> bool {
+    if attachment.mime.eq_ignore_ascii_case("text/calendar") {
+        return true;
+    }
+    attachment.filename.len() <= 128
+        && attachment.filename.to_ascii_lowercase().ends_with(".ics")
+        && matches!(attachment.mime.to_ascii_lowercase().as_str(), "application/ics" | "application/octet-stream" | "text/x-vcalendar")
+}
+
+fn invite_view(invite: &postino_sync::CalendarInvite) -> CalendarInviteView {
+    let method = match invite.method.as_str() {
+        "REQUEST" => "request",
+        "CANCEL" => "cancel",
+        "REPLY" => "reply",
+        _ => "other",
+    };
+    CalendarInviteView {
+        method: method.to_owned(),
+        summary: invite.summary.clone(),
+        organizer: invite.organizer.clone(),
+        attendees: invite.attendees.clone(),
+        start: invite.start.clone(),
+        end: invite.end.clone(),
+        location: invite.location.clone(),
+        recurrence: invite.recurrence,
+        timezone: invite.timezone.clone(),
+        valid: invite.valid,
+        invalid_reason: invite.invalid_reason.clone(),
+        cancelled: invite.cancelled,
+        can_reply: invite.can_reply,
+        warnings: invite.warnings.iter().map(|warning| warning.message().to_owned()).collect(),
+    }
+}
+
+/// The fixed text of an invite reply. It is a draft, so it says so: no automatic response, no
+/// calendar update, and only the organizer on the To line.
+fn invite_reply_body(invite: &postino_sync::CalendarInvite, response: InviteResponse) -> String {
+    let answer = match response {
+        InviteResponse::Accept => "Ho accettato l'invito.",
+        InviteResponse::Tentative => "Ho segnato l'invito come tentativo.",
+        InviteResponse::Decline => "Ho rifiutato l'invito.",
+    };
+    let mut body = format!("{answer}\n\nOggetto: {}\n", invite.summary);
+    if let Some(start) = invite.start.as_deref() {
+        match invite.end.as_deref() {
+            Some(end) => body.push_str(&format!("Quando: {start} — {end}\n")),
+            None => body.push_str(&format!("Quando: {start}\n")),
+        }
+    }
+    if let Some(location) = invite.location.as_deref() {
+        body.push_str(&format!("Luogo: {location}\n"));
+    }
+    body.push_str("\nNessuna risposta automatica: rivedi e invia questa bozza. Nessun calendario è stato aggiornato.");
+    body
 }
 
 /// Rename a duplicate to `name (2).ext`, keeping the extension and the 255-byte bound.

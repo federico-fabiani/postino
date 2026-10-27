@@ -86,6 +86,22 @@ pub fn op_defs() -> Vec<OpDef> {
         ),
         def!("message_get", "Get a message", "One message with its body, recipients and attachments.", MessageGetArgs, true, false),
         def!(
+            "message_invite",
+            "Read a calendar invite",
+            "Parse the first text/calendar attachment of one message into an invite card: METHOD, summary, organizer, attendees, start/end, location, recurrence and timezone flags, validity and warnings. The part is capped at 256 KiB, 1000 components and 2000 attendees; malformed or hostile input returns `invite: null` and the file stays a normal attachment. Read-only and offline: nothing is stored, expanded or added to a calendar.",
+            MessageInviteArgs,
+            true,
+            false
+        ),
+        def!(
+            "invite_reply_draft",
+            "Draft a reply to an invite",
+            "Create a draft that answers a valid METHOD:REQUEST invite with accept, tentative or decline. The only recipient is the organizer; attendees are never copied and Bcc is empty. On a stored account the draft carries a text/calendar METHOD:REPLY part (invito.ics) and In-Reply-To/References. It never sends and never touches a calendar: the person edits and sends the draft. CANCEL, REPLY, an invalid event or a missing organizer is refused. Returns the draft message.",
+            InviteReplyDraftArgs,
+            false,
+            false
+        ),
+        def!(
             "message_flag",
             "Change message flags",
             "Set the read/unread or starred state of one message. At least one flag is required.",
@@ -483,6 +499,28 @@ pub struct MessagesListArgs {
 #[serde(deny_unknown_fields)]
 pub struct MessageGetArgs {
     pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessageInviteArgs {
+    /// Message id returned by messages_list, message_get or a search result.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InviteReplyDraftArgs {
+    /// The message that carries the text/calendar part.
+    pub message: String,
+    /// accept, tentative or decline.
+    pub response: crate::model::InviteResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MessageInvite {
+    /// `null` when the message has no readable calendar part.
+    pub invite: Option<crate::model::CalendarInviteView>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1439,6 +1477,14 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "message_get" => {
             let args: MessageGetArgs = parse(args)?;
             message(engine, args)
+        }
+        "message_invite" => {
+            let args: MessageInviteArgs = parse(args)?;
+            value(MessageInvite { invite: engine.message_invite(&args.id)? })
+        }
+        "invite_reply_draft" => {
+            let args: InviteReplyDraftArgs = parse(args)?;
+            value(DraftSave { draft: engine.invite_reply_draft(&args.message, args.response)? })
         }
         "message_flag" => {
             let args: MessageFlagArgs = parse(args)?;

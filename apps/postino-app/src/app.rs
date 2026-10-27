@@ -13,9 +13,9 @@ use eframe::egui::{
     RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
-    Account, Address, Attachment, DraftSave, Engine, FolderKind, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate,
-    Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView, SavedSearch, SearchResult, SendQueued, SyncPhase,
-    ThreadGetResult, ThreadSummary, ThreadsListResult,
+    Account, Address, Attachment, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor, LabelCreate,
+    LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView, SavedSearch,
+    SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
@@ -123,6 +123,7 @@ pub enum ScreenshotState {
     Mailbox,
     Offline,
     ReadingAttachments,
+    ReadingInvite,
     LinkConfirm,
     Settings,
     SettingsSignature,
@@ -160,6 +161,7 @@ impl ScreenshotState {
             "mailbox" => Ok(Self::Mailbox),
             "offline" => Ok(Self::Offline),
             "reading_attachments" => Ok(Self::ReadingAttachments),
+            "reading_invite" => Ok(Self::ReadingInvite),
             "link_confirm" => Ok(Self::LinkConfirm),
             "settings" => Ok(Self::Settings),
             "settings_signature" => Ok(Self::SettingsSignature),
@@ -175,7 +177,7 @@ impl ScreenshotState {
             other => Err(format!(
                 "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
                  empty_unread, empty_attachments, empty_label_unread, onboarding_welcome, onboarding_provider, onboarding_form, onboarding_error, \
-                 onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, link_confirm, settings, settings_signature, outbox, \
+                 onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, reading_invite, link_confirm, settings, settings_signature, outbox, \
                  search, search_error, threads, conversation, saved_searches, rules, rule_editor, rule_preview"
             )),
         }
@@ -473,6 +475,14 @@ pub struct PostinoApp {
     attachment_save_ids: BTreeMap<String, Id>,
     /// A message override used only by deterministic screenshots (HTML plus attachment fixtures).
     screenshot_message: Option<Message>,
+    /// The invite card shown for [`Self::screenshot_message`], when the scene is an invite.
+    screenshot_invite: Option<CalendarInviteView>,
+    /// One-entry cache for the parsed invite of the open message. The part cannot change while the
+    /// message is open; a new selection replaces the entry and no re-read happens per frame.
+    invite_cache: Option<(String, Option<CalendarInviteView>)>,
+    /// True while the reading pane shows a received, valid invite that can be answered. The three
+    /// invite commands read this rule; the card never carries its own enabled state.
+    invite_ready: bool,
     /// The sidebar account row, used to return focus when settings closes.
     account_switcher_id: Option<Id>,
     /// The widget to restore when the settings dialog closes.
@@ -1144,6 +1154,9 @@ impl PostinoApp {
             attachment_overwrite: None,
             attachment_save_ids: BTreeMap::new(),
             screenshot_message: None,
+            screenshot_invite: None,
+            invite_cache: None,
+            invite_ready: false,
             account_switcher_id: None,
             settings_return_focus: None,
             settings_focus_pending: false,
@@ -1218,6 +1231,9 @@ impl PostinoApp {
 
     fn seed_screenshot(&mut self, state: ScreenshotState) {
         self.screenshot_message = None;
+        self.screenshot_invite = None;
+        self.invite_cache = None;
+        self.invite_ready = false;
         match state {
             ScreenshotState::Shell => {}
             ScreenshotState::Reading => {
@@ -1447,6 +1463,48 @@ impl PostinoApp {
                         backslash: false,
                         focus_cancel: false,
                     });
+                }
+            }
+            ScreenshotState::ReadingInvite => {
+                self.demo = false;
+                let last = self.now_utc.timestamp_millis() - 12 * 60 * 1000;
+                self.sync_view = SyncView::Idle { last_sync: Some(last) };
+                self.last_sync = Some(last);
+                self.status.clear();
+                let first = self.visible_messages().0.first().map(|message| message.id.clone());
+                if let Some(id) = first {
+                    self.open_message(id.clone());
+                    self.now = 1.0;
+                    self.maybe_complete_read();
+                    self.toast = None;
+                    self.status.clear();
+                    if let Some(mut message) = self.engine.message(&id) {
+                        message.summary.subject = "Revisione preventivo".to_owned();
+                        message.summary.from = Address::new("Giulia Ferri", "giulia.ferri@example.com");
+                        message.body_text = "Ciao Federico,\n\nti confermo la revisione del preventivo giovedì mattina in studio. Se non riesci, rispondi pure con un tentativo e troviamo un'altra data.\n\nGiulia"
+                            .to_owned();
+                        message.body_html = None;
+                        message.remote_images = 0;
+                        message.attachments.clear();
+                        message.summary.has_attachments = false;
+                        self.screenshot_message = Some(message);
+                        self.screenshot_invite = Some(CalendarInviteView {
+                            method: "request".to_owned(),
+                            summary: "Revisione preventivo".to_owned(),
+                            organizer: Some("giulia.ferri@example.com".to_owned()),
+                            attendees: vec!["giulia.ferri@example.com".to_owned(), "federico@example.it".to_owned()],
+                            start: Some("2026-11-05T09:00:00".to_owned()),
+                            end: Some("2026-11-05T10:00:00".to_owned()),
+                            location: Some("Studio Postino, Via Roma 1".to_owned()),
+                            recurrence: false,
+                            timezone: Some("Europe/Rome".to_owned()),
+                            valid: true,
+                            invalid_reason: None,
+                            cancelled: false,
+                            can_reply: true,
+                            warnings: vec!["Fuso orario dichiarato ma non applicato: gli orari sono quelli scritti nell'invito.".to_owned()],
+                        });
+                    }
                 }
             }
             ScreenshotState::Settings => {
@@ -3802,6 +3860,7 @@ impl PostinoApp {
         self.reading_open = false;
         self.reading_full = false;
         self.pending_read = None;
+        self.invite_ready = false;
     }
 
     fn move_selected(&mut self, kind: FolderKind, confirmation: &str, plural: &str) {
@@ -4743,6 +4802,9 @@ impl PostinoApp {
         let mut labels = false;
         let mut rename_label = false;
         let mut outbox = false;
+        let mut invite_accept = false;
+        let mut invite_tentative = false;
+        let mut invite_decline = false;
         // Only a real text field may swallow the single-key map. `egui_wants_keyboard_input()`
         // is also true for a focused row or button, and clicking a label left the app deaf to
         // F2/L/J/K/? until Esc.
@@ -4775,6 +4837,9 @@ impl PostinoApp {
             labels = !typing && !input.modifiers.command && input.key_pressed(Key::L);
             rename_label = !typing && !input.modifiers.command && input.key_pressed(Key::F2);
             outbox = !typing && input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::O);
+            invite_accept = !typing && input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Num1);
+            invite_tentative = !typing && input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Num2);
+            invite_decline = !typing && input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Num3);
         });
         if palette {
             self.show_palette = !self.show_palette;
@@ -4829,6 +4894,15 @@ impl PostinoApp {
         if outbox {
             self.refresh_outbox();
             self.outbox_open = true;
+        }
+        if self.reading_open && self.invite_ready {
+            if invite_accept {
+                self.execute_command("invite_accept", ctx);
+            } else if invite_tentative {
+                self.execute_command("invite_tentative", ctx);
+            } else if invite_decline {
+                self.execute_command("invite_decline", ctx);
+            }
         }
         if compose {
             self.compose_new();
@@ -7300,6 +7374,56 @@ impl PostinoApp {
         }
     }
 
+    /// Parse the open message's calendar part once. A screenshot scene owns its card directly.
+    fn reading_invite(&mut self, message: &Message) -> Option<CalendarInviteView> {
+        if self.screenshot_message.as_ref().is_some_and(|screenshot| screenshot.summary.id == message.summary.id) {
+            return self.screenshot_invite.clone();
+        }
+        if let Some((id, invite)) = &self.invite_cache
+            && id == &message.summary.id
+        {
+            return invite.clone();
+        }
+        let invite = self.engine.message_invite(&message.summary.id).ok().flatten();
+        self.invite_cache = Some((message.summary.id.clone(), invite.clone()));
+        invite
+    }
+
+    /// Ask the engine for the reply draft, then open it in the composer. The engine writes the
+    /// draft; this method never sends and never marks anything on a calendar.
+    fn reply_to_invite(&mut self, response: InviteResponse) {
+        if let Some(message_id) = self.selected.clone() {
+            self.start_invite_reply(&message_id, response);
+        }
+    }
+
+    fn start_invite_reply(&mut self, message_id: &str, response: InviteResponse) {
+        let parent = self.engine.reply_target(message_id).ok().and_then(|target| target.parent_message_id);
+        match self.op("invite_reply_draft", json!({ "message": message_id, "response": response })) {
+            Ok(value) => match serde_json::from_value::<DraftSave>(value) {
+                Ok(saved) => {
+                    let draft = saved.draft;
+                    let mut state = ComposerState::new(ComposeMode::Draft);
+                    state.draft_id = Some(draft.summary.id.clone());
+                    state.to = Address::format_list(&draft.summary.to);
+                    state.cc = Address::format_list(&draft.cc);
+                    state.bcc = Address::format_list(&draft.bcc);
+                    state.show_cc = !draft.cc.is_empty();
+                    state.show_bcc = !draft.bcc.is_empty();
+                    state.subject = draft.summary.subject.clone();
+                    state.body = draft.body_text.clone();
+                    state.attachments = draft.attachments.clone();
+                    state.in_reply_to = parent;
+                    state.saved_at = Some(format_time(draft.summary.date));
+                    self.start_composer(state);
+                    self.push_info_toast("Bozza creata: rivedi e invia. Nessuna risposta automatica.", ToastKind::Info);
+                }
+                Err(_) => self.push_info_toast("La bozza è stata creata ma non è stato possibile aprirla: cercala in Bozze.", ToastKind::Info),
+            },
+            Err(error) => self.push_info_toast(invite_reply_error(&error.to_string()), ToastKind::Info),
+        }
+    }
+
     fn reading_content(&mut self, ui: &mut Ui, t: &Tokens, full: bool) {
         let content_bottom = ui.max_rect().bottom();
         let selected = self.selected.clone();
@@ -7313,10 +7437,13 @@ impl PostinoApp {
             self.close_reading();
             return;
         };
+        let invite = self.reading_invite(&message);
         #[cfg(test)]
         probe::clear_actions(ui);
         #[cfg(test)]
         probe::clear_attachment_saves(ui);
+        #[cfg(test)]
+        probe::clear_invite_actions(ui);
         #[cfg(test)]
         probe::clear_links(ui);
         if self.selected_thread.is_some() && self.threads_view {
@@ -7515,6 +7642,8 @@ impl PostinoApp {
             self.select_label(id);
             return;
         }
+        // The three reply commands are enabled only while a received, valid invite is on screen.
+        self.invite_ready = invite.as_ref().is_some_and(|invite| invite.valid && !invite.cancelled && invite.can_reply);
         // The count is stored truth from sync, not a scan of `body_html`: the sanitizer removed the
         // remote references, so the HTML cannot tell the pane that anything was blocked.
         if let Some(remote) = remote_images_text(message.remote_images) {
@@ -7549,6 +7678,7 @@ impl PostinoApp {
         // A whole message shares one link budget; the scanner also rejects a link over the byte
         // bound, so a hostile body cannot create unlimited widgets or a huge dialog.
         let mut link_budget = reading::MAX_LINKS_PER_MESSAGE;
+        let mut invite_command = None;
         ui.scope_builder(UiBuilder::new().max_rect(body_rect), |ui| {
             egui::ScrollArea::vertical()
                 .id_salt(("reading-scroll", message.summary.id.as_str()))
@@ -7556,6 +7686,13 @@ impl PostinoApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let mut clicked_link = None;
+                    // The card lives inside the reserved body budget: a long organizer, a warning or a
+                    // 2000-name attendee list scrolls with the body instead of pushing the pinned
+                    // attachment strip and the remote-content line off the 980×600 pane.
+                    if let Some(invite) = invite.as_ref() {
+                        invite_command = reading_invite_card(ui, invite, t);
+                        ui.add_space(space::SM);
+                    }
                     match view.as_ref() {
                         body::View::Blocks(body) => {
                             clicked_link = body_ui::blocks(ui, body, t, &mut link_budget);
@@ -7611,6 +7748,10 @@ impl PostinoApp {
             self.request_attachment_save(&attachment);
         }
 
+        if let Some(command) = invite_command {
+            self.execute_command(command, ui.ctx());
+            return;
+        }
         let action = left_action.or(right_action);
         match action {
             Some(ReadingAction::Archive) => self.move_selected(FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati"),
@@ -9596,6 +9737,7 @@ impl PostinoApp {
             CommandRule::LabelFilter => self.label_filter.is_some(),
             CommandRule::Sync => self.sync_ready(),
             CommandRule::Store => self.can_add_account(),
+            CommandRule::Invite => self.reading_open && self.selected.is_some() && self.invite_ready,
         }
     }
 
@@ -9614,6 +9756,9 @@ impl PostinoApp {
                     self.reply_to(&message, ComposeMode::ReplyAll);
                 }
             }
+            "invite_accept" => self.reply_to_invite(InviteResponse::Accept),
+            "invite_tentative" => self.reply_to_invite(InviteResponse::Tentative),
+            "invite_decline" => self.reply_to_invite(InviteResponse::Decline),
             "forward" => {
                 if let Some(message) = self.selected.clone() {
                     self.reply_to(&message, ComposeMode::Forward);
@@ -10616,6 +10761,8 @@ enum CommandRule {
     Sync,
     /// Adding or removing accounts needs the encrypted store; the demo is memory-only.
     Store,
+    /// The three replies need a received, valid METHOD:REQUEST that names an organizer.
+    Invite,
 }
 
 impl CommandRule {
@@ -10629,6 +10776,7 @@ impl CommandRule {
             Self::LabelFilter => Some("Nessun filtro etichetta attivo"),
             Self::Sync => Some("Aggiungi un account per sincronizzare"),
             Self::Store => Some("La modalità demo non ha un archivio locale"),
+            Self::Invite => Some("Apri un invito ricevuto per rispondere"),
         }
     }
 
@@ -10653,6 +10801,9 @@ const COMMANDS: &[Command] = &[
     Command { id: "reply", label: "Rispondi", icon: icons::REPLY, shortcut: "R", rule: CommandRule::Message, in_palette: true },
     Command { id: "reply_all", label: "Rispondi a tutti", icon: icons::REPLY_ALL, shortcut: "A", rule: CommandRule::Message, in_palette: true },
     Command { id: "forward", label: "Inoltra", icon: icons::FORWARD, shortcut: "F", rule: CommandRule::Message, in_palette: true },
+    Command { id: "invite_accept", label: "Accetta", icon: icons::CHECK, shortcut: "Ctrl+Shift+1", rule: CommandRule::Invite, in_palette: true },
+    Command { id: "invite_tentative", label: "Tentativo", icon: icons::CLOCK, shortcut: "Ctrl+Shift+2", rule: CommandRule::Invite, in_palette: true },
+    Command { id: "invite_decline", label: "Rifiuta", icon: icons::X_CIRCLE, shortcut: "Ctrl+Shift+3", rule: CommandRule::Invite, in_palette: true },
     Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", rule: CommandRule::Message, in_palette: false },
     Command { id: "send", label: "Invia", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
     Command { id: "outbox", label: "Coda di invio", icon: icons::SEND, shortcut: "Ctrl+Shift+O", rule: CommandRule::Always, in_palette: true },
@@ -11150,6 +11301,143 @@ fn remote_images_text(count: u32) -> Option<String> {
         1 => Some("1 immagine remota bloccata · il contenuto arriva dal server e non viene caricato".to_owned()),
         count => Some(format!("{count} immagini remote bloccate · il contenuto arriva dal server e non viene caricato")),
     }
+}
+
+fn invite_when(invite: &CalendarInviteView) -> Option<String> {
+    let pretty = |raw: &str| {
+        let raw = raw.trim();
+        let (body, utc) = match raw.strip_suffix('Z') {
+            Some(body) => (body, true),
+            None => (raw, false),
+        };
+        let body = body.replacen('T', " ", 1);
+        if utc { format!("{body} UTC") } else { body }
+    };
+    match (invite.start.as_deref(), invite.end.as_deref()) {
+        (Some(start), Some(end)) => Some(format!("Quando: {} – {}", pretty(start), pretty(end))),
+        (Some(start), None) => Some(format!("Quando: {}", pretty(start))),
+        _ => None,
+    }
+}
+
+/// The reading-pane invite card. It only reports a click; the caller owns the draft. Buttons are
+/// disabled with a visible reason when the event cannot be answered, and never rendered for a
+/// cancelled or invalid event.
+fn reading_invite_card(ui: &mut Ui, invite: &CalendarInviteView, t: &Tokens) -> Option<&'static str> {
+    let headline = match invite.method.as_str() {
+        "request" => "INVITO",
+        "cancel" => "INVITO ANNULLATO",
+        "reply" => "RISPOSTA A UN INVITO",
+        _ => "EVENTO",
+    };
+    let unavailable = if invite.cancelled {
+        Some("L'organizzatore ha annullato l'evento.")
+    } else if !invite.valid {
+        Some(invite.invalid_reason.as_deref().unwrap_or("L'evento non è valido."))
+    } else if invite.organizer.is_none() {
+        Some("Manca l'organizzatore: non c'è a chi rispondere.")
+    } else if !invite.can_reply {
+        Some("Questo messaggio non è una richiesta di partecipazione ricevuta: non si risponde.")
+    } else {
+        None
+    };
+    let mut command = None;
+    let card = Frame::new()
+        .fill(t.panel_alt)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(radius::CONTROL)
+        .inner_margin(Margin::symmetric(inset::LG, inset::SM))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(icons::icon(icons::CALENDAR, 16.0, t.gold_ink));
+                ui.add_space(space::SM);
+                ui.label(typography::text(Role::Caption, headline, t.text_faint));
+            });
+            ui.add_space(space::XXS);
+            ui.label(typography::strong(Role::BodySmall, invite.summary.as_str(), t.text));
+            ui.add_space(space::XS);
+            if let Some(organizer) = invite.organizer.as_deref() {
+                ui.label(typography::text(Role::Meta, format!("Organizzatore: {organizer}"), t.text_muted));
+            }
+            let when = invite_when(invite);
+            let has_when = when.is_some();
+            if has_when || invite.location.is_some() {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(when) = when.as_deref() {
+                        ui.label(typography::mono(when, 11.0, t.text_muted));
+                    }
+                    if let Some(location) = invite.location.as_deref() {
+                        if has_when {
+                            ui.label(typography::text(Role::Meta, "·", t.text_faint));
+                        }
+                        ui.label(typography::text(Role::Meta, format!("Luogo: {location}"), t.text_muted));
+                    }
+                });
+            }
+            for warning in &invite.warnings {
+                ui.horizontal(|ui| {
+                    ui.label(icons::icon(icons::WARNING, 13.0, t.gold_ink));
+                    ui.add_space(space::XS);
+                    ui.label(typography::text(Role::Caption, warning.as_str(), t.gold_ink));
+                });
+            }
+            if let Some(reason) = unavailable {
+                ui.add_space(space::XS);
+                ui.horizontal(|ui| {
+                    ui.label(icons::icon(icons::WARNING, 13.0, t.text_faint));
+                    ui.add_space(space::XS);
+                    ui.label(typography::text(Role::Caption, reason, t.text_faint));
+                });
+            }
+            if invite.valid && !invite.cancelled {
+                ui.add_space(space::XS);
+                let enabled = invite.can_reply;
+                ui.horizontal_wrapped(|ui| {
+                    for id in ["invite_accept", "invite_tentative", "invite_decline"] {
+                        let label = command_label(id, "Accetta");
+                        let button = match id {
+                            "invite_accept" => Button::new(label),
+                            "invite_tentative" => Button::ghost(label),
+                            _ => Button::danger(label),
+                        };
+                        let response = button.enabled(enabled).show(ui);
+                        #[cfg(test)]
+                        probe::invite_action(ui, id, &response, enabled);
+                        if response.clicked() {
+                            command = Some(id);
+                        }
+                    }
+                });
+            }
+            ui.add_space(space::XS);
+            ui.horizontal(|ui| {
+                ui.label(icons::icon(icons::INFO, 13.0, t.text_faint));
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Caption, "Nessuna risposta automatica: bozza da rivedere, calendario invariato.", t.text_faint));
+            });
+        });
+    #[cfg(test)]
+    probe::invite_card(ui, card.response.rect);
+    #[cfg(not(test))]
+    let _ = card.response.rect;
+    command
+}
+
+fn invite_reply_error(raw: &str) -> String {
+    let raw = raw.strip_prefix("invalid arguments: ").unwrap_or(raw);
+    if raw.contains("no readable text/calendar") {
+        return "Questa email non contiene un invito leggibile.".to_owned();
+    }
+    if raw.contains("cannot be answered") {
+        return "L'invito non è valido o è stato annullato: non si può rispondere.".to_owned();
+    }
+    if raw.contains("only a valid METHOD:REQUEST") {
+        return "Solo una richiesta di partecipazione ricevuta può essere risposta.".to_owned();
+    }
+    if raw.contains("no organizer") {
+        return "Manca l'organizzatore: non c'è a chi rispondere.".to_owned();
+    }
+    "Non è stato possibile creare la bozza di risposta. Riprova o rispondi con una bozza normale.".to_owned()
 }
 
 fn signature_error_message(raw: &str) -> String {
@@ -11830,6 +12118,43 @@ pub(crate) mod probe {
 
     pub fn clear_attachment_saves(ui: &Ui) {
         ui.ctx().data_mut(|data| data.insert_temp(id("attachment-saves"), BTreeMap::<String, Rect>::new()));
+    }
+
+    pub fn clear_invite_actions(ui: &Ui) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("invite-actions"), BTreeMap::<String, Rect>::new());
+            data.insert_temp(id("invite-action-enabled"), BTreeMap::<String, bool>::new());
+            data.insert_temp(id("invite-action-ids"), BTreeMap::<String, Id>::new());
+            data.insert_temp(id("invite-card"), None::<Rect>);
+        });
+    }
+
+    pub fn invite_action(ui: &Ui, action: &str, widget: &eframe::egui::Response, enabled: bool) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("invite-actions")).insert(action.to_owned(), widget.rect);
+            data.get_temp_mut_or_default::<BTreeMap<String, bool>>(id("invite-action-enabled")).insert(action.to_owned(), enabled);
+            data.get_temp_mut_or_default::<BTreeMap<String, Id>>(id("invite-action-ids")).insert(action.to_owned(), widget.id);
+        });
+    }
+
+    pub fn invite_action_id(ctx: &Context, action: &str) -> Option<Id> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Id>>(id("invite-action-ids"))).and_then(|rows| rows.get(action).copied())
+    }
+
+    pub fn invite_action_rect(ctx: &Context, action: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("invite-actions"))).and_then(|rows| rows.get(action).copied())
+    }
+
+    pub fn invite_action_is_enabled(ctx: &Context, action: &str) -> Option<bool> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, bool>>(id("invite-action-enabled"))).and_then(|rows| rows.get(action).copied())
+    }
+
+    pub fn invite_card(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("invite-card"), Some(rect)));
+    }
+
+    pub fn invite_card_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<Option<Rect>>(id("invite-card"))).flatten()
     }
 
     pub fn attachment_save(ui: &Ui, attachment_id: &str, rect: Rect) {
@@ -13781,6 +14106,7 @@ mod tests {
             ("mailbox", ScreenshotState::Mailbox),
             ("offline", ScreenshotState::Offline),
             ("reading_attachments", ScreenshotState::ReadingAttachments),
+            ("reading_invite", ScreenshotState::ReadingInvite),
             ("link_confirm", ScreenshotState::LinkConfirm),
             ("settings", ScreenshotState::Settings),
             ("settings_signature", ScreenshotState::SettingsSignature),
@@ -16070,6 +16396,43 @@ mod tests {
         store.upsert_message(&store_message(&folder, id, &format!("msg_{id}_1"), &format!("Messaggio di {id}"))).expect("message row");
     }
 
+    /// A booted store-backed window with a received REQUEST and an outgoing Sent copy, both carrying
+    /// the same real `text/calendar` blob. The demo has no calendar part, so the full reply path is
+    /// exercised here and not through the screenshot fixture.
+    fn invite_store_app(name: &str) -> PostinoApp {
+        const CALENDAR: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//Inviti//IT\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:invito-app@example.com\r\nDTSTAMP:20261024T084200Z\r\nDTSTART:20261105T090000Z\r\nDTEND:20261105T100000Z\r\nSUMMARY:Revisione preventivo\r\nLOCATION:Studio Postino\r\nORGANIZER:mailto:giulia.ferri@example.com\r\nATTENDEE:mailto:federico@example.it\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut app = booted_app(name, Vec::new(), |store| {
+            seed_account_rows(store, "acc_invite", "federico@example.it", None);
+            for (id, folder, subject) in
+                [("msg_invite", "fld_acc_invite_inbox", "Revisione preventivo"), ("msg_sent", "fld_acc_invite_sent", "Revisione inviata")]
+            {
+                let mut message = store_message(folder, "acc_invite", id, subject);
+                message.message_id = Some(format!("{id}@example.com"));
+                message.summary.unread = false;
+                message.summary.has_attachments = true;
+                store.upsert_message(&message).expect("invite message");
+                let attachment_id = format!("att_{id}");
+                let size = u64::try_from(CALENDAR.len()).expect("calendar size");
+                store
+                    .replace_attachments(
+                        id,
+                        &[postino_store::Attachment {
+                            id: attachment_id.clone(),
+                            filename: "invito.ics".to_owned(),
+                            mime: "text/calendar".to_owned(),
+                            size,
+                            blob_hash: None,
+                        }],
+                    )
+                    .expect("attachment row");
+                let hash = store.blobs().put(CALENDAR.as_bytes()).expect("calendar blob");
+                store.set_attachment_blob_hash(id, &attachment_id, Some(&hash), size).expect("calendar hash");
+            }
+        });
+        app.open_message("msg_invite".to_owned());
+        app
+    }
+
     fn booted_app(name: &str, roots: Vec<CertificateDer<'static>>, seed: impl FnOnce(&postino_store::Store)) -> PostinoApp {
         let (path, key, vault) = fresh_store(name);
         {
@@ -17485,6 +17848,164 @@ mod tests {
             let line = &text[remote];
             assert!(!line.contains("http") && !line.contains("tracker"), "the line must not name a URL: {line:?}");
         }
+    }
+
+    #[test]
+    fn the_980_invite_card_renders_in_both_themes_with_live_actions() {
+        for dark in [false, true] {
+            let clock = screenshot_clock().expect("the frozen screenshot clock");
+            let mut app = PostinoApp::demo_at(true, clock);
+            app.seed_screenshot(ScreenshotState::ReadingInvite);
+            let message = app.screenshot_message.as_mut().expect("the screenshot message");
+            message.remote_images = 2;
+            message.attachments = vec![Attachment {
+                id: "att_invite_pdf".to_owned(),
+                filename: "preventivo.pdf".to_owned(),
+                mime: "application/pdf".to_owned(),
+                size: 248_320,
+            }];
+            message.summary.has_attachments = true;
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let size = Vec2::new(980.0, 600.0);
+            settle_at(&ctx, &mut app, size);
+            let card = probe::invite_card_rect(&ctx).expect("the invite card");
+            let body = probe::reading_body_rect(&ctx).expect("the reading body region");
+            assert!(card.min.y >= body.min.y - 0.5, "dark={dark}: the card starts outside the body budget: {card:?} in {body:?}");
+            assert!(
+                card.left() >= body.left() - 0.5 && card.right() <= body.right() + 0.5,
+                "dark={dark}: the card is wider than the body: {card:?} in {body:?}"
+            );
+            for action in ["invite_accept", "invite_tentative", "invite_decline"] {
+                let rect = probe::invite_action_rect(&ctx, action).unwrap_or_else(|| panic!("dark={dark}: {action} is missing"));
+                assert!(card.contains_rect(rect), "dark={dark}: {action} is outside the card: {rect:?} in {card:?}");
+                assert_eq!(probe::invite_action_is_enabled(&ctx, action), Some(true), "dark={dark}: {action} must be usable");
+            }
+            assert!(probe::attachment_save_rect(&ctx, "att_invite_pdf").is_some(), "dark={dark}: the attachment strip must stay visible");
+            let save = probe::attachment_save_rect(&ctx, "att_invite_pdf").expect("the save button");
+            assert!(save.min.y >= body.bottom() - 0.5, "dark={dark}: the strip overlaps the body: {save:?} vs {body:?}");
+            let text = painted_text(&ctx, &mut app, size).join(" ");
+            for expected in ["INVITO", "Revisione preventivo", "Giulia Ferri", "2 immagini remote bloccate", "preventivo.pdf"] {
+                assert!(text.contains(expected), "dark={dark}: {expected:?} is missing from {text:?}");
+            }
+            // The card scrolls inside the body budget; the automatic-reply note is reachable, not
+            // pushed outside the pane where a user could never read it.
+            frame_at(&ctx, &mut app, size, wheel_by(body.center(), 30, -6.0));
+            let text = painted_text(&ctx, &mut app, size).join(" ");
+            assert!(text.contains("Nessuna risposta automatica"), "dark={dark}: the note is unreachable: {text:?}");
+            let enabled = app.command_enabled(command("invite_accept").expect("the accept command"));
+            assert!(enabled, "dark={dark}: the command table must agree with the visible button");
+        }
+    }
+
+    #[test]
+    fn an_invalid_cancelled_or_organizerless_invite_has_no_live_reply() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        app.seed_screenshot(ScreenshotState::ReadingInvite);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+
+        let invite = app.screenshot_invite.as_mut().expect("the screenshot invite");
+        invite.organizer = None;
+        invite.can_reply = false;
+        settle_at(&ctx, &mut app, size);
+        for action in ["invite_accept", "invite_tentative", "invite_decline"] {
+            assert_eq!(probe::invite_action_is_enabled(&ctx, action), Some(false), "{action} must be visibly disabled without an organizer");
+        }
+        assert!(probe::invite_action_rect(&ctx, "invite_accept").is_some());
+        assert!(!app.command_enabled(command("invite_accept").expect("the accept command")), "the palette must agree when the organizer is missing");
+        let text = painted_text(&ctx, &mut app, size).join(" ");
+        assert!(text.contains("Manca l'organizzatore"), "{text:?}");
+
+        let invite = app.screenshot_invite.as_mut().expect("the screenshot invite");
+        invite.cancelled = true;
+        settle_at(&ctx, &mut app, size);
+        for action in ["invite_accept", "invite_tentative", "invite_decline"] {
+            assert!(probe::invite_action_rect(&ctx, action).is_none(), "a cancelled invite must not offer {action}");
+        }
+        let text = painted_text(&ctx, &mut app, size).join(" ");
+        assert!(text.contains("annullato"), "{text:?}");
+
+        let invite = app.screenshot_invite.as_mut().expect("the screenshot invite");
+        invite.cancelled = false;
+        invite.valid = false;
+        invite.invalid_reason = Some("L'evento non ha una data di inizio.".to_owned());
+        settle_at(&ctx, &mut app, size);
+        assert!(probe::invite_action_rect(&ctx, "invite_accept").is_none(), "an invalid event must not offer a reply");
+    }
+
+    #[test]
+    fn clicking_an_enabled_action_on_a_stored_invite_creates_the_text_and_calendar_reply() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(1200.0, 800.0);
+        let mut app = invite_store_app("app-invite-reply");
+        settle_at(&ctx, &mut app, size);
+        assert!(app.invite_ready, "the stored REQUEST is answerable");
+        let rect = probe::invite_action_rect(&ctx, "invite_accept").expect("the Accetta button");
+        click_at(&ctx, &mut app, rect.center(), size);
+        assert!(app.composer.open, "the click opens a draft");
+        let draft_id = app.composer.draft_id.clone().expect("the draft id");
+        assert!(app.composer.to.contains("giulia.ferri@example.com"), "{:?}", app.composer.to);
+        assert!(app.composer.body.contains("Nessuna risposta automatica"), "{:?}", app.composer.body);
+        assert_eq!(app.engine.draft_reply_link(&draft_id), Some("msg_invite@example.com"));
+        assert_eq!(app.composer.attachments.len(), 1, "the stored path carries the calendar reply");
+        assert_eq!(app.composer.attachments[0].mime, "text/calendar");
+        let bytes = app.engine.attachment_bytes(&app.composer.attachments[0].id).expect("reply bytes");
+        assert!(String::from_utf8(bytes).expect("utf-8").contains("PARTSTAT=ACCEPTED"));
+
+        app.composer.open = false;
+        app.composer.dirty = false;
+        let small = Vec2::new(980.0, 600.0);
+        settle_at(&ctx, &mut app, small);
+        let mods = Modifiers { command: true, shift: true, ..Modifiers::NONE };
+        frame_at(&ctx, &mut app, small, vec![egui::Event::ModifiersChanged(mods), key(Key::Num2, mods)]);
+        assert!(app.composer.open, "Ctrl+Shift+2 reaches the same command table at 980x600");
+        let tentative_id = app.composer.draft_id.clone().expect("the tentative draft id");
+        assert_ne!(Some(tentative_id.clone()), Some(draft_id));
+        assert!(app.composer.subject.starts_with("Tentativo:"), "{:?}", app.composer.subject);
+
+        // Scarta then undo: the standard undo toast must bring the draft back, not a manual move.
+        app.discard_composer();
+        assert!(app.toast.as_ref().and_then(|toast| toast.undo.as_ref()).is_some(), "discarding a draft offers undo");
+        app.undo_last();
+        assert_eq!(app.engine.message(&tentative_id).expect("restored draft").summary.folder_id, "fld_acc_invite_drafts");
+    }
+
+    #[test]
+    fn an_outgoing_copy_and_a_demo_invite_do_not_offer_a_live_reply() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        let mut app = invite_store_app("app-invite-sent");
+        app.open_message("msg_sent".to_owned());
+        settle_at(&ctx, &mut app, size);
+        assert!(!app.invite_ready, "a Sent copy is informational");
+        assert_eq!(probe::invite_action_is_enabled(&ctx, "invite_accept"), Some(false));
+        assert!(!app.command_enabled(command("invite_accept").expect("the accept command")));
+    }
+
+    #[test]
+    fn the_invite_reply_buttons_are_keyboard_reachable() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        app.seed_screenshot(ScreenshotState::ReadingInvite);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(1200.0, 800.0);
+        settle_at(&ctx, &mut app, size);
+        let id = probe::invite_action_id(&ctx, "invite_accept").expect("the Accetta widget id");
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        frame_at(&ctx, &mut app, size, vec![key(Key::Enter, Modifiers::NONE)]);
+        let toast = app.toast.as_ref().expect("Enter reached the invite action");
+        assert!(toast.message.contains("non contiene un invito leggibile"), "{:?}", toast.message);
     }
 
     #[test]

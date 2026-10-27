@@ -563,6 +563,67 @@ impl Message {
     }
 }
 
+/// A parsed `text/calendar` invite, reduced to what the card and an agent need. It is derived from
+/// the attachment on every read: nothing is stored, expanded or added to a calendar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalendarInviteView {
+    /// `request`, `cancel`, `reply` or `other`.
+    pub method: String,
+    pub summary: String,
+    /// Organizer mailbox, without the `mailto:` prefix.
+    pub organizer: Option<String>,
+    /// Attendee mailboxes, bounded and de-duplicated.
+    pub attendees: Vec<String>,
+    /// Normalized start (`2026-11-05T09:00:00Z`) or a date-only value.
+    pub start: Option<String>,
+    /// Normalized end, when the event declares it.
+    pub end: Option<String>,
+    pub location: Option<String>,
+    /// The event declares a recurrence rule: it is warned about, never expanded.
+    pub recurrence: bool,
+    /// The declared `TZID`, kept honest: no timezone database is applied.
+    pub timezone: Option<String>,
+    /// The event has the fields a reply needs.
+    pub valid: bool,
+    /// Why the event is not valid, in a short sentence.
+    pub invalid_reason: Option<String>,
+    /// The organizer cancelled the event.
+    pub cancelled: bool,
+    /// A reply draft is offered only for a valid `REQUEST` with an organizer.
+    pub can_reply: bool,
+    pub warnings: Vec<String>,
+}
+
+/// The answer a person picked on the invite card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteResponse {
+    Accept,
+    Tentative,
+    Decline,
+}
+
+impl InviteResponse {
+    /// The `PARTSTAT` value carried by the `METHOD:REPLY` part.
+    pub fn partstat(self) -> &'static str {
+        match self {
+            Self::Accept => "ACCEPTED",
+            Self::Tentative => "TENTATIVE",
+            Self::Decline => "DECLINED",
+        }
+    }
+
+    /// The fixed draft subject prefix.
+    pub fn subject_prefix(self) -> &'static str {
+        match self {
+            Self::Accept => "Accettato",
+            Self::Tentative => "Tentativo",
+            Self::Decline => "Rifiutato",
+        }
+    }
+}
+
 /// The one-line preview used by the list. It is deliberately short and never includes a header.
 pub(crate) fn snippet(body: &str) -> String {
     let line = body.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");

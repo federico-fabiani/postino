@@ -3361,6 +3361,24 @@ mod tests {
     }
 
     #[test]
+    fn the_generic_cli_route_dispatches_both_invite_operations() {
+        let mut engine = Engine::demo();
+        let id = engine.messages().first().map(|message| message.id.clone()).expect("a demo message");
+        run(cli(Command::Run { op: "message_invite".to_owned(), args: Some(json!({ "id": id }).to_string()), params: Vec::new() }), &mut engine)
+            .expect("message_invite reaches the registry through `postino run`");
+        let error = run(
+            cli(Command::Run {
+                op: "invite_reply_draft".to_owned(),
+                args: Some(json!({ "message": id, "response": "accept" }).to_string()),
+                params: Vec::new(),
+            }),
+            &mut engine,
+        )
+        .expect_err("the demo message has no calendar part");
+        assert!(error.to_string().contains("no readable text/calendar invite"), "{error}");
+    }
+
+    #[test]
     fn cli_draft_save_patches_only_the_flags_the_user_passed() {
         let mut engine = Engine::demo();
         run(

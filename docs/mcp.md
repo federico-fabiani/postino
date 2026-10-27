@@ -68,6 +68,8 @@ agent can read the message and recover.
 | `folders_list` | yes | Folders with unread and total counts |
 | `messages_list` | yes | Message summaries, paginated; `label` alone spans every folder, `folder` narrows it |
 | `message_get` | yes | One message with body and attachments |
+| `message_invite` | yes | Parse the first `text/calendar` attachment (≤ 256 KiB, 1 000 components, 2 000 attendees, 64-character organizer/attendee lines); `invite` is `null` for malformed or hostile input and the file stays an attachment |
+| `invite_reply_draft` | no | Draft accept/tentative/decline to the organizer only, with `text/calendar` METHOD:REPLY; only a received REQUEST is answerable, a Sent copy is informational; never sends and never updates a calendar |
 | `message_flag` | no | Set read/unread and/or starred |
 | `message_move` | no | Move a message to a regular folder |
 | `draft_save` | no | Create a draft or patch one in place; metadata only, including the optional `in_reply_to` |

@@ -666,6 +666,7 @@ pub fn mime_for_filename(filename: &str) -> &'static str {
         "mp3" => "audio/mpeg",
         "mp4" => "video/mp4",
         "eml" => "message/rfc822",
+        "ics" => "text/calendar",
         _ => "application/octet-stream",
     }
 }
