@@ -213,12 +213,15 @@ interaction model before real mail makes them expensive to change. Full spec:
 
 ## M6 — ship and automate
 
-- [ ] Gmail OAuth (bring-your-own client id or verified app), labels mapping.
-- [ ] Sieve/ManageSieve for server-side filters and vacation responder where supported.
+- [x] Gmail OAuth with a bring-your-own Desktop client and XOAUTH2 (P12a).
+- [ ] Gmail label mapping.
+- [ ] Sieve/ManageSieve for server-side filters and vacation responder where supported (deferred:
+      no confirmed provider; Gmail has none).
 - [ ] PGP via an external agent/library; S/MIME later.
 - [ ] `.ics` invites, unsubscribe, export/import `.eml`/`.mbox`, Thunderbird import.
 - [ ] MCP compact mode, resources, send guardrails, audit log.
-- [ ] Packaging: MSI, DMG, AppImage/deb/rpm, signed releases.
+- [x] Windows per-user packaging source: MSI/ZIP, manifest, external signing (P12e).
+- [ ] Signing/clean-VM verification and DMG/AppImage/deb/rpm.
 - [ ] Security review against `docs/threat-model.md`; fuzz MIME/HTML; `cargo-deny`/`audit`.
 - [ ] Verify: clean install on a fresh VM; agent sends a dry-run and a real message; offline
       restore from backup.
