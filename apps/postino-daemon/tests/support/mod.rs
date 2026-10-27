@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use postino_core::{CredentialVault, VaultError};
+use postino_core::{CredentialVault, OAuthGrant, VaultError};
 use postino_daemon::{Daemon, DaemonConfig};
 use postino_ipc::DaemonPaths;
 use postino_ipc::client::Client;
@@ -29,6 +29,15 @@ impl MockVault {
             vault.store_smtp_password(ACCOUNT, smtp.as_bytes()).expect("smtp secret");
         }
         vault
+    }
+
+    pub fn oauth_grant(&self, account_id: &str) -> Option<OAuthGrant> {
+        let bytes = self.secrets.lock().ok()?.get(&format!("{account_id}:oauth")).cloned()?;
+        OAuthGrant::from_bytes(&bytes).ok()
+    }
+
+    pub fn has_imap_password(&self, account_id: &str) -> bool {
+        self.secrets.lock().map(|secrets| secrets.contains_key(&format!("{account_id}:imap"))).unwrap_or(false)
     }
 }
 
@@ -58,6 +67,24 @@ impl CredentialVault for MockVault {
 
     fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError> {
         self.secrets.lock().map_err(|_| VaultError::new("test vault poisoned"))?.remove(&format!("{account_id}:smtp"));
+        Ok(())
+    }
+
+    fn store_oauth_grant(&self, account_id: &str, grant: &OAuthGrant) -> Result<(), VaultError> {
+        self.secrets.lock().map_err(|_| VaultError::new("test vault poisoned"))?.insert(format!("{account_id}:oauth"), grant.to_bytes().to_vec());
+        Ok(())
+    }
+
+    fn load_oauth_grant(&self, account_id: &str) -> Result<Option<OAuthGrant>, VaultError> {
+        let bytes = self.secrets.lock().map_err(|_| VaultError::new("test vault poisoned"))?.get(&format!("{account_id}:oauth")).cloned();
+        match bytes {
+            Some(bytes) => OAuthGrant::from_bytes(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn delete_oauth_grant(&self, account_id: &str) -> Result<(), VaultError> {
+        self.secrets.lock().map_err(|_| VaultError::new("test vault poisoned"))?.remove(&format!("{account_id}:oauth"));
         Ok(())
     }
 }

@@ -522,6 +522,19 @@ pub fn add_account(paths: &DaemonPaths, setup: &postino_core::AccountSetup) -> R
         "smtp_username": smtp.map(|smtp| smtp.username.clone()),
         "smtp_password": smtp.and_then(|smtp| smtp.password.as_ref()).map(|password| password.as_str()),
     });
+    let mut args = args;
+    if let Some(grant) = setup.oauth.as_ref()
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert(
+            "oauth".to_owned(),
+            json!({
+                "client_id": grant.client_id(),
+                "client_secret": grant.client_secret(),
+                "refresh_token": grant.refresh_token(),
+            }),
+        );
+    }
     let mut client = BlockingClient::connect_with(paths, CLIENT_NAME, true, CONNECT_TIMEOUT, CALL_TIMEOUT).map_err(|error| describe(&error))?;
     let value = client
         .call(postino_ipc::protocol::method::OP, json!({ "name": "account_add", "args": args }), CALL_TIMEOUT)

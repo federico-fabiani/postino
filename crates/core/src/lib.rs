@@ -15,6 +15,7 @@
 pub mod demo;
 pub mod engine;
 pub mod model;
+pub mod oauth;
 pub mod ops;
 pub mod outbox;
 mod reply;
@@ -32,6 +33,7 @@ pub use model::{
     Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect, RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings,
     SmtpSettings, ThreadSummary,
 };
+pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{
     AccountAdd, AccountRemove, AccountSignature, AccountTest, AccountUpdate, AccountsList, AppInfo, DraftAttachmentResult, DraftSave, DryRunResult,
     FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageFlag, MessageGet, MessagesList, OpDef, OutboxAction,

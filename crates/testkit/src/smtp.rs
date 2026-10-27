@@ -140,6 +140,26 @@ impl SmtpConn {
         }
     }
 
+    /// Expect `AUTH XOAUTH2 <payload>` and answer `235 2.7.0 authenticated`.
+    ///
+    /// `expected` is the exact base64 payload, normally from
+    /// [`expected_xoauth2`](crate::expected_xoauth2).
+    pub async fn auth_xoauth2(&mut self, expected: &str) {
+        let line = self.read_line().await;
+        assert_eq!(line, format!("AUTH XOAUTH2 {expected}"));
+        self.send_line("235 2.7.0 authenticated").await;
+    }
+
+    /// Expect `AUTH XOAUTH2 <payload>`, answer the `334` error challenge, expect the empty
+    /// acknowledgement and answer `535`.
+    pub async fn auth_xoauth2_refused(&mut self, expected: &str) {
+        let line = self.read_line().await;
+        assert_eq!(line, format!("AUTH XOAUTH2 {expected}"));
+        self.send_line("334 eyJzdGF0dXMiOiI0MDAifQ==").await;
+        self.expect("").await;
+        self.send_line("535 5.7.8 bad credentials").await;
+    }
+
     /// Read one CRLF-terminated line, recording it.
     pub async fn read_line(&mut self) -> String {
         self.read_line_opt().await.unwrap_or_else(|| panic!("client closed the connection; lines so far: {:?}", self.received))

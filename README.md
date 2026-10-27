@@ -524,6 +524,7 @@ The GNU toolchain plus MSYS2 is the path documented here.
 - [Product](docs/product.md): vision, scope, non-goals, honest limits.
 - [Architecture](docs/architecture.md): current M0 shape and the target design.
 - [MCP](docs/mcp.md): the stdio server, tools and protocol.
+- [Gmail OAuth](docs/oauth.md): BYO Desktop client, loopback redirect, Testing-mode expiry and the Gmail-only limits.
 - [Threat model](docs/threat-model.md): what Postino protects and what it does not.
 - [Security policy](SECURITY.md): how to report a vulnerability.
 - [Design](docs/design.md): palette, contrast, type, logo.

@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use postino_core::{CredentialVault, Engine, VaultError};
 use postino_daemon::{Daemon, DaemonConfig, DaemonSettings};
-use postino_platform::{Keyring, STORE_SCOPE, account_scope, account_smtp_scope};
+use postino_platform::{Keyring, STORE_SCOPE, account_oauth_scope, account_scope, account_smtp_scope};
 use postino_store::StoreKey;
 use zeroize::Zeroizing;
 
@@ -134,6 +134,22 @@ impl CredentialVault for PlatformVault {
 
     fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError> {
         let scope = account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn store_oauth_grant(&self, account_id: &str, grant: &postino_core::OAuthGrant) -> Result<(), VaultError> {
+        let scope = account_oauth_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.store_secret(&scope, &grant.to_bytes()).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn load_oauth_grant(&self, account_id: &str) -> Result<Option<postino_core::OAuthGrant>, VaultError> {
+        let scope = account_oauth_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        let bytes = self.keyring.load_secret(&scope).map_err(|error| VaultError::new(error.to_string()))?;
+        bytes.as_ref().map(|bytes| postino_core::OAuthGrant::from_bytes(bytes)).transpose()
+    }
+
+    fn delete_oauth_grant(&self, account_id: &str) -> Result<(), VaultError> {
+        let scope = account_oauth_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
         self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
     }
 }

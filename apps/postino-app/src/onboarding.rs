@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use eframe::egui::{self, Align, Key, Layout, Margin, Modifiers, Rect, ScrollArea, Sides, Stroke, Ui, Vec2};
-use postino_core::{AccountSetup, MailTls, Provider, SmtpSetup};
+use postino_core::{AccountSetup, MailTls, OAuthAccess, OAuthGrant, Provider, SmtpSetup};
 use postino_net::{CertificateDer, ImapConfig, NetError, Secret, TlsMode};
 use postino_store::FolderKind;
 use postino_sync::SyncError;
@@ -86,7 +86,7 @@ impl ProviderChoice {
     fn note(self) -> &'static str {
         match self {
             Self::Aruba => "Usa una password per le app se hai attivo il secondo fattore.",
-            Self::Gmail => "Serve una password per le app: la password Google non funziona con IMAP.",
+            Self::Gmail => "Scegli l'accesso con Google (OAuth) oppure una password per le app: la password Google non funziona con IMAP.",
             Self::Custom => "Scegli host, porta e modalità TLS del tuo server IMAP.",
         }
     }
@@ -121,6 +121,8 @@ pub enum FocusField {
     Name,
     Email,
     Password,
+    ClientId,
+    ClientSecret,
     Host,
     Port,
     SmtpHost,
@@ -134,6 +136,7 @@ pub enum FocusField {
 pub enum ErrorKind {
     Password,
     AppPassword,
+    OAuth,
     Tls,
     Dns,
     Timeout,
@@ -210,8 +213,6 @@ pub enum Action {
     Finish(String),
 }
 
-type ProbeResult = Result<FoldersPreview, ConnectionError>;
-
 pub struct Onboarding {
     mode: Mode,
     stage: Stage,
@@ -230,6 +231,13 @@ pub struct Onboarding {
     name: String,
     email: String,
     password: Zeroizing<String>,
+    /// Gmail OAuth instead of an app password: the BYO client id/secret, then the grant the probe
+    /// obtains after the browser round trip. The grant is handed to the engine exactly once.
+    oauth: bool,
+    oauth_client_id: String,
+    oauth_client_secret: Zeroizing<String>,
+    oauth_grant: Option<OAuthGrant>,
+    oauth_access: Option<OAuthAccess>,
     /// Local validation for one field, cleared as soon as the user edits or retries.
     field_error: Option<(FocusField, String)>,
     connection_error: Option<ConnectionError>,
@@ -276,6 +284,11 @@ impl Onboarding {
             name: String::new(),
             email: String::new(),
             password: Zeroizing::new(String::new()),
+            oauth: false,
+            oauth_client_id: String::new(),
+            oauth_client_secret: Zeroizing::new(String::new()),
+            oauth_grant: None,
+            oauth_access: None,
             field_error: None,
             connection_error: None,
             preview: None,
@@ -340,6 +353,15 @@ impl Onboarding {
     #[cfg(test)]
     pub fn set_probe_timeout(&mut self, timeout: Duration) {
         self.probe_timeout = Some(timeout);
+    }
+
+    /// Test-only: switch the seeded form to Gmail OAuth with a given BYO client pair, so validation
+    /// and setup building can be checked without a browser or a token endpoint.
+    #[cfg(test)]
+    pub fn set_oauth_for_test(&mut self, client_id: &str, client_secret: &str) {
+        self.oauth = true;
+        self.oauth_client_id = client_id.to_owned();
+        self.oauth_client_secret = Zeroizing::new(client_secret.to_owned());
     }
 
     /// A deterministic state for `--screenshot`. It never opens the network and never reads a store.
@@ -470,6 +492,9 @@ impl Onboarding {
     pub fn cancel(&mut self) -> Action {
         self.password.zeroize();
         self.smtp_password.zeroize();
+        self.oauth_client_secret.zeroize();
+        self.oauth_grant = None;
+        self.oauth_access = None;
         Action::Cancel
     }
 
@@ -477,6 +502,8 @@ impl Onboarding {
         !self.name.trim().is_empty()
             || !self.email.trim().is_empty()
             || !self.password.is_empty()
+            || !self.oauth_client_id.trim().is_empty()
+            || !self.oauth_client_secret.is_empty()
             || !self.host.trim().is_empty()
             || !self.smtp_host.trim().is_empty()
             || !self.smtp_password.is_empty()
@@ -564,6 +591,25 @@ impl Onboarding {
         if local.is_empty() || domain.is_empty() || domain.contains('@') {
             return Some((FocusField::Email, "L'indirizzo non è valido.".to_owned()));
         }
+        if self.oauth {
+            if self.provider != ProviderChoice::Gmail {
+                return Some((FocusField::Primary, "L'accesso con Google è disponibile solo per Gmail.".to_owned()));
+            }
+            let client_id = self.oauth_client_id.trim();
+            if client_id.is_empty() {
+                return Some((FocusField::ClientId, "Inserisci il client id OAuth del tuo progetto Google.".to_owned()));
+            }
+            if client_id.len() > 256 || client_id.chars().any(char::is_control) {
+                return Some((FocusField::ClientId, "Il client id OAuth non è valido.".to_owned()));
+            }
+            if self.oauth_client_secret.is_empty() {
+                return Some((FocusField::ClientSecret, "Inserisci il client secret OAuth del tuo progetto Google.".to_owned()));
+            }
+            if self.oauth_client_secret.len() > 512 || self.oauth_client_secret.chars().any(char::is_control) {
+                return Some((FocusField::ClientSecret, "Il client secret OAuth non è valido.".to_owned()));
+            }
+            return None;
+        }
         if self.password.is_empty() {
             return Some((FocusField::Password, "Inserisci la password o la password per le app.".to_owned()));
         }
@@ -609,8 +655,9 @@ impl Onboarding {
         }
     }
 
-    /// Start one probe thread. It owns a zeroising copy of the password and its own TLS config; the
-    /// UI only receives the plain [`FoldersPreview`] or a redacted error.
+    /// Start one probe thread. It owns a zeroising copy of the password (or the OAuth client secret)
+    /// and its own TLS config; the UI only receives the plain [`FoldersPreview`], a redacted error
+    /// and, for OAuth, the grant the browser round trip produced.
     pub fn start_probe(&mut self, extra_roots: Vec<CertificateDer<'static>>, advance_on_success: bool) {
         if self.testing {
             return;
@@ -625,6 +672,8 @@ impl Onboarding {
         let password = self.password.clone();
         let provider = self.provider;
         let timeout = self.probe_timeout;
+        let oauth =
+            self.oauth.then(|| OAuthProbe { client_id: self.oauth_client_id.trim().to_owned(), client_secret: self.oauth_client_secret.clone() });
         let (sender, receiver) = std::sync::mpsc::channel();
         self.probe = Some(receiver);
         self.testing = true;
@@ -633,7 +682,7 @@ impl Onboarding {
         self.field_error = None;
         self.focus = Some(FocusField::Primary);
         std::thread::spawn(move || {
-            let spec = ProbeSpec { provider: &provider, host: &host, port, tls, email: &email };
+            let spec = ProbeSpec { provider: &provider, host: &host, port, tls, email: &email, oauth };
             let result = run_probe(&spec, &password, extra_roots, timeout);
             let _ = sender.send(result);
         });
@@ -660,6 +709,9 @@ impl Onboarding {
         self.adding = false;
         self.password.zeroize();
         self.smtp_password.zeroize();
+        self.oauth_client_secret.zeroize();
+        self.oauth_grant = None;
+        self.oauth_access = None;
     }
 
     pub fn sync_failed(&mut self, message: String, cancelled: bool) {
@@ -667,6 +719,7 @@ impl Onboarding {
         self.adding = false;
         self.password.zeroize();
         self.smtp_password.zeroize();
+        self.oauth_client_secret.zeroize();
     }
 
     pub fn account_created(&mut self, id: &str, email: &str) {
@@ -679,6 +732,9 @@ impl Onboarding {
         self.focus = Some(FocusField::Primary);
         self.password.zeroize();
         self.smtp_password.zeroize();
+        self.oauth_client_secret.zeroize();
+        self.oauth_grant = None;
+        self.oauth_access = None;
     }
 
     pub fn account_failed(&mut self, message: String) {
@@ -708,22 +764,41 @@ impl Onboarding {
         };
         self.adding = true;
         self.add_error = None;
-        let smtp = self.smtp_settings().map(|(host, port, tls)| SmtpSetup {
-            host,
-            port,
-            tls: tls.mail_tls(),
-            username: if self.smtp_username.trim().is_empty() { self.email.trim().to_owned() } else { self.smtp_username.trim().to_owned() },
-            password: (!self.smtp_same_password).then(|| self.smtp_password.clone()),
-        });
+        let smtp = if self.oauth {
+            // The Gmail SMTP preset authorizes with the same grant; no password exists.
+            None
+        } else {
+            self.smtp_settings().map(|(host, port, tls)| SmtpSetup {
+                host,
+                port,
+                tls: tls.mail_tls(),
+                username: if self.smtp_username.trim().is_empty() { self.email.trim().to_owned() } else { self.smtp_username.trim().to_owned() },
+                password: (!self.smtp_same_password).then(|| self.smtp_password.clone()),
+            })
+        };
+        let oauth = if self.oauth {
+            let Some(grant) = self.oauth_grant.clone() else {
+                self.adding = false;
+                self.add_error = Some("Autorizza prima con Google: manca il consenso dell'account.".to_owned());
+                self.focus = Some(FocusField::Primary);
+                return None;
+            };
+            Some(grant)
+        } else {
+            None
+        };
+        let oauth_access = if self.oauth { self.oauth_access.clone() } else { None };
         Some(AccountSetup {
             provider: self.provider.provider(),
             email: self.email.trim().to_owned(),
             name: (!self.name.trim().is_empty()).then(|| self.name.trim().to_owned()),
-            password: self.password.clone(),
+            password: if self.oauth { Zeroizing::new(String::new()) } else { self.password.clone() },
             host,
             port,
             tls,
             smtp,
+            oauth,
+            oauth_access,
             extra_roots,
         })
     }
@@ -733,10 +808,14 @@ impl Onboarding {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok(preview)) => {
+            Ok(Ok(outcome)) => {
                 self.probe = None;
                 self.testing = false;
-                self.preview = Some(preview);
+                self.preview = Some(outcome.preview);
+                if outcome.grant.is_some() {
+                    self.oauth_grant = outcome.grant;
+                    self.oauth_access = outcome.oauth_access;
+                }
                 if self.advance_after_probe {
                     self.advance_after_probe = false;
                     self.stage = Stage::Folders;
@@ -912,7 +991,7 @@ impl Onboarding {
             ui.add_space(space::SM);
             ui.label(typography::text(
                 Role::Meta,
-                "Attiva la verifica in due passaggi, poi crea una password per le app nella pagina Sicurezza dell'account Google. OAuth arriverà più avanti.",
+                "Scegli l'accesso con Google (OAuth) con il tuo client id e secret di un client Desktop, oppure attiva la verifica in due passaggi e crea una password per le app. Postino riceve il redirect su 127.0.0.1:<porta>: nessun client Web. In modalità Testing Google fa scadere il refresh token dopo 7 giorni; la verifica dell'app (o CASA) ha un costo. Solo Gmail supporta OAuth in questa build.",
                 t.text_faint,
             ));
         } else if self.provider == ProviderChoice::Aruba {
@@ -977,7 +1056,7 @@ impl Onboarding {
                 });
             });
             ui.add_space(space::XS);
-            ui.label(typography::text(Role::Caption, format!("{} · {}", self.tls.label(), "nessun testo in chiaro"), t.text_faint));
+            ui.label(typography::text(Role::Caption, format!("{} Â· {}", self.tls.label(), "nessun testo in chiaro"), t.text_faint));
 
             ui.add_space(space::LG);
             SectionHeader::new("INVIO (SMTP)").show(ui);
@@ -1057,7 +1136,7 @@ impl Onboarding {
     fn credentials_body(&mut self, ui: &mut Ui, t: &Tokens, _extra_roots: Vec<CertificateDer<'static>>) {
         ui.add_space(space::MD);
         let focus = self.focus;
-        if matches!(focus, Some(FocusField::Name | FocusField::Email | FocusField::Password)) {
+        if matches!(focus, Some(FocusField::Name | FocusField::Email | FocusField::Password | FocusField::ClientId | FocusField::ClientSecret)) {
             self.focus = None;
         }
         let field_error = |state: &Self, field: FocusField| -> Option<String> {
@@ -1066,6 +1145,8 @@ impl Onboarding {
         let name_error = field_error(self, FocusField::Name);
         let email_error = field_error(self, FocusField::Email);
         let password_error = field_error(self, FocusField::Password);
+        let client_id_error = field_error(self, FocusField::ClientId);
+        let client_secret_error = field_error(self, FocusField::ClientSecret);
         let testing = self.testing;
         ui.add_enabled_ui(!testing && !self.adding, |ui| {
             let name = TextField::new(&mut self.name, "Federico")
@@ -1088,25 +1169,65 @@ impl Onboarding {
                 self.preview = None;
             }
             ui.add_space(space::SM);
-            let password = TextField::new(&mut self.password, "Password o password per le app")
-                .label("Password")
-                .icon(icons::LOCK)
-                .password(true)
-                .error(password_error.as_deref().unwrap_or(""))
-                .focus(focus == Some(FocusField::Password))
-                .show(ui);
-            if password.changed() {
-                self.preview = None;
+            if self.provider == ProviderChoice::Gmail {
+                let mut oauth = self.oauth;
+                if ui.checkbox(&mut oauth, "Accedi con Google (OAuth) invece di una password per le app").changed() {
+                    self.oauth = oauth;
+                    self.preview = None;
+                    self.oauth_grant = None;
+                    self.oauth_access = None;
+                }
+                ui.add_space(space::SM);
+            }
+            if self.oauth {
+                let client_id = TextField::new(&mut self.oauth_client_id, "1234567890-abc.apps.googleusercontent.com")
+                    .label("Client id OAuth")
+                    .error(client_id_error.as_deref().unwrap_or(""))
+                    .focus(focus == Some(FocusField::ClientId))
+                    .show(ui);
+                if client_id.changed() {
+                    self.preview = None;
+                    self.oauth_grant = None;
+                    self.oauth_access = None;
+                }
+                ui.add_space(space::SM);
+                let client_secret = TextField::new(&mut self.oauth_client_secret, "Client secret")
+                    .label("Client secret OAuth")
+                    .icon(icons::LOCK)
+                    .password(true)
+                    .error(client_secret_error.as_deref().unwrap_or(""))
+                    .focus(focus == Some(FocusField::ClientSecret))
+                    .show(ui);
+                if client_secret.changed() {
+                    self.preview = None;
+                    self.oauth_grant = None;
+                    self.oauth_access = None;
+                }
+            } else {
+                let password = TextField::new(&mut self.password, "Password o password per le app")
+                    .label("Password")
+                    .icon(icons::LOCK)
+                    .password(true)
+                    .error(password_error.as_deref().unwrap_or(""))
+                    .focus(focus == Some(FocusField::Password))
+                    .show(ui);
+                if password.changed() {
+                    self.preview = None;
+                }
             }
         });
-        if self.caps_lock {
+        if self.caps_lock && !self.oauth {
             ui.add_space(space::XS);
             ui.label(typography::text(Role::Meta, "Bloc Maiusc attivo: la password potrebbe essere digitata in maiuscolo.", t.gold_ink));
         }
         ui.add_space(space::XS);
         ui.label(typography::text(
             Role::Caption,
-            "La password resta in memoria solo fino alla creazione dell'account, poi va nel portachiavi di sistema.",
+            if self.oauth {
+                "Il client secret e il refresh token finiscono solo nel portachiavi di sistema; il token di accesso resta in memoria. Il browser si apre una volta su questo computer."
+            } else {
+                "La password resta in memoria solo fino alla creazione dell'account, poi va nel portachiavi di sistema."
+            },
             t.text_faint,
         ));
         if let Some(error) = self.connection_error.clone() {
@@ -1119,7 +1240,7 @@ impl Onboarding {
             ui.label(typography::text(
                 Role::BodySmall,
                 format!(
-                    "Connessione riuscita · {} cartell{} trovat{}.",
+                    "Connessione riuscita Â· {} cartell{} trovat{}.",
                     count,
                     if count == 1 { "a" } else { "e" },
                     if count == 1 { "a" } else { "e" }
@@ -1198,20 +1319,20 @@ impl Onboarding {
         ));
         ui.add_space(space::LG);
         let (label, fraction) = match &self.sync {
-            SyncStage::Idle => ("In attesa di iniziare…".to_owned(), None),
+            SyncStage::Idle => ("In attesa di iniziareâ€¦".to_owned(), None),
             SyncStage::Running(progress) => {
                 let progress = *progress;
                 let fraction = progress.fraction();
                 let label = if let Some(fraction) = fraction {
                     format!(
-                        "{:.0}% · {}/{} cartelle · {}",
+                        "{:.0}% Â· {}/{} cartelle Â· {}",
                         fraction * 100.0,
                         progress.folders_done,
                         progress.folders_total,
                         plural(progress.messages as usize, "messaggio", "messaggi")
                     )
                 } else {
-                    "Connessione al server…".to_owned()
+                    "Connessione al serverâ€¦".to_owned()
                 };
                 (label, fraction)
             }
@@ -1338,7 +1459,7 @@ impl Onboarding {
             Stage::Provider => ("Continua", true),
             Stage::Credentials => {
                 if self.testing {
-                    ("Verifica in corso…", false)
+                    ("Verifica in corsoâ€¦", false)
                 } else if self.preview.is_some() {
                     ("Continua", true)
                 } else if self.connection_error.is_some() {
@@ -1349,7 +1470,7 @@ impl Onboarding {
             }
             Stage::Folders => {
                 if self.adding {
-                    ("Creazione account…", false)
+                    ("Creazione accountâ€¦", false)
                 } else {
                     ("Aggiungi account", true)
                 }
@@ -1388,7 +1509,7 @@ fn ego_header(ui: &mut Ui, t: &Tokens, stage: Stage, provider: ProviderChoice) {
             ui.horizontal(|ui| {
                 ui.label(icons::icon(icons::MAIL, 18.0, t.gold_ink));
                 ui.add_space(space::SM);
-                ui.label(typography::text(Role::Caption, "POSTINO · CONFIGURAZIONE", t.text_faint));
+                ui.label(typography::text(Role::Caption, "POSTINO Â· CONFIGURAZIONE", t.text_faint));
             });
             let title = match stage {
                 Stage::Welcome => "Configurazione iniziale",
@@ -1439,6 +1560,25 @@ fn role_of(kind: FolderKind) -> FolderRole {
     }
 }
 
+/// What one probe produced: the folders, plus the OAuth grant when the browser round trip ran on this
+/// thread. The grant never enters a log or a result the UI prints.
+#[derive(Debug)]
+struct ProbeOutcome {
+    preview: FoldersPreview,
+    grant: Option<OAuthGrant>,
+    /// The token from the same exchange, so `add_account` probes without refreshing again.
+    oauth_access: Option<OAuthAccess>,
+}
+
+type ProbeResult = Result<ProbeOutcome, ConnectionError>;
+
+/// BYO Google client credentials for the OAuth probe. The secret is zeroised when the probe thread
+/// ends.
+struct OAuthProbe {
+    client_id: String,
+    client_secret: Zeroizing<String>,
+}
+
 /// The server and identity one probe checks. Kept together so the probe call cannot transpose host,
 /// port, TLS mode or login.
 struct ProbeSpec<'a> {
@@ -1447,6 +1587,7 @@ struct ProbeSpec<'a> {
     port: u16,
     tls: TlsChoice,
     email: &'a str,
+    oauth: Option<OAuthProbe>,
 }
 
 fn run_probe(
@@ -1459,14 +1600,37 @@ fn run_probe(
         TlsChoice::Implicit => TlsMode::Implicit,
         TlsChoice::StartTls => TlsMode::StartTls,
     };
+    let (oauth, access) = match &spec.oauth {
+        Some(oauth) => {
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            let authorized = postino_core::authorize(
+                &oauth.client_id,
+                oauth.client_secret.as_str(),
+                |url| postino_platform::open_in_browser(url).map_err(|error| error.to_string()),
+                &cancelled,
+            )
+            .map_err(|error| ConnectionError {
+                kind: ErrorKind::OAuth,
+                message: format!("L'accesso con Google non è riuscito: {error}. Controlla client id e client secret e riprova."),
+                focus: FocusField::ClientId,
+            })?;
+            let access = authorized.access_hint();
+            (Some(authorized.into_grant()), Some(access))
+        }
+        None => (None, None),
+    };
     let mut config = ImapConfig::new(spec.host, spec.port, mode, spec.email, Secret::new(password.as_str()));
+    if let Some(access) = &access {
+        config = config.with_oauth_token(Secret::new(access.token()));
+    }
     if let Some(timeout) = timeout {
         config = config.with_timeout(timeout);
     }
     for root in extra_roots {
         config = config.with_extra_root(root);
     }
-    let probe = postino_sync::probe(&config).map_err(|error| classify_probe_error(error, *spec.provider, spec.host, spec.port))?;
+    let probe =
+        postino_sync::probe(&config).map_err(|error| classify_probe_error(error, *spec.provider, spec.host, spec.port, spec.oauth.is_some()))?;
     let host = spec.host;
     if probe.folders.iter().all(|folder| !folder.is_selectable()) {
         return Err(ConnectionError {
@@ -1504,7 +1668,7 @@ fn run_probe(
     for folder in folders.iter().filter(|folder| folder.aggregate) {
         warnings.push(format!("“{}” è una vista aggregata del server: non viene scaricata separatamente.", folder.name));
     }
-    Ok(FoldersPreview { folders, warnings })
+    Ok(ProbeOutcome { preview: FoldersPreview { folders, warnings }, grant: oauth, oauth_access: access })
 }
 
 /// Where to put the keyboard after a server-side failure: a custom account can fix host/port, while
@@ -1515,10 +1679,16 @@ fn server_focus(provider: ProviderChoice) -> FocusField {
 
 /// Map a probe failure to a specific Italian sentence and the field that can fix it. No server
 /// text is used, because a broken server can echo a credential.
-pub fn classify_probe_error(error: SyncError, provider: ProviderChoice, host: &str, port: u16) -> ConnectionError {
+pub fn classify_probe_error(error: SyncError, provider: ProviderChoice, host: &str, port: u16, oauth: bool) -> ConnectionError {
     match error {
         SyncError::Auth(_) => {
-            if provider == ProviderChoice::Gmail {
+            if oauth {
+                ConnectionError {
+                    kind: ErrorKind::OAuth,
+                    message: "Google ha rifiutato il token OAuth. Controlla che l'autorizzazione includa la posta e riprova; se persiste, rimuovi l'accesso di Postino dall'account Google e autorizza di nuovo.".to_owned(),
+                    focus: FocusField::ClientId,
+                }
+            } else if provider == ProviderChoice::Gmail {
                 ConnectionError {
                     kind: ErrorKind::AppPassword,
                     message: "Gmail ha rifiutato l'accesso. Serve una password per le app: attiva la verifica in due passaggi e creala nella pagina Sicurezza dell'account Google. La password normale non funziona con IMAP.".to_owned(),
@@ -1712,6 +1882,7 @@ mod tests {
             port: server.port(),
             tls: TlsChoice::Implicit,
             email: postino_testkit::USER,
+            oauth: None,
         };
         let error = run_probe(&spec, &password, vec![server.ca()], Some(Duration::from_secs(3))).expect_err("the server rejected the login");
         assert_eq!(error.kind, ErrorKind::Password);
@@ -1731,6 +1902,7 @@ mod tests {
             port: server.port(),
             tls: TlsChoice::Implicit,
             email: postino_testkit::USER,
+            oauth: None,
         };
         let error = run_probe(&spec, &password, Vec::new(), Some(Duration::from_secs(3))).expect_err("the certificate is not trusted");
         assert_eq!(error.kind, ErrorKind::Tls);
@@ -1748,6 +1920,7 @@ mod tests {
             port: server.port(),
             tls: TlsChoice::Implicit,
             email: postino_testkit::USER,
+            oauth: None,
         };
         let error = run_probe(&spec, &password, vec![server.ca()], Some(Duration::from_millis(200))).expect_err("the greeting never arrives");
         assert_eq!(error.kind, ErrorKind::Timeout);
@@ -1965,20 +2138,76 @@ mod tests {
             ),
         ];
         for (error, provider, kind, focus) in cases {
-            let classified = classify_probe_error(error, provider, "mail.example", 993);
+            let classified = classify_probe_error(error, provider, "mail.example", 993, false);
             assert_eq!(classified.kind, kind);
             assert_eq!(classified.focus, focus);
             assert!(!classified.message.is_empty());
         }
-        let gmail = classify_probe_error(SyncError::Auth("x".to_owned()), ProviderChoice::Gmail, "imap.gmail.com", 993);
+        let gmail = classify_probe_error(SyncError::Auth("x".to_owned()), ProviderChoice::Gmail, "imap.gmail.com", 993, false);
         assert!(gmail.message.contains("password per le app"));
     }
 
     #[test]
     fn the_gmail_copy_mentions_2fa_and_an_app_password() {
-        let error = classify_probe_error(SyncError::Auth("x".to_owned()), ProviderChoice::Gmail, "imap.gmail.com", 993);
+        let error = classify_probe_error(SyncError::Auth("x".to_owned()), ProviderChoice::Gmail, "imap.gmail.com", 993, false);
         assert!(error.message.contains("due passaggi"));
         assert!(error.message.contains("Sicurezza"));
+    }
+
+    #[test]
+    fn gmail_oauth_wants_client_credentials_instead_of_a_password() {
+        let mut onboarding = Onboarding::first_run();
+        onboarding.seed_for_test(Stage::Credentials, ProviderChoice::Gmail, None, None);
+        onboarding.set_oauth_for_test("", "secret");
+        let action = onboarding.advance(Vec::new());
+        assert!(matches!(action, Action::None));
+        assert_eq!(onboarding.focus, Some(FocusField::ClientId));
+        assert!(onboarding.field_error.as_ref().is_some_and(|(field, _)| *field == FocusField::ClientId));
+        onboarding.set_oauth_for_test("client-id.apps.googleusercontent.com", "client-secret");
+        let grant = postino_core::OAuthGrant::new("client-id.apps.googleusercontent.com", "client-secret", "1//refresh");
+        onboarding.preview = Some(FoldersPreview { folders: Vec::new(), warnings: Vec::new() });
+        onboarding.oauth_grant = Some(grant);
+        let setup = onboarding.take_setup(Vec::new()).expect("a verified OAuth account");
+        assert!(setup.password.is_empty(), "an OAuth account never carries a password");
+        assert!(setup.oauth.is_some());
+        assert!(setup.smtp.is_none(), "the Gmail SMTP preset authorizes with the grant");
+    }
+
+    #[test]
+    fn the_oauth_fields_render_and_never_paint_the_client_secret() {
+        let mut onboarding = Onboarding::first_run();
+        onboarding.seed_for_test(Stage::Credentials, ProviderChoice::Gmail, None, None);
+        onboarding.set_oauth_for_test("client-id.apps.googleusercontent.com", "super-secret");
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let mut output =
+            ctx.run_ui(RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() }, |ui| {
+                let _ = onboarding.show(ui, false, Vec::new());
+            });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        output.textures_delta.clear();
+        assert!(text.iter().any(|line| line == "Client id OAuth"), "the OAuth client id field is missing: {text:?}");
+        assert!(text.iter().any(|line| line == "Client secret OAuth"), "the OAuth client secret field is missing: {text:?}");
+        assert!(!text.iter().any(|line| line.contains("super-secret")), "the client secret is painted in clear: {text:?}");
+    }
+
+    #[test]
+    fn oauth_is_refused_for_a_provider_without_an_authorization_seam() {
+        let mut onboarding = Onboarding::first_run();
+        onboarding.seed_for_test(Stage::Credentials, ProviderChoice::Custom, None, None);
+        onboarding.set_custom("mail.example", "993");
+        onboarding.set_oauth_for_test("client-id", "client-secret");
+        let action = onboarding.advance(Vec::new());
+        assert!(matches!(action, Action::None));
+        assert_eq!(onboarding.focus, Some(FocusField::Primary));
+        assert!(onboarding.field_error.as_ref().is_some_and(|(_, message)| message.contains("solo per Gmail")));
     }
 
     #[test]

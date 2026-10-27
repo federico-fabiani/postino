@@ -71,6 +71,12 @@ impl Capabilities {
         self.has("AUTH=PLAIN")
     }
 
+    /// `AUTH=XOAUTH2`, required for an OAuth access token.
+    #[must_use]
+    pub fn auth_xoauth2(&self) -> bool {
+        self.has("AUTH=XOAUTH2")
+    }
+
     /// `LOGINDISABLED`: the server refuses plaintext credentials even now.
     #[must_use]
     pub fn login_disabled(&self) -> bool {

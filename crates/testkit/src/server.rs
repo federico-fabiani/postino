@@ -249,6 +249,19 @@ impl Conn {
         assert_eq!(payload, expected_sasl());
         self.send_line("A0002 OK [CAPABILITY IMAP4rev1 IDLE] logged in").await;
     }
+
+    /// Greeting, CAPABILITY with `AUTH=XOAUTH2`, and the full XOAUTH2 exchange.
+    pub async fn prepare_xoauth2(&mut self, expected: &str) {
+        self.send_line("* OK fake IMAP ready").await;
+        self.expect("A0001 CAPABILITY").await;
+        self.send_line("* CAPABILITY IMAP4rev1 AUTH=XOAUTH2 IDLE").await;
+        self.send_line("A0001 OK done").await;
+        self.expect("A0002 AUTHENTICATE XOAUTH2").await;
+        self.send_line("+ ").await;
+        let payload = self.read_line().await;
+        assert_eq!(payload, expected);
+        self.send_line("A0002 OK [CAPABILITY IMAP4rev1 IDLE] logged in").await;
+    }
 }
 
 /// A listener on `127.0.0.1` that runs one handler for one connection.

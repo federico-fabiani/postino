@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
-    LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OpDef, OpError, OutboxAction,
+    LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction,
     OutboxListResult, OutboxRunReport, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
     RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult,
     SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
@@ -333,8 +333,23 @@ enum AccountCommand {
         smtp_password_stdin: bool,
         /// Read the password (or app password) from one stdin line instead of prompting. There is
         /// deliberately no --password argument: a password must not appear in argv or shell history.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "oauth")]
         password_stdin: bool,
+        /// Authorize Gmail with OAuth 2.0 (XOAUTH2) instead of an app password. Needs a Desktop-app
+        /// OAuth client from the user's Google Cloud project with redirect URI
+        /// http://127.0.0.1:<port> and scope https://mail.google.com/. The system browser opens once;
+        /// there is no device code and no embedded webview. Google Testing mode expires refresh tokens
+        /// after 7 days; app verification/CASA has a cost and unverified apps are limited. Gmail only.
+        /// The refresh token and the client secret go to the OS keyring only. See docs/oauth.md.
+        #[arg(long)]
+        oauth: bool,
+        /// Google OAuth client id. Public, but it is also prompted when omitted. Requires --oauth.
+        #[arg(long, requires = "oauth")]
+        client_id: Option<String>,
+        /// Read the OAuth client secret from one stdin line. Never a command-line value; prompted
+        /// with no echo when stdin is a terminal.
+        #[arg(long, requires = "oauth", conflicts_with = "password_stdin")]
+        client_secret_stdin: bool,
     },
     /// Log in with the stored credential and list folders. Writes nothing.
     Test {
@@ -705,6 +720,25 @@ impl CredentialVault for PlatformVault {
 
     fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError> {
         let scope = postino_platform::account_smtp_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn store_oauth_grant(&self, account_id: &str, grant: &OAuthGrant) -> Result<(), VaultError> {
+        let scope = postino_platform::account_oauth_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        let bytes = grant.to_bytes();
+        self.keyring.store_secret(&scope, &bytes).map_err(|error| VaultError::new(error.to_string()))
+    }
+
+    fn load_oauth_grant(&self, account_id: &str) -> Result<Option<OAuthGrant>, VaultError> {
+        let scope = postino_platform::account_oauth_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
+        let Some(bytes) = self.keyring.load_secret(&scope).map_err(|error| VaultError::new(error.to_string()))? else {
+            return Ok(None);
+        };
+        OAuthGrant::from_bytes(&bytes).map(Some)
+    }
+
+    fn delete_oauth_grant(&self, account_id: &str) -> Result<(), VaultError> {
+        let scope = postino_platform::account_oauth_scope(account_id).map_err(|error| VaultError::new(error.to_string()))?;
         self.keyring.delete_secret(&scope).map_err(|error| VaultError::new(error.to_string()))
     }
 }
@@ -1607,6 +1641,9 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 smtp_username,
                 smtp_password_stdin,
                 password_stdin,
+                oauth,
+                client_id,
+                client_secret_stdin,
             } => {
                 let provider =
                     Provider::parse(&provider).ok_or_else(|| usage(format!("provider {provider:?} is not valid; use aruba, gmail or custom")))?;
@@ -1638,6 +1675,66 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     smtp_username: smtp_username.clone(),
                 };
                 engine.check_account_request(&request)?;
+                if oauth {
+                    if provider != Provider::Gmail {
+                        return Err(usage("--oauth authorizes Gmail only; add another provider with an app password"));
+                    }
+                    if password_stdin || smtp_password_stdin {
+                        return Err(usage("--oauth replaces the password: omit --password-stdin and --smtp-password-stdin"));
+                    }
+                    if smtp_host.is_some() || smtp_port.is_some() || smtp_tls.is_some() || smtp_username.is_some() {
+                        return Err(usage("--oauth uses the Gmail SMTP preset; omit --smtp-host, --smtp-port, --smtp-tls and --smtp-username"));
+                    }
+                    if client_secret_stdin && interactive {
+                        return Err(usage(
+                            "stdin is a terminal: omit --client-secret-stdin to use the no-echo prompt, or pipe the client secret from a file or script",
+                        ));
+                    }
+                    let client_id = match client_id {
+                        Some(client_id) => client_id,
+                        None if interactive => {
+                            rpassword::prompt_password("Client id OAuth (pubblico): ").context("reading the OAuth client id from the terminal")?
+                        }
+                        None => return Err(usage("pass --client-id when stdin is not a terminal; it is public and belongs in the command")),
+                    };
+                    let client_secret = if client_secret_stdin {
+                        read_password_stdin(input)?
+                    } else if interactive {
+                        let secret =
+                            rpassword::prompt_password("Client secret OAuth: ").context("reading the OAuth client secret from the terminal")?;
+                        if secret.is_empty() {
+                            return Err(usage("the OAuth client secret must not be empty"));
+                        }
+                        Zeroizing::new(secret)
+                    } else {
+                        return Err(usage(
+                            "no terminal is available to prompt for the OAuth client secret; use --client-secret-stdin and pipe one line into postino",
+                        ));
+                    };
+                    let authorized = authorize_gmail(&client_id, &client_secret)?;
+                    let oauth_access = Some(authorized.access_hint());
+                    let view = account_add(
+                        engine,
+                        AccountAddRequest {
+                            provider,
+                            email,
+                            name,
+                            host,
+                            port,
+                            tls,
+                            smtp: None,
+                            password: Zeroizing::new(String::new()),
+                            oauth: Some(authorized.into_grant()),
+                            oauth_access,
+                        },
+                    )?;
+                    if json_output {
+                        print_json(&AccountAdd { account: view })?;
+                    } else {
+                        say(format_account_add(&view))?;
+                    }
+                    return Ok(());
+                }
                 if password_stdin && interactive {
                     return Err(usage(
                         "stdin is a terminal: omit --password-stdin to use the no-echo prompt, or pipe the password from a file or script",
@@ -1674,7 +1771,10 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     None
                 };
                 let smtp = smtp_setup(provider, &email, &request, smtp_password)?;
-                let view = account_add(engine, AccountAddRequest { provider, email, name, host, port, tls, smtp, password })?;
+                let view = account_add(
+                    engine,
+                    AccountAddRequest { provider, email, name, host, port, tls, smtp, password, oauth: None, oauth_access: None },
+                )?;
                 if json_output {
                     print_json(&AccountAdd { account: view })?;
                 } else {
@@ -1734,7 +1834,7 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 if json_output {
                     print_json(&removed)?;
                 } else {
-                    say(format_account_remove(&removed.account))?;
+                    say(format_account_remove(&removed))?;
                 }
             }
         },
@@ -2406,6 +2506,8 @@ struct AccountAddRequest {
     tls: Option<MailTls>,
     smtp: Option<SmtpSetup>,
     password: Zeroizing<String>,
+    oauth: Option<OAuthGrant>,
+    oauth_access: Option<postino_core::OAuthAccess>,
 }
 
 /// Build the optional SMTP setup from the validated flags. Known providers use their preset; a
@@ -2435,10 +2537,26 @@ fn smtp_setup(provider: Provider, email: &str, request: &AccountRequest, passwor
     }
 }
 
+/// Run the Gmail OAuth flow: loopback + PKCE + state, the system browser, then the code exchange.
+/// The grant and the access token from that one exchange leave this function together; `account_add`
+/// probes with the token, so the first sync does not spend a second token request.
+fn authorize_gmail(client_id: &str, client_secret: &str) -> Result<postino_core::Authorized> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    match postino_core::authorize(
+        client_id,
+        client_secret,
+        |url| postino_platform::open_in_browser(url).map_err(|error| error.to_string()),
+        &cancelled,
+    ) {
+        Ok(authorized) => Ok(authorized),
+        Err(error) => bail!("the Google authorization failed: {error}"),
+    }
+}
+
 /// Dispatch `account_add` through the registry. The passwords travel in the request to the engine,
 /// which hands them to the keyring adapter after the login check; they are never printed here.
 fn account_add<B: CliBackend>(engine: &mut B, request: AccountAddRequest) -> Result<AccountView> {
-    let AccountAddRequest { provider, email, name, host, port, tls, smtp, password } = request;
+    let AccountAddRequest { provider, email, name, host, port, tls, smtp, password, oauth, oauth_access } = request;
     let mut args = json!({
         "provider": provider,
         "email": email,
@@ -2448,6 +2566,23 @@ fn account_add<B: CliBackend>(engine: &mut B, request: AccountAddRequest) -> Res
         "port": port,
         "tls": tls,
     });
+    if let Some(grant) = oauth
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert(
+            "oauth".to_owned(),
+            json!({
+                "client_id": grant.client_id(),
+                "client_secret": grant.client_secret(),
+                "refresh_token": grant.refresh_token(),
+            }),
+        );
+    }
+    if let Some(access) = oauth_access
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert("oauth_access".to_owned(), json!({ "token": access.token(), "expires_at_ms": access.expires_at_ms() }));
+    }
     if let Some(smtp) = smtp
         && let Some(object) = args.as_object_mut()
     {
@@ -2639,8 +2774,16 @@ fn format_account_test(result: &AccountTest) -> String {
     )
 }
 
-fn format_account_remove(view: &AccountView) -> String {
-    format!("Account rimosso: {} <{}>. Credenziale e cache locale eliminate; le etichette restano.\n", view.account.id, view.account.email)
+fn format_account_remove(result: &AccountRemove) -> String {
+    let mut text = if result.removed {
+        format!("Account rimosso: {}. Credenziale e cache locale eliminate; le etichette restano.\n", result.account)
+    } else {
+        format!("Account {} non presente: era già stato rimosso; nulla da fare.\n", result.account)
+    };
+    for warning in &result.warnings {
+        text.push_str(&format!("  ! {warning}\n"));
+    }
+    text
 }
 
 fn format_sync_report(report: &SyncReport) -> String {
@@ -3826,6 +3969,46 @@ mod tests {
     }
 
     #[test]
+    fn oauth_has_no_client_secret_argument_and_reads_it_from_stdin() {
+        let cli = Cli::try_parse_from([
+            "postino",
+            "account",
+            "add",
+            "--provider",
+            "gmail",
+            "--email",
+            "user@example.com",
+            "--oauth",
+            "--client-id",
+            "client-id.apps.googleusercontent.com",
+            "--client-secret-stdin",
+        ])
+        .expect("the OAuth flags parse");
+        let Command::Account { command: AccountCommand::Add { oauth, client_id, client_secret_stdin, password_stdin, .. } } = cli.command else {
+            panic!("expected account add");
+        };
+        assert!(oauth);
+        assert!(client_secret_stdin);
+        assert!(!password_stdin);
+        assert_eq!(client_id.as_deref(), Some("client-id.apps.googleusercontent.com"));
+        let refused = Cli::try_parse_from([
+            "postino",
+            "account",
+            "add",
+            "--provider",
+            "gmail",
+            "--email",
+            "user@example.com",
+            "--oauth",
+            "--client-id",
+            "client-id",
+            "--client-secret",
+            "leaked",
+        ]);
+        assert!(refused.is_err(), "a client secret must never be a command-line value");
+    }
+
+    #[test]
     fn there_is_no_password_argv_flag_and_missing_arguments_exit_with_two() {
         let error =
             Cli::try_parse_from(["postino", "account", "add", "--provider", "custom", "--email", "me@example.com", "--password", "not-allowed"])
@@ -3882,6 +4065,9 @@ mod tests {
                     smtp_username: None,
                     smtp_password_stdin: false,
                     password_stdin: true,
+                    oauth: false,
+                    client_id: None,
+                    client_secret_stdin: false,
                 },
             }),
             &mut engine,
@@ -3912,6 +4098,9 @@ mod tests {
                     smtp_username: None,
                     smtp_password_stdin: false,
                     password_stdin: true,
+                    oauth: false,
+                    client_id: None,
+                    client_secret_stdin: false,
                 },
             }),
             &mut engine,
@@ -4005,6 +4194,9 @@ mod tests {
                     smtp_username: None,
                     smtp_password_stdin: false,
                     password_stdin: true,
+                    oauth: false,
+                    client_id: None,
+                    client_secret_stdin: false,
                 },
             }),
             &mut engine,
@@ -4061,6 +4253,9 @@ mod tests {
                     smtp_username: None,
                     smtp_password_stdin: false,
                     password_stdin: true,
+                    oauth: false,
+                    client_id: None,
+                    client_secret_stdin: false,
                 },
             }),
             &mut engine,

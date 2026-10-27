@@ -3461,10 +3461,13 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "getrandom 0.3.4",
  "log",
  "postino-testkit",
  "rustls",
  "rustls-platform-verifier",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",

@@ -276,8 +276,20 @@ pub async fn serve_mailbox(conn: Conn, folders: Vec<TestFolder>) -> Conn {
 }
 
 /// [`serve_mailbox`] with failure and cancellation hooks.
-pub async fn serve_mailbox_with(mut conn: Conn, folders: Vec<TestFolder>, script: MailboxScript) -> Conn {
+pub async fn serve_mailbox_with(conn: Conn, folders: Vec<TestFolder>, script: MailboxScript) -> Conn {
+    let mut conn = conn;
     conn.prepare_sasl().await;
+    serve_mailbox_inner(conn, folders, script).await
+}
+
+/// [`serve_mailbox`] for an account that authenticates with `AUTHENTICATE XOAUTH2`.
+pub async fn serve_mailbox_with_xoauth2(conn: Conn, folders: Vec<TestFolder>, script: MailboxScript, token: &str) -> Conn {
+    let mut conn = conn;
+    conn.prepare_xoauth2(&crate::expected_xoauth2(crate::USER, token)).await;
+    serve_mailbox_inner(conn, folders, script).await
+}
+
+async fn serve_mailbox_inner(mut conn: Conn, folders: Vec<TestFolder>, script: MailboxScript) -> Conn {
     let mut selected: Option<usize> = None;
     let mut selects = 0u32;
     let mut bodies = 0u32;

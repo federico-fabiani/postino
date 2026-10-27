@@ -15,10 +15,12 @@ use std::time::Duration;
 
 use std::future::Future;
 
-use postino_core::{AccountSetup, CredentialVault, MailTls, Provider, VaultError};
+use postino_core::{AccountSetup, CredentialVault, MailTls, OAuthGrant, Provider, VaultError};
 use postino_net::{CertificateDer, ImapConfig, Secret, SmtpConfig, TlsMode};
 use postino_store::{Account, AccountServer, AccountTls, Folder, FolderKind, SmtpServer, Store, StoreKey};
-use postino_testkit::{Conn, FakeServer, FakeSmtp, MailboxScript, SmtpConn, TestFolder, TlsFixture, USER, serve_mailbox_with};
+use postino_testkit::{
+    Conn, FakeServer, FakeSmtp, MailboxScript, SmtpConn, TestFolder, TlsFixture, USER, serve_mailbox_with, serve_mailbox_with_xoauth2,
+};
 use zeroize::Zeroizing;
 
 pub const ACCOUNT_ID: &str = "acc_test";
@@ -55,6 +57,7 @@ impl Harness {
 pub struct MemoryVault {
     secrets: Mutex<HashMap<String, Vec<u8>>>,
     fail_delete: AtomicBool,
+    fail_load: AtomicBool,
     deletions: Mutex<Vec<String>>,
 }
 
@@ -87,6 +90,11 @@ impl MemoryVault {
     /// Make every later delete fail, to prove the `account_remove` failure window.
     pub fn fail_deletes(&self) {
         self.fail_delete.store(true, Ordering::SeqCst);
+    }
+
+    /// Make every later OAuth grant read fail, to prove removal does not depend on the keyring.
+    pub fn fail_loads(&self) {
+        self.fail_load.store(true, Ordering::SeqCst);
     }
 }
 
@@ -122,6 +130,31 @@ impl CredentialVault for MemoryVault {
         self.secrets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&format!("smtp:{account_id}"));
         Ok(())
     }
+
+    fn store_oauth_grant(&self, account_id: &str, grant: &OAuthGrant) -> Result<(), VaultError> {
+        let bytes = grant.to_bytes();
+        self.secrets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(format!("oauth:{account_id}"), bytes.to_vec());
+        Ok(())
+    }
+
+    fn load_oauth_grant(&self, account_id: &str) -> Result<Option<OAuthGrant>, VaultError> {
+        if self.fail_load.load(Ordering::SeqCst) {
+            return Err(VaultError::new("the mock keyring refuses reads"));
+        }
+        let bytes = self.secrets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&format!("oauth:{account_id}")).cloned();
+        match bytes {
+            Some(bytes) => OAuthGrant::from_bytes(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn delete_oauth_grant(&self, account_id: &str) -> Result<(), VaultError> {
+        if self.fail_delete.load(Ordering::SeqCst) {
+            return Err(VaultError::new("the mock keyring refuses deletes"));
+        }
+        self.secrets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&format!("oauth:{account_id}"));
+        Ok(())
+    }
 }
 
 /// A fake mailbox on one port that accepts a fixed number of connections sequentially.
@@ -142,6 +175,18 @@ impl RunningServer {
     where
         F: Fn(usize) -> MailboxScript + Send + 'static,
     {
+        Self::start_impl(mailbox, connections, script, None)
+    }
+
+    /// Serve an account that authenticates with `AUTHENTICATE XOAUTH2` and this access token.
+    pub fn start_oauth(folders: Vec<TestFolder>, connections: usize, token: &str) -> Self {
+        Self::start_impl(Arc::new(Mutex::new(folders)), connections, |_| MailboxScript::default(), Some(token.to_owned()))
+    }
+
+    fn start_impl<F>(mailbox: Arc<Mutex<Vec<TestFolder>>>, connections: usize, script: F, oauth: Option<String>) -> Self
+    where
+        F: Fn(usize) -> MailboxScript + Send + 'static,
+    {
         let tls = TlsFixture::generate();
         let ca = tls.ca();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -153,8 +198,16 @@ impl RunningServer {
                     let index = counter.fetch_add(1, Ordering::SeqCst);
                     let folders = mailbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                     let script = script(index);
+                    let oauth = oauth.clone();
                     async move {
-                        let _ = serve_mailbox_with(conn, folders, script).await;
+                        match oauth {
+                            Some(token) => {
+                                let _ = serve_mailbox_with_xoauth2(conn, folders, script, &token).await;
+                            }
+                            None => {
+                                let _ = serve_mailbox_with(conn, folders, script).await;
+                            }
+                        }
                     }
                 })
                 .await;
@@ -494,6 +547,8 @@ pub fn account_setup(server: &RunningServer) -> AccountSetup {
         port: Some(server.port()),
         tls: Some(MailTls::Implicit),
         smtp: None,
+        oauth: None,
+        oauth_access: None,
         extra_roots: vec![server.ca()],
     }
 }

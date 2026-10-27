@@ -98,6 +98,33 @@ pub enum NetError {
         /// Missing capability or feature.
         feature: &'static str,
     },
+    /// The OAuth consent did not complete: the person declined, the window was cancelled, the
+    /// redirect carried the wrong `state`, or it never arrived.
+    #[error("the OAuth sign-in did not complete: {reason}")]
+    OAuthConsent {
+        /// What stopped the flow, in printable ASCII. Never a code, a state or a token.
+        reason: String,
+    },
+    /// The OAuth token endpoint refused the request.
+    #[error("the OAuth token endpoint refused the request (HTTP {status}: {code})")]
+    OAuthRejected {
+        /// HTTP status the endpoint answered.
+        status: u16,
+        /// Provider error code, sanitised. Never the response body.
+        code: String,
+    },
+    /// The stored grant is no longer valid: the person revoked it, or it expired.
+    #[error("the OAuth grant is no longer valid: {reason}")]
+    OAuthGrant {
+        /// The sentence that reaches the person.
+        reason: String,
+    },
+    /// The token endpoint answered something this client cannot read.
+    #[error("the OAuth token response is not usable: {reason}")]
+    OAuthToken {
+        /// What is wrong, in printable ASCII.
+        reason: String,
+    },
 }
 
 /// Reduce untrusted text to bounded printable ASCII.

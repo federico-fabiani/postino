@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
-use postino_net::{CertificateDer, ImapConfig, NetError, Secret, SmtpConfig, SmtpEnvelope, SmtpError, SmtpLimits};
+use postino_net::{CertificateDer, NetError, SmtpEnvelope, SmtpError, SmtpLimits};
 use postino_store::{FlagUpdate, OutboxEntry, OutboxState, Store};
 use postino_sync::SyncError;
 use serde_json::Value;
@@ -182,6 +182,14 @@ pub struct AccountSetup {
     /// accounts may omit it and then can read but not send. The password inside is optional: absent
     /// means "use the IMAP credential".
     pub smtp: Option<SmtpSetup>,
+    /// The OAuth grant for an account that authorizes with XOAUTH2 instead of an app password.
+    /// `None` is an app-password account, unchanged. When this is present, `password` must be empty:
+    /// the engine refuses a setup that carries both, so an account can never fall back silently.
+    pub oauth: Option<crate::oauth::OAuthGrant>,
+    /// The access token the same code exchange produced, when the caller still has it. `add_account`
+    /// probes with it instead of spending a second token request; it is never stored. `None` (a CLI
+    /// or desktop that only kept the grant) makes `add_account` refresh once, as before.
+    pub oauth_access: Option<crate::oauth::OAuthAccess>,
     /// Extra certificate authorities. Empty in production; tests pass the fake server's CA.
     pub extra_roots: Vec<CertificateDer<'static>>,
 }
@@ -285,7 +293,7 @@ pub struct Engine {
     /// Extra trust anchors for IMAP connections. Empty in production. Tests use
     /// [`Engine::set_test_extra_roots`] to trust the fake server's throwaway CA; this can only add
     /// anchors and never disables verification.
-    extra_roots: Vec<CertificateDer<'static>>,
+    pub(crate) extra_roots: Vec<CertificateDer<'static>>,
     /// Test seam: stop right after the server's `250` and before the durable
     /// `append_pending` transition, as a process death would. Only a debug/test build has it; a
     /// release build compiles the field and the check out.
@@ -344,7 +352,22 @@ pub struct Engine {
     pub(crate) allow_send: bool,
     /// Demo-only `all` page cursors, keyed by rule id.
     pub(crate) demo_rule_all_cursors: HashMap<String, (i64, String)>,
+    /// Account id → the access token of an OAuth account and its expiry. Memory only: never written to
+    /// the store, a log or an operation result, and dropped with the engine. A `RefCell` because reads
+    /// (`test_account`, `sync_now`) take `&self` and still refresh once.
+    pub(crate) oauth_access: RefCell<HashMap<String, crate::oauth::CachedAccess>>,
+    /// Test-only override of the provider endpoints, set by [`Engine::set_test_oauth_endpoints`].
+    #[cfg(debug_assertions)]
+    pub(crate) test_oauth_endpoints: Option<(String, String, String)>,
+    /// Test-only Gmail IMAP/SMTP endpoints, set by [`Engine::set_test_oauth_hosts`].
+    #[cfg(debug_assertions)]
+    pub(crate) test_oauth_hosts: Option<TestOAuthHosts>,
 }
+
+/// Test-only Gmail endpoints: IMAP host and port, plus the SMTP host and port when the preset has
+/// one. Only `cfg(test)` code and integration tests through the public hook set it.
+#[cfg(debug_assertions)]
+pub(crate) type TestOAuthHosts = (String, u16, Option<(String, u16)>);
 
 /// The computed half of a saved-search row.
 #[derive(Debug, Clone, Default)]
@@ -399,6 +422,11 @@ impl Engine {
             demo_rules_applied: BTreeSet::new(),
             allow_send: true,
             demo_rule_all_cursors: HashMap::new(),
+            oauth_access: RefCell::new(HashMap::new()),
+            #[cfg(debug_assertions)]
+            test_oauth_endpoints: None,
+            #[cfg(debug_assertions)]
+            test_oauth_hosts: None,
         }
     }
 
@@ -444,6 +472,22 @@ impl Engine {
     /// operation, so no caller can set it from JSON. Production builds leave it empty.
     pub fn set_test_extra_roots(&mut self, roots: Vec<CertificateDer<'static>>) {
         self.extra_roots = roots;
+    }
+
+    /// Point the Gmail OAuth provider at a scripted token endpoint. Tests only, same contract as
+    /// [`Engine::set_test_extra_roots`]: it is a debug-build hook, not an operation, so no caller can
+    /// redirect a production refresh from JSON. The browser authorize URL is replaced too, but it is
+    /// never opened by the engine.
+    #[cfg(debug_assertions)]
+    pub fn set_test_oauth_endpoints(&mut self, authorize: String, token: String, revoke: String) {
+        self.test_oauth_endpoints = Some((authorize, token, revoke));
+    }
+
+    /// Point a Gmail account at a local fake IMAP/SMTP server. Tests only, same contract as
+    /// [`Engine::set_test_extra_roots`]. A debug-build hook, never reachable from JSON.
+    #[cfg(debug_assertions)]
+    pub fn set_test_oauth_hosts(&mut self, imap: (String, u16), smtp: Option<(String, u16)>) {
+        self.test_oauth_hosts = Some((imap.0, imap.1, smtp));
     }
 
     /// Set whether this engine may queue outbound mail. The desktop and CLI leave this true; the MCP
@@ -609,6 +653,11 @@ impl Engine {
             store,
             vault: None,
             extra_roots: Vec::new(),
+            oauth_access: RefCell::new(HashMap::new()),
+            #[cfg(debug_assertions)]
+            test_oauth_endpoints: None,
+            #[cfg(debug_assertions)]
+            test_oauth_hosts: None,
             #[cfg(debug_assertions)]
             crash_after_accept: false,
             #[cfg(debug_assertions)]
@@ -1460,6 +1509,21 @@ impl Engine {
             request.smtp_username.as_deref(),
             &email,
         )?;
+        #[cfg(debug_assertions)]
+        let (host, port, tls, smtp) = match &self.test_oauth_hosts {
+            Some((imap_host, imap_port, smtp_host)) if matches!(request.provider, Provider::Gmail) => (
+                imap_host.clone(),
+                *imap_port,
+                MailTls::Implicit,
+                smtp_host.as_ref().map(|(host, port)| SmtpSettings {
+                    host: host.clone(),
+                    port: *port,
+                    tls: MailTls::Implicit,
+                    username: email.clone(),
+                }),
+            ),
+            _ => (host, port, tls, smtp),
+        };
         self.require_store("account_add")?;
         self.require_vault("account_add")?;
         if let Some(existing) = self.accounts.iter().find(|account| account.email.eq_ignore_ascii_case(&email)) {
@@ -1499,17 +1563,60 @@ impl Engine {
             smtp_username: setup.smtp.as_ref().map(|smtp| smtp.username.clone()),
         };
         let resolved = self.resolve_account(&request)?;
-        validate_account_password(&setup.password)?;
+        let oauth = setup.oauth.clone();
+        match &oauth {
+            Some(grant) => {
+                grant.validate().map_err(|reason| OpError::InvalidArgs(format!("the OAuth authorization was refused: {reason}")))?;
+                if !setup.password.is_empty() {
+                    return Err(OpError::InvalidArgs(
+                        "an OAuth account must not also carry an app password; add it either with OAuth or with an app password, never both"
+                            .to_owned(),
+                    ));
+                }
+                if self.oauth_provider_for(resolved.provider.as_str()).is_none() {
+                    return Err(OpError::InvalidArgs(format!(
+                        "provider {} has no OAuth authorization in this build; add it with an app password or choose Gmail",
+                        resolved.provider.as_str()
+                    )));
+                }
+            }
+            None => validate_account_password(&setup.password)?,
+        }
         let store = self.require_store("account_add")?;
         let vault = self.require_vault("account_add")?;
         let ResolvedAccount { id, provider, email, name, host, port, tls, smtp } = resolved;
 
-        let mut config = ImapConfig::new(host.clone(), port, store_map::net_tls(tls), email.clone(), Secret::new(setup.password.as_str().to_owned()));
         let mut extra_roots = self.extra_roots.clone();
         extra_roots.extend(setup.extra_roots.clone());
-        for root in &extra_roots {
-            config = config.with_extra_root(root.clone());
-        }
+        // The grant is probed before anything is written. When the caller still holds the token the
+        // code exchange produced, use it: refreshing immediately spends a second token request and
+        // rotates a refresh token the provider just issued. Only an absent or stale hint refreshes,
+        // so an expired or revoked grant still fails with an empty keyring and an empty store.
+        let hint = setup.oauth_access.clone();
+        let (oauth_grant, oauth_token, oauth_cached) = match oauth {
+            Some(grant) => match hint.filter(|access| access.is_fresh_now()) {
+                Some(access) => {
+                    let cached = crate::oauth::CachedAccess::from_hint(&access);
+                    (Some(grant), Some(Zeroizing::new(access.token().to_owned())), Some(cached))
+                }
+                None => {
+                    let seam = self
+                        .oauth_provider_for(provider.as_str())
+                        .ok_or_else(|| OpError::InvalidArgs(format!("provider {} has no OAuth authorization in this build", provider.as_str())))?;
+                    let refreshed = self.refresh_grant(seam, &grant, &id, "adding the account")?;
+                    let access = refreshed.access();
+                    let cached = refreshed.cached();
+                    let rotated = refreshed.rotated.unwrap_or(grant);
+                    (Some(rotated), Some(access), Some(cached))
+                }
+            },
+            None => (None, None, None),
+        };
+        let imap_credential = match &oauth_token {
+            Some(token) => crate::oauth::Credential::OAuth(token.clone()),
+            None => crate::oauth::Credential::Password(setup.password.clone()),
+        };
+        let config = crate::oauth::imap_config_for(host.clone(), port, tls, email.clone(), imap_credential, extra_roots.clone());
         let probe = postino_sync::probe(&config).map_err(|error| {
             account_error(
                 error,
@@ -1517,7 +1624,11 @@ impl Engine {
                 &id,
                 &host,
                 "checking the connection",
-                "Nothing was written; check the address, host, password and TLS mode and retry.",
+                if oauth_grant.is_some() {
+                    "Nothing was written; check that IMAP is enabled for the account and that the authorization was granted, then retry."
+                } else {
+                    "Nothing was written; check the address, host, password and TLS mode and retry."
+                },
             )
         })?;
         if probe.folders.iter().all(|folder| !folder.is_selectable()) {
@@ -1534,30 +1645,33 @@ impl Engine {
         // the difference between a queue that fails on every attempt and a queue that works.
         let mut smtp_password = None;
         if let Some(smtp) = &smtp {
-            let password = match setup.smtp.as_ref().and_then(|setup| setup.password.as_ref()) {
-                Some(password) => password.clone(),
-                None => setup.password.clone(),
+            let credential = match &oauth_token {
+                Some(token) => crate::oauth::Credential::OAuth(token.clone()),
+                None => {
+                    let password = match setup.smtp.as_ref().and_then(|setup| setup.password.as_ref()) {
+                        Some(password) => password.clone(),
+                        None => setup.password.clone(),
+                    };
+                    validate_account_password(&password)?;
+                    crate::oauth::Credential::Password(password)
+                }
             };
-            validate_account_password(&password)?;
-            let mut smtp_config = postino_net::SmtpConfig::new(
-                smtp.host.clone(),
-                smtp.port,
-                store_map::net_tls(smtp.tls),
-                smtp.username.clone(),
-                Secret::new(password.as_str().to_owned()),
-            );
-            for root in &extra_roots {
-                smtp_config = smtp_config.with_extra_root(root.clone());
-            }
+            let smtp_config =
+                crate::oauth::smtp_config(smtp.host.clone(), smtp.port, smtp.tls, smtp.username.clone(), credential, extra_roots.clone());
             postino_sync::verify_smtp(smtp_config).map_err(|error| {
                 OpError::Auth(format!(
-                    "the SMTP server {}:{} did not accept the credential ({}). Nothing was written; check the SMTP password, host, port and TLS mode.",
+                    "the SMTP server {}:{} did not accept the credential ({}). Nothing was written; {}",
                     smtp.host,
                     smtp.port,
-                    smtp_failure_reason(&error)
+                    smtp_failure_reason(&error),
+                    if oauth_grant.is_some() {
+                        "check that the authorization includes the mail scope and retry."
+                    } else {
+                        "check the SMTP password, host, port and TLS mode."
+                    }
                 ))
             })?;
-            smtp_password = setup.smtp.as_ref().and_then(|setup| setup.password.clone());
+            smtp_password = if oauth_grant.is_some() { None } else { setup.smtp.as_ref().and_then(|setup| setup.password.clone()) };
         }
 
         let created_at = Utc::now().timestamp_millis();
@@ -1585,36 +1699,51 @@ impl Engine {
         };
         let folder_rows = planned.into_iter().map(|folder| folder.row).collect::<Vec<_>>();
 
-        if let Err(error) = vault.store_imap_password(&id, setup.password.as_bytes()) {
-            return Err(OpError::Failed(format!("the IMAP credential could not be stored in the OS keyring: {error}. Nothing was written.")));
-        }
-        let smtp_credential = match smtp_password.as_ref() {
-            Some(password) => vault.store_smtp_password(&id, password.as_bytes()).map_err(|error| {
-                let cleanup = vault.delete_imap_password(&id);
-                let mut sentence = format!("the SMTP credential could not be stored in the OS keyring: {error}.");
-                if cleanup.is_ok() {
-                    sentence.push_str(" The IMAP credential was removed again; nothing was written.");
-                } else {
-                    sentence.push_str(" The IMAP credential could not be removed again; delete it in the OS credential manager.");
+        // The credential is written **first** on purpose, then the account rows. An OAuth account
+        // stores one grant and no password at all; a stale password entry is removed so a later read
+        // cannot prefer it over the grant.
+        match &oauth_grant {
+            Some(grant) => {
+                if let Err(error) = vault.store_oauth_grant(&id, grant) {
+                    return Err(OpError::Failed(format!("the OAuth grant could not be stored in the OS keyring: {error}. Nothing was written.")));
                 }
-                OpError::Failed(sentence)
-            }),
-            // A separate SMTP secret that used to exist would shadow the IMAP fallback, so remove
-            // it. Deleting a missing entry is a no-op.
-            None => vault.delete_smtp_password(&id).map_err(|error| {
                 let _ = vault.delete_imap_password(&id);
-                OpError::Failed(format!(
-                    "the old SMTP credential could not be removed from the OS keyring ({error}); the IMAP credential was removed again and nothing was written."
-                ))
-            }),
-        };
-        smtp_credential?;
+                let _ = vault.delete_smtp_password(&id);
+            }
+            None => {
+                if let Err(error) = vault.store_imap_password(&id, setup.password.as_bytes()) {
+                    return Err(OpError::Failed(format!("the IMAP credential could not be stored in the OS keyring: {error}. Nothing was written.")));
+                }
+                let smtp_credential = match smtp_password.as_ref() {
+                    Some(password) => vault.store_smtp_password(&id, password.as_bytes()).map_err(|error| {
+                        let cleanup = vault.delete_imap_password(&id);
+                        let mut sentence = format!("the SMTP credential could not be stored in the OS keyring: {error}.");
+                        if cleanup.is_ok() {
+                            sentence.push_str(" The IMAP credential was removed again; nothing was written.");
+                        } else {
+                            sentence.push_str(" The IMAP credential could not be removed again; delete it in the OS credential manager.");
+                        }
+                        OpError::Failed(sentence)
+                    }),
+                    // A separate SMTP secret that used to exist would shadow the IMAP fallback, so remove
+                    // it. Deleting a missing entry is a no-op.
+                    None => vault.delete_smtp_password(&id).map_err(|error| {
+                        let _ = vault.delete_imap_password(&id);
+                        OpError::Failed(format!(
+                            "the old SMTP credential could not be removed from the OS keyring ({error}); the IMAP credential was removed again and nothing was written."
+                        ))
+                    }),
+                };
+                smtp_credential?;
+            }
+        }
         if let Err(error) = store.save_account(&account_row, &server_row, &folder_rows) {
             let imap_cleanup = vault.delete_imap_password(&id);
             let smtp_cleanup = vault.delete_smtp_password(&id);
-            let outcome = match (imap_cleanup, smtp_cleanup) {
-                (Ok(()), Ok(())) => "The credentials were removed again and nothing was written.".to_owned(),
-                _ => "One or both credentials could not be removed again from the OS keyring; a retry with the same address overwrites them, or delete them in the OS credential manager.".to_owned(),
+            let oauth_cleanup = vault.delete_oauth_grant(&id);
+            let outcome = match (imap_cleanup, smtp_cleanup, oauth_cleanup) {
+                (Ok(()), Ok(()), Ok(())) => "The credentials were removed again and nothing was written.".to_owned(),
+                _ => "One or more credentials could not be removed again from the OS keyring; a retry with the same address overwrites them, or delete them in the OS credential manager.".to_owned(),
             };
             return Err(OpError::Failed(format!("the local store refused the account: {error}. {outcome}")));
         }
@@ -1623,6 +1752,9 @@ impl Engine {
         // clears a previous authentication halt: the user has just proved the credential works.
         let _ = clear_halt(store, &id);
         let account = store_map::account(account_row);
+        if let Some(cached) = oauth_cached {
+            self.oauth_access.borrow_mut().insert(id.clone(), cached);
+        }
         self.accounts.push(account.clone());
         self.folders.extend(folder_rows.iter().cloned().map(store_map::folder));
         self.recount();
@@ -1678,11 +1810,19 @@ impl Engine {
         )?
         .ok_or_else(|| OpError::InvalidArgs("provide smtp_host, smtp_port and smtp_tls together".to_owned()))?;
         let new_password = request.smtp_password.is_some();
+        let oauth = self.oauth_grant(&account.id)?;
+        if new_password && oauth.is_some() {
+            return Err(OpError::InvalidArgs(format!(
+                "account {:?} authorizes with OAuth; a separate SMTP password cannot be added to it. Remove the account and add it again with an app password if you want password submission.",
+                account.id
+            )));
+        }
         let password = match request.smtp_password {
             Some(password) => {
                 validate_account_password(&password)?;
-                password
+                Some(password)
             }
+            None if oauth.is_some() => None,
             None => {
                 let bytes = vault
                     .load_smtp_password(&account.id)
@@ -1691,19 +1831,14 @@ impl Engine {
                     .ok_or_else(|| OpError::Failed(format!("account {:?} has no SMTP or IMAP credential; supply a new SMTP password", account.id)))?;
                 let text = std::str::from_utf8(bytes.as_slice())
                     .map_err(|_| OpError::Failed(format!("the stored SMTP credential for account {:?} is not valid UTF-8", account.id)))?;
-                Zeroizing::new(text.to_owned())
+                Some(Zeroizing::new(text.to_owned()))
             }
         };
-        let mut config = postino_net::SmtpConfig::new(
-            smtp.host.clone(),
-            smtp.port,
-            store_map::net_tls(smtp.tls),
-            smtp.username.clone(),
-            Secret::new(password.as_str().to_owned()),
-        );
-        for root in &self.extra_roots {
-            config = config.with_extra_root(root.clone());
-        }
+        let credential = match &password {
+            Some(password) => crate::oauth::Credential::Password(password.clone()),
+            None => crate::oauth::Credential::OAuth(self.oauth_access(&account.id, "updating the SMTP endpoint")?),
+        };
+        let config = crate::oauth::smtp_config(smtp.host.clone(), smtp.port, smtp.tls, smtp.username.clone(), credential, self.extra_roots.clone());
         postino_sync::verify_smtp(config).map_err(|error| {
             OpError::Auth(format!(
                 "the SMTP server {}:{} did not accept the credential ({}). Nothing was written; check the SMTP password, host, port and TLS mode.",
@@ -1715,7 +1850,10 @@ impl Engine {
         // Keep the previous secret so a failed row write can put it back: the endpoint must never
         // end up paired with a password the server has not accepted.
         let previous_secret = if new_password { vault.load_smtp_password(&account.id).ok().flatten().map(|bytes| bytes.to_vec()) } else { None };
-        if new_password && let Err(error) = vault.store_smtp_password(&account.id, password.as_bytes()) {
+        if new_password
+            && let Some(password) = &password
+            && let Err(error) = vault.store_smtp_password(&account.id, password.as_bytes())
+        {
             return Err(OpError::Failed(format!(
                 "the SMTP credential could not be stored in the OS keyring: {error}. The endpoint was not changed."
             )));
@@ -1759,8 +1897,8 @@ impl Engine {
         let server = store.get_account_server(&account.id).map_err(store_map::read_error)?.ok_or_else(|| {
             OpError::Failed(format!("account {:?} has no IMAP server configuration; remove it with account_remove and add it again", account.id))
         })?;
-        let password = self.load_password(&account.id, "account_test")?;
-        let config = imap_config(&server, &password, self.extra_roots.clone());
+        let credential = self.credential(&account.id, "account_test")?;
+        let config = crate::oauth::imap_config(&server, credential, self.extra_roots.clone());
         let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
         let probe = postino_sync::probe(&config).map_err(|error| {
             account_error(error, provider, &account.id, &server.host, "checking the connection", "The account and its cached mail are unchanged.")
@@ -1769,17 +1907,15 @@ impl Engine {
         // valid" must not be true while sending fails. Fixed sentences only: this server holds the
         // password and may echo it.
         if let Some(smtp) = server.smtp.clone() {
-            let smtp_password = self.load_smtp_password(&account.id, "account_test")?;
-            let mut smtp_config = SmtpConfig::new(
+            let smtp_credential = self.smtp_credential(&account.id, "account_test")?;
+            let smtp_config = crate::oauth::smtp_config(
                 smtp.host.clone(),
                 smtp.port,
-                store_map::net_tls(store_map::mail_tls(smtp.tls)),
+                store_map::mail_tls(smtp.tls),
                 smtp.username.clone(),
-                Secret::new(smtp_password.as_str().to_owned()),
+                smtp_credential,
+                self.extra_roots.clone(),
             );
-            for root in &self.extra_roots {
-                smtp_config = smtp_config.with_extra_root(root.clone());
-            }
             if let Err(error) = postino_sync::verify_smtp(smtp_config) {
                 let reason = smtp_failure_reason(&error);
                 let sentence = format!(
@@ -1795,26 +1931,45 @@ impl Engine {
 
     /// Remove an account, its keyring credential and its local cache.
     ///
+    /// Removal is idempotent and truthful: once the local account rows are gone the call succeeds,
+    /// even when Google could not be told to revoke the grant or the OS keyring refused to delete a
+    /// credential. Those two cases add a bounded warning, because the secret is then unreferenced or
+    /// the grant stays valid until it expires. A retry after a successful removal reports
+    /// `removed: false` instead of "unknown account".
+    ///
     /// The order is deliberate: the store rows go first, the credential second. The only failure
     /// window therefore leaves an orphan keyring entry, never cached mail whose password is gone.
-    /// An orphan secret is retryable (a re-add with the same address derives the same account id and
-    /// the same scope) and is reported explicitly. Labels are mailbox-wide and stay.
-    pub fn remove_account(&mut self, id: &str, confirm: bool) -> Result<AccountView, OpError> {
-        let index = self.accounts.iter().position(|account| account.id == id).ok_or_else(|| unknown_account(id))?;
+    pub fn remove_account(&mut self, id: &str, confirm: bool) -> Result<crate::ops::AccountRemove, OpError> {
         if !confirm {
             return Err(OpError::InvalidArgs(format!(
                 "removing account {id:?} also deletes its cached mail and its IMAP credential; pass confirm: true to proceed"
             )));
         }
-        let account = self.accounts.get(index).cloned().ok_or_else(|| unknown_account(id))?;
-        let view = self.account_view(&account)?;
         let store = self.require_store("account_remove")?;
         let vault = self.require_vault("account_remove")?;
-        if !store.delete_account(&account.id).map_err(store_map::write_error)? {
-            return Err(OpError::Failed(format!("the local store no longer has account {:?}; nothing was changed", account.id)));
+        let Some(index) = self.accounts.iter().position(|account| account.id == id) else {
+            // A retry after a removal that already deleted the local row is a success, not "unknown
+            // account". A row that is in the store but not in memory is a different problem.
+            if store.list_accounts().map_err(store_map::read_error)?.iter().any(|row| row.id == id) {
+                return Err(OpError::Failed(format!(
+                    "account {id:?} is in the local store but was not loaded by the engine; restart Postino and retry"
+                )));
+            }
+            return Ok(crate::ops::AccountRemove { account: id.to_owned(), removed: false, warnings: Vec::new() });
+        };
+        let account = self.accounts.get(index).cloned().ok_or_else(|| unknown_account(id))?;
+        // The row going away is the commit point: if it was already absent, finish the cleanup below.
+        let _ = store.delete_account(&account.id).map_err(store_map::write_error)?;
+        // Revoke before deleting the grant: revocation needs the refresh token, and the provider is
+        // the one from the account row. A revocation failure is a warning, never a removal error.
+        let mut warnings = Vec::new();
+        if let Some(warning) = self.revoke_oauth(&account.id) {
+            warnings.push(warning);
         }
         let imap_credential = vault.delete_imap_password(&account.id);
         let smtp_credential = vault.delete_smtp_password(&account.id);
+        let oauth_credential = vault.delete_oauth_grant(&account.id);
+        self.oauth_access.borrow_mut().remove(&account.id);
         let folder_ids =
             self.folders.iter().filter(|folder| folder.account_id == account.id).map(|folder| folder.id.clone()).collect::<BTreeSet<_>>();
         self.accounts.retain(|candidate| candidate.id != account.id);
@@ -1834,18 +1989,19 @@ impl Engine {
         self.draft_snapshots.retain(|draft_id, _| live.contains(draft_id));
         self.bump_revision();
         self.recount();
-        match (imap_credential, smtp_credential) {
-            (Ok(()), Ok(())) => Ok(view),
-            (imap, smtp) => Err(OpError::Failed(format!(
-                "account {:?} and its cached mail were removed, but the OS keyring refused to delete a credential (IMAP: {}; SMTP: {}). The credential is now unreferenced; adding this address again overwrites it, or delete it in the OS credential manager.",
+        if !(imap_credential.is_ok() && smtp_credential.is_ok() && oauth_credential.is_ok()) {
+            warnings.push(format!(
+                "account {:?} and its cached mail were removed, but the OS keyring refused to delete a credential (IMAP: {}; SMTP: {}; OAuth: {}). The credential is now unreferenced; adding this address again overwrites it, or delete it in the OS credential manager.",
                 account.id,
-                credential_outcome(&imap),
-                credential_outcome(&smtp)
-            ))),
+                credential_outcome(&imap_credential),
+                credential_outcome(&smtp_credential),
+                credential_outcome(&oauth_credential)
+            ));
         }
+        Ok(crate::ops::AccountRemove { account: account.id, removed: true, warnings })
     }
 
-    fn load_smtp_password(&self, account_id: &str, operation: &str) -> Result<Zeroizing<String>, OpError> {
+    pub(crate) fn load_smtp_password(&self, account_id: &str, operation: &str) -> Result<Zeroizing<String>, OpError> {
         let vault = self.require_vault(operation)?;
         let bytes = vault
             .load_smtp_password(account_id)
@@ -1897,8 +2053,8 @@ impl Engine {
             .get_account(&account.id)
             .map_err(store_map::read_error)?
             .ok_or_else(|| OpError::Failed(format!("account {:?} is not in the local store", account.id)))?;
-        let password = self.load_password(&account.id, "sync_now")?;
-        let config = imap_config(&server, &password, self.extra_roots.clone());
+        let credential = self.credential(&account.id, "sync_now")?;
+        let config = crate::oauth::imap_config(&server, credential, self.extra_roots.clone());
         let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
         let result = postino_sync::sync_account(store, &row, &config, &limits, cancel).map_err(|error| {
             account_error(
@@ -1935,7 +2091,7 @@ impl Engine {
             .collect()
     }
 
-    fn find_account(&self, id: &str) -> Result<&Account, OpError> {
+    pub(crate) fn find_account(&self, id: &str) -> Result<&Account, OpError> {
         self.accounts.iter().find(|account| account.id == id).ok_or_else(|| unknown_account(id))
     }
 
@@ -1961,7 +2117,7 @@ impl Engine {
         self.requested_account(id, operation).map(|account| account.id)
     }
 
-    fn load_password(&self, account_id: &str, operation: &str) -> Result<Zeroizing<String>, OpError> {
+    pub(crate) fn load_password(&self, account_id: &str, operation: &str) -> Result<Zeroizing<String>, OpError> {
         let vault = self.require_vault(operation)?;
         let bytes = vault
             .load_imap_password(account_id)
@@ -2010,7 +2166,7 @@ impl Engine {
         self.require_store(operation)
     }
 
-    fn require_vault(&self, operation: &str) -> Result<&dyn CredentialVault, OpError> {
+    pub(crate) fn require_vault(&self, operation: &str) -> Result<&dyn CredentialVault, OpError> {
         match &self.vault {
             Some(vault) => Ok(vault.as_ref()),
             None => Err(OpError::Failed(format!(
@@ -3039,21 +3195,19 @@ impl Engine {
             Ok(raw) => raw,
             Err(_) => return self.fail_leased(store, entry, lease, "i byte salvati del messaggio non sono leggibili", report),
         };
-        let smtp_password = match self.load_smtp_password(&entry.account_id, "sending") {
-            Ok(password) => password,
+        let smtp_credential = match self.smtp_credential(&entry.account_id, "sending") {
+            Ok(credential) => credential,
             Err(_) => return self.fail_leased(store, entry, lease, "la credenziale SMTP non è disponibile", report),
         };
-        let mut config = SmtpConfig::new(
+        let mut config = crate::oauth::smtp_config(
             smtp.host.clone(),
             smtp.port,
-            store_map::net_tls(store_map::mail_tls(smtp.tls)),
+            store_map::mail_tls(smtp.tls),
             smtp.username.clone(),
-            Secret::new(smtp_password.as_str().to_owned()),
+            smtp_credential,
+            self.extra_roots.clone(),
         );
         config.limits = SmtpLimits { max_message: usize::try_from(MAX_SUBMISSION_BYTES).unwrap_or(usize::MAX), ..SmtpLimits::default() };
-        for root in self.extra_roots.clone() {
-            config = config.with_extra_root(root);
-        }
         let message = SmtpEnvelope { from: envelope.from.clone(), recipients: envelope.recipients.clone() };
         match postino_sync::submit(config, &message, raw.as_slice()) {
             Ok(_delivery) => {
@@ -3202,8 +3356,8 @@ impl Engine {
                 return Err(format!("outbox row {:?}: i byte salvati del messaggio non sono leggibili.", entry.id));
             }
         };
-        let password = match self.load_password(&entry.account_id, "the Sent append") {
-            Ok(password) => password,
+        let credential = match self.credential(&entry.account_id, "the Sent append") {
+            Ok(credential) => credential,
             Err(_) => {
                 let _ = store.reschedule_outbox_append(
                     &entry.id,
@@ -3214,7 +3368,7 @@ impl Engine {
                 return Err(format!("outbox row {:?}: la credenziale IMAP non è disponibile.", entry.id));
             }
         };
-        let mut config = imap_config(&server, &password, self.extra_roots.clone());
+        let mut config = crate::oauth::imap_config(&server, credential, self.extra_roots.clone());
         config.limits.max_literal = config.limits.max_literal.max(raw.len().saturating_add(1024)).min(postino_net::Limits::HARD_MAX_LITERAL);
         if postino_sync::append_sent(&config, raw.as_slice()).is_err() {
             // No server text: the IMAP server holds the password and can echo it in a `NO`.
@@ -4011,20 +4165,6 @@ fn smtp_failure_reason(error: &postino_net::SmtpError) -> &'static str {
     }
 }
 
-fn imap_config(server: &postino_store::AccountServer, password: &Zeroizing<String>, extra_roots: Vec<CertificateDer<'static>>) -> ImapConfig {
-    let mut config = ImapConfig::new(
-        server.host.clone(),
-        server.port,
-        store_map::net_tls(store_map::mail_tls(server.tls)),
-        server.username.clone(),
-        Secret::new(password.as_str().to_owned()),
-    );
-    for root in extra_roots {
-        config = config.with_extra_root(root);
-    }
-    config
-}
-
 /// Turn a sync/probe failure into an actionable operation error with a tail that states what was and
 /// was not written.
 ///
@@ -4075,6 +4215,9 @@ fn net_phase(error: &NetError) -> &'static str {
         NetError::ServerNo { command, .. } | NetError::ServerBad { command, .. } => command_phase(command),
         NetError::TooLarge { .. } => "reading a response that exceeded a bound",
         NetError::Unsupported { .. } => "negotiating a required capability",
+        NetError::OAuthConsent { .. } => "waiting for the browser authorization",
+        NetError::OAuthRejected { .. } | NetError::OAuthGrant { .. } => "refreshing the OAuth token",
+        NetError::OAuthToken { .. } => "reading the OAuth token response",
     }
 }
 

@@ -376,7 +376,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "account_add",
             "Add an account",
-            "Sensitive: the IMAP password and an optional separate SMTP password are read from the caller, used once for the login checks and stored in the OS keyring (`account:<id>:imap` and `account:<id>:smtp`), never logged or written to the database. Known providers are offline: aruba uses imaps.aruba.it:993 and smtps.aruba.it:465 implicit; gmail uses imap.gmail.com:993 and smtp.gmail.com:465 implicit and needs 2-Step Verification plus an app password (OAuth arrives in P12); custom requires IMAP host/port/tls and may add SMTP host/port/tls. Both servers are contacted before anything is written, so a failed login writes nothing. When no separate SMTP password is supplied, the IMAP credential is used for submission. Returns the account with its endpoints and sync state; never the credentials.",
+            "Sensitive: the IMAP password and an optional separate SMTP password are read from the caller, used once for the login checks and stored in the OS keyring (`account:<id>:imap` and `account:<id>:smtp`), never logged or written to the database. Known providers are offline: aruba uses imaps.aruba.it:993 and smtps.aruba.it:465 implicit; gmail uses imap.gmail.com:993 and smtp.gmail.com:465 implicit and authenticates with SASL XOAUTH2 when `oauth` carries the user's own Google client id, client secret and refresh token, or with 2-Step Verification plus an app password otherwise; custom requires IMAP host/port/tls and may add SMTP host/port/tls. Gmail OAuth needs a Desktop-app OAuth client with redirect URI `http://127.0.0.1:<port>` and the `https://mail.google.com/` scope; Google Testing mode expires refresh tokens after 7 days, and unverified apps have limits described in `docs/oauth.md`. `oauth_access` optionally passes the access token from the same code exchange so the first probe does not spend a second token request; it is memory-only. Both servers are contacted before anything is written, so a failed login writes nothing. When no separate SMTP password is supplied, the IMAP credential is used for submission. Returns the account with its endpoints and sync state; never the credentials.",
             AccountAddArgs,
             false,
             false,
@@ -410,7 +410,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "account_remove",
             "Remove an account",
-            "Sensitive and destructive: delete the account's IMAP credential, its server configuration and its local cache (folders, messages, drafts and attachments). Labels stay. Requires confirm: true. The cache is deleted first and the keyring entry second, so a failure can leave an orphan credential but never cached mail whose password is gone. Available only from the CLI and the desktop app, never over MCP.",
+            "Sensitive and destructive: delete the account's IMAP credential, its server configuration and its local cache (folders, messages, drafts and attachments). Labels stay. Requires confirm: true. Removal is idempotent and truthful: once the local account is gone the call succeeds, and a retry returns removed: false instead of an unknown-account error. The cache is deleted first and the keyring entry second; a Google revocation failure or a keyring refusal after that point is reported in `warnings` (the grant stays valid until it expires, or the credential is unreferenced) and never turns the removal into a failure. Available only from the CLI and the desktop app, never over MCP. See `docs/oauth.md` for the Google limits.",
             AccountRemoveArgs,
             false,
             true,
@@ -909,7 +909,7 @@ pub struct LabelApplyArgs {
 }
 
 /// Add an account. Sensitive: never exposed over MCP.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountAddArgs {
     /// Offline provider: aruba, gmail or custom.
@@ -919,8 +919,18 @@ pub struct AccountAddArgs {
     /// Display name. Omit it to use the local part of the address.
     pub name: Option<String>,
     /// Password or app password. Read from the caller, never logged and never written to the
-    /// database; it is stored in the OS keyring only after the server accepts it.
+    /// database; it is stored in the OS keyring only after the server accepts it. Empty when
+    /// `oauth` is present: an account has exactly one authentication kind.
+    #[serde(default)]
     pub password: String,
+    /// OAuth 2.0 instead of an app password. The client id and secret are the user's own Google
+    /// OAuth client (BYO); the refresh token comes from the browser authorization. None of the
+    /// three is logged or written to the database: they live in the OS keyring. Only `gmail` has an
+    /// OAuth provider in this build.
+    pub oauth: Option<OAuthAddArgs>,
+    /// The access token the same code exchange produced. Optional and memory-only: it saves the
+    /// immediate refresh after authorization. Never logged, stored or returned.
+    pub oauth_access: Option<OAuthAccessArgs>,
     /// Only for provider custom; known providers own their endpoint.
     pub host: Option<String>,
     /// Only for provider custom; 1-65535.
@@ -939,6 +949,73 @@ pub struct AccountAddArgs {
     /// SMTP password when it differs from the IMAP one. When omitted, the IMAP credential is used
     /// for submission too; the value is never logged or written to the database.
     pub smtp_password: Option<String>,
+}
+
+impl std::fmt::Debug for AccountAddArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountAddArgs")
+            .field("provider", &self.provider)
+            .field("email", &self.email)
+            .field("name", &self.name)
+            .field("password", &if self.password.is_empty() { "[empty]" } else { "[redacted]" })
+            .field("oauth", &self.oauth)
+            .field("oauth_access", &self.oauth_access)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_tls", &self.smtp_tls)
+            .field("smtp_username", &self.smtp_username)
+            .field("smtp_password", &self.smtp_password.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+/// The durable half of a Gmail OAuth authorization, supplied by the caller that ran the browser flow.
+///
+/// All three values go straight to the OS keyring. They are never accepted on a command line, never
+/// logged and never written to the store; the access token is not part of this struct.
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthAddArgs {
+    /// The user's own Google OAuth client id. Not a secret.
+    pub client_id: String,
+    /// The user's own Google OAuth client secret. Keyring only.
+    pub client_secret: String,
+    /// The refresh token returned by the browser authorization. Keyring only.
+    pub refresh_token: String,
+}
+
+impl std::fmt::Debug for OAuthAddArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthAddArgs")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .field("refresh_token", &"[redacted]")
+            .finish()
+    }
+}
+
+/// The access token from the same code exchange, when the caller still has it.
+///
+/// It is memory-only and is never written to the keyring or the store. `account_add` uses it for the
+/// first probe and refreshes only when it is absent or within 60 seconds of expiring.
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthAccessArgs {
+    /// The access token returned by the code exchange.
+    pub token: String,
+    /// When it expires, as Unix milliseconds.
+    pub expires_at_ms: i64,
+}
+
+impl std::fmt::Debug for OAuthAccessArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("OAuthAccessArgs").field("token", &"[redacted]").field("expires_at_ms", &self.expires_at_ms).finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1278,9 +1355,17 @@ pub struct AccountTest {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRemove {
-    pub account: AccountView,
+    /// The account id the call was for.
+    pub account: String,
+    /// True when this call deleted the local account; false when it was already gone, which is a
+    /// success so a retry after a partial failure is not reported as "unknown account".
+    pub removed: bool,
+    /// Bounded sentences about cleanup that could not finish after the local account was gone:
+    /// Google revocation or keyring deletion. Empty on a clean removal.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// What one sync run did. A serialisable mirror of `postino_sync::SyncOutcome`; no password, host
@@ -1566,11 +1651,15 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             } else {
                 None
             };
+            let oauth = args.oauth.map(|oauth| crate::oauth::OAuthGrant::new(oauth.client_id, oauth.client_secret, oauth.refresh_token));
+            let oauth_access = args.oauth_access.map(|access| crate::oauth::OAuthAccess::new(access.token, access.expires_at_ms));
             let setup = AccountSetup {
                 provider: args.provider,
                 email: args.email,
                 name: args.name,
                 password: Zeroizing::new(args.password),
+                oauth,
+                oauth_access,
                 host: args.host,
                 port: args.port,
                 tls: args.tls,
@@ -1602,7 +1691,7 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "account_remove" => {
             let args: AccountRemoveArgs = parse(args)?;
-            value(AccountRemove { account: engine.remove_account(&args.id, args.confirm)? })
+            value(engine.remove_account(&args.id, args.confirm)?)
         }
         "sync_now" => {
             let args: SyncNowArgs = parse(args)?;
@@ -2663,8 +2752,33 @@ mod tests {
         assert!(!by_name("sync_now").read_only);
         assert!(by_name("account_add").description.contains("never logged"));
         assert!(by_name("account_add").description.contains("app password"));
+        assert!(by_name("account_add").input_schema["properties"]["oauth"].is_object());
+        assert!(by_name("account_add").input_schema["properties"]["oauth_access"].is_object());
         assert!(by_name("account_add").input_schema["properties"]["password"].is_object());
+        assert!(by_name("account_add").description.contains("docs/oauth.md"));
         assert!(by_name("account_remove").input_schema["properties"]["confirm"].is_object());
+        assert!(by_name("account_remove").description.contains("idempotent"));
+    }
+
+    #[test]
+    fn account_add_debug_never_prints_a_secret() {
+        let args: super::AccountAddArgs = serde_json::from_value(json!({
+            "provider": "gmail",
+            "email": "user@example.com",
+            "password": "imap-secret-value",
+            "oauth": {
+                "client_id": "client-id.apps.googleusercontent.com",
+                "client_secret": "oauth-client-secret",
+                "refresh_token": "oauth-refresh-token",
+            },
+            "oauth_access": { "token": "oauth-access-token", "expires_at_ms": 1 },
+        }))
+        .expect("valid args");
+        let debug = format!("{args:?}");
+        for secret in ["imap-secret-value", "oauth-client-secret", "oauth-refresh-token", "oauth-access-token"] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("client-id.apps.googleusercontent.com"), "the public client id stays readable");
     }
 
     #[test]

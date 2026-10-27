@@ -92,7 +92,17 @@ pub struct DaemonConfig {
     pub notifier: Option<Arc<dyn Notifier>>,
     /// How "Apri Postino" launches the app; tests record the store path instead of spawning.
     pub app_launcher: Arc<dyn AppLauncher>,
+    /// Test-only OAuth endpoints. Debug builds only, so production always talks to Google.
+    #[cfg(debug_assertions)]
+    pub oauth_endpoints: Option<(String, String, String)>,
+    /// Test-only Gmail IMAP/SMTP endpoints for the XOAUTH2 probe. Debug builds only.
+    #[cfg(debug_assertions)]
+    pub oauth_hosts: Option<OAuthHosts>,
 }
+
+/// Test-only `(imap, optional smtp)` host/port overrides for the Gmail OAuth probe.
+#[cfg(debug_assertions)]
+pub type OAuthHosts = ((String, u16), Option<(String, u16)>);
 
 impl DaemonConfig {
     pub fn new(store_path: impl Into<PathBuf>, key: Arc<StoreKey>, vault: Arc<dyn CredentialVault>) -> Self {
@@ -122,6 +132,10 @@ impl DaemonConfig {
             tray: None,
             notifier: None,
             app_launcher: Arc::new(ProcessLauncher),
+            #[cfg(debug_assertions)]
+            oauth_endpoints: None,
+            #[cfg(debug_assertions)]
+            oauth_hosts: None,
         }
     }
 
@@ -166,6 +180,15 @@ impl Daemon {
         store.set_writer_endpoint(&paths.endpoint.describe())?;
         let mut engine = Engine::open_with_vault(store, Arc::clone(&config.vault))?;
         engine.set_test_extra_roots(config.extra_roots.clone());
+        #[cfg(debug_assertions)]
+        {
+            if let Some((authorize, token, revoke)) = config.oauth_endpoints.clone() {
+                engine.set_test_oauth_endpoints(authorize, token, revoke);
+            }
+            if let Some((imap, smtp)) = config.oauth_hosts.clone() {
+                engine.set_test_oauth_hosts(imap, smtp);
+            }
+        }
         let store_root = paths.store.parent().map(|parent| parent.display().to_string()).unwrap_or_default();
         let state = Arc::new(DaemonState::new(engine, Arc::new(postino_ipc::EventHub::new()), config, paths.clone(), token, store_root.clone()));
         let shutdown = state.shutdown();

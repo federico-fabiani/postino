@@ -115,18 +115,24 @@ impl Session {
         self.selected.as_deref()
     }
 
-    /// Authenticate: `AUTHENTICATE PLAIN` when the server offers it, `LOGIN` otherwise.
+    /// Authenticate: `AUTHENTICATE XOAUTH2` for an OAuth account, `AUTHENTICATE PLAIN` when the
+    /// server offers it, `LOGIN` otherwise.
     ///
-    /// A server that advertises `LOGINDISABLED` is refused with [`NetError::Auth`] instead of a
-    /// retry. A `PREAUTH` greeting makes this a no-op. When the tagged `OK` carries
-    /// `[CAPABILITY ...]` that list replaces the current one; otherwise the pre-login list stands,
-    /// because a server that does not volunteer the new list has not claimed anything changed.
+    /// An OAuth session has no password and is never downgraded: if the server does not advertise
+    /// `AUTH=XOAUTH2` the login fails as [`NetError::Unsupported`]. A password session on a server
+    /// that advertises `LOGINDISABLED` is refused with [`NetError::Auth`] instead of a retry. A
+    /// `PREAUTH` greeting makes this a no-op. When the tagged `OK` carries `[CAPABILITY ...]` that
+    /// list replaces the current one; otherwise the pre-login list stands, because a server that
+    /// does not volunteer the new list has not claimed anything changed.
     pub async fn login(&mut self) -> Result<(), NetError> {
         if self.closed {
             return Err(NetError::Closed { phase: "auth" });
         }
         if self.authenticated {
             return Ok(());
+        }
+        if self.config.oauth.is_some() {
+            return self.authenticate_xoauth2().await;
         }
         if self.capabilities.login_disabled() {
             return Err(NetError::Auth {
@@ -607,6 +613,98 @@ impl Session {
         }
     }
 
+    async fn authenticate_xoauth2(&mut self) -> Result<(), NetError> {
+        let result = self.authenticate_xoauth2_inner().await;
+        if let Err(error) = &result {
+            self.note_failure(error);
+        }
+        result
+    }
+
+    /// SASL `XOAUTH2` (RFC 7628) with the memory-only access token.
+    ///
+    /// A server that does not advertise `AUTH=XOAUTH2` is refused, never downgraded: an OAuth
+    /// account has no password to fall back to. Google answers a rejected token with a second
+    /// continuation carrying a base64 error document; this client acknowledges it with an empty
+    /// line and lets the tagged `NO` become the readable [`NetError::Auth`].
+    async fn authenticate_xoauth2_inner(&mut self) -> Result<(), NetError> {
+        let phase = "auth";
+        let token = match self.config.oauth.as_ref() {
+            Some(token) if !token.is_empty() => token.clone(),
+            _ => return Err(NetError::Auth { reason: "this session has no OAuth access token".to_owned() }),
+        };
+        if !self.capabilities.auth_xoauth2() {
+            return Err(NetError::Unsupported { feature: "AUTH=XOAUTH2" });
+        }
+        let tag = self.next_tag();
+        let command = Zeroizing::new(format!("{tag} AUTHENTICATE XOAUTH2\r\n"));
+        log::debug!("imap: {tag} AUTHENTICATE XOAUTH2");
+        let deadline = self.deadline();
+        self.conn.write_all(command.as_bytes(), phase, deadline).await?;
+
+        let mut budget = self.budget();
+        let limit = self.config.limits.max_untagged;
+        let mut count = 0usize;
+        loop {
+            let segments = self.conn.read_response(phase, deadline, &mut budget).await?;
+            match parse_response(&segments)? {
+                Response::Continuation(_) => break,
+                Response::Untagged(item) => {
+                    count += 1;
+                    if count > limit {
+                        return Err(NetError::TooLarge { what: "untagged responses", limit });
+                    }
+                    if matches!(&item, Untagged::Status(status) if status.status == Status::Bye) {
+                        self.closed = true;
+                        return Err(NetError::Closed { phase });
+                    }
+                }
+                Response::Tagged { tag: got, response } => {
+                    self.check_tag(&got, &tag)?;
+                    return Err(auth_error(response.into_error("AUTHENTICATE")));
+                }
+            }
+        }
+
+        let payload = crate::oauth::sasl_xoauth2(&self.config.username, token.expose());
+        let line = Zeroizing::new(format!("{}\r\n", payload.as_str()));
+        self.conn.write_all(line.as_bytes(), phase, deadline).await?;
+
+        loop {
+            let segments = self.conn.read_response(phase, deadline, &mut budget).await?;
+            match parse_response(&segments)? {
+                Response::Continuation(_) => {
+                    // The provider sent a SASL error challenge. An empty response makes it send the
+                    // tagged status that carries the real reason; the challenge itself is dropped
+                    // without decoding, so its contents never reach a log.
+                    self.conn.write_all(b"\r\n", phase, deadline).await?;
+                }
+                Response::Untagged(item) => {
+                    count += 1;
+                    if count > limit {
+                        return Err(NetError::TooLarge { what: "untagged responses", limit });
+                    }
+                    if matches!(&item, Untagged::Status(status) if status.status == Status::Bye) {
+                        self.closed = true;
+                        return Err(NetError::Closed { phase });
+                    }
+                }
+                Response::Tagged { tag: got, response } => {
+                    self.check_tag(&got, &tag)?;
+                    return match response.status {
+                        Status::Ok => {
+                            self.absorb_capabilities(response.code.as_ref());
+                            self.authenticated = true;
+                            self.forget_password();
+                            Ok(())
+                        }
+                        _ => Err(auth_error(response.into_error("AUTHENTICATE"))),
+                    };
+                }
+            }
+        }
+    }
+
     async fn login_with_password(&mut self) -> Result<(), NetError> {
         let user = astring(&self.config.username, "username")?;
         let password = astring(self.config.password.expose(), "password")?;
@@ -624,6 +722,7 @@ impl Session {
     /// Drop and zeroise the password once it cannot be needed again.
     fn forget_password(&mut self) {
         self.config.password = Secret::new(String::new());
+        self.config.oauth = None;
     }
 
     async fn greet(&mut self) -> Result<(), NetError> {

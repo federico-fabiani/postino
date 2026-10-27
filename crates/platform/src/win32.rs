@@ -23,13 +23,14 @@ use windows_sys::Win32::System::Registry::{
     RegOpenKeyExW, RegSetValueExW,
 };
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, LR_DEFAULTCOLOR, MF_STRING, MSG, PostMessageW, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+    RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow, SetWindowLongPtrW, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
 };
 
 use crate::notify::{Notice, Notifier};
@@ -604,6 +605,25 @@ pub fn registry_delete_value(key: &str, value: &str) -> Result<(), RegistryError
     }
     if deleted != 0 {
         return Err(registry_error("deleting the autostart value", deleted));
+    }
+    Ok(())
+}
+
+/// Hand one validated `https` URL to the user's default browser.
+///
+/// `ShellExecuteW` with the `open` verb is the documented, shell-free way to do this: no command
+/// line, no `cmd.exe`, nothing interpolated into a string a shell would parse. The URL itself is
+/// validated by [`crate::open_in_browser`] before it reaches this function.
+pub(crate) fn open_url(url: &str) -> Result<(), crate::PlatformError> {
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let target: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both strings are NUL-terminated owned buffers that outlive the call, and every other
+    // argument is null or a constant; the return value is only compared against the documented
+    // failure range.
+    let result = unsafe { ShellExecuteW(null_mut(), operation.as_ptr(), target.as_ptr(), null(), null(), SW_SHOWNORMAL) };
+    let code = result as isize;
+    if code <= 32 {
+        return Err(crate::PlatformError::Browser { detail: format!("the desktop returned code {code}") });
     }
     Ok(())
 }

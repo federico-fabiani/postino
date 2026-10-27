@@ -9,9 +9,12 @@ description = "IMAP4rev1 client: TLS-first, bounded, testable against a scripted
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
+getrandom.workspace = true
 log.workspace = true
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

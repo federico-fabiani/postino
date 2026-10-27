@@ -152,6 +152,8 @@ fn an_unreachable_host_writes_nothing() {
         port: Some(port),
         tls: Some(MailTls::Implicit),
         smtp: None,
+        oauth: None,
+        oauth_access: None,
         extra_roots: Vec::new(),
     };
 
@@ -323,7 +325,7 @@ fn account_remove_deletes_its_credential_and_cache_and_leaves_the_other_account(
     assert!(engine.accounts().iter().any(|account| account.id == "acc_a"));
 
     let removed = engine.remove_account("acc_a", true).expect("remove");
-    assert_eq!(removed.account.id, "acc_a");
+    assert_eq!(removed.account, "acc_a");
     assert_eq!(engine.accounts().len(), 1);
     assert_eq!(engine.accounts()[0].id, "acc_b");
     assert!(engine.message("msg_a").is_none());
@@ -400,7 +402,7 @@ fn a_damaged_sync_status_is_a_warning_and_does_not_block_listing_or_removal() {
     assert!(!listed["warnings"].as_array().expect("warnings").is_empty());
 
     let removed = engine.remove_account(ACCOUNT_ID, true).expect("a damaged status must not block removal");
-    assert_eq!(removed.account.id, ACCOUNT_ID);
+    assert_eq!(removed.account, ACCOUNT_ID);
     assert!(engine.accounts().is_empty());
     assert!(!vault.contains(ACCOUNT_ID));
 }
@@ -444,8 +446,9 @@ fn a_failed_credential_delete_leaves_no_cached_mail_without_a_password() {
     let mut engine = Engine::open_with_vault(harness.open(), vault.clone()).expect("engine");
     vault.fail_deletes();
 
-    let error = engine.remove_account(ACCOUNT_ID, true).expect_err("the keyring refused the delete");
-    let text = error.to_string();
+    let removed = engine.remove_account(ACCOUNT_ID, true).expect("the keyring refusal is a warning, not a failure");
+    assert!(removed.removed);
+    let text = removed.warnings.join("\n");
     assert!(text.contains("cached mail were removed"), "{text}");
     assert!(text.contains("keyring refused"), "{text}");
 
@@ -478,6 +481,8 @@ fn the_demo_engine_answers_account_and_sync_operations_with_a_readable_error() {
         port: Some(1),
         tls: Some(MailTls::Implicit),
         smtp: None,
+        oauth: None,
+        oauth_access: None,
         extra_roots: Vec::new(),
     };
     let error = engine.add_account(setup).expect_err("the demo has no store");
@@ -501,6 +506,8 @@ fn account_add_validates_input_before_anything_is_written() {
         port: Some(993),
         tls: Some(MailTls::Implicit),
         smtp: None,
+        oauth: None,
+        oauth_access: None,
         extra_roots: Vec::new(),
     };
 

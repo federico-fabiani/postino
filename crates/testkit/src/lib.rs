@@ -26,13 +26,15 @@
 #![deny(missing_docs)]
 
 mod mailbox;
+mod oauth;
 mod responses;
 mod server;
 mod smtp;
 mod synthetic;
 mod tls;
 
-pub use mailbox::{FailPoint, MailboxScript, TestFolder, TestMessage, serve_mailbox, serve_mailbox_with};
+pub use mailbox::{FailPoint, MailboxScript, TestFolder, TestMessage, serve_mailbox, serve_mailbox_with, serve_mailbox_with_xoauth2};
+pub use oauth::{FakeOAuth, TokenReply, expected_xoauth2, token_json};
 pub use responses::{
     EnvelopeAddress, EnvelopeFields, SelectStatus, fetch_body_response, fetch_envelope_line, fetch_uid_flags_line, idle_continuation, list_line,
     quoted, select_lines,

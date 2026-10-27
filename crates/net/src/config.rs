@@ -34,7 +34,16 @@ pub struct ImapConfig {
     /// Login name. Quoted and escaped when written, never logged.
     pub username: String,
     /// Password or app password. Zeroised on drop.
+    ///
+    /// Empty for an OAuth account: [`ImapConfig::oauth`] carries the credential instead and the
+    /// session never falls back to this field.
     pub password: Secret,
+    /// OAuth 2.0 access token for SASL `XOAUTH2`, memory-only.
+    ///
+    /// When set, [`crate::Session::login`] sends `AUTHENTICATE XOAUTH2` and refuses the session if
+    /// the server does not advertise it. It never downgrades to a password: an OAuth account has
+    /// none.
+    pub oauth: Option<Secret>,
     /// Timeout for each phase: DNS, TCP connect, TLS handshake, greeting, every command and the
     /// `DONE` half of IDLE.
     pub timeout: Duration,
@@ -57,10 +66,21 @@ impl ImapConfig {
             tls,
             username: username.into(),
             password,
+            oauth: None,
             timeout: DEFAULT_TIMEOUT,
             limits: Limits::default(),
             extra_roots: Vec::new(),
         }
+    }
+
+    /// Authenticate with an OAuth 2.0 access token (SASL `XOAUTH2`) instead of a password.
+    ///
+    /// The token is copied into a zeroising buffer and never printed. Use this for a Gmail account
+    /// authorized through [`crate::oauth`]; the password path is untouched.
+    #[must_use]
+    pub fn with_oauth_token(mut self, token: Secret) -> Self {
+        self.oauth = Some(token);
+        self
     }
 
     /// Override the per-phase timeout.
@@ -96,6 +116,7 @@ impl std::fmt::Debug for ImapConfig {
             .field("tls", &self.tls)
             .field("username", &"[redacted]")
             .field("password", &self.password)
+            .field("oauth", &self.oauth.is_some())
             .field("timeout", &self.timeout)
             .field("limits", &self.limits)
             .field("extra_roots", &self.extra_roots.len())

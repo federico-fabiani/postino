@@ -135,7 +135,14 @@ fn class_of(error: &NetError) -> Class {
         NetError::Auth { .. } => Class::Auth,
         NetError::ServerNo { .. } => Class::ServerNo,
         NetError::Unsupported { .. } => Class::Unsupported,
-        NetError::ServerBad { .. } | NetError::Dns { .. } | NetError::Connect { .. } | NetError::Tls { .. } => {
+        NetError::ServerBad { .. }
+        | NetError::Dns { .. }
+        | NetError::Connect { .. }
+        | NetError::Tls { .. }
+        | NetError::OAuthConsent { .. }
+        | NetError::OAuthRejected { .. }
+        | NetError::OAuthGrant { .. }
+        | NetError::OAuthToken { .. } => {
             panic!("the corpus never provokes {error:?}")
         }
     }

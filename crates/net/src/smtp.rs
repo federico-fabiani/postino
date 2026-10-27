@@ -9,7 +9,8 @@
 //!
 //! `PIPELINING` is parsed but never used: every command waits for its reply. `DSN` is available only
 //! when the server advertises it; the compose path does not request it. There is no plaintext mode,
-//! no way to skip certificate verification and no OAuth.
+//! no way to skip certificate verification and no password fallback for an OAuth account: when a
+//! session carries an access token it authenticates with `AUTH XOAUTH2` or not at all.
 //!
 //! # Bounds and secrets
 //!
@@ -102,7 +103,11 @@ pub struct SmtpConfig {
     /// Login name. Normally the account address.
     pub username: String,
     /// Password or app password. Zeroised on drop and never printed.
+    ///
+    /// Empty for an OAuth account: [`SmtpConfig::oauth`] carries the credential instead.
     pub password: Secret,
+    /// OAuth 2.0 access token for SASL `XOAUTH2`, memory-only. Never printed.
+    pub oauth: Option<Secret>,
     /// Timeout for DNS, TCP, TLS, the greeting and every command.
     pub timeout: Duration,
     /// Protocol bounds; clamped on connect.
@@ -120,10 +125,21 @@ impl SmtpConfig {
             tls,
             username: username.into(),
             password,
+            oauth: None,
             timeout: DEFAULT_TIMEOUT,
             limits: SmtpLimits::default(),
             extra_roots: Vec::new(),
         }
+    }
+
+    /// Authenticate with an OAuth 2.0 access token (SASL `XOAUTH2`) instead of a password.
+    ///
+    /// Gmail needs this for `smtp.gmail.com` when the account was authorized through
+    /// [`crate::oauth`]. The password path is untouched.
+    #[must_use]
+    pub fn with_oauth_token(mut self, token: Secret) -> Self {
+        self.oauth = Some(token);
+        self
     }
 
     /// Override the per-phase timeout.
@@ -158,6 +174,7 @@ impl std::fmt::Debug for SmtpConfig {
             .field("tls", &self.tls)
             .field("username", &"[redacted]")
             .field("password", &self.password)
+            .field("oauth", &self.oauth.is_some())
             .field("timeout", &self.timeout)
             .field("limits", &self.limits)
             .field("extra_roots", &self.extra_roots.len())
@@ -189,6 +206,8 @@ pub struct SmtpCapabilities {
     pub auth_plain: bool,
     /// `AUTH LOGIN`.
     pub auth_login: bool,
+    /// `AUTH XOAUTH2`.
+    pub auth_xoauth2: bool,
     /// `STARTTLS` was advertised before the upgrade.
     pub starttls: bool,
     /// `PIPELINING` was advertised. It is parsed for diagnostics and never used.
@@ -216,6 +235,7 @@ impl SmtpCapabilities {
                         match mechanism {
                             "PLAIN" => capabilities.auth_plain = true,
                             "LOGIN" => capabilities.auth_login = true,
+                            "XOAUTH2" => capabilities.auth_xoauth2 = true,
                             _ => {}
                         }
                     }
@@ -487,11 +507,13 @@ impl SmtpClient {
         self.authenticated
     }
 
-    /// Authenticate with `AUTH PLAIN` when advertised, otherwise `AUTH LOGIN`.
+    /// Authenticate: `AUTH XOAUTH2` for an OAuth account, otherwise `AUTH PLAIN` when advertised,
+    /// otherwise `AUTH LOGIN`.
     ///
-    /// The password is dropped and zeroised after a success. A server that offers neither mechanism
-    /// is [`SmtpError::Unsupported`]; a rejected credential is [`SmtpError::Auth`], never a raw
-    /// server `NO` that could be mistaken for a transient failure.
+    /// The credential is dropped and zeroised after a success. A server that offers none of the
+    /// mechanisms this account can use is [`SmtpError::Unsupported`]; a rejected credential is
+    /// [`SmtpError::Auth`], never a raw server `NO` that could be mistaken for a transient failure.
+    /// An OAuth account never falls back to a password: it has none.
     pub async fn authenticate(&mut self) -> Result<(), SmtpError> {
         if self.closed {
             return Err(SmtpError::Closed { phase: "auth" });
@@ -499,7 +521,9 @@ impl SmtpClient {
         if self.authenticated {
             return Ok(());
         }
-        let result = if self.capabilities.auth_plain {
+        let result = if self.config.oauth.is_some() {
+            self.auth_xoauth2().await
+        } else if self.capabilities.auth_plain {
             self.auth_plain().await
         } else if self.capabilities.auth_login {
             self.auth_login().await
@@ -510,12 +534,14 @@ impl SmtpClient {
             Ok(()) => {
                 self.authenticated = true;
                 self.config.password = Secret::new(String::new());
+                self.config.oauth = None;
                 Ok(())
             }
             Err(error) => {
-                // Never keep the password in memory after a refused attempt: the session is not
+                // Never keep the credential in memory after a refused attempt: the session is not
                 // reused for auth and the caller has to decide whether to reopen.
                 self.config.password = Secret::new(String::new());
+                self.config.oauth = None;
                 Err(error)
             }
         }
@@ -758,6 +784,26 @@ impl SmtpClient {
         }
         let password = Zeroizing::new(STANDARD.encode(self.config.password.expose().as_bytes()));
         let reply = self.command("auth", &password).await?;
+        if is_success(&reply) { Ok(()) } else { Err(auth_error(&reply)) }
+    }
+
+    async fn auth_xoauth2(&mut self) -> Result<(), SmtpError> {
+        if !self.capabilities.auth_xoauth2 {
+            return Err(SmtpError::Unsupported { feature: "AUTH XOAUTH2" });
+        }
+        let token = match self.config.oauth.as_ref() {
+            Some(token) if !token.is_empty() => token,
+            _ => return Err(SmtpError::Auth { reason: "this session has no OAuth access token".to_owned() }),
+        };
+        let payload = crate::oauth::sasl_xoauth2(&self.config.username, token.expose());
+        let line = Zeroizing::new(format!("AUTH XOAUTH2 {}", payload.as_str()));
+        let reply = self.command("auth", &line).await?;
+        if reply.code == 334 {
+            // The provider asked for a SASL error acknowledgement. An empty line makes it send the
+            // final status; the challenge text itself is never read back or logged.
+            let reply = self.command("auth", "").await?;
+            return if is_success(&reply) { Ok(()) } else { Err(auth_error(&reply)) };
+        }
         if is_success(&reply) { Ok(()) } else { Err(auth_error(&reply)) }
     }
 

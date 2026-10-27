@@ -11,6 +11,8 @@
 
 use zeroize::Zeroizing;
 
+use crate::oauth::OAuthGrant;
+
 /// A credential-vault failure, already reduced to a redacted sentence.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
@@ -55,6 +57,25 @@ pub trait CredentialVault: Send + Sync {
 
     /// Delete one account's SMTP password. Deleting a missing credential succeeds.
     fn delete_smtp_password(&self, account_id: &str) -> Result<(), VaultError>;
+
+    /// Create or replace one account's OAuth grant: the BYO client id and secret plus the refresh
+    /// token, in one entry. Its presence is what makes the account an OAuth account; an account with
+    /// only passwords never has one. The default fails loudly so a vault that predates OAuth cannot
+    /// silently store a token somewhere else or drop it.
+    fn store_oauth_grant(&self, _account_id: &str, _grant: &OAuthGrant) -> Result<(), VaultError> {
+        Err(VaultError::new("this credential vault does not support OAuth grants"))
+    }
+
+    /// Read one account's OAuth grant. `Ok(None)` means the account uses an app password. The
+    /// default is `Ok(None)`, so every existing vault keeps its password accounts working.
+    fn load_oauth_grant(&self, _account_id: &str) -> Result<Option<OAuthGrant>, VaultError> {
+        Ok(None)
+    }
+
+    /// Delete one account's OAuth grant. Deleting a missing grant succeeds.
+    fn delete_oauth_grant(&self, _account_id: &str) -> Result<(), VaultError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

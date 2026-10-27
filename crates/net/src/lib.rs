@@ -23,10 +23,10 @@
 //! - **Typed.** Every failure is a [`NetError`], every timeout closes the session, and a password
 //!   lives in a [`Secret`] that zeroises itself and prints as `[redacted]`. Logs carry tags and
 //!   command verbs, never arguments, bodies or credentials.
-//! - **Honest.** The IMAP commands below exist; SMTP submission lives in [`smtp`]. QRESYNC,
-//!   CONDSTORE, SORT/THREAD, METADATA, ACL, OAuth (SASL XOAUTH2), S/MIME and autodiscovery are not
-//!   implemented; unknown untagged responses are collected as [`response`] noise and ignored rather
-//!   than trusted.
+//! - **Honest.** The IMAP commands below exist; SMTP submission lives in [`smtp`]. OAuth is the
+//!   authorization-code flow with PKCE in [`oauth`], and SASL `XOAUTH2` is the only thing it does.
+//!   QRESYNC, CONDSTORE, SORT/THREAD, METADATA, ACL, S/MIME and autodiscovery are not implemented;
+//!   unknown untagged responses are collected as [`response`] noise and ignored rather than trusted.
 //!
 //! See `README.md` for the command grammar, the bounds and the fake server that proves each path.
 
@@ -40,6 +40,7 @@ mod folder;
 mod limits;
 mod mailbox;
 mod message;
+pub mod oauth;
 mod parser;
 mod response;
 mod secret;
@@ -56,6 +57,7 @@ pub use folder::{MailboxStatus, RemoteFolder, SpecialUse};
 pub use limits::Limits;
 pub use mailbox::{decode_utf7, encode_utf7};
 pub use message::{Address, Envelope, Flag, FlagMode, IdleEvent, UidFlags};
+pub use oauth::{AuthRequest, Authorization, Loopback, OAuthProvider, Pkce, REFRESH_SKEW, TokenEndpoint, TokenSet};
 pub use rustls::pki_types::CertificateDer;
 pub use secret::Secret;
 pub use session::Session;

@@ -98,6 +98,11 @@ pub const ACCOUNT_SCOPE_SUFFIX: &str = ":imap";
 /// Suffix of the per-account SMTP credential scope. When it is absent the engine falls back to the
 /// IMAP credential, which is what Aruba and Gmail app passwords do in practice.
 pub const ACCOUNT_SMTP_SCOPE_SUFFIX: &str = ":smtp";
+/// Suffix of the per-account OAuth scope: the refresh token, the client id and the client secret.
+///
+/// Its presence *is* the account's authentication kind. There is no store column: an account with
+/// this entry is an OAuth account, an account without it uses the IMAP/SMTP password scopes.
+pub const ACCOUNT_OAUTH_SCOPE_SUFFIX: &str = ":oauth";
 
 /// Length of a store key in bytes (AES-256 for SQLCipher).
 const STORE_KEY_BYTES: usize = 32;
@@ -108,6 +113,9 @@ const MAX_SCOPE_CHARS: usize = 128;
 
 /// Longest accepted account id inside a credential scope.
 const MAX_ACCOUNT_ID_CHARS: usize = 64;
+
+/// Longest URL handed to the system browser opener.
+const MAX_BROWSER_URL_BYTES: usize = 8192;
 
 /// How many generate → write → read-back attempts happen inside the first-run lock.
 const CREATE_ATTEMPTS: usize = 2;
@@ -184,6 +192,12 @@ pub enum PlatformError {
     ReadBackMismatch { scope: String },
     #[error("this platform has no supported OS keyring; Postino refuses to keep secrets on disk")]
     Unsupported,
+    #[error("only an https URL can be opened in the system browser")]
+    UnsafeUrl,
+    #[error("the system browser could not be started: {detail}")]
+    Browser { detail: String },
+    #[error("opening the system browser is not implemented on this platform yet")]
+    NoBrowser,
 }
 
 /// The credential scope of one account's IMAP password: `account:<id>:imap`.
@@ -202,6 +216,15 @@ pub fn account_smtp_scope(account_id: &str) -> Result<String, PlatformError> {
     account_scoped(account_id, ACCOUNT_SMTP_SCOPE_SUFFIX)
 }
 
+/// The OAuth scope of one account: `account:<id>:oauth`.
+///
+/// One entry holds the refresh token and the BYO client id/secret, encoded by the caller. It uses the
+/// same account-id validation as [`account_scope`], and it is deleted together with the password
+/// scopes when the account is removed.
+pub fn account_oauth_scope(account_id: &str) -> Result<String, PlatformError> {
+    account_scoped(account_id, ACCOUNT_OAUTH_SCOPE_SUFFIX)
+}
+
 fn account_scoped(account_id: &str, suffix: &str) -> Result<String, PlatformError> {
     let valid = !account_id.is_empty()
         && account_id.chars().count() <= MAX_ACCOUNT_ID_CHARS
@@ -212,6 +235,32 @@ fn account_scoped(account_id: &str, suffix: &str) -> Result<String, PlatformErro
     let scope = format!("{ACCOUNT_SCOPE_PREFIX}{account_id}{suffix}");
     validate_scope(&scope)?;
     Ok(scope)
+}
+
+/// Open one `https://` authorization URL in the user's default browser.
+///
+/// This is the only browser integration in the product: Postino never embeds one and never starts a
+/// shell. The URL is the OAuth authorization request built in `postino-net`, which already carries the
+/// PKCE challenge and the state; the callback is the loopback listener the caller owns. The URL is
+/// validated here again so a bug elsewhere cannot hand the desktop an arbitrary scheme or a file path.
+pub fn open_in_browser(url: &str) -> Result<(), PlatformError> {
+    let safe = url.len() <= MAX_BROWSER_URL_BYTES
+        && url.starts_with("https://")
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\'));
+    if !safe {
+        return Err(PlatformError::UnsafeUrl);
+    }
+    browser_open(url)
+}
+
+#[cfg(windows)]
+fn browser_open(url: &str) -> Result<(), PlatformError> {
+    win32::open_url(url)
+}
+
+#[cfg(not(windows))]
+fn browser_open(_url: &str) -> Result<(), PlatformError> {
+    Err(PlatformError::NoBrowser)
 }
 
 /// A handle to the OS keyring with an explicit first-run lock path.
@@ -626,13 +675,48 @@ mod tests {
     fn account_scopes_are_bounded_and_unambiguous() {
         assert_eq!(account_scope("acc_0123456789abcdef").expect("scope"), "account:acc_0123456789abcdef:imap");
         assert_eq!(account_smtp_scope("acc_0123456789abcdef").expect("scope"), "account:acc_0123456789abcdef:smtp");
+        assert_eq!(account_oauth_scope("acc_0123456789abcdef").expect("scope"), "account:acc_0123456789abcdef:oauth");
         for id in ["", "a:b", "a/b", "a b", "a\nb", "../x"] {
             assert!(matches!(account_scope(id), Err(PlatformError::InvalidAccount)), "{id:?}");
             assert!(matches!(account_smtp_scope(id), Err(PlatformError::InvalidAccount)), "{id:?}");
+            assert!(matches!(account_oauth_scope(id), Err(PlatformError::InvalidAccount)), "{id:?}");
         }
         let long = "a".repeat(MAX_ACCOUNT_ID_CHARS + 1);
         assert!(matches!(account_scope(&long), Err(PlatformError::InvalidAccount)));
         assert!(matches!(account_smtp_scope(&long), Err(PlatformError::InvalidAccount)));
+        assert!(matches!(account_oauth_scope(&long), Err(PlatformError::InvalidAccount)));
+    }
+
+    #[test]
+    fn an_oauth_scope_lives_next_to_the_passwords_and_deletes_alone() {
+        let _guard = vault();
+        install_mock();
+        let (_dir, lock) = temp_lock();
+        let keyring = Keyring::at(&lock);
+        let oauth = account_oauth_scope("acc_oauth").expect("scope");
+        keyring.store_secret(&oauth, b"refresh-token-and-client").expect("store");
+        keyring.store_secret(&account_scope("acc_oauth").expect("scope"), b"imap-password").expect("store");
+        assert_eq!(keyring.load_secret(&oauth).expect("load").expect("present").as_slice(), b"refresh-token-and-client");
+        assert_eq!(keyring.load_secret(&account_scope("acc_oauth").expect("scope")).expect("load").expect("present").as_slice(), b"imap-password");
+        keyring.delete_secret(&oauth).expect("delete");
+        assert!(keyring.load_secret(&oauth).expect("load").is_none());
+        assert!(keyring.load_secret(&account_scope("acc_oauth").expect("scope")).expect("load").is_some());
+    }
+
+    #[test]
+    fn the_browser_opener_only_accepts_https() {
+        for url in [
+            "http://127.0.0.1:9/callback",
+            "file:///C:/Windows/System32/cmd.exe",
+            "javascript:alert(1)",
+            "https://accounts.google.com/o/oauth2/v2/auth?x=\"y\"",
+            "https://accounts.google.com/\r\nHost: evil",
+            "",
+        ] {
+            assert!(matches!(open_in_browser(url), Err(PlatformError::UnsafeUrl)), "{url:?} was accepted");
+        }
+        let long = format!("https://example.com/{}", "a".repeat(MAX_BROWSER_URL_BYTES));
+        assert!(matches!(open_in_browser(&long), Err(PlatformError::UnsafeUrl)));
     }
 
     #[test]
