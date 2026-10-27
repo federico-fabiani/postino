@@ -528,6 +528,8 @@ The GNU toolchain plus MSYS2 is the path documented here.
 - [Security policy](SECURITY.md): how to report a vulnerability.
 - [Design](docs/design.md): palette, contrast, type, logo.
 - [Development](docs/development.md): toolchain, layout, testing.
+- [Windows packaging](installer/README.md): per-user MSI, portable ZIP, signing and checksum
+  verification.
 - [Store spike](docs/store-spike.md): P3a encrypted-SQLite evaluation, numbers and decision.
 - [Briefs](docs/briefs/): the package contracts, including P3c engine wiring.
 - [Roadmap](ROADMAP.md): M0 to M6.
