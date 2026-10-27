@@ -1,6 +1,7 @@
 # Brief — P12c PGP
 
-> **Package:** P12c1 key store/ops, then P12c2 MIME/app. **Depends on:** P12c1 for P12c2.
+> **Package:** P12c1 key store/ops, P12c2a raw retention (v9), P12c2b MIME/core/CLI, P12c2c app UI.
+> **Depends on:** P12c1, then P12c2a, then P12c2b, then P12c2c.
 > **Review:** blind crypto/credential review each; one fix round each. **Parallel:** P12f fuzz only.
 
 ## Decisions
@@ -29,23 +30,43 @@
 - CLI `postino pgp keys list|import|delete|export-public`; MCP parity for non-sensitive ops; app UI
   key manager belongs to P12c2.
 
-## P12c2 — MIME and app
+## P12c2a — raw retention (schema v9)
 
-- Verify signed messages, decrypt encrypted messages, sign and encrypt outgoing drafts; preserve the
-  exact signed bytes; explicit status badges and a locked-key reason; refuse to send unencrypted when
-  the person asked to encrypt; no auto-decrypt of hostile/broken input.
-- Operations/CLI for `message_pgp_verify`, `message_pgp_decrypt`, `draft_pgp_sign`,
-  `draft_pgp_encrypt` (passphrase-sensitive where applicable; MCP exclusion); app reading badges and
-  composer toggles; 980×600 light/dark; no new HTML path.
-- Tests: test vectors, tamper/bad signature, wrong/missing key, locked key, wrong passphrase, MIME
-  round-trip, exact signed bytes, no plaintext downgrade, no secret in logs, store v8 migration,
-  CLI/MCP, 980 UI. No network.
+Received PGP/MIME cannot be verified from the current parsed body: sync drops the raw entity, so
+exact signed bytes, CRLF and header folding are irrecoverable. Do not reconstruct them.
+
+- Schema v9 adds nullable `messages.raw_blob_hash`; ingest stores the bounded raw message in the
+  existing encrypted blob store only for `multipart/signed` or `multipart/encrypted`.
+- GC must see the raw hash (`referenced_blob_hashes`/`blob_is_referenced`); migration v8→v9 and
+  rollback; bounds from `max_message_bytes`.
+- Old rows without raw bytes report `Not stored`; an explicit refresh may fetch again, never a fake
+  verify. No schema work for outgoing mail: `queue_send` already journals exact bytes.
+
+## P12c2b — MIME/core/CLI
+
+- `crates/mime` stays structure-only: detect PGP/MIME, extract signed entity/signature/encrypted
+  payload, and serialize RFC 3156 entities; no crypto in mime.
+- Core uses `pgp` to verify/decrypt received raw bytes and sign/encrypt outgoing bytes. Operations:
+  `message_pgp_verify`, `message_pgp_decrypt`; send options `PgpSendOptions` on `message_send`,
+  `send_schedule`, `send_dry_run` instead of separate draft sign/encrypt ops (avoids a TOCTOU).
+- Missing/revoked/expired recipient key aborts the send; no cleartext fallback. Decrypted bodies
+  never overwrite `body_text`/`body_html` and never enter FTS. Passphrase per use from no-echo/stdin,
+  zeroised, never argv/env/log; fixed errors; decrypt output re-parsed under existing MIME limits.
+- Tests: exact-byte verify, one-byte tamper → Bad, CRLF preservation, unknown/locked/wrong
+  passphrase, decrypt, sign, encrypt, sign+encrypt, v1–v9 migration/rollback, GC keeps raw, outbox
+  blob equality, no-downgrade, log redaction, CLI/MCP. No network.
+
+## P12c2c — app UI
+
+- Reading badges (Verified/Bad/Unknown/Locked/Not stored), decrypt action, composer sign/encrypt
+  toggles and key manager; 980×600 light/dark; decrypted HTML goes through the existing sanitizer,
+  no WebView path. No keyserver/auto-fetch.
 
 ## Limits
 
 PGP is local only; no key discovery, no revocation fetch, no S/MIME, no HTML signing; key UX is a
-settings table with import/delete, not a full key manager. Document the v8 migration and the
-passphrase-per-use model.
+settings table with import/delete, not a full key manager. Document the v8 key migration, the v9 raw
+retention migration, the `Not stored` state for pre-v9 received mail and the passphrase-per-use model.
 
 ## Report (max 15 lines per package)
 
