@@ -93,7 +93,12 @@ Status: `todo` · `active` · `review` · `done`.
 | P11a1 | M5 render | bounded sanitized block model/parser in `crates/mime` | done |
 | P11a2 | M5 render | egui mapping, link sheet, text fallback | done |
 | P11b | M5 render | optional sandboxed WebView2 backend | todo |
-| P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
+| P12a | M6 ship | Gmail OAuth/XOAUTH2, keyring tokens, app onboarding | active |
+| P12b | M6 ship | ManageSieve client and script activation | todo |
+| P12c | M6 ship | PGP keyring, MIME verify/decrypt/sign/encrypt | todo |
+| P12d | M6 ship | iCalendar invites, RSVP drafts | todo |
+| P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | active |
+| P12f | M6 ship | standalone fuzz targets and security CI | todo |
 
 P0-P2 close U0. P3-P6d make M1 real; P7-P8 close M2. Each package may split when the brief is too
 large; splits are recorded here. The P6c blind review found one filename-warning blocker and several
@@ -142,6 +147,9 @@ activation/quit. M4 is complete at `2dcd612`.
 **P11a1** merged the bounded sanitized block model in `crates/mime`; **P11a2** maps the blocks to
 egui in the reading pane, keeps the link sheet/text fallback and the 980×600 budget. The full CI is
 green on the merged tree. P11b (optional sandboxed WebView2) remains after P11a2.
+M6 is split: **P12a** Gmail OAuth and **P12e** Windows packaging start in parallel; **P12b**
+ManageSieve, **P12c** PGP, **P12d** invites and **P12f** fuzz follow. The audit keeps them vertical
+because they touch core/store/app; packaging and fuzz are the only infrastructure packages.
 
 ## 5. Delighters backlog
 
