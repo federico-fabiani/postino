@@ -1,6 +1,6 @@
 # Delivery plan
 
-> **Status:** active · **Updated:** 2026-10-26 · **Owner:** coordinator
+> **Status:** active · **Updated:** 2026-10-27 · **Owner:** coordinator
 >
 > This document is the operating plan for the push from the M0/U0 shell to a finished v0.1. It is
 > not a second roadmap: milestones and scope stay in [ROADMAP.md](../ROADMAP.md).
@@ -85,7 +85,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P8 | M2 compose | attachment bytes, signatures per identity, reply/forward recipients and headers, size caps | done |
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, v7 inert tables | done |
 | P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | done |
-| P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | active |
+| P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | done |
 | P10 | M4 daemon | `postino-daemon`, named pipe/UDS + token, tray, autostart, clients | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
@@ -110,9 +110,14 @@ thread pages, subject-fallback stability, saved-search freshness/account cleanup
 thread paging and partial-batch undo. The account-wide `threads_list` target is met (80.7 ms P50 /
 82.1 ms P95 at 100k) and 100 real 3-reference inserts take 307 ms (P95 6.0 ms); the folder-scoped list
 misses it (356–359 ms P95) and is reported in the architecture/threat-model tables. P9b creates derived
-indexes idempotently on normal open but has no schema version change. P9c is the last M3 package: local
-rules, preview, idempotent runs, undo and forwarding through P7; it inherits the inert v7 rule tables
-and needs no migration.
+indexes idempotently on normal open but has no schema version change. P9c is the last M3 package and is
+done: local rules, preview, idempotent runs, state-checked undo and forwarding through P7 on the
+inherited v7 rule tables, with no migration and no new dependency. A rule is a validated search query
+plus 1-5 actions; runs are per rule in priority order with stop, received mail only, an
+`ingested_at >= created_at` horizon and a 2 000-candidate cap. The journal keeps ids/folders/labels and
+booleans only and 20 runs; a forward is one P7 outbox row with `Auto-Submitted`/`X-Postino-Rule`, a
+loop guard in encrypted meta and a 50/run cap. MCP gates `rules_run` and forward payloads behind
+`--allow-send`; the Rules page has list/editor/preview/run/undo at 980×600 in both themes.
 
 ## 5. Delighters backlog
 

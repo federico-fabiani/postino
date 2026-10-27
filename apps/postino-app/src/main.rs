@@ -8,6 +8,7 @@ mod app;
 mod boot;
 mod onboarding;
 mod reading;
+mod rules_ui;
 mod seams;
 mod send_worker;
 mod settings;

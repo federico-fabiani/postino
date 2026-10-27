@@ -286,6 +286,32 @@ per action, no hidden mutation.
   `postino-p9b-conversation-980-dark.png`, `postino-p9b-saved-searches-980.png`,
   `postino-p9b-saved-searches-980-dark.png`.
 
+### 6.7 Local rules (P9c)
+
+- **Entry.** The Rules page is a full-page modal opened by **Regole locali** in Settings → DATI and by
+  the palette commands **Regole locali** / **Nuova regola**. `Esc` closes it and returns to the shell;
+  the mailbox selection and scroll position are untouched.
+- **List + editor.** The left column lists rules in execution order with priority, enabled state and a
+  visible “non valida” marker for a deleted target. The right column edits name, condition (the same
+  search language as `/`), priority, `Ferma le regole successive`, `Attiva` and 1–5 actions. Each
+  action has its target picker (folder/label) and a Rimuovi button; adding an action that already
+  exists or a destination that does not exist is disabled with a reason. Forward is disabled with a
+  visible reason when the account has no P7 SMTP endpoint; the demo has none.
+- **Preview.** **Anteprima** evaluates the editor state without writing anything and shows the first 20
+  matches, each with its subject and one `applica` / `già così` / `salta` line per action. A loop-guarded
+  forward is `salta`. The preview does not create a run, move mail, apply a label or queue an outbox row.
+- **Save / run / undo.** Save/Cancel/Delete sit above the run row, so they stay visible when the editor
+  scrolls at 980×600. Delete asks for confirmation. **Esegui nuove** / **Esegui tutte** ask for
+  confirmation, then report the run id, matches, changed actions and errors; **Annulla esecuzione**
+  reverses the newest run and reports skipped messages and any forward outbox ids. Recent runs show
+  mode, changed actions and “annullata”.
+- **Keyboard.** Tab reaches every field and button; the palette opens the page; `Esc` closes the page.
+  There is no mouse-only action, and a disabled control always carries a reason.
+- 980×600 light/dark screenshots: `docs/images/postino-p9c-rules-980.png`,
+  `postino-p9c-rules-980-dark.png`, `postino-p9c-rule-editor-980.png`,
+  `postino-p9c-rule-editor-980-dark.png`, `postino-p9c-rule-preview-980.png`,
+  `postino-p9c-rule-preview-980-dark.png`.
+
 ## 7. Compose and drafts
 
 - `Scrivi` opens a **composer modal** (not a status message or a floating window): To/Cc/Bcc,

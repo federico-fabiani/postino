@@ -5,8 +5,9 @@
 > accounts and credentials (P6a) + app on real mail (P6b/P6c) + remote-content count (P6d) + SMTP
 > submission and the outbox (P7) + compose depth: attachment bytes, signatures per account and
 > reply/forward headers (P8) + encrypted FTS5 search, the body-free read path and schema v7 (P9a) +
-> conversation derivation/merge/alias, the conversation view and saved searches (P9b) ·
-> **Last updated:** 2026-10-26 ·
+> conversation derivation/merge/alias, the conversation view and saved searches (P9b) + local rules
+> with preview, idempotent runs, undo and forwarding through P7 (P9c) ·
+> **Last updated:** 2026-10-27 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
 ## 1. Shape today
@@ -20,7 +21,7 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounds, typed errors |
 | `crates/platform` | OS seams: store key and account credentials in the OS keyring |
-| `crates/store` | SQLCipher schema v7, migrations, the repository, FTS5 search, the conversation cache, saved searches, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7, P9a, P9b) |
+| `crates/store` | SQLCipher schema v7, migrations, the repository, FTS5 search, the conversation cache, saved searches, local rules and their journal, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7, P9a, P9b, P9c) |
 | `crates/sync` | One account from IMAP into the store, plus submission serialization and the Sent append (P5b, P7) |
 | `crates/testkit` | Test-only fake IMAP/SMTP servers, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -117,12 +118,12 @@ decision and the migration path.
 | Crate | Responsibility |
 |---|---|
 | `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
-| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b) |
+| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b); local rules, candidate query and journal (P9c) |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
 | `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. Autodiscovery and QRESYNC later |
 | `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler later |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
-| `postino-rules` | local rules and Sieve generation |
+| `postino-rules` | Sieve generation later; P9c's local rules deliberately live in `postino-store` and `postino-core`, not in a new crate |
 | `postino-ipc` | JSON-RPC over pipe/socket, token, versioning |
 | `postino-platform` | keyring (P3b); paths, notifications, tray, autostart, single instance later |
 | `postino-testkit` | fake IMAP/SMTP, TLS fixture, response builders and synthetic messages (P5b; dev-dependency only) |
@@ -315,10 +316,10 @@ the daemon (M4). The repository returns folders and labels ordered by name; onbo
 server's folder tree in that order.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
-a store. **Still missing:** local rules (P9c), the daemon scheduler (M4) and HTML rendering (M5). The
-default store path, the account/sync operations and their CLI/MCP bindings landed in P6a (§4.7); the
-body-free read path and search landed in P9a (§4.11); conversations and saved searches landed in P9b
-(§4.12).
+a store. **Still missing:** the daemon scheduler (M4), server-side Sieve (M6) and HTML rendering (M5).
+The default store path, the account/sync operations and their CLI/MCP bindings landed in P6a (§4.7);
+the body-free read path and search landed in P9a (§4.11); conversations and saved searches landed in
+P9b (§4.12); local rules landed in P9c (§4.13).
 
 ### 4.3 Implemented in P4a: the MIME crate
 
@@ -1136,8 +1137,11 @@ second builder can see a half-built index, so do not run it from the desktop and
 runs `VACUUM`, because FTS keys on `messages.rowid`.
 
 `threads`, `thread_aliases`, `saved_searches`, `rules`, `rule_runs` and `rule_actions` are created empty
-and inert in v7 so P9b/P9c would need no second migration. P9a did not read or write them; P9b now
-owns `threads`, `thread_aliases` and `saved_searches`, while the P9c rule tables stay inert.
+in v7 so P9b/P9c would need no second migration. P9a did not read or write them; P9b owns `threads`,
+`thread_aliases` and `saved_searches`; P9c owns `rules`, `rule_runs` and `rule_actions`. P9c also
+creates `rules(account_id,name COLLATE NOCASE)` as a `UNIQUE INDEX IF NOT EXISTS` on normal open, the
+same derived/index-maintenance seam P9b used: `user_version` stays 7 and a read-only open creates
+nothing.
 
 **Query language.** `postino-core::search` is a hand-written recursive-descent parser with one AST and
 one canonical printer:
@@ -1325,6 +1329,73 @@ participant/label facts of a page are read from at most 2 000 message rows and 4
 very large page may omit late participants, and rows written by P9a keep the old `subject_norm` without
 a stripped prefix, so the subject fallback can miss pre-P9 mail until a future backfill.
 
+### 4.13 Implemented in P9c: local rules
+
+A local rule is one validated search query plus 1–5 actions. The kinds are `move(folder)`,
+`label(label)`, `read`, `unread`, `trash` and `forward(1–10 addresses)`, at most one of each; `read`
+and `unread` exclude each other. Names are 1–48 characters, unique per account ignoring case (a
+`UNIQUE INDEX` added idempotently at normal open, not a schema version), and an account holds at most
+100 rules. Execution order is `priority ASC, id ASC`; `stop` makes later rules skip a message this
+rule matched. Folders, labels and recipients are validated on save. A target deleted later leaves the
+row visible as `valid:false` with a readable error and fails at run time; it never corrupts the run.
+`move` refuses virtual folders, Drafts and Sent, so a rule cannot turn received mail into a draft or a
+second Sent copy.
+
+**Candidates.** Execution is per rule, in order, and each rule queries the store again so it sees the
+earlier rule's moves, labels and flags. Only received mail is eligible: Drafts, Sent and Trash rows
+are excluded, as are outbox rows (not message rows at all). The rule's own `created_at` is the
+horizon: `messages.ingested_at >= rules.created_at`, so a new rule never rewrites mail that arrived
+before it existed. `new` (the default, and the pass that follows `sync_now`) additionally requires
+`rules_applied_at IS NULL`; it takes one bounded universe of 2 000 new received messages and then
+runs every rule over that universe. `all` gives each rule its own 2 000-candidate page ordered by
+`ingested_at,id`, so a rule created today is not starved by an older rule's longer history. A `new`
+run marks the universe it considered with `rules_applied_at`; the next run starts after it. The demo
+engine has no `ingested_at`, so its synthetic rules use the same action semantics without the horizon
+and keep a 2 000-candidate per-rule cap.
+
+**Actions and idempotency.** Every action is applied immediately. A move/label/read/trash action that
+is already in its target state is a no-op and writes no journal row; a forward resolves to one outbox
+row with the deterministic key `rule:<rule_id>:<message_id>` and is a no-op on the second run. A
+failing action increments the run's error count, records a fixed sentence naming rule, message and
+target ids, and aborts only that rule's remaining actions for that message. A later rule still runs.
+A rule failure never fails `sync_now`: the run is journaled and the sync report is unchanged.
+
+**Forward through P7.** The engine builds a standalone submission (no draft, so there is no draft to
+move to Sent), serializes it through the same `postino-sync`/`postino-mime` path as compose, stores
+the exact bytes in the encrypted blob store and inserts one `outbox` row. `OutboxEnvelope.draft_id`
+is optional for this row; submission and the Sent append use the stored bytes and `finalize` is
+skipped. The message carries `Auto-Submitted: auto-forwarded` and `X-Postino-Rule: <rule_id>`. Sync
+records either incoming header in the encrypted `meta` key `rule_guard:<message_id>` (v7 has no header
+column; P9c does not migrate); a forward on a guarded message is skipped and does not consume the
+50-forwards-per-run budget. A missing SMTP endpoint fails the action with a sentence instead of
+queueing an undeliverable row. MCP refuses `rules_run` without `--allow-send` and refuses a
+`rules_create`/`rules_update` payload containing a forward action before the typed parser runs; the
+CLI and desktop still manage rules locally.
+
+**Journal and undo.** `rule_runs` stores the mode, start/finish, rule count, matched pairs, changed
+actions, error count and (in `meta`) whether undo already reversed it; the newest 20 non-dry runs per
+account are kept and older runs are deleted with their actions. `rule_actions` stores run/rule/message
+ids, the action name, a changed flag and a JSON value with ids, folders, labels and booleans only:
+never a subject, address, query or body. Each changed action's value also carries the message's
+post-action state (folder id, unread boolean, label ids). `rules_undo` groups the run by message,
+compares the live state with that last snapshot, and skips every action for a message changed after
+the run; an unchanged message is reversed newest-action-first. A forward is never undone: the undo
+result reports its outbox id so the user can cancel the row. A run can be undone once; undo is a
+one-way meta marker, not a second journal.
+
+**Operations and UI.** `rules_list`, `rules_create`, `rules_update`, `rules_delete`, `rules_preview`,
+`rules_run`, `rules_undo` and `rules_runs` all use `deny_unknown_fields`, schemas derived from the
+types, and `read_only`/`destructive` annotations. `rules_preview` writes nothing: no journal, no
+`rules_applied_at`, no flag, move, label or outbox row; it returns the first 50 matches and one typed
+effect per action (`apply`, `no_op`, `skip`). `rules_run` is destructive/open-world and `rules_delete`
+is destructive. The desktop Rules page is reachable from Settings and the palette (`Regole locali`,
+`Nuova regola`), lists rules, edits condition/actions/priority/stop/enabled, shows the first 20 preview
+matches, offers Save/Cancel/Delete, run with confirmation and Undo, and lists recent runs. Forward is
+disabled with a visible reason when the account has no P7 SMTP endpoint; the demo has none. The page
+is a 980×600 modal built from the same components and tokens as Settings; keyboard-only users reach
+it through the palette and leave with `Esc`. P9c adds no crate or dependency, no new SMTP client and
+no schema version: the v7 rule tables and one idempotent unique index carry it.
+
 ## 5. Synchronization
 
 
@@ -1434,3 +1505,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-26 | major | P9a: body-free store read path (summaries + owned cached `message`), schema v7 search columns and contentless-delete FTS5, recursive-descent query language with canonical printer, typed bound execution with bm25 ranking, `search`/`search_status`/`search_reindex`, CLI/MCP/UI parity, 100k evidence |
 | 2026-10-26 | major | P9b: reference-chain conversation derivation with phantom joins, order-independent merges and aliases, bounded subject fallback, cached thread rows with mailbox-wide counts, thread operations, one-open-card conversation view at 980, saved searches with stale-aware computed counts, recent queries in encrypted meta, CLI/MCP parity, 20k/100k evidence |
 | 2026-10-26 | major | P9b closure: `messages(account_id,message_id)` and `subject_norm` indexes (1.29 s/ref → 2.7 ms/insert), sent-draft ghost removed, store-backed thread flag counts, live thread pages and paging, subject-fallback re-fetch stability, saved-search freshness/account cleanup/atomic cap/account scope, conversation Enter, partial-batch undo, read-only cache guard |
+| 2026-10-27 | major | P9c: local rules on the v7 tables (no migration), validated query + 1–5 actions, priority/stop, received-only new-vs-all runs with `ingested_at`/`rules_applied_at`, 2 000-candidate and 50-forward caps, idempotent actions, journal with ids/booleans only and 20-run retention, state-checked undo, standalone rule forward through the P7 outbox with `Auto-Submitted`/`X-Postino-Rule` loop guard in encrypted meta, eight operations, CLI/MCP/UI parity and 980 rules screenshots |

@@ -186,6 +186,15 @@ pub(crate) fn ingest(
     let (in_reply_to, references) = ids::thread_headers(&parsed.references, parsed.in_reply_to.as_deref());
     store.upsert_synced_message_with_refs(&row, &attachments, in_reply_to.as_deref(), &references).map_err(SyncError::Store)?;
     store.set_message_reply_to(&id, &reply_to).map_err(SyncError::Store)?;
+    // P9c's forward loop guard. The headers are recorded in the encrypted `meta` table because v7
+    // has no header column and P9c must not migrate; a normal message writes nothing.
+    let guard = store::RuleGuard {
+        auto_submitted: parsed.headers.get("Auto-Submitted").is_some(),
+        x_postino_rule: parsed.headers.get("X-Postino-Rule").is_some(),
+    };
+    if guard.any() {
+        store.set_rule_guard(&id, guard).map_err(SyncError::Store)?;
+    }
     index.inserted.insert(id.clone(), uid);
     Ok(Some(Ingested { message_id: id, new, drift, attachments_stored: stored }))
 }

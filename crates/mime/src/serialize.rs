@@ -43,6 +43,10 @@ pub struct OutgoingMessage {
     /// Caller-provided `Message-ID`, with or without angle brackets. When absent, one is derived
     /// deterministically from the content hash and the sender domain.
     pub message_id: Option<String>,
+    /// Extra top-level headers, in order. P9c uses this for `Auto-Submitted` and
+    /// `X-Postino-Rule` on a rule forward. Names are validated tokens, duplicates and the
+    /// composer-owned headers are refused, and values must be printable ASCII.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// An attachment to serialize.
@@ -88,6 +92,11 @@ const MAX_DISPLAY_NAME_BYTES: usize = 1024;
 const MAX_ID_BYTES: usize = 900;
 /// Most references accepted in one message.
 const MAX_REFERENCES: usize = 1000;
+/// Most caller-supplied top-level headers. P9c needs two; eight leaves room without becoming a
+/// second header composer.
+const MAX_EXTRA_HEADERS: usize = 8;
+/// Longest accepted extra header value.
+const MAX_EXTRA_HEADER_VALUE: usize = 256;
 
 /// Serialize a message to RFC 5322 bytes and an envelope.
 ///
@@ -138,6 +147,8 @@ pub fn serialize(message: &OutgoingMessage) -> Result<Serialized, MimeError> {
     let mixed_boundary = unique_boundary(&mixed_boundary, &bodies);
     let alternative_boundary = unique_boundary(&alternative_boundary, &bodies);
 
+    validate_extra_headers(&message.extra_headers)?;
+
     let mut writer = Writer::default();
     writer.header("From", &from)?;
     if !to.is_empty() {
@@ -154,6 +165,9 @@ pub fn serialize(message: &OutgoingMessage) -> Result<Serialized, MimeError> {
     }
     if !references.is_empty() {
         writer.header("References", &references.join(" "))?;
+    }
+    for (name, value) in &message.extra_headers {
+        writer.header(name, value)?;
     }
     writer.header("MIME-Version", "1.0")?;
 
@@ -264,13 +278,13 @@ struct Writer {
 }
 
 impl Writer {
-    fn header(&mut self, name: &'static str, value: &str) -> Result<(), MimeError> {
+    fn header(&mut self, name: &str, value: &str) -> Result<(), MimeError> {
         validate_header_value(name, value)?;
         self.write_folded(name, value);
         Ok(())
     }
 
-    fn write_folded(&mut self, name: &'static str, value: &str) {
+    fn write_folded(&mut self, name: &str, value: &str) {
         let mut queue = value;
         let mut line = format!("{name}:");
         let mut name_only = true;
@@ -331,7 +345,49 @@ impl Writer {
     }
 }
 
-fn validate_header_value(name: &'static str, value: &str) -> Result<(), MimeError> {
+/// A caller-supplied top-level header. The composer owns the addressing, threading, identity and
+/// MIME headers; a second copy of any of them is a smuggling attempt, not a preference.
+fn validate_extra_headers(headers: &[(String, String)]) -> Result<(), MimeError> {
+    if headers.len() > MAX_EXTRA_HEADERS {
+        return Err(MimeError::Encode { reason: "more than 8 extra headers" });
+    }
+    let mut seen = HashSet::new();
+    for (name, value) in headers {
+        if name.is_empty() || name.len() > 64 || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+            return Err(MimeError::Encode { reason: "an extra header name is not an RFC 5322 field name" });
+        }
+        let lower = name.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            return Err(MimeError::Encode { reason: "an extra header is repeated" });
+        }
+        if matches!(
+            lower.as_str(),
+            "from"
+                | "to"
+                | "cc"
+                | "bcc"
+                | "subject"
+                | "date"
+                | "message-id"
+                | "in-reply-to"
+                | "references"
+                | "mime-version"
+                | "content-type"
+                | "content-transfer-encoding"
+                | "content-disposition"
+                | "content-id"
+        ) {
+            return Err(MimeError::Encode { reason: "an extra header would duplicate a composer-owned header" });
+        }
+        if value.len() > MAX_EXTRA_HEADER_VALUE {
+            return Err(MimeError::Encode { reason: "an extra header value is longer than 256 bytes" });
+        }
+        validate_header_value(name, value)?;
+    }
+    Ok(())
+}
+
+fn validate_header_value(name: &str, value: &str) -> Result<(), MimeError> {
     reject_controls(name, value)?;
     if !value.is_ascii() {
         return Err(MimeError::Encode { reason: "a header value reached the writer without RFC 2047 encoding" });
@@ -339,11 +395,33 @@ fn validate_header_value(name: &'static str, value: &str) -> Result<(), MimeErro
     Ok(())
 }
 
-fn reject_controls(name: &'static str, value: &str) -> Result<(), MimeError> {
+fn reject_controls(name: &str, value: &str) -> Result<(), MimeError> {
     if value.chars().any(char::is_control) {
-        return Err(MimeError::HeaderInjection { header: name });
+        return Err(MimeError::HeaderInjection { header: static_header_name(name) });
     }
     Ok(())
+}
+
+/// The error carries a `&'static str` so a caller can match a fixed header name. Caller-supplied
+/// extra headers share one redacted label: the value is never echoed, and neither is the name.
+fn static_header_name(name: &str) -> &'static str {
+    match name {
+        "From" => "From",
+        "To" => "To",
+        "Cc" => "Cc",
+        "Bcc" => "Bcc",
+        "Subject" => "Subject",
+        "Date" => "Date",
+        "Message-ID" => "Message-ID",
+        "In-Reply-To" => "In-Reply-To",
+        "References" => "References",
+        "MIME-Version" => "MIME-Version",
+        "Content-Type" => "Content-Type",
+        "Content-Transfer-Encoding" => "Content-Transfer-Encoding",
+        "Content-Disposition" => "Content-Disposition",
+        "Content-ID" => "Content-ID",
+        _ => "extra header",
+    }
 }
 
 fn format_date(date: DateTime<Utc>) -> String {

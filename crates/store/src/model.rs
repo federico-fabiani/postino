@@ -639,6 +639,117 @@ pub struct Draft {
     pub in_reply_to: Option<String>,
 }
 
+// ---------------------------------------------------------------------------------------------
+// Rules (P9c)
+// ---------------------------------------------------------------------------------------------
+
+/// One stored rule. `actions_json` is the engine-owned JSON array of 1-5 actions; this crate never
+/// interprets it, and the journal never stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// Lower runs first.
+    pub priority: i64,
+    /// When true, later rules skip a message this rule matched.
+    pub stop: bool,
+    /// The documented search language, validated by core before it is stored.
+    pub query: String,
+    /// The engine's serialized action list. Never a subject, a body or a log line.
+    pub actions_json: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub updated_at: i64,
+}
+
+/// One journaled rule run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleRun {
+    pub id: String,
+    pub account_id: String,
+    /// Unix milliseconds.
+    pub started_at: i64,
+    /// Unix milliseconds; `None` while the run is in flight or after a crash.
+    pub finished_at: Option<i64>,
+    /// `new` or `all`.
+    pub mode: String,
+    pub rule_count: u32,
+    /// Rule/message pairs the conditions matched.
+    pub matched: u32,
+    /// Actions that actually changed a message.
+    pub changed: u32,
+    pub errors: u32,
+    /// True when `rules_undo` already reversed this run.
+    pub undone: bool,
+}
+
+/// One journaled action. `value_json` carries ids, folders, labels and booleans only: never a
+/// subject, an address, a query or a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleActionRecord {
+    pub run_id: String,
+    pub ordinal: u32,
+    pub rule_id: String,
+    pub message_id: String,
+    /// `move`, `label`, `read`, `trash` or `forward`.
+    pub action: String,
+    pub value_json: String,
+    pub changed: bool,
+}
+
+/// The received-mail candidate filter for one rule or for the preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleCandidateFilter {
+    pub account_id: String,
+    /// The translated search expression; `None` matches every received message.
+    pub expr: Option<SearchExpr>,
+    /// Only messages ingested at or after this instant.
+    pub since: i64,
+    /// Only messages that no earlier `new` run has already applied.
+    pub new_only: bool,
+    /// Clamped to 1..=[`MAX_RULE_CANDIDATES`].
+    pub limit: u32,
+}
+
+/// One candidate page plus the exact total up to the documented cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleCandidatePage {
+    pub messages: Vec<MessageSummary>,
+    pub total: u32,
+    pub total_capped: bool,
+}
+
+/// The largest candidate page a rule run or preview can request.
+pub const MAX_RULE_CANDIDATES: u32 = 2_000;
+
+/// The current folder, read state and labels of one candidate. Undo compares against this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleMessageState {
+    pub folder_id: String,
+    pub folder_kind: FolderKind,
+    pub unread: bool,
+    pub labels: Vec<String>,
+}
+
+/// The loop guard persisted for a received message that carried `Auto-Submitted` or
+/// `X-Postino-Rule`. Stored in the encrypted `meta` table, never as a message column.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuleGuard {
+    pub auto_submitted: bool,
+    /// The incoming message already carries the header this client adds to rule forwards.
+    pub x_postino_rule: bool,
+}
+
+impl RuleGuard {
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.auto_submitted || self.x_postino_rule
+    }
+}
+
 /// The editable fields of a draft. The store owns `revision` and increments it on every save.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftUpdate {

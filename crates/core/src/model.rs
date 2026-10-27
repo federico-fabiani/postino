@@ -389,6 +389,111 @@ pub struct SavedSearch {
     pub index_pending: bool,
 }
 
+/// One action of a local rule (P9c). The tag is the action; a rule carries 1-5 actions and at most
+/// one of each kind. A forward carries 1-10 recipients and is only ever queued through P7.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuleAction {
+    /// Move the message to a regular folder of the same account.
+    Move { folder: String },
+    /// Add a local label.
+    Label { label: String },
+    /// Mark the message read.
+    Read,
+    /// Mark the message unread.
+    Unread,
+    /// Move the message to the account's Trash folder.
+    Trash,
+    /// Forward the message through the outbox, 1-10 recipients.
+    Forward { to: Vec<Address> },
+}
+
+impl RuleAction {
+    /// The journal/storage tag, never localized.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Move { .. } => "move",
+            Self::Label { .. } => "label",
+            Self::Read => "read",
+            Self::Unread => "unread",
+            Self::Trash => "trash",
+            Self::Forward { .. } => "forward",
+        }
+    }
+}
+
+/// One local rule as the operations and the UI see it. `valid` is computed against the current
+/// folders and labels: a deleted target is shown as stale and fails at run time, never silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rule {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub priority: i64,
+    pub stop: bool,
+    /// The documented search language.
+    pub query: String,
+    pub actions: Vec<RuleAction>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+/// Which messages a run considers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleRunScope {
+    /// Messages no earlier `new` run has applied.
+    #[default]
+    New,
+    /// Every received message since the rule was created, up to the 2 000-message cap.
+    All,
+}
+
+/// One run summary. The journal holds ids, folders, labels and booleans only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleRun {
+    pub id: String,
+    pub account_id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub mode: RuleRunScope,
+    pub rule_count: u32,
+    pub matched: u32,
+    pub changed: u32,
+    pub errors: u32,
+    pub undone: bool,
+}
+
+/// How an action would change one previewed message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleEffectStatus {
+    /// The action would change the message.
+    Apply,
+    /// The message is already in that state.
+    NoOp,
+    /// The action is deliberately skipped, for example a forward loop guard.
+    Skip,
+}
+
+/// One action's effect in `rules_preview`. The UI localizes the action and the status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulePreviewEffect {
+    pub action: RuleAction,
+    pub status: RuleEffectStatus,
+}
+
+/// One previewed message and the effects the hypothetical rule would have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulePreviewRow {
+    pub message: MessageSummary,
+    pub effects: Vec<RulePreviewEffect>,
+}
+
 /// The list-row shape. Bodies are fetched separately so a mailbox list stays cheap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSummary {

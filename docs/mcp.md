@@ -87,6 +87,14 @@ agent can read the message and recover.
 | `saved_search_update` | no | Change the name, query and/or sort of one saved search; `account` is required in a multi-account mailbox |
 | `saved_search_delete` | no | Delete one saved search; `account` is required in a multi-account mailbox, local metadata only |
 | `saved_search_recent_clear` | no | Forget one account's recent queries from the encrypted `meta` table |
+| `rules_list` | yes | Local rules in `priority ASC, id ASC` with actions and computed `valid`/`error` |
+| `rules_create` | no | Create a validated query plus 1–5 actions (≤ 100 rules; forward gated by `--allow-send`) |
+| `rules_update` | no | Change name/query/actions/priority/stop/enabled; a forward payload is gated by `--allow-send` |
+| `rules_delete` | no | Delete one local rule; past runs stay in the journal |
+| `rules_preview` | yes | First 50 matches plus one typed effect per action; writes nothing |
+| `rules_run` | no | Run enabled rules (`new`/`all`) and return the journaled run plus fixed errors; disabled unless `--allow-send` |
+| `rules_undo` | no | Reverse a run's move/label/read/trash where the message is unchanged; forward ids are reported |
+| `rules_runs` | yes | Newest ≤ 20 runs with mode, counts, errors, finish and undone flag |
 | `labels_list` | yes | Labels with mailbox-wide total and unread counts |
 | `label_create` | no | Create a local label with a semantic colour |
 | `label_update` | no | Rename and/or recolour a label; the id is stable |
@@ -101,12 +109,16 @@ Sending is an explicit opt-in:
 postino mcp --allow-send
 ```
 
-Without the flag, `message_send`, `send_schedule`, `outbox_retry` and `outbox_mark_sent` are still
-listed (so an agent can see why they are unavailable) but carry `"enabled": false` with a
-`disabledReason`, and `tools/call` refuses them before parsing the arguments. `outbox_list`,
-`outbox_cancel` and `send_dry_run` stay available: a dry run writes nothing and a cancel discards a
-queued or permanently failed submission without sending. `outbox_retry` is gated because it can send
-stored bytes, and `outbox_mark_sent` because it resolves an uncertainty a person should resolve.
+Without the flag, `message_send`, `send_schedule`, `outbox_retry`, `outbox_mark_sent` and
+`rules_run` are still listed (so an agent can see why they are unavailable) but carry
+`"enabled": false` with a `disabledReason`, and `tools/call` refuses them before parsing the
+arguments. `outbox_list`, `outbox_cancel`, `send_dry_run`, non-forward rule CRUD and `rules_preview`
+stay available: a dry run writes nothing, a preview writes nothing and a cancel discards a queued or
+permanently failed submission without sending. `outbox_retry` is gated because it can send stored
+bytes, `outbox_mark_sent` because it resolves an uncertainty a person should resolve, and `rules_run`
+because an enabled rule may forward. A `rules_create`/`rules_update` payload containing a forward
+action is refused before the typed parser runs; create the forward rule from the CLI or the desktop
+instead.
 
 **MCP only queues.** The server has no timer and never runs the outbox pass. A `message_send` or
 `send_schedule` call writes the journal row and returns; the message leaves the machine when the
@@ -157,16 +169,17 @@ receives a password: it uses the credential already in the OS keyring.
 Annotations:
 
 - `readOnlyHint`: true for `accounts_list`, `account_test`, `sync_status`, `outbox_list`,
-  `send_dry_run` and every read.
-- `destructiveHint`: true for `account_remove` (it deletes the local cache for one account). Sending
-  and message deletion are not marked destructive: `message_send` is the product's purpose and
-  `outbox_cancel` discards a queued submission, not mail.
+  `send_dry_run`, `rules_list`, `rules_preview`, `rules_runs` and every read.
+- `destructiveHint`: true for `account_remove` (it deletes the local cache for one account),
+  `rules_run` (it changes local mail and may queue a submission) and `rules_delete` (rule metadata
+  only). Sending and message deletion are not marked destructive: `message_send` is the product's
+  purpose and `outbox_cancel` discards a queued submission, not mail.
 - `idempotentHint`: true for reads, `message_flag`, `label_apply`, `label_update` and `outbox_list`.
-  It is false for `outbox_cancel`: a second cancel finds the row already `cancelled` and returns an
-  error, not "no change".
-- `openWorldHint`: true for `account_test`, `sync_now` and `outbox_retry`, which open a connection to
-  the user's own server. `message_send` and `send_schedule` only queue, so they are local; the drain
-  that opens SMTP is the app or the CLI. Everything else is local.
+  It is false for `outbox_cancel` and `rules_run`: a second cancel finds the row already `cancelled`,
+  and a run writes a new journal row even when every action is a no-op.
+- `openWorldHint`: true for `account_test`, `sync_now`, `outbox_retry` and `rules_run`, which can
+  reach the user's own server. `message_send` and `send_schedule` only queue, so they are local; the
+  drain that opens SMTP is the app or the CLI. Everything else is local.
 
 `labels_list`, `label_create`, `label_update`, `label_delete` and `label_apply` are backed by the
 same registry the app and the CLI use. Labels are local metadata: in memory in the demo, in the
@@ -241,6 +254,44 @@ required when the mailbox has several accounts and the row must belong to it. `r
 eight successful queries in the encrypted `meta.recent_searches:<account>` value; only an explicit
 commit records one, and `saved_search_recent_clear` forgets them. Deleting an account deletes that key.
 
+## Local rules over MCP
+
+A rule is `{name, query, actions, priority?, stop?, enabled?}`; `query` is the same search language and
+`actions` is 1–5 objects, at most one per kind:
+
+```json
+{"kind":"move","folder":"archive"}
+{"kind":"label","label":"lbl_3"}
+{"kind":"read"}
+{"kind":"unread"}
+{"kind":"trash"}
+{"kind":"forward","to":[{"name":"","email":"dest@example.com"}]}
+```
+
+Names are 1–48 characters, unique per account ignoring case, and an account holds at most 100 rules.
+Move targets must be regular folders of the same account (not virtual, Drafts or Sent); a label target
+must exist; forward takes 1–10 distinct addresses. A target deleted later leaves `valid:false` with a
+readable `error`; `rules_run` records the failure and carries on with the later rules.
+
+`rules_run` takes `{account?, scope?: "new"|"all"}`. `new` is the default and considers received mail
+ingested after the rule was created and not yet handled; `all` re-evaluates up to 2 000 candidates per
+rule. Only received mail is eligible: Drafts, Sent, Trash and outbox rows are excluded. Rules run in
+`priority ASC, id ASC`; `stop` makes later rules skip a message the rule matched. Each rule queries
+fresh candidates, so a later rule sees an earlier rule's move, label or flag. A repeated action is a
+no-op, a forward resolves to the deterministic outbox key `rule:<rule>:<message>`, and at most 50
+forwards are queued per run. A missing SMTP endpoint fails the action instead of queueing. The result
+is `{run, errors}`; `rules_runs` lists the newest 20 runs, and deletion keeps that history. A
+forward's bytes carry `Auto-Submitted: auto-forwarded` and `X-Postino-Rule: <rule_id>`; incoming mail
+carrying either header is skipped for forwarding and the fact is stored only in the encrypted `meta`
+table.
+
+`rules_preview {account?, query, actions, limit?}` returns `{total, rows, truncated}` with one effect
+per action (`apply`, `no_op`, `skip`) and writes nothing. `rules_undo {id, account?}` reverses a run's
+move/label/read/trash actions only for messages still in the state the run left; it returns
+`{run, restored, skipped, forwards}` where `forwards` names outbox rows that were deliberately not
+undone. `rules_run` is destructive/open-world, `rules_delete` is destructive, `rules_preview` and
+`rules_runs` are read-only, and none is sensitive. Without `--allow-send`, `rules_run` and any forward
+payload in `rules_create`/`rules_update` are refused.
 
 `draft_save` refuses CR/LF in addresses or the subject, validates every recipient, and returns the
 draft with a stable id. **It is a patch on update:** every content field (`to`, `cc`, `bcc`,
@@ -273,9 +324,10 @@ an alias of `postino send --draft <id>`, and both now submit for real.
 
 - The server is opt-in and stdio-only; there is no network listener.
 - The daemon pipe (M4) will be same-user and token-authenticated.
-- Sending is off unless `postino mcp --allow-send`; `message_send`, `send_schedule`, `outbox_retry` and
-  `outbox_mark_sent` are refused before the arguments are read. The server never runs the outbox pass:
-  it only queues. An uncertain submission is never retried automatically; a manual retry requires
+- Sending is off unless `postino mcp --allow-send`; `message_send`, `send_schedule`, `outbox_retry`,
+  `outbox_mark_sent` and `rules_run` are refused before the arguments are read, and a rule payload
+  containing a forward action is refused before parsing. The server never runs the outbox pass: it
+  only queues. An uncertain submission is never retried automatically; a manual retry requires
   `confirm: true`.
 - Tool arguments are validated against `deny_unknown_fields`; typos are rejected rather than
   ignored.

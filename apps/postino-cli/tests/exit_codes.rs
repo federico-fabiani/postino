@@ -195,6 +195,35 @@ fn threads_and_saved_searches_round_trip_through_the_cli() {
 }
 
 #[test]
+fn rules_round_trip_through_the_cli_surface() {
+    let (code, stdout, stderr) =
+        run(&["--demo", "rules", "create", "Fatture", "subject:fattura", "--action", "label:lbl_3", "--action", "read", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("\"kind\": \"label\""), "{stdout}");
+    assert!(stdout.contains("\"kind\": \"read\""), "{stdout}");
+    assert!(stdout.contains("\"id\": \"rule_1\""), "{stdout}");
+
+    let (code, stdout, stderr) = run(&["--demo", "rules", "preview", "subject:fattura", "--action", "read", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("\"total\": 1"), "the demo has one fattura: {stdout}");
+    assert!(stdout.contains("\"status\": \"apply\""), "{stdout}");
+
+    let (code, stdout, stderr) = run(&["--demo", "rules", "run", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("\"rule_count\": 0"), "a fresh demo has no rules: {stdout}");
+    let (code, stdout, stderr) = run(&["--demo", "rules", "runs", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("\"runs\""), "{stdout}");
+
+    let (code, _, stderr) = run(&["--demo", "rules", "create", "Rotta", "subject:fattura", "--action", "move:", "--json"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("needs a value"), "{stderr}");
+    let (code, _, stderr) = run(&["--demo", "rules", "create", "Inoltro", "subject:fattura", "--action", "forward:not-an-address"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("invalid forward recipient"), "{stderr}");
+}
+
+#[test]
 fn a_bad_saved_search_is_a_usage_error_and_writes_nothing() {
     let (code, _, stderr) = run(&["--demo", "saved", "create", "Rotta", "subject:\"unclosed"], None);
     assert_eq!(code, 2, "{stderr}");

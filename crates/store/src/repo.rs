@@ -147,6 +147,10 @@ impl Store {
             [account_id],
         )?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'reply_to:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
+        tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_guard:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
+        tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_run_mode:' || id FROM rule_runs WHERE account_id = ?1)", [account_id])?;
+        tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_run_undone:' || id FROM rule_runs WHERE account_id = ?1)", [account_id])?;
+        tx.execute("DELETE FROM rule_runs WHERE account_id = ?1", [account_id])?;
         tx.execute("DELETE FROM messages WHERE account_id = ?1", [account_id])?;
         tx.execute("DELETE FROM drafts WHERE account_id = ?1", [account_id])?;
         tx.execute("DELETE FROM account_servers WHERE account_id = ?1", [account_id])?;
@@ -246,6 +250,19 @@ impl Store {
     pub fn get_outbox(&self, id: &str) -> Result<Option<OutboxEntry>, StoreError> {
         self.conn
             .query_row(&format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE id = ?1"), [id], row_to_outbox)
+            .optional()
+            .map_err(|error| corrupt_on_decode("outbox", error))
+    }
+
+    /// The newest row with one idempotency key, whatever its state. A rule forward uses the key as
+    /// its dedupe: two runs over the same message must resolve to the same row.
+    pub fn outbox_by_key(&self, key: &str) -> Result<Option<OutboxEntry>, StoreError> {
+        self.conn
+            .query_row(
+                &format!("SELECT {OUTBOX_COLUMNS} FROM outbox WHERE idempotency_key = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1"),
+                [key],
+                row_to_outbox,
+            )
             .optional()
             .map_err(|error| corrupt_on_decode("outbox", error))
     }
@@ -804,6 +821,8 @@ impl Store {
         tx.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
         tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
+        let guard_key = format!("{}{id}", crate::rules::RULE_GUARD_KEY_PREFIX);
+        tx.execute("DELETE FROM meta WHERE key = ?1", [guard_key])?;
         tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
         if let Some((folder, thread, account)) = &row {
             refresh_folder_counts(&tx, folder)?;

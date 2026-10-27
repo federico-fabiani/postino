@@ -51,6 +51,30 @@ fn a_synced_reply_to_is_persisted_for_the_reply_composer() {
 }
 
 #[test]
+fn loop_guard_headers_are_recorded_for_received_mail() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let mut guarded = synthetic_message(1);
+    let raw = String::from_utf8_lossy(&guarded.raw).replacen(
+        "From: Synthetic Sender <synthetic1@example.test>",
+        "From: Synthetic Sender <synthetic1@example.test>\r\nAuto-Submitted: auto-forwarded\r\nX-Postino-Rule: rule_1",
+        1,
+    );
+    guarded.raw = raw.into_bytes();
+    let plain = TestMessage::synthetic(synthetic_message(2));
+    let server = RunningServer::start(one_inbox(10, vec![TestMessage::synthetic(guarded), plain]));
+    sync(&store, &server).expect("sync with loop headers");
+    server.finish();
+
+    let guarded = message_by_header(&store, "synthetic-1@example.test");
+    let plain = message_by_header(&store, "synthetic-2@example.test");
+    let guard = store.rule_guard(&guarded.summary.id).expect("guard");
+    assert!(guard.auto_submitted && guard.x_postino_rule, "{guard:?}");
+    assert!(!store.rule_guard(&plain.summary.id).expect("plain").any(), "a normal message writes no guard");
+    assert!(store.get_meta(&format!("rule_guard:{}", plain.summary.id)).expect("meta").is_none());
+}
+
+#[test]
 fn status_is_absent_before_the_first_run() {
     let harness = Harness::new();
     let store = seeded(&harness);

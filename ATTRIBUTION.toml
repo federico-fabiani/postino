@@ -691,6 +691,66 @@ license_file = "LICENSE-MIT"
 sha256 = "59a665cf61643ba4f25ee49f8fefb54e966d42335fbd3ac45694ac2c610cc7f6"
 usage = "Documentation screenshot of dark-theme saved searches and recent queries at the minimum window"
 
+[[asset]]
+path = "docs/images/postino-p9c-rules-980.png"
+title = "Postino rules list and editor at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "29ec05481a4b424d679a7f0323ac2cbb5004e8a50a0cf1fc48546d8092388193"
+usage = "Documentation screenshot of the local rule list, editor actions, priority and recent runs at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p9c-rules-980-dark.png"
+title = "Postino rules list and editor at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "5b1535c15161fb26abe6382af58901df7112fcfbe283eca69e6c8686cd1c8ce2"
+usage = "Documentation screenshot of dark-theme local rules at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p9c-rule-editor-980.png"
+title = "Postino rule editor at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "f07595bc0249072d07467057b8c58c4d9202949c5dc230cf4c2bc15d5c144305"
+usage = "Documentation screenshot of a prefilled rule editor with actions and the disabled forward reason"
+
+[[asset]]
+path = "docs/images/postino-p9c-rule-editor-980-dark.png"
+title = "Postino rule editor at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "5af1d8b4f239466d503fe5f27fdd9f7189b31e0fa0b2c61af0078e7d487a9c68"
+usage = "Documentation screenshot of the dark-theme rule editor"
+
+[[asset]]
+path = "docs/images/postino-p9c-rule-preview-980.png"
+title = "Postino rule preview at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "681eecfafad4e97515c1ea1bce96b1d8002762ca6d75d6ca43e66594dc72f02e"
+usage = "Documentation screenshot of the read-only rule preview with one effect per action"
+
+[[asset]]
+path = "docs/images/postino-p9c-rule-preview-980-dark.png"
+title = "Postino rule preview at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "d5add86c58bc837803182ddd843ba9c5879d4bd575adbe9ad14fdf26cdeddbdc"
+usage = "Documentation screenshot of the dark-theme rule preview"
+
 [[dependency]]
 name = "Phosphor Icons"
 version = "bundled with egui-phosphor 0.14.0"

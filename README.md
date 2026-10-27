@@ -10,7 +10,8 @@ registry shared by the desktop app, the CLI and an MCP server.
 > submission and the outbox (P7) + compose depth: attachment bytes, per-account signatures and
 > reply/forward headers (P8) + encrypted FTS5 search with a documented query language, a
 > body-free read path and schema v7 (P9a) + conversations from the reference chain, thread
-> operations, the one-open-card conversation view and saved searches (P9b).** The desktop app opens
+> operations, the one-open-card conversation view and saved searches (P9b) + local rules with
+> preview, idempotent runs, undo and forwarding through the P7 outbox (P9c).** The desktop app opens
 > the encrypted SQLCipher store by default,
 > offers a guided Aruba/Gmail/custom onboarding with a real connection test and background sync, and
 > reads cached mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI
@@ -36,6 +37,11 @@ registry shared by the desktop app, the CLI and an MCP server.
 ![An open conversation at 980×600: one expanded card, the others one click away](docs/images/postino-p9b-conversation-980.png)
 
 ![Saved searches at 980×600: RICERCHE under ETICHETTE and an applied query](docs/images/postino-p9b-saved-searches-980.png)
+
+![Local rules at 980×600: the rule list, condition, priority, actions and recent runs](docs/images/postino-p9c-rules-980.png)
+![The same rule editor in the dark theme](docs/images/postino-p9c-rules-980-dark.png)
+![The rule editor with a 20-match preview and the enabled/stop controls](docs/images/postino-p9c-rule-editor-980.png)
+![A rule preview at 980×600: the first matches and one effect per action, with nothing written](docs/images/postino-p9c-rule-preview-980.png)
 
 ![Encrypted search at 980×600: query chips, syntax help and bm25-ranked results](docs/images/postino-p9a-search.png)
 
@@ -88,15 +94,16 @@ MCP      ─┘
   reading width), data (store and blob paths with a copy action, open the blob folder) and version,
   licences and shortcuts; every section fits 980×600 and returns focus to the account switcher on
   `Esc`.
-- Forty typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
+- Forty-eight typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
   `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_flag`, `message_move`,
   `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
   `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`,
   `search_status`, `search_reindex`, `threads_list`, `thread_get`, `thread_flag`,
   `saved_searches_list`, `saved_search_create`, `saved_search_update`, `saved_search_delete`,
-  `saved_search_recent_clear`, `labels_list`, `label_create`, `label_update`, `label_delete`,
-  `label_apply`.
+  `saved_search_recent_clear`, `rules_list`, `rules_create`, `rules_update`, `rules_delete`,
+  `rules_preview`, `rules_run`, `rules_undo`, `rules_runs`, `labels_list`, `label_create`,
+  `label_update`, `label_delete`, `label_apply`.
 - **Conversations (P9b).** Thread ids come from the message's reference chain: an incoming
   `References`/`In-Reply-To` is normalised, bounded and resolved against the cached conversations; an
   unresolved reference becomes a phantom root waiting for its parent, two resolved threads merge into
@@ -119,6 +126,22 @@ MCP      ─┘
   search field is focused and empty; “Cancella ricerche recenti” clears them. Rename, edit and delete
   are undoable, and `saved_searches_list` plus the four CRUD/recent operations expose the same surface
   to agents.
+- **Local rules (P9c).** The Rules page (Settings → **Regole locali**, or the palette commands
+  **Regole locali**/**Nuova regola**) stores up to 100 rules per account on the encrypted v7 tables.
+  A rule is a validated search query plus 1–5 actions: move to a folder, add a label, read/unread,
+  trash, or forward to 1–10 addresses. Rules run by `priority ASC, id ASC`; **stop** makes later rules
+  skip the messages this one matched. `new` (the default) processes received mail ingested after the
+  rule was created and not yet handled, while `all` re-evaluates up to 2 000 candidates per rule;
+  Drafts, Sent, Trash and outbox rows are never candidates. Actions apply immediately in rule order,
+  a repeated run is a no-op, and a failing target is reported without stopping the later rules.
+  **Anteprima** shows the first 20 matches with one `applica`/`già così`/`salta` effect per action and
+  writes nothing. Every real run is journaled with ids and booleans only (no subject, address or
+  body), the newest 20 runs are kept, and **Annulla esecuzione** reverses move/label/read/trash only
+  on messages still in the state the run left them. A forward is one P7 outbox row with the
+  deterministic `rule:<rule>:<message>` key, `Auto-Submitted` and `X-Postino-Rule`; incoming mail with
+  either header is skipped, and a run queues at most 50. The app disables forward with a visible
+  reason when the account has no SMTP endpoint; MCP refuses `rules_run` and any forward payload
+  without `--allow-send`.
 - **Encrypted search (P9a).** `search` runs on the FTS5 index inside SQLCipher, not over an in-memory
   body vector: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:`, `has:`,
   `before:`/`after:`, `larger:`/`smaller:`, quoted phrases, `*` prefixes and uppercase `AND`/`OR`/`NOT`
@@ -139,8 +162,9 @@ MCP      ─┘
   `postino run` for any operation.
 - Opt-in MCP server over stdio: `postino mcp`. No port, no telemetry.
 - The persistence foundation, now wired into the engine: an encrypted SQLCipher store with schema v7
-  (the v5 outbox, the v6 remote-image count, the v7 search columns/index, the conversation cache and
-  the saved-search/rules tables), additive migrations and a typed repository (`postino-store`), plus
+  (the v5 outbox, the v6 remote-image count, the v7 search columns/index, the conversation cache,
+  saved searches and the rule tables/journal), additive migrations and a typed repository
+  (`postino-store`), plus
   the OS keyring seam (`postino-platform`). `Engine::open` loads summaries once, repairs orphan
   drafts, builds the conversation cache for a P9a store once, writes every mutation through in one
   transaction and keeps store errors categorised; the desktop app boots on the store, with `--demo`
@@ -260,7 +284,8 @@ MCP      ─┘
 
 The last four captures were exported from a 1.25× scaled Windows host, so the PNGs are 1225×750 while
 the layout and every headless test are 980×600. The P9b conversation and saved-search captures use the
-same harness and physical size. The composer still has no schedule control: scheduling is `postino
+same harness and physical size. The P9c rules list, editor and preview captures use the 980×600
+review size in both themes. The composer still has no schedule control: scheduling is `postino
 send --at` or `send_schedule` over MCP until the UI action lands.
 
 Everything below the UI is headless and has no egui dependency.
@@ -287,6 +312,11 @@ cargo run -p postino-cli -- --demo thread flag thr_preventivo --read
 cargo run -p postino-cli -- --demo saved create "Fatture" "label:Fatture" --sort date
 cargo run -p postino-cli -- --demo saved list
 cargo run -p postino-cli -- --demo saved recent-clear
+cargo run -p postino-cli -- --demo rules create "Fatture" "subject:fattura" --action label:lbl_3 --action read --priority 10
+cargo run -p postino-cli -- --demo rules preview "subject:fattura" --action label:lbl_3 --action read
+cargo run -p postino-cli -- --demo rules run
+cargo run -p postino-cli -- --demo rules runs
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" rules undo rule_run_1
 cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" search-status
 cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" search-reindex
 cargo run -p postino-cli -- --demo run messages_list folder=inbox limit=2
@@ -361,11 +391,14 @@ cargo run -p postino-cli -- --demo mcp
 
 The server speaks newline-delimited JSON-RPC 2.0 on stdin/stdout, implements `initialize`,
 `ping`, `tools/list` and `tools/call`, and stops at EOF. It is never started automatically.
-`postino mcp --allow-send` enables `message_send`, `send_schedule`, `outbox_retry` and
-`outbox_mark_sent`; without the flag those tools are listed as disabled with the reason and refused.
-`outbox_list`, `outbox_cancel` and `send_dry_run` stay available: a dry run is read-only and a cancel
-discards a queued or permanently failed row rather than sending one. The MCP server never runs the
-outbox pass — it only queues; the desktop app or `postino send` is what submits.
+`postino mcp --allow-send` enables `message_send`, `send_schedule`, `outbox_retry`,
+`outbox_mark_sent` and `rules_run`; without the flag those tools are listed as disabled with the
+reason and refused. `rules_run` is gated because an enabled rule may forward, and a
+`rules_create`/`rules_update` payload that contains a forward action is refused before the typed
+parser runs; non-forward rule CRUD and `rules_preview` stay available. `outbox_list`, `outbox_cancel`
+and `send_dry_run` also stay available: a dry run is read-only and a cancel discards a queued or
+permanently failed row rather than sending one. The MCP server never runs the outbox pass — it only
+queues; the desktop app or `postino send` is what submits.
 
 Example client configuration:
 

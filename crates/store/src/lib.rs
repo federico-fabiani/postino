@@ -48,6 +48,7 @@
 mod blob;
 mod model;
 mod repo;
+mod rules;
 mod saved;
 mod search;
 mod threads;
@@ -55,11 +56,13 @@ mod threads;
 pub use blob::BlobStore;
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
-    Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
-    SEARCH_TOTAL_CAP, SavedSearch, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer,
-    SyncState, ThreadDetail, ThreadFilter, ThreadPage, ThreadSummary, UidEntry,
+    Label, LabelCount, MAX_REMOTE_IMAGES, MAX_RULE_CANDIDATES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary,
+    OutboxEntry, OutboxState, Rule, RuleActionRecord, RuleCandidateFilter, RuleCandidatePage, RuleGuard, RuleMessageState, RuleRun, SEARCH_TOTAL_CAP,
+    SavedSearch, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer, SyncState,
+    ThreadDetail, ThreadFilter, ThreadPage, ThreadSummary, UidEntry,
 };
 pub use repo::{MAX_OUTBOX_ROWS, UNCERTAIN_AFTER_CRASH};
+pub use rules::{RULE_GUARD_KEY_PREFIX, RULE_RUN_MODE_KEY_PREFIX, RULE_RUN_UNDONE_KEY_PREFIX};
 pub use saved::RECENT_SEARCHES_KEY_PREFIX;
 
 use std::fmt;
@@ -502,6 +505,8 @@ pub enum StoreError {
     Duplicate { entity: &'static str, name: String },
     #[error("this account already has {limit} saved searches; delete one before adding another")]
     SavedSearchLimit { limit: u32 },
+    #[error("this account already has {limit} rules; delete one before adding another")]
+    RuleLimit { limit: u32 },
     #[error("attachment id {id:?} is repeated in the same draft; every attachment needs a unique id")]
     DuplicateAttachment { id: String },
     #[error("attachment id {id:?} belongs to message {owner:?}; omit the id so the engine assigns a new one")]
@@ -622,7 +627,11 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS threads_account_date ON threads(account_id, last_date DESC, id);
              CREATE INDEX IF NOT EXISTS messages_account_message_id ON messages(account_id, message_id);
              CREATE INDEX IF NOT EXISTS messages_account_subject_norm_date ON messages(account_id, subject_norm, date);
-             CREATE INDEX IF NOT EXISTS thread_aliases_account_new ON thread_aliases(account_id, new_id);",
+             CREATE INDEX IF NOT EXISTS thread_aliases_account_new ON thread_aliases(account_id, new_id);
+             -- P9c uniqueness without a second migration: v7 created the rule tables but no
+             -- case-insensitive name index. The table is inert until this build writes it, so the
+             -- index is safe to add on the next normal open; a read-only open never creates it.
+             CREATE UNIQUE INDEX IF NOT EXISTS rules_name ON rules(account_id, name COLLATE NOCASE);",
         )
         .map_err(translate)?;
         let blobs = BlobStore::open(blob_root(path), key)?;

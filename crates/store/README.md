@@ -102,11 +102,12 @@ v7 is additive from v6: derived search columns on `messages` (`search_sender`, `
 `search_cc`, `search_bcc`, `attachment_names`, `subject_norm`, `in_reply_to`, `references_json`,
 `ingested_at`, `rules_applied_at`), the contentless-delete `message_fts` index and rank table with
 their triggers, and the `threads`, `thread_aliases`, `saved_searches`, `rules`, `rule_runs` and
-`rule_actions` tables. P9b uses the conversation cache and saved searches; the P9c rule tables stay
-inert. Normal `Store::open` also creates the derived indexes idempotently
+`rule_actions` tables. P9b uses the conversation cache and saved searches; P9c uses the rule tables
+and their journal. Normal `Store::open` also creates the derived indexes idempotently
 (`threads(account_id,last_date DESC,id)`, `messages(account_id,message_id)`,
-`messages(account_id,subject_norm,date)`, `thread_aliases(account_id,new_id)`) so a P9a store gains
-them without a version bump; a read-only open never writes them.
+`messages(account_id,subject_norm,date)`, `thread_aliases(account_id,new_id)` and the unique
+`rules(account_id,name COLLATE NOCASE)`) so a P9a store gains them without a version bump; a read-only
+open never writes them.
 
 ## Schema v6
 
@@ -133,6 +134,9 @@ IMAP and optional SMTP secrets live in the OS keyring.
 | `threads` | conversation cache: subject, last date, mailbox-wide counts, attachments, latest message (P9b) |
 | `thread_aliases` | old merged thread id → current id (P9b) |
 | `saved_searches` | account, name (unique NOCASE), query, sort and timestamps (P9b) |
+| `rules` | account, name (unique NOCASE at open), enabled, priority, stop, query, action JSON (P9c) |
+| `rule_runs` | run id, account, start/finish, dry, rule/matched/changed/error counts (P9c) |
+| `rule_actions` | run ordinal, rule/message ids, action name, ids/folders/labels/booleans JSON, changed (P9c) |
 | `attachments` | metadata: filename, mime, size, optional blob hash; the bytes live in `blobs/` |
 | `labels` | account-scoped or mailbox-wide, name, semantic colour name |
 | `message_labels` | assignment join, `PRIMARY KEY(message_id, label_id)`, cascade both ways |
@@ -140,7 +144,7 @@ IMAP and optional SMTP secrets live in the OS keyring.
 | `draft_seq` | message id → highest revision ever written; survives a send and a move back |
 | `outbox` | draft id, content-stable idempotency key, state, submission and append attempt counters, due time, lease epoch, fixed error, raw blob hash, envelope JSON (P7) |
 | `sync_state` | per-folder sync cursor: next UID to fetch, `highest_modseq`, `last_error` |
-| `meta` | key/value store from P3a; holds `label_seq`, `draft_id_seq`, `saved_search_seq`, `recent_searches:<account>`, `reply_to:<message>`, `search_index`, `search_updated_at`, `sync_status:<account>` and `outbox_halt:<account>` |
+| `meta` | key/value store from P3a; holds `label_seq`, `draft_id_seq`, `saved_search_seq`, `rule_seq`, `rule_run_seq`, `recent_searches:<account>`, `reply_to:<message>`, `rule_guard:<message>`, `rule_run_mode:<run>`, `rule_run_undone:<run>`, `search_index`, `search_updated_at`, `sync_status:<account>` and `outbox_halt:<account>` |
 
 Indexes cover the hot reads: `messages(folder_id, date DESC)`, `messages(account_id, date DESC)`,
 `messages(account_id, thread_id, date DESC)`, `messages(account_id, message_id)`,
@@ -168,6 +172,12 @@ Plain data structs in `model.rs` (no `postino-core` dependency), methods in `rep
   server's advertised `UIDNEXT`, a different value.
 - labels: `create_label`, `update_label`, `delete_label`, `get_label`, `list_labels` (live counts),
   `apply_label`, `remove_label`, `messages_by_label`, `labels_for`.
+- rules (P9c): `list_rules`, `list_all_rules`, `get_rule`, `create_rule_limited`,
+  `update_rule`, `delete_rule`, `allocate_rule_id`; `rule_candidates` (received mail only,
+  `ingested_at`/`rules_applied_at` filters, typed search expression), `rule_message_state`,
+  `mark_rules_applied`; `create_rule_run`, `finish_rule_run`, `append_rule_action`,
+  `list_rule_runs`, `get_rule_run`, `rule_run_actions`, `mark_rule_run_undone`,
+  `prune_rule_runs`, `allocate_rule_run_id`; and the encrypted `set_rule_guard`/`rule_guard`.
 - attachments: `replace_attachments`, `attachments`, `list_all_attachments`, `find_attachment`
   (one row plus its message id) and `set_attachment_blob_hash(message, attachment, hash, size)`,
   which the engine calls after a blob write. `replace_attachments` preserves the hash **and size** of
@@ -246,8 +256,9 @@ cargo test -p postino-store
 
 ## Not here yet
 
-Desktop-app wiring (P6 onboarding), raw-message blobs, the rules engine (P9c), the daemon (M4), key
-rotation and blob garbage collection. `sync_state` and the sync-status `meta` key have writers
+Desktop-app wiring (P6 onboarding), raw-message blobs, the daemon scheduler (M4), key rotation and
+blob garbage collection. P9c's rules live here as data and candidate queries; their action engine
+and forward-through-P7 policy live in `postino-core`. `sync_state` and the sync-status `meta` key have writers
 now: `postino-sync` (P5b) is the client of this crate for received mail. Parsing MIME is not here:
 sync parses and hands over rows and blob hashes. The engine (P3c, P4b) is another client; this crate
 never depends on it.

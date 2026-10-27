@@ -40,6 +40,7 @@ pub(crate) fn write_error(error: StoreError) -> OpError {
         StoreError::SavedSearchLimit { limit } => {
             OpError::InvalidArgs(format!("this account already has {limit} saved searches; delete one before adding another"))
         }
+        StoreError::RuleLimit { limit } => OpError::InvalidArgs(format!("this account already has {limit} rules; delete one before adding another")),
         StoreError::DuplicateAttachment { id } => {
             OpError::InvalidArgs(format!("attachment id {id:?} is repeated in the draft; give every attachment a unique id"))
         }
@@ -178,6 +179,29 @@ pub(crate) fn saved_search(row: store::SavedSearch) -> SavedSearch {
         total: 0,
         unread: 0,
         index_pending: false,
+    }
+}
+
+/// A stored rule. The action JSON is engine-owned; a row that does not decode is returned with an
+/// empty action list and `valid: false`, so the list can show it instead of failing the mailbox.
+pub(crate) fn rule(row: store::Rule) -> crate::model::Rule {
+    let (actions, error) = match serde_json::from_str::<Vec<crate::model::RuleAction>>(&row.actions_json) {
+        Ok(actions) => (actions, None),
+        Err(_) => (Vec::new(), Some("the stored action list is unreadable; edit the rule".to_owned())),
+    };
+    crate::model::Rule {
+        id: row.id,
+        account_id: row.account_id,
+        name: row.name,
+        enabled: row.enabled,
+        priority: row.priority,
+        stop: row.stop,
+        query: row.query,
+        actions,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        valid: error.is_none(),
+        error,
     }
 }
 

@@ -141,11 +141,15 @@ pub(crate) struct OutboxEnvelope {
     pub recipients: Vec<String>,
     pub subject: String,
     pub message_id: String,
-    pub draft_id: String,
+    /// The local draft this row was built from. `None` for a P9c rule forward: it is a standalone
+    /// submission with no draft to move to Sent. A row written by an older build always has one.
+    #[serde(default)]
+    pub draft_id: Option<String>,
     /// The store revision of the draft when it was serialized. The submission only leaves the
     /// machine while the draft still has this revision; a stale connection cannot deliver old bytes
     /// and then label a newer draft as the delivered message. `None` for a row written by a build
-    /// before this field existed: those rows keep the old best-effort behaviour.
+    /// before this field existed or for a rule forward with no draft: those rows keep the old
+    /// best-effort behaviour.
     #[serde(default)]
     pub draft_revision: Option<u32>,
 }
@@ -175,7 +179,7 @@ pub(crate) fn view(entry: &OutboxEntry) -> (OutboxView, Option<String>) {
     let (subject, message_id, draft_id, recipient_count) = match decoded {
         Some(envelope) => {
             let count = envelope.recipients.len();
-            (envelope.subject, envelope.message_id, Some(envelope.draft_id), count)
+            (envelope.subject, envelope.message_id, envelope.draft_id, count)
         }
         None => (String::new(), String::new(), None, 0),
     };
@@ -241,7 +245,7 @@ mod tests {
             recipients: vec!["a@example.com".to_owned(), "b@example.com".to_owned()],
             subject: "Prova".to_owned(),
             message_id: "<id@example.com>".to_owned(),
-            draft_id: "draft_1".to_owned(),
+            draft_id: Some("draft_1".to_owned()),
             draft_revision: Some(3),
         };
         let raw = envelope.encode().expect("encode");

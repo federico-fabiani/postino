@@ -327,6 +327,17 @@ pub struct Engine {
     /// Recent successful queries per account, newest first, at most eight. Persisted in the
     /// encrypted `meta` table for a store-backed engine and kept in memory for the demo.
     recent_searches: HashMap<String, Vec<String>>,
+    /// P9c rules in `priority ASC, id ASC` order. The store is authoritative for a persistent
+    /// engine; the demo keeps the same rows in memory.
+    pub(crate) rules: Vec<crate::model::Rule>,
+    /// Next demo rule number. A store-backed engine uses the store's monotonic meta counter.
+    pub(crate) next_rule_seq: u32,
+    /// Demo-only rule journal. A store-backed engine writes `rule_runs`/`rule_actions`.
+    pub(crate) rule_runs: Vec<crate::model::RuleRun>,
+    pub(crate) rule_run_actions: HashMap<String, Vec<postino_store::RuleActionRecord>>,
+    pub(crate) next_rule_run_seq: u32,
+    /// Demo-only `rules_applied_at`: messages a `new` run has already considered.
+    pub(crate) demo_rules_applied: BTreeSet<String>,
 }
 
 /// The computed half of a saved-search row.
@@ -374,6 +385,12 @@ impl Engine {
             next_saved_search_seq: 1,
             saved_counts: RefCell::new(None),
             recent_searches: HashMap::new(),
+            rules: Vec::new(),
+            next_rule_seq: 1,
+            rule_runs: Vec::new(),
+            rule_run_actions: HashMap::new(),
+            next_rule_run_seq: 1,
+            demo_rules_applied: BTreeSet::new(),
         }
     }
 
@@ -497,6 +514,7 @@ impl Engine {
         // so the first `threads_list` is a cache read and never a full derivation.
         store.ensure_thread_cache().map_err(store_map::read_error)?;
         let saved_searches = store.list_saved_searches(None).map_err(store_map::read_error)?.into_iter().map(store_map::saved_search).collect();
+        let rules = store.list_all_rules().map_err(store_map::read_error)?.into_iter().map(store_map::rule).collect::<Vec<_>>();
         let mut recent_searches = HashMap::new();
         for account in &accounts {
             let recent = store.recent_searches(&account.id).map_err(store_map::read_error)?;
@@ -512,6 +530,14 @@ impl Engine {
         engine.reply_links = reply_links;
         engine.draft_snapshots = draft_snapshots;
         engine.saved_searches = saved_searches;
+        engine.rules = rules;
+        engine.next_rule_seq = engine
+            .rules
+            .iter()
+            .filter_map(|rule| rule.id.strip_prefix("rule_").and_then(|rest| rest.parse::<u32>().ok()))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         engine.next_saved_search_seq = engine
             .saved_searches
             .iter()
@@ -577,6 +603,12 @@ impl Engine {
             next_saved_search_seq: 1,
             saved_counts: RefCell::new(None),
             recent_searches: HashMap::new(),
+            rules: Vec::new(),
+            next_rule_seq: 1,
+            rule_runs: Vec::new(),
+            rule_run_actions: HashMap::new(),
+            next_rule_run_seq: 1,
+            demo_rules_applied: BTreeSet::new(),
         };
         engine.rebuild_message_index();
         engine.recount();
@@ -671,7 +703,7 @@ impl Engine {
         self.message_index = self.messages.iter().enumerate().map(|(index, message)| (message.id.clone(), index)).collect();
     }
 
-    fn bump_revision(&mut self) {
+    pub(crate) fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.body_cache.borrow_mut().clear();
     }
@@ -1736,6 +1768,10 @@ impl Engine {
         self.folders.retain(|folder| folder.account_id != account.id);
         self.messages.retain(|message| !folder_ids.contains(&message.folder_id));
         self.saved_searches.retain(|saved| saved.account_id != account.id);
+        self.rules.retain(|rule| rule.account_id != account.id);
+        self.rule_runs.retain(|run| run.account_id != account.id);
+        self.rule_run_actions.retain(|run_id, _| self.rule_runs.iter().any(|run| run.id == *run_id));
+        self.demo_rules_applied.clear();
         self.recent_searches.remove(&account.id);
         *self.saved_counts.borrow_mut() = None;
         self.rebuild_message_index();
@@ -1802,6 +1838,11 @@ impl Engine {
             )
         });
         let reload = self.reload_mailbox();
+        // P9c runs after a sync, on received mail only. A rule failure is journaled and returned by
+        // `rules_run`; it must never turn a successful sync into a failed one.
+        if self.rules.iter().any(|rule| rule.account_id == account.id && rule.enabled) {
+            let _ = self.run_rules(Some(&account.id), crate::model::RuleRunScope::New);
+        }
         finish_sync(result, reload).map(crate::ops::SyncReport::from)
     }
 
@@ -1908,7 +1949,7 @@ impl Engine {
     /// Re-read folders, messages, attachments and blob hashes from the store after a sync. Labels,
     /// the label sequence and the account list are untouched: sync never changes them, and a label
     /// assignment lives in the store anyway.
-    fn reload_mailbox(&mut self) -> Result<(), OpError> {
+    pub(crate) fn reload_mailbox(&mut self) -> Result<(), OpError> {
         let Some(store) = &self.store else {
             return Ok(());
         };
@@ -2524,7 +2565,7 @@ impl Engine {
             recipients: serialized.envelope.recipients.clone(),
             subject: _message.summary.subject.clone(),
             message_id: serialized.message_id.clone(),
-            draft_id: draft_id.to_owned(),
+            draft_id: Some(draft_id.to_owned()),
             draft_revision: revision,
         };
         let envelope_json = payload.encode().map_err(|error| OpError::Failed(format!("could not encode the envelope: {error}")))?;
@@ -2626,6 +2667,7 @@ impl Engine {
             // persisted from the incoming message.
             references: self.reply_links.get(draft_id).cloned().into_iter().collect(),
             message_id: None,
+            extra_headers: Vec::new(),
         };
         let serialized = postino_sync::serialize_submission(&submission)
             .map_err(|error| OpError::InvalidArgs(format!("the message cannot be serialized: {error}")))?;
@@ -2801,8 +2843,10 @@ impl Engine {
                 // delivered; leave everything alone and tell the caller to refresh.
                 return Err(OpError::Failed("the outbox row changed state before it could be marked sent; refresh the outbox".to_owned()));
             }
-            if let Some(envelope) = OutboxEnvelope::decode(&entry.envelope_json) {
-                let _ = self.finalize_outbox_draft(&envelope.draft_id, Some(&envelope.message_id), envelope.draft_revision, &store);
+            if let Some(envelope) = OutboxEnvelope::decode(&entry.envelope_json)
+                && let Some(draft_id) = envelope.draft_id.as_deref()
+            {
+                let _ = self.finalize_outbox_draft(Some(draft_id), Some(&envelope.message_id), envelope.draft_revision, &store);
             }
             let entry = store.get_outbox(id).map_err(store_map::read_error)?.unwrap_or(entry);
             let (view, _warning) = view(&entry);
@@ -2961,7 +3005,7 @@ impl Engine {
                     return Ok(());
                 }
                 let already_on_server = match self.finalize_outbox_draft(
-                    &envelope.draft_id,
+                    envelope.draft_id.as_deref(),
                     Some(&envelope.message_id),
                     envelope.draft_revision,
                     store,
@@ -3108,7 +3152,7 @@ impl Engine {
         if !store.finish_outbox_append(&entry.id, lease).map_err(|_| format!("outbox row {:?}: lo stato non è aggiornabile.", entry.id))? {
             return Err(format!("la riga {:?} è cambiata mentre la copia in Inviati veniva salvata; stato lasciato com'è.", entry.id));
         }
-        let _ = self.finalize_outbox_draft(&envelope.draft_id, Some(&envelope.message_id), envelope.draft_revision, store);
+        let _ = self.finalize_outbox_draft(envelope.draft_id.as_deref(), Some(&envelope.message_id), envelope.draft_revision, store);
         Ok(())
     }
 
@@ -3123,11 +3167,14 @@ impl Engine {
     /// taken.
     fn finalize_outbox_draft(
         &mut self,
-        draft_id: &str,
+        draft_id: Option<&str>,
         message_id: Option<&str>,
         expected_revision: Option<u32>,
         store: &Store,
     ) -> Result<FinalizeOutcome, OpError> {
+        // A rule forward has no local draft: the server Sent copy is the only local trace, and a
+        // later sync caches it. There is nothing to move and nothing to label.
+        let Some(draft_id) = draft_id else { return Ok(FinalizeOutcome::NotADraft) };
         let Some(summary) = self.summary(draft_id) else {
             return Ok(FinalizeOutcome::NotADraft);
         };
@@ -3851,10 +3898,10 @@ fn lost_lease_sentence(entry: &OutboxEntry) -> String {
 /// Why a leased submission must not leave the machine: the draft it was built from is gone or has a
 /// different store revision. `None` when the row predates the snapshot field or still matches.
 fn stale_submission_reason(store: &Store, envelope: &OutboxEnvelope) -> Result<Option<&'static str>, OpError> {
-    let Some(expected) = envelope.draft_revision else {
+    let (Some(draft_id), Some(expected)) = (envelope.draft_id.as_deref(), envelope.draft_revision) else {
         return Ok(None);
     };
-    match store.get_draft(&envelope.draft_id).map_err(store_map::read_error)? {
+    match store.get_draft(draft_id).map_err(store_map::read_error)? {
         None => Ok(Some("la bozza non esiste più; il messaggio non è stato inviato")),
         Some(draft) if draft.revision != expected => Ok(Some("la bozza è cambiata dopo l'accodamento; il messaggio non è stato inviato")),
         Some(_) => Ok(None),
@@ -4074,7 +4121,7 @@ fn validate_label_name(name: &str) -> Result<String, OpError> {
     Ok(name.to_owned())
 }
 
-fn is_bidi_or_format_control(character: char) -> bool {
+pub(crate) fn is_bidi_or_format_control(character: char) -> bool {
     matches!(character, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
 }
 
@@ -4131,7 +4178,7 @@ fn validate_draft(draft: &DraftContent) -> Result<(), OpError> {
     validate_attachments(&draft.attachments)
 }
 
-fn validate_addresses(field: &str, addresses: &[Address]) -> Result<(), OpError> {
+pub(crate) fn validate_addresses(field: &str, addresses: &[Address]) -> Result<(), OpError> {
     if addresses.len() > MAX_RECIPIENTS_PER_FIELD {
         return Err(OpError::InvalidArgs(format!("{field} has more than {MAX_RECIPIENTS_PER_FIELD} recipients")));
     }

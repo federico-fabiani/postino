@@ -1,8 +1,8 @@
 # Postino roadmap
 
-> **Current milestone:** M2 complete for SMTP/outbox and compose depth (P7/P8); M3 organize has
-> started with encrypted search (P9a) and conversations/saved searches (P9b). Local rules (P9c), full draft APPEND
-> and HTML compose remain · **Last updated:** 2026-10-26
+> **Current milestone:** M2 complete for SMTP/outbox and compose depth (P7/P8); M3 organize is
+> complete with encrypted search (P9a), conversations/saved searches (P9b) and local rules (P9c).
+> Full draft APPEND, attachment preview/save and HTML compose remain · **Last updated:** 2026-10-27
 >
 > M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
 > desktop app reads and syncs a real mailbox from the encrypted cache. M2 has started with SMTP,
@@ -165,18 +165,30 @@ interaction model before real mail makes them expensive to change. Full spec:
       architecture table; RSS is unverified (154.7–156.5 MiB is the seeding process, not an opened
       mailbox).
 - [x] Flags, move, archive, delete and undo; spam classification is out of scope for M3.
-- [x] Tags/labels; local rules (move, tag, read, delete, forward), rule preview remain P9c.
+- [x] Local rules (P9c): a validated query plus 1-5 actions (move, label, read/unread, trash,
+      forward), `priority ASC, id ASC` with `stop`, ≤100 rules and ≤5 actions per account. `new`
+      runs after `sync_now` or on demand on received mail ingested after the rule was created;
+      `all` re-evaluates up to 2 000 candidates per rule. Actions apply immediately in rule order so
+      later rules see earlier effects, repeats are no-ops, a failed target is journaled without
+      stopping the later rules, and `sync_now` never fails because of a rule. The journal holds
+      ids/folders/labels/booleans only, keeps 20 runs, and undo reverses move/label/read/trash only
+      on messages still in the state the run left. A forward is one P7 outbox row keyed
+      `rule:<rule>:<message>`, carries `Auto-Submitted`/`X-Postino-Rule`, skips loop-guarded mail and
+      is capped at 50/run; MCP gates it behind `--allow-send`. Rules page, preview, CLI/MCP parity and
+      980×600 light/dark captures.
 - [ ] Attachment preview/save with path confinement.
 - [ ] Verify: thread fixtures, rule idempotency, no path escape. The search, real-ingest and
       account-wide thread halves of the 100k gate are proven; the folder thread view and open/RSS
-      halves remain open.
+      halves remain open. P9c proves rule priority/stop, later-rule effects, idempotency, preview
+      writes nothing, state-checked undo, forward dedupe/loop/caps/no-SMTP, failure isolation and the
+      new-vs-old horizon.
 
 ## M4 — live in the background
 
 - [ ] `postino-daemon` owns the store, sync and scheduler.
 - [ ] JSON-RPC over a named pipe/UDS with a per-launch token; autostart and tray.
 - [ ] App/CLI/MCP become clients; "daemon not running" is a normal state.
-- [ ] Scheduled send, undo send, local rules, notifications.
+- [ ] Scheduled send, undo send, automatically running local rules while the app is closed, notifications.
 - [ ] Single-instance and crash recovery.
 - [ ] Verify: two clients (app + CLI) mutate one store; scheduled mail sends with the app closed;
       daemon restart loses no outbox entry.

@@ -28,6 +28,7 @@ fn message() -> OutgoingMessage {
         in_reply_to: Some("parent@example.com".to_owned()),
         references: vec!["root@example.com".to_owned(), "parent@example.com".to_owned()],
         message_id: None,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -107,6 +108,33 @@ fn injection_is_rejected_not_stripped() {
     let mut injected = message();
     injected.from.address = "giulia@example.com\r\nBcc: evil@example.com".to_owned();
     assert!(matches!(serialize(&injected), Err(MimeError::HeaderInjection { header: "From" })));
+}
+
+#[test]
+fn extra_headers_are_written_in_order_and_stay_closed() {
+    let mut with_headers = message();
+    with_headers.extra_headers = vec![("Auto-Submitted".to_owned(), "auto-forwarded".to_owned()), ("X-Postino-Rule".to_owned(), "rule_1".to_owned())];
+    let serialized = serialize(&with_headers).expect("serialize");
+    let raw = raw_text(&serialized);
+    assert!(raw.contains("Auto-Submitted: auto-forwarded\r\n"), "{raw}");
+    assert!(raw.contains("X-Postino-Rule: rule_1\r\n"), "{raw}");
+    assert!(raw.find("Auto-Submitted").zip(raw.find("X-Postino-Rule")).is_some_and(|(left, right)| left < right));
+
+    let mut reserved = message();
+    reserved.extra_headers = vec![("Subject".to_owned(), "secondo".to_owned())];
+    assert!(matches!(serialize(&reserved), Err(MimeError::Encode { .. })));
+
+    let mut duplicate = message();
+    duplicate.extra_headers = vec![("X-Test".to_owned(), "one".to_owned()), ("x-test".to_owned(), "two".to_owned())];
+    assert!(matches!(serialize(&duplicate), Err(MimeError::Encode { .. })));
+
+    let mut injected = message();
+    injected.extra_headers = vec![("X-Test".to_owned(), "ok\r\nBcc: evil@example.com".to_owned())];
+    assert!(matches!(serialize(&injected), Err(MimeError::HeaderInjection { header: "extra header" })));
+
+    let mut too_many = message();
+    too_many.extra_headers = (0..9).map(|index| (format!("X-Test-{index}"), "ok".to_owned())).collect();
+    assert!(matches!(serialize(&too_many), Err(MimeError::Encode { .. })));
 }
 
 #[test]

@@ -18,6 +18,7 @@ pub mod model;
 pub mod ops;
 pub mod outbox;
 mod reply;
+mod rules;
 pub mod search;
 mod store_map;
 pub mod vault;
@@ -28,17 +29,23 @@ pub use engine::{
 };
 pub use model::{
     Account, AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary,
-    Provider, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
+    Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect, RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings,
+    SmtpSettings, ThreadSummary,
 };
 pub use ops::{
     AccountAdd, AccountRemove, AccountSignature, AccountTest, AccountUpdate, AccountsList, AppInfo, DraftAttachmentResult, DraftSave, DryRunResult,
     FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageFlag, MessageGet, MessagesList, OpDef, OutboxAction,
-    OutboxListResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchHit,
-    SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView,
-    ThreadFlagOutput, ThreadGetResult, ThreadsListResult, op_defs,
+    OutboxListResult, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult,
+    SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchHit, SearchReindexResult, SearchResult,
+    SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView, ThreadFlagOutput, ThreadGetResult,
+    ThreadsListResult, op_defs,
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
 pub use postino_sync::{SyncPhase, SyncStatus};
 pub use reply::{ReplyMode, ReplyPrefill, compose_reply, forward_subject, new_message_body, quote_body, reply_subject, signature_block};
+pub use rules::{
+    MAX_FORWARD_RECIPIENTS, MAX_KEPT_RUNS, MAX_PREVIEW_ROWS, MAX_RULE_ACTIONS, MAX_RULES, MAX_RUN_FORWARDS, MAX_RUN_MESSAGES, RuleRunOutcome,
+    RuleUndoOutcome,
+};
 pub use search::{Expr as SearchExpr, Field as SearchField, IsFilter, ParsedQuery, SearchError, Snippet, make_snippet, parse as parse_search};
 pub use vault::{CredentialVault, VaultError};

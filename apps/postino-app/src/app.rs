@@ -23,6 +23,7 @@ use serde_json::json;
 use crate::boot::{self, BootFailure, Launch, StoreHandle};
 use crate::onboarding::{self, ConnectionError, ErrorKind, FocusField, FolderPreview, FolderRole, FoldersPreview, Onboarding, ProviderChoice, Stage};
 use crate::reading::{self, DangerousKind, ExtractedLink};
+use crate::rules_ui::RulesPage;
 use crate::seams::{
     CancellingFileSaver, FilePicker, FileSaver, FolderOpener, LinkOpener, RfdFilePicker, RfdFileSaver, SystemFolderOpener, SystemLinkOpener,
     UnavailableFilePicker, UnavailableFolderOpener, UnavailableLinkOpener,
@@ -75,6 +76,9 @@ pub enum ScreenshotState {
     Threads,
     Conversation,
     SavedSearches,
+    Rules,
+    RuleEditor,
+    RulePreview,
 }
 
 impl ScreenshotState {
@@ -109,11 +113,14 @@ impl ScreenshotState {
             "threads" => Ok(Self::Threads),
             "conversation" => Ok(Self::Conversation),
             "saved_searches" => Ok(Self::SavedSearches),
+            "rules" => Ok(Self::Rules),
+            "rule_editor" => Ok(Self::RuleEditor),
+            "rule_preview" => Ok(Self::RulePreview),
             other => Err(format!(
                 "unknown screenshot state {other:?}; expected one of: shell, reading, reading_full, compose, palette, labels, label_menu, label_editor, \
                  empty_unread, empty_attachments, empty_label_unread, onboarding_welcome, onboarding_provider, onboarding_form, onboarding_error, \
                  onboarding_folders, onboarding_sync, mailbox, offline, reading_attachments, link_confirm, settings, settings_signature, outbox, \
-                 search, search_error, threads, conversation, saved_searches"
+                 search, search_error, threads, conversation, saved_searches, rules, rule_editor, rule_preview"
             )),
         }
     }
@@ -203,6 +210,9 @@ pub struct PostinoApp {
     last_sync: Option<i64>,
     show_accounts_menu: bool,
     show_accounts_dialog: bool,
+    /// The P9c Rules page. A full-page modal over the shell; opening it is a command, not a new
+    /// route, so the mailbox keeps its selection and scroll state.
+    rules_page: Option<RulesPage>,
     account_remove: Option<AccountRemoveState>,
     /// Extra trust anchors for the fake server in tests. Empty in production.
     extra_roots: Vec<CertificateDer<'static>>,
@@ -471,6 +481,7 @@ impl PostinoApp {
             last_sync,
             show_accounts_menu: false,
             show_accounts_dialog: false,
+            rules_page: None,
             account_remove: None,
             extra_roots,
             selected: None,
@@ -906,6 +917,43 @@ impl PostinoApp {
                 self.threads_view = false;
                 if let Some(saved) = self.saved_searches.iter().find(|saved| saved.name == "Da Giulia").cloned() {
                     self.apply_saved_search(&saved.id);
+                }
+                self.status.clear();
+                self.toast = None;
+            }
+            ScreenshotState::Rules | ScreenshotState::RuleEditor | ScreenshotState::RulePreview => {
+                let account = self.engine.accounts().first().map(|account| account.id.clone());
+                if let Some(account) = account {
+                    let empty = self.engine.rules_list(Some(&account)).is_ok_and(|rules| rules.is_empty());
+                    if empty {
+                        for (name, query, actions, priority) in [
+                            ("Da Giulia", "from:giulia", json!([{ "kind": "label", "label": "lbl_1" }, { "kind": "read" }]), 10),
+                            ("Fatture", "subject:fattura", json!([{ "kind": "label", "label": "lbl_3" }, { "kind": "read" }]), 20),
+                            ("Newsletter", "subject:newsletter", json!([{ "kind": "move", "folder": "archive" }]), 30),
+                        ] {
+                            let _ = self.engine.call(
+                                "rules_create",
+                                json!({ "name": name, "query": query, "actions": actions, "priority": priority, "account": account }),
+                            );
+                        }
+                        let _ = self.engine.call("rules_run", json!({ "account": account, "scope": "new" }));
+                    }
+                    self.active_account = Some(account);
+                }
+                self.open_rules(false);
+                if state == ScreenshotState::RuleEditor || state == ScreenshotState::RulePreview {
+                    let actions = vec![
+                        postino_core::RuleAction::Move { folder: "archive".to_owned() },
+                        postino_core::RuleAction::Read,
+                    ];
+                    if let Some(page) = self.rules_page.as_mut() {
+                        page.seed_editor(&self.engine, "Fatture e ricevute", "subject:fattura", &actions);
+                    }
+                    if state == ScreenshotState::RulePreview
+                        && let Some(page) = self.rules_page.as_mut()
+                    {
+                        page.preview_now(&mut self.engine);
+                    }
                 }
                 self.status.clear();
                 self.toast = None;
@@ -6817,6 +6865,18 @@ impl PostinoApp {
         }
     }
 
+    fn open_rules(&mut self, new: bool) {
+        let Some(account) = self.active_account.clone().or_else(|| self.engine.accounts().first().map(|account| account.id.clone())) else {
+            self.status = "Aggiungi un account prima di creare regole".to_owned();
+            return;
+        };
+        let mut page = RulesPage::new(&mut self.engine, &account);
+        if new {
+            page.start_new(&self.engine);
+        }
+        self.rules_page = Some(page);
+    }
+
     fn open_settings(&mut self, ctx: &egui::Context, opener: Option<Id>) {
         let return_focus = opener.or(self.account_switcher_id).or_else(|| ctx.memory(|memory| memory.focused()));
         self.settings_return_focus = return_focus;
@@ -7279,6 +7339,7 @@ impl PostinoApp {
         let mut reduced = self.reduced_motion;
         let mut reset_pane = false;
         let mut open_folder = false;
+        let mut open_rules = false;
         let mut licences = false;
         let mut shortcuts = false;
         let mut signature_open: Option<String> = None;
@@ -7490,16 +7551,24 @@ impl PostinoApp {
                         }
                         ui.add_space(space::XS);
                         let can_open = self.store_path.is_some();
-                        let open_button = Button::new("Apri la cartella degli allegati")
-                            .icon(icons::FOLDER)
-                            .enabled(can_open)
-                            .disabled_reason("La modalità demo non ha una cartella dati")
-                            .show(ui);
-                        #[cfg(test)]
-                        probe::settings_action(ui, "open_folder", open_button.rect);
-                        if open_button.clicked() {
-                            open_folder = true;
-                        }
+                        ui.horizontal(|ui| {
+                            let open_button = Button::new("Apri la cartella degli allegati")
+                                .icon(icons::FOLDER)
+                                .enabled(can_open)
+                                .disabled_reason("La modalità demo non ha una cartella dati")
+                                .show(ui);
+                            #[cfg(test)]
+                            probe::settings_action(ui, "open_folder", open_button.rect);
+                            if open_button.clicked() {
+                                open_folder = true;
+                            }
+                            let rules_button = Button::new("Regole locali").icon(icons::FILTER).show(ui);
+                            #[cfg(test)]
+                            probe::settings_action(ui, "rules", rules_button.rect);
+                            if rules_button.clicked() {
+                                open_rules = true;
+                            }
+                        });
 
                         ui.add_space(space::XS);
                         let _info_header = ui.label(typography::mono(
@@ -7581,6 +7650,10 @@ impl PostinoApp {
         }
         if open_folder {
             self.open_data_folder();
+        }
+        if open_rules {
+            self.close_settings(ui.ctx());
+            self.open_rules(false);
         }
         if licences {
             self.open_licences(ui.ctx());
@@ -8407,6 +8480,8 @@ impl PostinoApp {
                     Err(_) => self.report_failure("Non è stato possibile cancellare le ricerche recenti.", false),
                 }
             }
+            "rules" => self.open_rules(false),
+            "rules_new" => self.open_rules(true),
             "next" => self.step_selection(1, false),
             "previous" => self.step_selection(-1, false),
             "extend_next" => self.step_selection(1, true),
@@ -8561,6 +8636,11 @@ impl PostinoApp {
         self.label_delete_dialog(ui);
         self.account_menu(ui);
         self.accounts_dialog(ui);
+        if let Some(mut page) = self.rules_page.take()
+            && !page.show(ui, &mut self.engine)
+        {
+            self.rules_page = Some(page);
+        }
         self.outbox_dialog(ui);
         self.outbox_confirm_dialog(ui);
         self.account_remove_dialog(ui);
@@ -9288,6 +9368,8 @@ const COMMANDS: &[Command] = &[
         in_palette: false,
     },
     Command { id: "saved_search_delete", label: "Elimina ricerca", icon: icons::TRASH, shortcut: "", rule: CommandRule::Always, in_palette: false },
+    Command { id: "rules", label: "Regole locali", icon: icons::FILTER, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "rules_new", label: "Nuova regola", icon: icons::PLUS, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
         id: "saved_search_clear_recent",
         label: "Cancella ricerche recenti",
@@ -12206,6 +12288,9 @@ mod tests {
             ("outbox", ScreenshotState::Outbox),
             ("search", ScreenshotState::Search),
             ("search_error", ScreenshotState::SearchError),
+            ("rules", ScreenshotState::Rules),
+            ("rule_editor", ScreenshotState::RuleEditor),
+            ("rule_preview", ScreenshotState::RulePreview),
         ] {
             assert_eq!(ScreenshotState::parse(name), Ok(state), "{name} must be a known scene");
         }
@@ -14874,6 +14959,46 @@ mod tests {
             assert!(reading::find_links(raw).is_empty(), "{raw}");
             assert!(!reading::is_allowed_url(raw), "{raw}");
         }
+    }
+
+    #[test]
+    fn the_rules_page_renders_list_editor_and_preview_at_980_light_and_dark() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let mut app = PostinoApp::demo(true);
+            app.seed_screenshot(ScreenshotState::Rules);
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            assert!(text.iter().any(|line| line == "REGOLE"), "the rules page header is missing: {text:?}");
+            assert!(text.iter().any(|line| line.contains("Fatture")), "the seeded rule list is missing: {text:?}");
+            assert!(text.iter().any(|line| line.contains("Salva")), "the editor actions are missing: {text:?}");
+            let page = app.rules_page.as_ref().expect("the rules page is open");
+            assert!(!page.is_forward_allowed(), "the demo has no P7 outbox and must disable forward with a reason");
+
+            let mut app = PostinoApp::demo(true);
+            app.seed_screenshot(ScreenshotState::RulePreview);
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            assert!(text.iter().any(|line| line.contains("Fatture e ricevute")), "the editor name is missing: {text:?}");
+            assert!(text.iter().any(|line| line.contains("ANTEPRIMA")), "the preview section is missing: {text:?}");
+            assert!(text.iter().any(|line| line.contains("applica")), "the preview effects are missing: {text:?}");
+        }
+    }
+
+    #[test]
+    fn the_rules_page_opens_from_the_keyboard_palette_and_escapes_back() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::COMMAND), key(Key::K, Modifiers::COMMAND)]);
+        assert!(app.show_palette);
+        app.palette_query = "regole".to_owned();
+        app.palette_selected = 0;
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(app.rules_page.is_some(), "the palette command must open the rules page");
+        frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.rules_page.is_none(), "Esc closes the rules page");
+        assert!(!app.show_palette);
     }
 
     #[test]

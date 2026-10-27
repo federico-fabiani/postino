@@ -16,6 +16,7 @@ use postino_sync::SyncStatus;
 use crate::engine::{AccountSetup, Engine, OpError, unknown_account, unknown_folder, unknown_label, unknown_message};
 use crate::model::{
     AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary, Provider,
+    RuleAction, RuleRunScope,
 };
 use crate::store_map;
 
@@ -266,6 +267,70 @@ pub fn op_defs() -> Vec<OpDef> {
             "Forget one account's eight recent successful queries. They live only in the encrypted store's `meta` table and are never sent anywhere. Returns whether anything was removed.",
             SavedSearchRecentClearArgs,
             false,
+            false
+        ),
+        def!(
+            "rules_list",
+            "List rules",
+            "Local rules of one account in execution order (`priority ASC, id ASC`), with their validated query, 1-5 actions, stop/enabled flags and a computed `valid`/`error`. A rule whose target folder or label was deleted stays visible as stale; it fails with a readable error at run time. Read-only and offline.",
+            RulesListArgs,
+            true,
+            false
+        ),
+        def!(
+            "rules_create",
+            "Create a rule",
+            "Create a local rule for one account. The condition is the documented search language and is validated now; actions are 1-5 of move, label, read, unread, trash and forward (1-10 recipients). Names are 1-48 characters, unique per account ignoring case, and at most 100 rules exist per account. A rule applies only to received mail ingested after it was created; it never edits a draft or a Sent copy. A forward only queues through the outbox and needs an SMTP endpoint; it is gated over MCP by --allow-send. Rules are local metadata in the encrypted store.",
+            RuleCreateArgs,
+            false,
+            false
+        ),
+        def!(
+            "rules_update",
+            "Update a rule",
+            "Change the name, query, actions, priority, stop or enabled flag of one rule. At least one field is required; the id and account never change, and targets are validated exactly like rules_create. Replacing `actions` replaces the whole list. A payload that adds a forward action is gated over MCP by --allow-send. Returns the row with its computed validity.",
+            RuleUpdateArgs,
+            false,
+            false
+        ),
+        def!(
+            "rules_delete",
+            "Delete a rule",
+            "Delete one local rule. Past runs stay in the journal: they are history, not configuration. This never touches mail or the outbox. `account` is required when the mailbox has several accounts.",
+            RuleDeleteArgs,
+            false,
+            true
+        ),
+        def!(
+            "rules_preview",
+            "Preview a rule",
+            "Evaluate a hypothetical rule against the current received mail and return the first 50 matching summaries with one effect per action (apply, no-op or skipped). It writes nothing: no journal, no flag, no move, no label, no outbox row and no rules_applied_at. A forward on a message carrying Auto-Submitted or X-Postino-Rule is reported as skipped. Read-only and offline.",
+            RulesPreviewArgs,
+            true,
+            false
+        ),
+        def!(
+            "rules_run",
+            "Run rules now",
+            "Run every enabled rule in priority order and return the journaled run plus fixed errors. `new` (default) considers only received messages no earlier run applied; `all` re-evaluates at most 2 000 candidates per rule since that rule was created. Each rule queries fresh candidates, so a later rule sees the earlier rule's moves, labels and flags. A failing action is recorded and only that rule's remaining actions for that message are skipped; rules never fail a sync. A forward is one P7 outbox row with the deterministic `rule:<rule>:<message>` key, adds Auto-Submitted and X-Postino-Rule, skips loop-guarded mail and is capped at 50 per run. Rules never open SMTP. Destructive and open-world: it changes local mail and may queue a submission.",
+            RulesRunArgs,
+            false,
+            true
+        ),
+        def!(
+            "rules_undo",
+            "Undo a rule run",
+            "Reverse the move, label, read and trash actions of one journaled run, newest action first, only where the message is still in the state that action left it in. A message changed afterwards is skipped, not overwritten. A forward is never undone; its outbox id is reported so the user can cancel the row in the outbox. Marking a run undone is one-way. Returns the run, restored/skipped counts and forward outbox ids.",
+            RulesUndoArgs,
+            false,
+            false
+        ),
+        def!(
+            "rules_runs",
+            "List rule runs",
+            "The newest rule runs of one account (at most 20), newest first: mode, counts, errors, start/finish and whether `rules_undo` already reversed it. The journal holds ids, folders, labels and booleans only; never a subject, address, query or body. Read-only and offline.",
+            RulesRunsArgs,
+            true,
             false
         ),
         def!(
@@ -711,6 +776,96 @@ pub struct SavedSearchRecentClearArgs {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct RulesListArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuleCreateArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// 1-48 characters, unique per account ignoring case.
+    pub name: String,
+    /// The documented search language, validated before it is stored.
+    pub query: String,
+    /// 1-5 actions; at most one of each kind.
+    pub actions: Vec<RuleAction>,
+    /// Execution order, lower first. Defaults to 0.
+    pub priority: Option<i64>,
+    /// When true, later rules skip a message this rule matched.
+    #[serde(default)]
+    pub stop: bool,
+    /// Defaults to true.
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuleUpdateArgs {
+    pub id: String,
+    /// Account that owns the rule. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    pub name: Option<String>,
+    pub query: Option<String>,
+    /// Replaces the whole action list.
+    pub actions: Option<Vec<RuleAction>>,
+    pub priority: Option<i64>,
+    pub stop: Option<bool>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuleDeleteArgs {
+    pub id: String,
+    /// Account that owns the rule. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RulesPreviewArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// The documented search language, validated before the preview.
+    pub query: String,
+    /// 1-5 actions; at most one of each kind.
+    pub actions: Vec<RuleAction>,
+    /// Rows, 1-50. Defaults to 50; the UI shows the first 20.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RulesRunArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// new (default) or all.
+    pub scope: Option<RuleRunScope>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RulesUndoArgs {
+    /// Run id returned by rules_run or rules_runs.
+    pub id: String,
+    /// Account that owns the run. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RulesRunsArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Runs, 1-20. Defaults to 20.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LabelsListArgs {}
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1027,6 +1182,48 @@ pub struct SavedSearchRecentClearResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulesListResult {
+    pub rules: Vec<crate::model::Rule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleResult {
+    pub rule: crate::model::Rule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleDeleteResult {
+    pub rule: crate::model::Rule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulesPreviewResult {
+    pub total: u32,
+    pub rows: Vec<crate::model::RulePreviewRow>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulesRunResult {
+    pub run: crate::model::RuleRun,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulesUndoResult {
+    pub run: crate::model::RuleRun,
+    pub restored: u32,
+    pub skipped: u32,
+    /// Outbox ids of the run's forwards. A forward is never undone.
+    pub forwards: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulesRunsResult {
+    pub runs: Vec<crate::model::RuleRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelsList {
     pub labels: Vec<LabelSummary>,
 }
@@ -1273,6 +1470,62 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let account = engine.requested_account_id(args.account.as_deref(), "saved_search_recent_clear")?;
             let cleared = engine.clear_recent_searches(Some(&account))?;
             value(SavedSearchRecentClearResult { account, cleared })
+        }
+        "rules_list" => {
+            let args: RulesListArgs = parse(args)?;
+            engine.reload_rules(args.account.as_deref())?;
+            value(RulesListResult { rules: engine.rules_list(args.account.as_deref())? })
+        }
+        "rules_create" => {
+            let args: RuleCreateArgs = parse(args)?;
+            let rule = engine.create_rule(
+                args.account.as_deref(),
+                &args.name,
+                &args.query,
+                args.actions,
+                args.priority,
+                args.stop,
+                args.enabled.unwrap_or(true),
+            )?;
+            value(RuleResult { rule })
+        }
+        "rules_update" => {
+            let args: RuleUpdateArgs = parse(args)?;
+            let rule = engine.update_rule(
+                args.account.as_deref(),
+                &args.id,
+                args.name.as_deref(),
+                args.query.as_deref(),
+                args.actions,
+                args.priority,
+                args.stop,
+                args.enabled,
+            )?;
+            value(RuleResult { rule })
+        }
+        "rules_delete" => {
+            let args: RuleDeleteArgs = parse(args)?;
+            let rule = engine.delete_rule(args.account.as_deref(), &args.id)?;
+            value(RuleDeleteResult { rule })
+        }
+        "rules_preview" => {
+            let args: RulesPreviewArgs = parse(args)?;
+            let (total, truncated, rows) = engine.rules_preview(args.account.as_deref(), &args.query, &args.actions, args.limit)?;
+            value(RulesPreviewResult { total, rows, truncated })
+        }
+        "rules_run" => {
+            let args: RulesRunArgs = parse(args)?;
+            let outcome = engine.run_rules(args.account.as_deref(), args.scope.unwrap_or_default())?;
+            value(RulesRunResult { run: outcome.run, errors: outcome.errors })
+        }
+        "rules_undo" => {
+            let args: RulesUndoArgs = parse(args)?;
+            let outcome = engine.undo_rule_run(args.account.as_deref(), &args.id)?;
+            value(RulesUndoResult { run: outcome.run, restored: outcome.restored, skipped: outcome.skipped, forwards: outcome.forwards })
+        }
+        "rules_runs" => {
+            let args: RulesRunsArgs = parse(args)?;
+            value(RulesRunsResult { runs: engine.rule_runs(args.account.as_deref(), args.limit)? })
         }
         "labels_list" => {
             let _: LabelsListArgs = parse(args)?;
@@ -1759,7 +2012,7 @@ fn resolve_label(engine: &Engine, value: &str) -> Result<Label, OpError> {
 
 /// Translate the parsed AST into the store's typed filter tree. Text leaves become a safe FTS5
 /// phrase; label and folder names become ids here, in core, so the store never sees a name lookup.
-fn translate_search(expr: &crate::search::Expr, engine: &Engine, account: Option<&str>) -> Result<postino_store::SearchExpr, OpError> {
+pub(crate) fn translate_search(expr: &crate::search::Expr, engine: &Engine, account: Option<&str>) -> Result<postino_store::SearchExpr, OpError> {
     use crate::search::{Expr, Field};
     Ok(match expr {
         Expr::And(children) => {
@@ -1864,7 +2117,7 @@ fn demo_search(
     Ok((hits, total, total > 10_000))
 }
 
-fn demo_matches(expr: &crate::search::Expr, message: &Message, engine: &Engine) -> bool {
+pub(crate) fn demo_matches(expr: &crate::search::Expr, message: &Message, engine: &Engine) -> bool {
     use crate::search::Expr;
     match expr {
         Expr::And(children) => children.iter().all(|child| demo_matches(child, message, engine)),

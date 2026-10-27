@@ -115,10 +115,11 @@ What is still demo or missing:
   an APPEND that follows a long submission, still owns a full window. There is no daemon, pipe or
   cross-process lock yet (M4): do not copy or move the database while a command runs, and do not treat
   two clients as two independent mailboxes.
-- IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox, compose depth and
-  encrypted search (attachment bytes, per-account signatures, reply/forward headers, P5-P9a) exist.
-  Still missing: threads, saved searches and rules (P9b/P9c), the daemon and a scheduled send that runs
-  with the app closed (M4), HTML rendering (M5), server-side signatures and Gmail OAuth (P12).
+- IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox, compose depth,
+  encrypted search, conversations, saved searches and local rules (attachment bytes, per-account
+  signatures, reply/forward headers, P5-P9c) exist. Still missing: the daemon and a scheduled send
+  that runs with the app closed (M4), server-side Sieve/HTML rendering (M5/M6), server-side signatures
+  and Gmail OAuth (P12).
   `message_send` queues real mail; the desktop send worker (which polls the store every two seconds)
   and `postino send` process the outbox, so a future `--at` row waits until one of them runs.
   A plain `postino send` (no `--at`) waits the 5-second undo window and submits in the same command.
@@ -384,8 +385,10 @@ link and one PDF attachment in the pinned strip), `link_confirm` (the same messa
 full-destination sheet, which shows the host/recipient line as well as the exact URL), `settings`
 (the full settings dialog), `settings_signature` (the same dialog with the per-account Firma editor
 open and a seeded signature), `threads` (the demo inbox grouped by conversation), `conversation`
-(the preventivo thread open with one expanded card) and `saved_searches` (three saved searches with
-the `from:giulia` one applied). The onboarding, mailbox, P6c, P6d, P8 and P9b scenes are deterministic
+(the preventivo thread open with one expanded card), `saved_searches` (three saved searches with
+the `from:giulia` one applied), `rules` (three local rules and the selected editor), `rule_editor`
+(a prefilled new rule) and `rule_preview` (the same rule with the first 20 matches and effects). The
+onboarding, mailbox, P6c, P6d, P8, P9b and P9c scenes are deterministic
 fixtures; they do not read a store or touch the network, and the P6c/P8 scenes install the
 unavailable/cancelling seams so no native dialog or browser can open. The `reading_attachments`
 message is **stored truth**: its HTML is already sanitized (no remote `src`, no tracker) and

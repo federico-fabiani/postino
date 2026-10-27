@@ -572,7 +572,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 /// Compile a typed expression into fixed SQL fragments with bound values. The recursion depth is
 /// bounded again here, because the store crate can be called directly by its own tests.
-fn expr_sql(expr: &SearchExpr, values: &mut Vec<Value>, depth: &mut u8) -> Result<String, StoreError> {
+pub(crate) fn expr_sql(expr: &SearchExpr, values: &mut Vec<Value>, depth: &mut u8) -> Result<String, StoreError> {
     *depth = depth.saturating_add(1);
     if *depth > 16 {
         return Err(StoreError::Corrupt { table: "search", detail: "query nesting is deeper than 16 levels".to_owned() });

@@ -23,12 +23,12 @@ enum BoundedLine {
 
 /// Operations that can create a network submission or resolve a delivered one. They are listed but
 /// disabled unless the server was started with `--allow-send`; `outbox_retry` is included because it
-/// can send stored bytes, and `outbox_mark_sent` because it records a delivery decision that removes
-/// the uncertainty a person should resolve.
-const SEND_GATED: [&str; 4] = ["message_send", "send_schedule", "outbox_retry", "outbox_mark_sent"];
+/// can send stored bytes, `outbox_mark_sent` because it records a delivery decision that removes the
+/// uncertainty a person should resolve, and `rules_run` because an enabled rule may forward. A
+/// `rules_create`/`rules_update` payload that carries a forward action is refused before parsing.
+const SEND_GATED: [&str; 5] = ["message_send", "send_schedule", "outbox_retry", "outbox_mark_sent", "rules_run"];
 
-const SEND_DISABLED_REASON: &str =
-    "sending is disabled: start `postino mcp --allow-send` to allow message_send, send_schedule, outbox_retry and outbox_mark_sent";
+const SEND_DISABLED_REASON: &str = "sending is disabled: start `postino mcp --allow-send` to allow message_send, send_schedule, outbox_retry, outbox_mark_sent and rules_run (including rule forwards)";
 
 pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
     let stdin = std::io::stdin();
@@ -162,7 +162,7 @@ fn tools_list(engine: &Engine, allow_send: bool) -> Value {
                     "readOnlyHint": def.read_only,
                     "destructiveHint": def.destructive,
                     "idempotentHint": def.read_only || matches!(def.name, "message_flag" | "label_apply" | "label_update" | "thread_flag"),
-                    "openWorldHint": matches!(def.name, "account_test" | "sync_now" | "outbox_retry")
+                    "openWorldHint": matches!(def.name, "account_test" | "sync_now" | "outbox_retry" | "rules_run")
                 }
             });
             if let Some(object) = tool.as_object_mut() {
@@ -189,6 +189,12 @@ fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<V
     if SEND_GATED.contains(&name) && !allow_send {
         return Ok(send_disabled_refusal(name));
     }
+    // A forward action can be created or updated without a network call, but it arms a future one.
+    // Refuse the payload before the typed parser sees it: the CLI and the desktop can still create
+    // the rule locally.
+    if !allow_send && matches!(name, "rules_create" | "rules_update") && requests_rule_forward(&arguments) {
+        return Ok(send_disabled_refusal(name));
+    }
 
     match engine.call(name, arguments) {
         Ok(value) => {
@@ -203,6 +209,15 @@ fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<V
             "isError": true
         })),
     }
+}
+
+/// Scan the raw action list without deserializing the request. A forward action is the only rule
+/// payload that can eventually submit mail, and the MCP gate must reject it before parsing.
+fn requests_rule_forward(arguments: &Value) -> bool {
+    arguments
+        .get("actions")
+        .and_then(Value::as_array)
+        .is_some_and(|actions| actions.iter().any(|action| action.get("kind").and_then(Value::as_str) == Some("forward")))
 }
 
 fn send_disabled_refusal(name: &str) -> Value {
@@ -824,6 +839,69 @@ mod tests {
         .expect("response");
         assert_eq!(stale["result"]["isError"], json!(true));
         assert!(stale["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("unknown label")));
+    }
+
+    #[test]
+    fn rule_tools_are_exposed_and_forward_is_gated_before_parsing() {
+        let mut engine = Engine::demo();
+        let tools = request(&mut engine, "tools/list");
+        let definitions = tools["result"]["tools"].as_array().expect("tools");
+        for name in ["rules_list", "rules_create", "rules_update", "rules_delete", "rules_preview", "rules_run", "rules_undo", "rules_runs"] {
+            let tool = definitions.iter().find(|tool| tool["name"] == name).unwrap_or_else(|| panic!("{name} is missing"));
+            assert!(tool["inputSchema"].is_object(), "{name} has no schema");
+            assert!(tool["annotations"]["readOnlyHint"].is_boolean(), "{name} has no annotation");
+        }
+        assert_eq!(definitions.iter().find(|tool| tool["name"] == "rules_preview").expect("preview")["annotations"]["readOnlyHint"], true);
+        assert_eq!(definitions.iter().find(|tool| tool["name"] == "rules_run").expect("run")["annotations"]["destructiveHint"], true);
+        assert_eq!(definitions.iter().find(|tool| tool["name"] == "rules_run").expect("run")["annotations"]["openWorldHint"], true);
+
+        let disabled = raw_handle(&mut engine, &json!({ "jsonrpc": "2.0", "id": 80, "method": "tools/list" }), false).expect("response");
+        let definitions = disabled["result"]["tools"].as_array().expect("tools");
+        let run = definitions.iter().find(|tool| tool["name"] == "rules_run").expect("rules_run");
+        assert_eq!(run["enabled"], false);
+        assert!(run["disabledReason"].as_str().is_some_and(|text| text.contains("--allow-send")));
+
+        // The forward action is refused before the typed request is parsed: this payload has no
+        // name, so a parser error would prove the gate ran too late.
+        let refused = raw_handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 81, "method": "tools/call",
+                "params": { "name": "rules_create", "arguments": {
+                    "actions": [{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]
+                }}
+            }),
+            false,
+        )
+        .expect("response");
+        assert_eq!(refused["result"]["isError"], true);
+        assert!(refused["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("--allow-send")), "{refused}");
+
+        let refused_run = raw_handle(
+            &mut engine,
+            &json!({ "jsonrpc": "2.0", "id": 82, "method": "tools/call", "params": { "name": "rules_run", "arguments": { "bogus": true } } }),
+            false,
+        )
+        .expect("response");
+        assert_eq!(refused_run["result"]["isError"], true);
+        assert!(refused_run["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("--allow-send")), "{refused_run}");
+
+        // With --allow-send the same rule is accepted locally, and a non-forward rule is always
+        // available over MCP.
+        let created = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 83, "method": "tools/call",
+                "params": { "name": "rules_create", "arguments": {
+                    "name": "Inoltro",
+                    "query": "subject:prova",
+                    "actions": [{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]
+                }}
+            }),
+        )
+        .expect("response");
+        assert!(created.get("error").is_none(), "{created}");
+        assert_eq!(created["result"]["structuredContent"]["rule"]["actions"][0]["kind"], "forward");
     }
 
     #[test]

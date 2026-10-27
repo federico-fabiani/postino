@@ -27,8 +27,9 @@ use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
     LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OpError, OutboxAction, OutboxListResult,
-    Provider, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup,
-    SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
+    Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult,
+    SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow,
+    SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
 };
 use postino_platform::Keyring;
 use serde::Serialize;
@@ -193,6 +194,91 @@ enum SavedCommand {
     RecentClear {
         #[arg(long)]
         account: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuleCommand {
+    /// List local rules in execution order.
+    List {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Create a rule. Repeat --action: move:FOLDER, label:LABEL, read, unread, trash or
+    /// forward:ADDRESS[,ADDRESS].
+    Create {
+        name: String,
+        query: String,
+        #[arg(long = "action", value_name = "ACTION")]
+        action: Vec<String>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i64,
+        /// Later rules skip a message this rule matched.
+        #[arg(long)]
+        stop: bool,
+        /// Create it disabled.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Change a rule. At least one flag is required; --action replaces the whole list.
+    Update {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long = "action", value_name = "ACTION")]
+        action: Option<Vec<String>>,
+        #[arg(long)]
+        priority: Option<i64>,
+        #[arg(long, conflicts_with = "no_stop")]
+        stop: bool,
+        #[arg(long = "no-stop", conflicts_with = "stop")]
+        no_stop: bool,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
+    /// Delete a rule. Past runs stay in the journal.
+    Delete {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Evaluate a hypothetical rule without writing anything.
+    Preview {
+        query: String,
+        #[arg(long = "action", value_name = "ACTION")]
+        action: Vec<String>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Run enabled rules now; --all re-evaluates the first 2 000 candidates per rule.
+    Run {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Reverse one run's move/label/read/trash actions where the message is unchanged.
+    Undo {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Show the newest runs of one account.
+    Runs {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
     },
 }
 
@@ -485,6 +571,11 @@ enum Command {
         #[command(subcommand)]
         command: SavedCommand,
     },
+    /// List, preview, run and undo local rules.
+    Rules {
+        #[command(subcommand)]
+        command: RuleCommand,
+    },
     /// Call any operation with JSON or key=value arguments.
     Run {
         op: String,
@@ -652,6 +743,7 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Threads { .. } => true,
         Command::Thread { command } => matches!(command, ThreadCommand::Get { .. }),
         Command::Saved { command } => matches!(command, SavedCommand::List { .. }),
+        Command::Rules { command } => matches!(command, RuleCommand::List { .. } | RuleCommand::Preview { .. } | RuleCommand::Runs { .. }),
         Command::Outbox { command } => matches!(command, OutboxCommand::List { .. }),
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
         // operation is refused before dispatch and must not create one either.
@@ -1381,6 +1473,172 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                 }
             }
         },
+        Command::Rules { command } => match command {
+            RuleCommand::List { account } => {
+                let result: RulesListResult = decode(call(engine, "rules_list", json!({ "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else if result.rules.is_empty() {
+                    say("Nessuna regola. Creane una con `postino rules create <nome> <query> --action read`.\n")?;
+                } else {
+                    let mut text = String::new();
+                    for rule in &result.rules {
+                        text.push_str(&format_rule(rule));
+                    }
+                    say(text)?;
+                }
+            }
+            RuleCommand::Create { name, query, action, account, priority, stop, disabled } => {
+                let actions = parse_rule_actions(&action)?;
+                let result: RuleResult = decode(call(
+                    engine,
+                    "rules_create",
+                    json!({
+                        "name": name,
+                        "query": query,
+                        "actions": actions,
+                        "account": account,
+                        "priority": priority,
+                        "stop": stop,
+                        "enabled": !disabled
+                    }),
+                )?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Regola creata:\n{}", format_rule(&result.rule)))?;
+                }
+            }
+            RuleCommand::Update { id, account, name, query, action, priority, stop, no_stop, enable, disable } => {
+                let actions = action.as_deref().map(parse_rule_actions).transpose()?;
+                let stop = if stop {
+                    Some(true)
+                } else if no_stop {
+                    Some(false)
+                } else {
+                    None
+                };
+                let enabled = if enable {
+                    Some(true)
+                } else if disable {
+                    Some(false)
+                } else {
+                    None
+                };
+                if name.is_none() && query.is_none() && actions.is_none() && priority.is_none() && stop.is_none() && enabled.is_none() {
+                    return Err(usage("rules update needs --name, --query, --action, --priority, --stop/--no-stop or --enable/--disable".to_owned()));
+                }
+                let result: RuleResult = decode(call(
+                    engine,
+                    "rules_update",
+                    json!({
+                        "id": id,
+                        "account": account,
+                        "name": name,
+                        "query": query,
+                        "actions": actions,
+                        "priority": priority,
+                        "stop": stop,
+                        "enabled": enabled
+                    }),
+                )?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Regola aggiornata:\n{}", format_rule(&result.rule)))?;
+                }
+            }
+            RuleCommand::Delete { id, account } => {
+                let result: RuleDeleteResult = decode(call(engine, "rules_delete", json!({ "id": id, "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Regola eliminata: {} \"{}\"\n", result.rule.id, result.rule.name))?;
+                }
+            }
+            RuleCommand::Preview { query, action, account, limit } => {
+                let actions = parse_rule_actions(&action)?;
+                let result: RulesPreviewResult =
+                    decode(call(engine, "rules_preview", json!({ "query": query, "actions": actions, "account": account, "limit": limit }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    let mut text = format!("{} messaggi corrispondono", result.total);
+                    if result.truncated {
+                        text.push_str(" (anteprima troncata)");
+                    }
+                    text.push_str(".\n");
+                    for row in &result.rows {
+                        let effects = row
+                            .effects
+                            .iter()
+                            .map(|effect| format!("{}:{}", rule_action_text(&effect.action), rule_status_text(effect.status)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        text.push_str(&format!("{}  {}  {}\n", row.message.id, row.message.subject, effects));
+                    }
+                    text.push_str("Nessuna modifica scritta.\n");
+                    say(text)?;
+                }
+            }
+            RuleCommand::Run { account, all } => {
+                let scope = if all { "all" } else { "new" };
+                let result: RulesRunResult = decode(call(engine, "rules_run", json!({ "account": account, "scope": scope }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    let mut text = format!(
+                        "Esecuzione {} · {} regole · {} corrispondenze · {} modifiche · {} errori\n",
+                        result.run.id, result.run.rule_count, result.run.matched, result.run.changed, result.run.errors
+                    );
+                    for error in &result.errors {
+                        text.push_str(&format!("! {error}\n"));
+                    }
+                    if result.run.changed > 0 || result.run.errors == 0 {
+                        text.push_str(&format!("Annulla con `postino rules undo {}`.\n", result.run.id));
+                    }
+                    say(text)?;
+                }
+            }
+            RuleCommand::Undo { id, account } => {
+                let result: RulesUndoResult = decode(call(engine, "rules_undo", json!({ "id": id, "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    let mut text = format!(
+                        "Esecuzione {} annullata: {} azioni ripristinate, {} saltate (messaggi cambiati dopo l'esecuzione).\n",
+                        result.run.id, result.restored, result.skipped
+                    );
+                    for outbox in &result.forwards {
+                        text.push_str(&format!("Inoltro non annullabile, riga in coda: {outbox}\n"));
+                    }
+                    say(text)?;
+                }
+            }
+            RuleCommand::Runs { account, limit } => {
+                let result: RulesRunsResult = decode(call(engine, "rules_runs", json!({ "account": account, "limit": limit }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else if result.runs.is_empty() {
+                    say("Nessuna esecuzione registrata.\n")?;
+                } else {
+                    let mut text = String::new();
+                    for run in &result.runs {
+                        text.push_str(&format!(
+                            "{}  {}  {} regole  {} corrispondenze  {} modifiche  {} errori{}\n",
+                            run.id,
+                            if run.mode == postino_core::RuleRunScope::All { "tutte" } else { "nuove" },
+                            run.rule_count,
+                            run.matched,
+                            run.changed,
+                            run.errors,
+                            if run.undone { "  annullata" } else { "" }
+                        ));
+                    }
+                    say(text)?;
+                }
+            }
+        },
         Command::Run { op, args, params } => {
             if engine.tools().into_iter().any(|def| def.name == op && def.sensitive) {
                 return Err(usage(format!(
@@ -1729,6 +1987,85 @@ fn count_label(count: u32, singular: &str, plural: &str) -> String {
 
 /// Where a store-backed engine keeps mutations, in words a person can check against what they see
 /// after a restart.
+/// Parse one `--action` value into the typed P9c action. The CLI never invents a target: a folder,
+/// label or address is passed through and the engine validates it.
+fn parse_rule_actions(raw: &[String]) -> Result<Vec<RuleAction>> {
+    if raw.is_empty() {
+        return Err(usage("a rule needs at least one --action (move:FOLDER, label:LABEL, read, unread, trash or forward:ADDRESS)".to_owned()));
+    }
+    raw.iter()
+        .map(|value| {
+            let value = value.trim();
+            if value.eq_ignore_ascii_case("read") {
+                return Ok(RuleAction::Read);
+            }
+            if value.eq_ignore_ascii_case("unread") {
+                return Ok(RuleAction::Unread);
+            }
+            if value.eq_ignore_ascii_case("trash") {
+                return Ok(RuleAction::Trash);
+            }
+            let Some((kind, target)) = value.split_once(':') else {
+                return Err(usage(format!("unknown rule action {value:?}; expected move:, label:, forward:, read, unread or trash")));
+            };
+            let target = target.trim();
+            match kind {
+                "move" if !target.is_empty() => Ok(RuleAction::Move { folder: target.to_owned() }),
+                "label" if !target.is_empty() => Ok(RuleAction::Label { label: target.to_owned() }),
+                "forward" if !target.is_empty() => {
+                    let to = Address::parse_list(target).map_err(|error| usage(format!("invalid forward recipient: {error}")))?;
+                    Ok(RuleAction::Forward { to })
+                }
+                "move" | "label" | "forward" => Err(usage(format!("rule action {kind:?} needs a value after the colon"))),
+                other => Err(usage(format!("unknown rule action {other:?}; expected move:, label:, forward:, read, unread or trash"))),
+            }
+        })
+        .collect()
+}
+
+fn rule_action_text(action: &RuleAction) -> String {
+    match action {
+        RuleAction::Move { folder } => format!("sposta in {folder}"),
+        RuleAction::Label { label } => format!("etichetta {label}"),
+        RuleAction::Read => "segna letto".to_owned(),
+        RuleAction::Unread => "segna non letto".to_owned(),
+        RuleAction::Trash => "cestina".to_owned(),
+        RuleAction::Forward { to } => format!("inoltra a {} destinatari", to.len()),
+    }
+}
+
+fn rule_status_text(status: postino_core::RuleEffectStatus) -> &'static str {
+    match status {
+        postino_core::RuleEffectStatus::Apply => "applica",
+        postino_core::RuleEffectStatus::NoOp => "già così",
+        postino_core::RuleEffectStatus::Skip => "salta",
+    }
+}
+
+fn format_rule(rule: &Rule) -> String {
+    let state = if !rule.enabled {
+        "disattivata"
+    } else if rule.valid {
+        "attiva"
+    } else {
+        "non valida"
+    };
+    let mut text = format!(
+        "{}  {}  [priorità {} · {} · {}]  {}\n  {}\n",
+        rule.id,
+        rule.name,
+        rule.priority,
+        if rule.stop { "ferma" } else { "continua" },
+        state,
+        rule.query,
+        rule.actions.iter().map(rule_action_text).collect::<Vec<_>>().join(" · ")
+    );
+    if let Some(error) = &rule.error {
+        text.push_str(&format!("  ! {error}\n"));
+    }
+    text
+}
+
 fn labels_note(engine: &Engine) -> &'static str {
     if engine.is_persistent() {
         "Etichette locali, salvate nel database cifrato: nessun server viene aggiornato.\n"
