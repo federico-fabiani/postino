@@ -6,6 +6,7 @@
 
 mod app;
 mod boot;
+mod daemon;
 mod onboarding;
 mod reading;
 mod rules_ui;

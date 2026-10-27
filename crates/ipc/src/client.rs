@@ -269,6 +269,17 @@ impl BlockingClient {
         self.runtime.block_on(self.client.call(method_name, params, request_timeout))
     }
 
+    /// Send a request and return its id without waiting. A caller that must stay cancellable
+    /// (a long sync) starts it here and sends `cancel` from another connection.
+    pub fn start_request(&mut self, method_name: &str, params: Value) -> Result<u64> {
+        self.runtime.block_on(self.client.start_request(method_name, params))
+    }
+
+    /// Wait for a request started with [`BlockingClient::start_request`].
+    pub fn wait_for(&mut self, id: u64, request_timeout: Duration) -> Result<Value> {
+        self.runtime.block_on(self.client.wait_for(id, request_timeout))
+    }
+
     pub fn ping(&mut self, request_timeout: Duration) -> Result<Value> {
         self.runtime.block_on(self.client.ping(request_timeout))
     }

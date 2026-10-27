@@ -339,6 +339,16 @@ impl DaemonState {
         Some(SyncWatcher { stop, handle: Some(handle) })
     }
 
+    /// Whether the account has at least one enabled rule, so a sync ran the engine's post-sync
+    /// rules pass and the clients must reload labels without waiting for the next blob GC.
+    pub(crate) async fn rules_enabled(&self, account: &str) -> bool {
+        let account = account.to_owned();
+        let probe = self
+            .with_engine(move |engine| engine.rules_list(Some(&account)).map(|rules| rules.iter().any(|rule| rule.enabled)).unwrap_or(false))
+            .await;
+        matches!(probe, Ok(true))
+    }
+
     /// Run a blocking engine operation on the blocking pool while holding the one engine mutex.
     /// A panic inside a handler becomes a readable failure; it never tears down the daemon.
     pub(crate) async fn with_engine<T, F>(&self, operation: F) -> Result<T, DaemonError>

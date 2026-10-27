@@ -261,6 +261,11 @@ async fn run_sync(state: &DaemonState) {
                     }),
                 );
                 state.mark_index_dirty();
+                if state.rules_enabled(&report.account).await {
+                    // The post-sync rules pass changed labels inside the engine: the app must see
+                    // that without waiting for the next blob GC.
+                    state.publish("rules", json!({ "account": report.account, "source": "sync" }));
+                }
                 if let Ok(mut status) = state.status.lock() {
                     status.last_sync_at = Some(crate::now_ms());
                     status.gc_due = true;
@@ -293,6 +298,9 @@ async fn run_index(state: &DaemonState) -> bool {
                         "indexed": status.indexed,
                         "total": status.total,
                         "ready": status.ready,
+                        "last_error": status.last_error,
+                        "size_bytes": status.size_bytes,
+                        "updated_at": status.updated_at,
                     }),
                 );
                 if let Ok(mut live) = state.status.lock() {

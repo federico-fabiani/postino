@@ -108,8 +108,13 @@ fn layers() -> Result<()> {
         ("postino-testkit", &["postino-net"][..]),
         // The desktop app is the second production adapter of the credential seam: it opens the
         // default store from the keyring, runs sync on its worker thread and probes a server during
-        // onboarding. It never depends on the CLI.
-        ("postino-app", &["postino-core", "postino-net", "postino-platform", "postino-store", "postino-sync", "postino-testkit"][..]),
+        // onboarding. It never depends on the CLI; since P10a2 it is a `postino-ipc` client of the
+        // daemon (functions only, no listener of its own).
+        (
+            "postino-app",
+            &["postino-core", "postino-daemon", "postino-ipc", "postino-net", "postino-platform", "postino-store", "postino-sync", "postino-testkit"]
+                [..],
+        ),
         // The CLI is the production adapter between the engine's vault seam and the OS keyring; it
         // uses the network types only in its account/sync tests. It is also a daemon client; the
         // daemon library is a dev-dependency for the end-to-end client test.
@@ -127,6 +132,7 @@ fn layers() -> Result<()> {
     let dev_only: HashMap<&str, &[&str]> = HashMap::from([
         ("postino-net", &["postino-testkit"][..]),
         ("postino-sync", &["postino-core", "postino-testkit"][..]),
+        ("postino-app", &["postino-daemon"][..]),
         ("postino-cli", &["postino-daemon", "postino-net"][..]),
     ]);
 

@@ -18,9 +18,11 @@ use postino_core::{
     ThreadGetResult, ThreadSummary, ThreadsListResult,
 };
 use postino_net::CertificateDer;
+use serde_json::Value;
 use serde_json::json;
 
 use crate::boot::{self, BootFailure, Launch, StoreHandle};
+use crate::daemon;
 use crate::onboarding::{self, ConnectionError, ErrorKind, FocusField, FolderPreview, FolderRole, FoldersPreview, Onboarding, ProviderChoice, Stage};
 use crate::reading::{self, DangerousKind, ExtractedLink};
 use crate::rules_ui::RulesPage;
@@ -173,6 +175,44 @@ const COMPOSER_CARD_MIN_HEIGHT: f32 = 700.0;
 const READING_BODY_MIN: f32 = 48.0;
 /// `label_apply` accepts at most 500 ids per call; undoing a delete restores in these batches.
 const LABEL_APPLY_CHUNK: usize = 500;
+
+/// Which process command is in flight. `Start` releases the writer lock before spawning, `Stop`
+/// takes it back after the daemon exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonJob {
+    Start,
+    Stop,
+}
+
+/// A start/stop request running off the UI thread, polled once per frame.
+struct DaemonJobState {
+    kind: DaemonJob,
+    receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+}
+
+/// One counter from a daemon event body; a missing or negative value is zero, never a panic.
+fn count(data: &Value, key: &str) -> u32 {
+    data.get(key).and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()).unwrap_or_default()
+}
+
+/// The search-index status carried by an `index` event. The daemon publishes the full shape; the
+/// counters are enough for the banner if a future daemon omits the optional fields, so the build
+/// never appears stalled because one field was missing.
+fn index_status(data: &Value) -> Option<postino_core::SearchStatusResult> {
+    if let Ok(status) = serde_json::from_value::<postino_core::SearchStatusResult>(data.clone()) {
+        return Some(status);
+    }
+    let state = data.get("state").and_then(Value::as_str)?;
+    Some(postino_core::SearchStatusResult {
+        ready: data.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        indexed: count(data, "indexed"),
+        total: count(data, "total"),
+        last_error: data.get("last_error").and_then(Value::as_str).map(str::to_owned),
+        size_bytes: data.get("size_bytes").and_then(Value::as_u64).unwrap_or_default(),
+        state: state.to_owned(),
+        updated_at: data.get("updated_at").and_then(Value::as_i64).unwrap_or_default(),
+    })
+}
 
 pub struct PostinoApp {
     engine: Engine,
@@ -392,6 +432,14 @@ pub struct PostinoApp {
     licences_focus_pending: bool,
     /// Whether the theme follows the operating system instead of `dark`.
     system_theme: bool,
+    /// Who owns the store: a live daemon this window writes through, or this window itself.
+    connection: daemon::Connection,
+    /// The one write path while a daemon owns the store. `None` in-process and in demo mode.
+    daemon_link: Option<daemon::Link>,
+    /// The subscription that turns daemon events into view updates, with bounded reconnects.
+    daemon_events: Option<daemon::EventWorker>,
+    /// A start/stop request in flight: the window must never freeze for a process spawn.
+    daemon_job: Option<DaemonJobState>,
 }
 
 impl PostinoApp {
@@ -437,10 +485,394 @@ impl PostinoApp {
     }
 
     fn from_booted(booted: boot::Booted, custom_chrome: bool, now: DateTime<Utc>, launch: Launch, extra_roots: Vec<CertificateDer<'static>>) -> Self {
-        let boot::Booted { engine, store, demo, writer_lock } = booted;
+        let boot::Booted { engine, store, demo, writer_lock, daemon } = booted;
         let mut app = Self::with_engine(engine, store, demo, None, launch, custom_chrome, now, extra_roots);
         app.writer_lock = writer_lock;
+        app.attach_daemon(daemon);
         app
+    }
+
+    /// Publish who owns the store. A live daemon replaces the local sync/send workers with the IPC
+    /// client and removes every local write path; `None` restores the in-process mode.
+    fn attach_daemon(&mut self, hello: Option<daemon::Hello>) {
+        self.stop_sync_worker();
+        self.send_worker = None;
+        self.daemon_events = None;
+        self.daemon_link = None;
+        let Some(handle) = self.store.clone().filter(|_| !self.demo) else {
+            self.connection = if self.demo { daemon::Connection::Demo } else { daemon::Connection::InProcess };
+            return;
+        };
+        match hello {
+            Some(hello) => {
+                let path = handle.path().to_path_buf();
+                match daemon::Link::connect(&path) {
+                    Ok(link) => self.daemon_link = Some(link),
+                    Err(message) => {
+                        // The daemon answered the probe but the channel will not open: stay a
+                        // client, tell the truth, and let the next probe/command retry.
+                        self.status = message;
+                        self.connection = daemon::Connection::Lost;
+                        return;
+                    }
+                }
+                if let Ok(paths) = daemon::paths(&path) {
+                    self.daemon_events = Some(daemon::EventWorker::start(Box::new(daemon::IpcTransport::new(paths))));
+                }
+                self.sync_worker = Some(SyncWorker::start(Box::new(crate::sync_worker::DaemonSyncBackend::new(path))));
+                self.connection = daemon::Connection::Connected(hello);
+            }
+            None => {
+                self.sync_worker =
+                    Some(SyncWorker::start(Box::new(crate::sync_worker::StoreSyncBackend::new(handle.clone(), self.extra_roots.clone()))));
+                self.send_worker = Some(SendWorker::start(Box::new(StoreSendBackend::new(handle, self.extra_roots.clone()))));
+                self.connection = daemon::Connection::InProcess;
+            }
+        }
+    }
+
+    /// The one write path. With a daemon it is `op {name, args}` over `postino-ipc`, exactly the
+    /// schema the CLI and MCP dispatch; without one it is the in-process registry. A read may fall
+    /// back to the read-only store while the channel is down; a write never does.
+    fn op(&mut self, name: &str, args: Value) -> Result<Value, postino_core::OpError> {
+        if self.daemon_link.is_some() {
+            let read_only = daemon::is_read_only(name);
+            let attempt = match self.daemon_link.as_mut() {
+                Some(link) => link.call(name, args.clone()),
+                None => Err(daemon::absent_sentence()),
+            };
+            match attempt {
+                Ok(value) => {
+                    if !read_only {
+                        // The list, thread and saved-search caches are keyed on the local engine
+                        // revision, and that revision never advances while a daemon owns the store:
+                        // a flag/read/star/label write through `op` must reopen the read-only engine
+                        // or the list keeps painting the row it wrote to.
+                        self.reload_engine_after_sync(false);
+                    }
+                    return Ok(value);
+                }
+                Err(message) => {
+                    if read_only && let Ok(value) = self.engine.call(name, args) {
+                        return Ok(value);
+                    }
+                    return Err(postino_core::OpError::Failed(message));
+                }
+            }
+        }
+        self.engine.call(name, args)
+    }
+
+    /// Drain the daemon subscription once per frame. A dropped channel is a state, not a failure
+    /// toast: the mailbox stays readable and the composer keeps its draft.
+    fn poll_daemon(&mut self) {
+        let events = self.daemon_events.as_mut().map(daemon::EventWorker::poll).unwrap_or_default();
+        for event in events {
+            match event {
+                daemon::Event::Connected(hello) => {
+                    let was_live = self.connection.is_live();
+                    self.connection = daemon::Connection::Connected(hello);
+                    if !was_live {
+                        self.reload_engine_after_sync(false);
+                        self.status = "Daemon collegato: questa finestra scrive attraverso il canale locale.".to_owned();
+                    }
+                }
+                daemon::Event::Reconnecting { attempt } => {
+                    self.connection = daemon::Connection::Reconnecting { attempt };
+                }
+                daemon::Event::Lost => {
+                    self.connection = daemon::Connection::Lost;
+                    self.status = "Il daemon non risponde: la posta resta leggibile, le modifiche sono sospese.".to_owned();
+                    self.reload_engine_after_sync(false);
+                }
+                daemon::Event::Daemon(value) => self.apply_daemon_event(value),
+            }
+        }
+    }
+
+    /// The same store-backed views the in-process workers refresh, driven by the daemon's bounded
+    /// events instead of a polling loop.
+    fn apply_daemon_event(&mut self, event: Value) {
+        let kind = event.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let data = event.get("data").cloned().unwrap_or(Value::Null);
+        match kind {
+            "sync" => {
+                let phase = data.get("phase").and_then(Value::as_str).unwrap_or_default();
+                let account = data.get("account").and_then(Value::as_str).map(str::to_owned);
+                match phase {
+                    "started" => self.apply_sync_event(SyncEvent::Started { account }),
+                    "progress" => {
+                        let number = |key: &str| data.get(key).and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok());
+                        let progress = SyncProgress {
+                            folders_done: number("folders_done").unwrap_or_default(),
+                            folders_total: number("folders_total").unwrap_or_default(),
+                            messages: number("messages").unwrap_or_default(),
+                        };
+                        self.apply_sync_event(SyncEvent::Progress { account, progress });
+                    }
+                    "finished" => {
+                        let report = postino_core::SyncReport {
+                            account: account.clone().unwrap_or_default(),
+                            folders: count(&data, "folders"),
+                            fetched: count(&data, "fetched"),
+                            updated_flags: count(&data, "updated_flags"),
+                            removed: count(&data, "removed"),
+                            attachments_stored: count(&data, "attachments_stored"),
+                            warnings: Vec::new(),
+                        };
+                        self.apply_sync_event(SyncEvent::Finished { report });
+                    }
+                    "failed" => {
+                        let category = data.get("error").and_then(Value::as_str).unwrap_or_default();
+                        let offline = category == "server unreachable";
+                        let message = match category {
+                            "authentication failed" => "Il server ha rifiutato le credenziali.",
+                            "server unreachable" => "Il server non è raggiungibile: la posta è quella locale.",
+                            "shutting down" => "Il daemon si sta chiudendo.",
+                            _ => "Sincronizzazione non riuscita.",
+                        };
+                        self.apply_sync_event(SyncEvent::Failed { account, message: message.to_owned(), cancelled: false, offline });
+                    }
+                    _ => {}
+                }
+            }
+            "outbox" => self.last_outbox_poll = 0.0,
+            "index" => {
+                // The daemon publishes the full status shape; a partial payload still moves the
+                // banner forward instead of being dropped silently.
+                if let Some(status) = index_status(&data) {
+                    self.index_progress = Some(status);
+                    self.index_checked = true;
+                } else {
+                    log::debug!("the daemon published an index event without a readable status");
+                }
+            }
+            // Rules and blob GC change messages, labels or attachments without an op of this
+            // window: reload the read-only engine so the list, thread and reading pane agree.
+            "rules" | "gc" => self.reload_engine_after_sync(false),
+            _ => {}
+        }
+    }
+
+    /// Start the daemon from an explicit command. Releases this window's writer lock first: the
+    /// daemon must be the only writer from the instant it opens the store.
+    fn request_start_daemon(&mut self) {
+        if let Some(reason) = self.connection.reason_start(self.demo) {
+            self.status = reason.to_owned();
+            return;
+        }
+        if self.daemon_job.is_some() {
+            self.status = "Un comando sul daemon è già in corso.".to_owned();
+            return;
+        }
+        let Some(path) = self.store_path.clone() else {
+            self.status = "Non c'è un archivio da affidare al daemon.".to_owned();
+            return;
+        };
+        self.stop_sync_worker();
+        self.send_worker = None;
+        self.writer_lock = None;
+        if let Some(handle) = self.store.clone() {
+            match handle.as_read_only().open_engine() {
+                Ok(engine) => {
+                    self.store = Some(handle.as_read_only());
+                    self.engine = engine;
+                }
+                Err(message) => {
+                    self.recover_after_failed_start(format!("Non riesco a riaprire l'archivio mentre avvio il daemon: {message}"));
+                    return;
+                }
+            }
+        }
+        if let Ok(link) = daemon::Link::connect(&path) {
+            self.daemon_link = Some(link);
+        }
+        self.connection = daemon::Connection::Reconnecting { attempt: 1 };
+        self.status = "Avvio del daemon…".to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawn_path = path.clone();
+        let spawned = std::thread::Builder::new().name("postino-app-daemon-start".to_owned()).spawn(move || {
+            let _ = sender.send(daemon::start(&spawn_path));
+        });
+        if spawned.is_err() {
+            self.recover_after_failed_start("Non riesco ad avviare il processo del daemon.".to_owned());
+            return;
+        }
+        self.daemon_job = Some(DaemonJobState { kind: DaemonJob::Start, receiver });
+    }
+
+    /// Every failed "Avvia daemon" path returns here. The worker was already silenced and the writer
+    /// lock released, so the window must come back as a coherent whole: in-process with its sync and
+    /// send workers when the archive is free, read-only and honestly labelled when another writer
+    /// still owns it. Never a state with no workers and a label stuck on "riconnessione".
+    fn recover_after_failed_start(&mut self, message: String) {
+        let Some(path) = self.store_path.clone() else {
+            self.report_failure(message, false);
+            return;
+        };
+        let mut restored = false;
+        if let Some(handle) = self.store.clone()
+            && let Ok(lock) = postino_store::WriterLock::acquire_as(&path, "app", None)
+        {
+            match handle.as_writable().open_engine() {
+                Ok(engine) => {
+                    self.store = Some(handle.as_writable());
+                    self.engine = engine;
+                    self.writer_lock = Some(lock);
+                    self.attach_daemon(None);
+                    restored = true;
+                }
+                Err(error) => log::warn!("the archive could not be reopened for writing after a failed daemon start: {error}"),
+            }
+        }
+        if !restored {
+            if let Some(handle) = self.store.clone() {
+                match handle.as_read_only().open_engine() {
+                    Ok(engine) => {
+                        self.store = Some(handle.as_read_only());
+                        self.engine = engine;
+                    }
+                    Err(error) => log::warn!("the archive could not be reopened read-only after a failed daemon start: {error}"),
+                }
+            }
+            self.writer_lock = None;
+            self.connection = daemon::Connection::Lost;
+            if self.daemon_link.is_none() {
+                self.daemon_link = daemon::Link::connect(&path).ok();
+            }
+            if let Ok(paths) = daemon::paths(&path) {
+                self.stop_sync_worker();
+                self.send_worker = None;
+                self.daemon_events = Some(daemon::EventWorker::start(Box::new(daemon::IpcTransport::new(paths))));
+                self.sync_worker = Some(SyncWorker::start(Box::new(crate::sync_worker::DaemonSyncBackend::new(path))));
+            }
+        }
+        self.report_failure(message, false);
+    }
+
+    /// Stop the daemon from an explicit command, then take the store back in this window if the
+    /// lock is free. A daemon that does not answer leaves the window read-only and says so.
+    fn request_stop_daemon(&mut self) {
+        if let Some(reason) = self.connection.reason_stop() {
+            self.status = reason.to_owned();
+            return;
+        }
+        if self.daemon_job.is_some() {
+            self.status = "Un comando sul daemon è già in corso.".to_owned();
+            return;
+        }
+        let Some(path) = self.store_path.clone() else {
+            return;
+        };
+        let Ok(mut link) = daemon::Link::connect(&path) else {
+            self.status = "Il canale locale non è disponibile: riavvia il daemon dalla CLI.".to_owned();
+            return;
+        };
+        self.status = "Chiusura del daemon…".to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawn_path = path.clone();
+        let spawned = std::thread::Builder::new().name("postino-app-daemon-stop".to_owned()).spawn(move || {
+            let result = daemon::stop(&mut link, &spawn_path);
+            let _ = sender.send(result);
+        });
+        if spawned.is_err() {
+            self.status = "Non riesco a fermare il daemon.".to_owned();
+            return;
+        }
+        self.daemon_job = Some(DaemonJobState { kind: DaemonJob::Stop, receiver });
+    }
+
+    fn poll_daemon_job(&mut self) {
+        let result = {
+            let Some(job) = &self.daemon_job else {
+                return;
+            };
+            match job.receiver.try_recv() {
+                Ok(result) => Some((job.kind, result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((job.kind, Err("L'operazione sul daemon si è interrotta.".to_owned()))),
+            }
+        };
+        let Some((kind, result)) = result else {
+            return;
+        };
+        self.daemon_job = None;
+        match (kind, result) {
+            (DaemonJob::Start, Ok(())) => self.adopt_daemon_client(),
+            (DaemonJob::Start, Err(message)) => self.recover_after_failed_start(format!("Il daemon non è partito: {message}")),
+            (DaemonJob::Stop, Ok(())) => self.take_over_in_process(),
+            (DaemonJob::Stop, Err(message)) => {
+                self.report_failure(format!("Il daemon non si è fermato: {message}"), false);
+                self.reload_engine_after_sync(false);
+            }
+        }
+    }
+
+    /// Reconnect to a daemon that has just started, keeping the selected folder, the filters, the
+    /// open message, the thread view and the composer: only the engine is replaced.
+    fn adopt_daemon_client(&mut self) {
+        let Some(handle) = self.store.clone() else {
+            self.status = "L'archivio non è più aperto in questa finestra.".to_owned();
+            return;
+        };
+        let Some(path) = self.store_path.clone() else {
+            return;
+        };
+        let Some(hello) = daemon::probe(&path) else {
+            self.status = "Il daemon non risponde ancora: riprova tra un istante.".to_owned();
+            return;
+        };
+        let handle = handle.as_read_only();
+        match handle.open_engine() {
+            Ok(engine) => {
+                self.store = Some(handle);
+                self.engine = engine;
+                self.attach_daemon(Some(hello));
+                self.keep_view_state();
+                self.status = "Il daemon ora possiede l'archivio: la finestra scrive attraverso il canale locale.".to_owned();
+            }
+            Err(message) => self.report_failure(format!("L'archivio non si riapre in sola lettura: {message}"), false),
+        }
+    }
+
+    /// The explicit stop succeeded: take the writer lock back in this window.
+    fn take_over_in_process(&mut self) {
+        let Some(handle) = self.store.clone() else {
+            return;
+        };
+        let path = handle.path().to_path_buf();
+        match postino_store::WriterLock::acquire_as(&path, "app", None) {
+            Ok(lock) => match handle.as_writable().open_engine() {
+                Ok(engine) => {
+                    self.store = Some(handle.as_writable());
+                    self.engine = engine;
+                    self.writer_lock = Some(lock);
+                    self.attach_daemon(None);
+                    self.keep_view_state();
+                    self.status = "Daemon fermato: l'archivio è di questa finestra.".to_owned();
+                }
+                Err(message) => self.report_failure(format!("L'archivio non si riapre per scrivere: {message}"), false),
+            },
+            Err(postino_store::StoreError::StoreBusy { .. }) => {
+                self.status = "Il daemon possiede ancora l'archivio: riprova tra un istante.".to_owned();
+            }
+            Err(error) => self.report_failure(format!("Non riesco a riprendere l'archivio: {error}"), false),
+        }
+    }
+
+    fn daemon_status_text(&mut self) -> String {
+        match self.daemon_link.as_mut().map(daemon::Link::status) {
+            Some(Ok(value)) => format!(
+                "daemon {} · pid {} · {} account · index {} · ultimo errore: {}",
+                value.get("version").and_then(Value::as_str).unwrap_or("?"),
+                value.get("pid").and_then(Value::as_u64).unwrap_or_default(),
+                value.get("accounts").and_then(Value::as_u64).unwrap_or_default(),
+                value.pointer("/index/state").and_then(Value::as_str).unwrap_or("?"),
+                value.get("last_error").and_then(Value::as_str).unwrap_or("nessuno"),
+            ),
+            Some(Err(message)) => message,
+            None => self.connection.detail(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -594,6 +1026,10 @@ impl PostinoApp {
             licences_return_focus: None,
             licences_focus_pending: false,
             system_theme: false,
+            connection: if demo { daemon::Connection::Demo } else { daemon::Connection::InProcess },
+            daemon_link: None,
+            daemon_events: None,
+            daemon_job: None,
         }
     }
 
@@ -661,7 +1097,7 @@ impl PostinoApp {
                     .map(|message| message.id.clone())
                     .collect::<Vec<_>>();
                 for id in ids {
-                    let _ = self.engine.call("message_flag", json!({ "id": id, "unread": false, "starred": null }));
+                    let _ = self.op("message_flag", json!({ "id": id, "unread": false, "starred": null }));
                 }
                 self.refresh_labels();
                 self.unread_only = true;
@@ -678,7 +1114,7 @@ impl PostinoApp {
                     .map(|message| message.id.clone())
                     .collect::<Vec<_>>();
                 for id in ids {
-                    let _ = self.engine.call("message_move", json!({ "id": id, "folder": "archive" }));
+                    let _ = self.op("message_move", json!({ "id": id, "folder": "archive" }));
                 }
                 self.refresh_labels();
                 self.attachments_only = true;
@@ -694,7 +1130,7 @@ impl PostinoApp {
                     .map(|message| message.id.clone())
                     .collect::<Vec<_>>();
                 for id in ids {
-                    let _ = self.engine.call("message_flag", json!({ "id": id, "unread": false, "starred": null }));
+                    let _ = self.op("message_flag", json!({ "id": id, "unread": false, "starred": null }));
                 }
                 self.refresh_labels();
                 self.unread_only = true;
@@ -920,7 +1356,7 @@ impl PostinoApp {
             ScreenshotState::SavedSearches => {
                 if !self.engine.accounts().is_empty() && self.saved_searches.is_empty() {
                     for (name, query) in [("Da Giulia", "from:giulia"), ("Fatture", "label:Fatture"), ("Non letti", "is:unread")] {
-                        let _ = self.engine.call("saved_search_create", json!({ "name": name, "query": query }));
+                        let _ = self.op("saved_search_create", json!({ "name": name, "query": query }));
                     }
                 }
                 self.refresh_saved_searches();
@@ -941,12 +1377,12 @@ impl PostinoApp {
                             ("Fatture", "subject:fattura", json!([{ "kind": "label", "label": "lbl_3" }]), 20),
                             ("Newsletter", "subject:newsletter", json!([{ "kind": "move", "folder": "archive" }]), 30),
                         ] {
-                            let _ = self.engine.call(
+                            let _ = self.op(
                                 "rules_create",
                                 json!({ "name": name, "query": query, "actions": actions, "priority": priority, "account": account }),
                             );
                         }
-                        let _ = self.engine.call("rules_run", json!({ "account": account, "scope": "new" }));
+                        let _ = self.op("rules_run", json!({ "account": account, "scope": "new" }));
                     }
                     self.active_account = Some(account);
                 }
@@ -1211,69 +1647,75 @@ impl PostinoApp {
             worker.poll()
         };
         for event in events {
-            let event_account = match &event {
-                SyncEvent::Started { account } => account.clone(),
-                SyncEvent::Progress { account, .. } => account.clone(),
-                SyncEvent::Finished { report } => Some(report.account.clone()),
-                SyncEvent::Failed { account, .. } => account.clone(),
-            };
-            let active = self.active_account.clone();
-            let applies = event_account.is_none() || event_account.as_deref() == active.as_deref();
-            match event {
-                SyncEvent::Started { .. } => {
-                    if applies && !matches!(self.sync_view, SyncView::Running(_)) {
-                        if self.sync_account.is_none() {
-                            self.sync_account = event_account;
-                        }
-                        self.sync_view = SyncView::Running(SyncProgress::default());
+            self.apply_sync_event(event);
+        }
+    }
+
+    /// One sync outcome, whether it came from this window's worker (in-process mode) or from a
+    /// `sync` event the daemon published (client mode). Both replace the engine and keep the view.
+    fn apply_sync_event(&mut self, event: SyncEvent) {
+        let event_account = match &event {
+            SyncEvent::Started { account } => account.clone(),
+            SyncEvent::Progress { account, .. } => account.clone(),
+            SyncEvent::Finished { report } => Some(report.account.clone()),
+            SyncEvent::Failed { account, .. } => account.clone(),
+        };
+        let active = self.active_account.clone();
+        let applies = event_account.is_none() || event_account.as_deref() == active.as_deref();
+        match event {
+            SyncEvent::Started { .. } => {
+                if applies && !matches!(self.sync_view, SyncView::Running(_)) {
+                    if self.sync_account.is_none() {
+                        self.sync_account = event_account;
                     }
+                    self.sync_view = SyncView::Running(SyncProgress::default());
                 }
-                SyncEvent::Progress { progress, .. } => {
-                    if applies {
-                        self.sync_view = SyncView::Running(progress);
-                        if let Some(onboarding) = self.onboarding.as_mut() {
-                            onboarding.set_sync_progress(progress);
-                        }
-                    }
-                }
-                SyncEvent::Finished { report } => {
-                    self.reload_engine_after_sync(true);
-                    self.clear_sync_account(event_account.as_deref());
-                    if !applies {
-                        continue;
-                    }
-                    let last = self.last_sync.or_else(|| Some(self.now_utc.timestamp_millis()));
-                    self.last_sync = last;
-                    self.sync_view = SyncView::Idle { last_sync: last };
-                    self.status = format!(
-                        "Sincronizzazione completata · {}",
-                        plural(usize::try_from(report.fetched).unwrap_or(usize::MAX), "messaggio aggiornato", "messaggi aggiornati")
-                    );
+            }
+            SyncEvent::Progress { progress, .. } => {
+                if applies {
+                    self.sync_view = SyncView::Running(progress);
                     if let Some(onboarding) = self.onboarding.as_mut() {
-                        onboarding.sync_finished();
+                        onboarding.set_sync_progress(progress);
                     }
-                    self.finish_onboarding_if_synced();
                 }
-                SyncEvent::Failed { message, cancelled, offline, .. } => {
-                    self.reload_engine_after_sync(false);
-                    self.clear_sync_account(event_account.as_deref());
-                    if !applies {
-                        continue;
-                    }
-                    if cancelled {
-                        self.sync_view = SyncView::Idle { last_sync: self.last_sync };
-                        self.status = "Sincronizzazione annullata".to_owned();
+            }
+            SyncEvent::Finished { report } => {
+                self.reload_engine_after_sync(true);
+                self.clear_sync_account(event_account.as_deref());
+                if !applies {
+                    return;
+                }
+                let last = self.last_sync.or_else(|| Some(self.now_utc.timestamp_millis()));
+                self.last_sync = last;
+                self.sync_view = SyncView::Idle { last_sync: last };
+                self.status = format!(
+                    "Sincronizzazione completata · {}",
+                    plural(usize::try_from(report.fetched).unwrap_or(usize::MAX), "messaggio aggiornato", "messaggi aggiornati")
+                );
+                if let Some(onboarding) = self.onboarding.as_mut() {
+                    onboarding.sync_finished();
+                }
+                self.finish_onboarding_if_synced();
+            }
+            SyncEvent::Failed { message, cancelled, offline, .. } => {
+                self.reload_engine_after_sync(false);
+                self.clear_sync_account(event_account.as_deref());
+                if !applies {
+                    return;
+                }
+                if cancelled {
+                    self.sync_view = SyncView::Idle { last_sync: self.last_sync };
+                    self.status = "Sincronizzazione annullata".to_owned();
+                } else {
+                    self.sync_view = if offline {
+                        SyncView::Offline { last_sync: self.last_sync }
                     } else {
-                        self.sync_view = if offline {
-                            SyncView::Offline { last_sync: self.last_sync }
-                        } else {
-                            SyncView::Error { reason: message.clone(), last_sync: self.last_sync }
-                        };
-                        self.status = message.clone();
-                    }
-                    if let Some(onboarding) = self.onboarding.as_mut() {
-                        onboarding.sync_failed(message, cancelled);
-                    }
+                        SyncView::Error { reason: message.clone(), last_sync: self.last_sync }
+                    };
+                    self.status = message.clone();
+                }
+                if let Some(onboarding) = self.onboarding.as_mut() {
+                    onboarding.sync_failed(message, cancelled);
                 }
             }
         }
@@ -1457,7 +1899,7 @@ impl PostinoApp {
         if self.active_account.as_deref() == Some(state.id.as_str()) {
             self.cancel_sync();
         }
-        match self.engine.call("account_remove", json!({ "id": state.id, "confirm": true })) {
+        match self.op("account_remove", json!({ "id": state.id, "confirm": true })) {
             Ok(_) => self.after_account_removal(&state.id, None),
             Err(error) => {
                 // The engine removes the store rows before the credential. A keyring refusal can
@@ -1538,11 +1980,21 @@ impl PostinoApp {
         let Some(store) = &self.store else {
             return;
         };
-        self.sync_worker = Some(SyncWorker::start(Box::new(crate::sync_worker::StoreSyncBackend::new(store.clone(), self.extra_roots.clone()))));
+        let backend: Box<dyn crate::sync_worker::SyncBackend> = if self.daemon_link.is_some() {
+            Box::new(crate::sync_worker::DaemonSyncBackend::new(store.path().to_path_buf()))
+        } else {
+            Box::new(crate::sync_worker::StoreSyncBackend::new(store.clone(), self.extra_roots.clone()))
+        };
+        self.sync_worker = Some(SyncWorker::start(backend));
     }
 
     fn open_demo(&mut self) {
         self.stop_sync_worker();
+        self.send_worker = None;
+        self.daemon_events = None;
+        self.daemon_link = None;
+        self.daemon_job = None;
+        self.connection = daemon::Connection::Demo;
         if !self.demo {
             // Keep the handle the store launch already opened. Leaving the demo then reopens the
             // archive without asking the keyring again; the recovery path, which never had a
@@ -1628,9 +2080,20 @@ impl PostinoApp {
         let lock = self.writer_lock.take();
         let reopened = match (self.demo_return.take(), lock) {
             (Some(store), Some(writer_lock)) => match store.open_engine() {
-                Ok(engine) => Some(boot::Booted { engine, store: Some(store), demo: false, writer_lock: Some(writer_lock) }),
+                Ok(engine) => Some(boot::Booted { engine, store: Some(store), demo: false, writer_lock: Some(writer_lock), daemon: None }),
                 Err(_) => None,
             },
+            (Some(store), None) if store.is_read_only() => {
+                // Entered the demo while a daemon owned the store: come back as a client, never as
+                // a second writer.
+                let hello = daemon::probe(store.path());
+                match (store.open_engine(), hello) {
+                    (Ok(engine), Some(hello)) => {
+                        Some(boot::Booted { engine, store: Some(store), demo: false, writer_lock: None, daemon: Some(hello) })
+                    }
+                    _ => None,
+                }
+            }
             (store, None) => {
                 self.demo_return = store;
                 None
@@ -1669,10 +2132,17 @@ impl PostinoApp {
                 };
                 let (sender, receiver) = std::sync::mpsc::channel();
                 self.add_account_job = Some(receiver);
+                let daemon_route =
+                    if self.daemon_link.is_some() { self.store_path.as_deref().and_then(|path| daemon::paths(path).ok()) } else { None };
                 std::thread::spawn(move || {
-                    let result = match handle.open_engine() {
-                        Ok(mut engine) => engine.add_account(*setup).map(|view| (view.account.id, view.account.email)).map_err(add_account_copy),
-                        Err(error) => Err(format!("Non riesco ad aprire l'archivio locale: {error}")),
+                    let result = match daemon_route {
+                        // The daemon admits this window for the sensitive operation: the password
+                        // travels only inside the same-user channel, never on a command line.
+                        Some(paths) => daemon::add_account(&paths, &setup),
+                        None => match handle.open_engine() {
+                            Ok(mut engine) => engine.add_account(*setup).map(|view| (view.account.id, view.account.email)).map_err(add_account_copy),
+                            Err(error) => Err(format!("Non riesco ad aprire l'archivio locale: {error}")),
+                        },
                     };
                     let _ = sender.send(result);
                 });
@@ -2141,10 +2611,8 @@ impl PostinoApp {
         let previous = mode.as_deref().and_then(|id| self.saved_searches.iter().find(|saved| saved.id == id).cloned());
         let update_account = previous.as_ref().map(|saved| saved.account_id.clone()).or_else(|| account.clone());
         let result = match mode {
-            Some(id) => {
-                self.engine.call("saved_search_update", json!({ "id": id, "account": update_account, "name": name, "query": query, "sort": sort }))
-            }
-            None => self.engine.call("saved_search_create", json!({ "account": account, "name": name, "query": query, "sort": sort })),
+            Some(id) => self.op("saved_search_update", json!({ "id": id, "account": update_account, "name": name, "query": query, "sort": sort })),
+            None => self.op("saved_search_create", json!({ "account": account, "name": name, "query": query, "sort": sort })),
         };
         match result {
             Ok(_) => {
@@ -2178,7 +2646,7 @@ impl PostinoApp {
 
     fn delete_saved_search(&mut self, id: &str) {
         let Some(saved) = self.saved_searches.iter().find(|saved| saved.id == id).cloned() else { return };
-        match self.engine.call("saved_search_delete", json!({ "id": id, "account": saved.account_id })) {
+        match self.op("saved_search_delete", json!({ "id": id, "account": saved.account_id })) {
             Ok(_) => {
                 self.refresh_saved_searches();
                 let message = format!("Ricerca “{}” eliminata", saved.name);
@@ -2231,7 +2699,7 @@ impl PostinoApp {
         self.list_signature.clear();
         if saved.valid && !saved.index_pending {
             let account = self.active_account.clone();
-            let _ = self.engine.record_recent_search(account.as_deref(), &saved.query);
+            self.remember_search(account.as_deref(), &saved.query);
             self.refresh_recent_searches();
         }
         self.status = format!("Ricerca “{}”", saved.name);
@@ -2300,7 +2768,7 @@ impl PostinoApp {
     /// newest page so the latest unread is visible even in a thread larger than the 200-message cap.
     fn load_thread_page(&mut self, id: String, open: bool, offset: Option<u32>) {
         let account = self.active_account.clone();
-        let summary = match self.engine.call("thread_get", json!({ "id": id, "account": account, "limit": 1, "offset": 0 })) {
+        let summary = match self.op("thread_get", json!({ "id": id, "account": account, "limit": 1, "offset": 0 })) {
             Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
                 Ok(detail) => detail,
                 Err(_) => {
@@ -2315,7 +2783,7 @@ impl PostinoApp {
         };
         let total = summary.total;
         let start = offset.unwrap_or_else(|| total.saturating_sub(200));
-        let page = match self.engine.call("thread_get", json!({ "id": summary.resolved_id, "account": account, "limit": 200, "offset": start })) {
+        let page = match self.op("thread_get", json!({ "id": summary.resolved_id, "account": account, "limit": 200, "offset": start })) {
             Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
                 Ok(detail) => detail,
                 Err(_) => {
@@ -2366,7 +2834,7 @@ impl PostinoApp {
         }
         let account = self.active_account.clone();
         let offset = self.thread_offset.saturating_sub(200);
-        match self.engine.call("thread_get", json!({ "id": id, "account": account, "limit": 200, "offset": offset })) {
+        match self.op("thread_get", json!({ "id": id, "account": account, "limit": 200, "offset": offset })) {
             Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
                 Ok(detail) => {
                     let known = self.thread_messages.iter().map(|message| message.id.clone()).collect::<BTreeSet<_>>();
@@ -2450,7 +2918,7 @@ impl PostinoApp {
         let Some(id) = self.selected_thread.clone() else { return };
         let account = self.active_account.clone();
         let offset = self.thread_offset;
-        if let Ok(value) = self.engine.call("thread_get", json!({ "id": id, "account": account, "limit": 200, "offset": offset }))
+        if let Ok(value) = self.op("thread_get", json!({ "id": id, "account": account, "limit": 200, "offset": offset }))
             && let Ok(detail) = serde_json::from_value::<ThreadGetResult>(value)
         {
             self.thread_summary = Some(detail.thread);
@@ -2469,7 +2937,7 @@ impl PostinoApp {
                 return;
             }
         };
-        match self.engine.call("thread_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
+        match self.op("thread_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
             Ok(value) => {
                 self.pending_read = None;
                 let mut unread_changes = Vec::new();
@@ -2688,7 +3156,7 @@ impl PostinoApp {
     }
 
     fn delete_label(&mut self, state: &LabelDeleteState) {
-        match self.engine.call("label_delete", json!({ "id": state.id })) {
+        match self.op("label_delete", json!({ "id": state.id })) {
             Ok(value) => match serde_json::from_value::<LabelDelete>(value) {
                 Ok(deleted) => {
                     self.refresh_labels();
@@ -2785,7 +3253,7 @@ impl PostinoApp {
             self.status = if apply { "Etichetta già applicata" } else { "Etichetta non presente" }.to_owned();
             return;
         }
-        match self.engine.call("label_apply", json!({ "id": id, "message_ids": ids, "apply": apply })) {
+        match self.op("label_apply", json!({ "id": id, "message_ids": ids, "apply": apply })) {
             Ok(value) => match serde_json::from_value::<LabelApply>(value) {
                 Ok(result) => {
                     self.refresh_labels();
@@ -3079,7 +3547,7 @@ impl PostinoApp {
                 failed = true;
                 break;
             };
-            match self.engine.call("message_move", json!({ "id": id, "folder": folder })) {
+            match self.op("message_move", json!({ "id": id, "folder": folder })) {
                 Ok(_) => moved.push((id.clone(), previous)),
                 Err(_) => {
                     failed = true;
@@ -3166,7 +3634,7 @@ impl PostinoApp {
     }
 
     fn set_flag_for(&mut self, id: &str, unread: Option<bool>, starred: Option<bool>) -> bool {
-        match self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
+        match self.op("message_flag", json!({ "id": id, "unread": unread, "starred": starred })) {
             Ok(_) => {
                 // Any explicit flag action wins over the 600 ms auto-read. Otherwise pressing U
                 // right after opening would be overwritten by the timer.
@@ -3345,7 +3813,7 @@ impl PostinoApp {
         match undo {
             UndoAction::Unread(changes) => {
                 for (id, unread) in changes {
-                    if self.engine.call("message_flag", json!({ "id": id, "unread": unread, "starred": null })).is_err() {
+                    if self.op("message_flag", json!({ "id": id, "unread": unread, "starred": null })).is_err() {
                         failed = true;
                         break;
                     }
@@ -3353,7 +3821,7 @@ impl PostinoApp {
             }
             UndoAction::Starred(changes) => {
                 for (id, starred) in changes {
-                    if self.engine.call("message_flag", json!({ "id": id, "unread": null, "starred": starred })).is_err() {
+                    if self.op("message_flag", json!({ "id": id, "unread": null, "starred": starred })).is_err() {
                         failed = true;
                         break;
                     }
@@ -3361,14 +3829,14 @@ impl PostinoApp {
             }
             UndoAction::Move(changes) => {
                 for (id, folder) in changes {
-                    if self.engine.call("message_move", json!({ "id": id, "folder": folder })).is_err() {
+                    if self.op("message_move", json!({ "id": id, "folder": folder })).is_err() {
                         failed = true;
                         break;
                     }
                 }
             }
             UndoAction::CancelSend(id) => {
-                if self.engine.call("outbox_cancel", json!({ "id": id })).is_err() {
+                if self.op("outbox_cancel", json!({ "id": id })).is_err() {
                     failed = true;
                 } else {
                     self.refresh_outbox();
@@ -3376,20 +3844,20 @@ impl PostinoApp {
             }
             UndoAction::Labels(changes) => {
                 for (message_id, label_id, was_applied) in changes {
-                    if self.engine.call("label_apply", json!({ "id": label_id, "message_ids": [message_id], "apply": was_applied })).is_err() {
+                    if self.op("label_apply", json!({ "id": label_id, "message_ids": [message_id], "apply": was_applied })).is_err() {
                         failed = true;
                         break;
                     }
                 }
             }
-            UndoAction::LabelDelete { name, color, message_ids } => match self.engine.call("label_create", json!({ "name": name, "color": color })) {
+            UndoAction::LabelDelete { name, color, message_ids } => match self.op("label_create", json!({ "name": name, "color": color })) {
                 Ok(value) => match serde_json::from_value::<LabelCreate>(value) {
                     Ok(created) => {
                         let ids = message_ids.iter().filter(|id| self.engine.message(id).is_some()).cloned().collect::<Vec<_>>();
                         // A deleted label can carry more assignments than one `label_apply` call
                         // accepts (500), so restore in chunks instead of failing halfway.
                         for chunk in ids.chunks(LABEL_APPLY_CHUNK) {
-                            if self.engine.call("label_apply", json!({ "id": created.label.id, "message_ids": chunk, "apply": true })).is_err() {
+                            if self.op("label_apply", json!({ "id": created.label.id, "message_ids": chunk, "apply": true })).is_err() {
                                 failed = true;
                                 break;
                             }
@@ -3400,12 +3868,12 @@ impl PostinoApp {
                 Err(_) => failed = true,
             },
             UndoAction::LabelRename { id, name, color } => {
-                if self.engine.call("label_update", json!({ "id": id, "name": name, "color": color })).is_err() {
+                if self.op("label_update", json!({ "id": id, "name": name, "color": color })).is_err() {
                     failed = true;
                 }
             }
             UndoAction::SavedSearchDelete { name, query, sort, account } => {
-                if self.engine.call("saved_search_create", json!({ "account": account, "name": name, "query": query, "sort": sort })).is_err() {
+                if self.op("saved_search_create", json!({ "account": account, "name": name, "query": query, "sort": sort })).is_err() {
                     failed = true;
                 } else {
                     self.refresh_saved_searches();
@@ -3528,7 +3996,7 @@ impl PostinoApp {
             self.list_cache = Some((signature, self.engine.revision(), Vec::new(), 0, 0, false));
             return empty;
         }
-        let result = match self.engine.call(name, args) {
+        let result = match self.op(name, args) {
             Ok(value) if searching => match serde_json::from_value::<SearchResult>(value) {
                 Ok(result) => {
                     self.search_error = None;
@@ -3660,7 +4128,7 @@ impl PostinoApp {
         while u32::try_from(rows.len()).unwrap_or(u32::MAX) < wanted {
             let mut page_args = args.clone();
             page_args["offset"] = json!(offset);
-            match self.engine.call("threads_list", page_args) {
+            match self.op("threads_list", page_args) {
                 Ok(value) => match serde_json::from_value::<ThreadsListResult>(value) {
                     Ok(result) => {
                         total = result.total;
@@ -3706,6 +4174,12 @@ impl PostinoApp {
             }
         }
         let should_build = self.index_progress.as_ref().is_some_and(|status| !status.ready && status.state != "error");
+        if should_build && self.daemon_link.is_some() {
+            // The daemon owns the index batches and publishes `index` events; a read-only client
+            // must not advance the index itself. The banner keeps polling the status it can read.
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            return;
+        }
         if should_build && let Ok(Some(status)) = self.engine.advance_search_index() {
             self.index_progress = Some(postino_core::SearchStatusResult::from_store(status));
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -3715,6 +4189,59 @@ impl PostinoApp {
                 self.refresh_saved_searches();
             }
         }
+    }
+
+    /// Remember a recent query. With a daemon the window must not write the store: the list stays
+    /// per-session and the daemon persists the queries its own search op records.
+    fn remember_search(&mut self, account: Option<&str>, query: &str) {
+        if self.daemon_link.is_some() {
+            return;
+        }
+        let _ = self.engine.record_recent_search(account, query);
+    }
+
+    /// Forget one account's recent queries: the registry op when a daemon owns the store.
+    fn clear_recent_searches(&mut self, account: Option<&str>) -> Result<bool, String> {
+        if self.daemon_link.is_some() {
+            let value = self.op("saved_search_recent_clear", serde_json::json!({ "account": account })).map_err(|error| error.to_string())?;
+            return Ok(value.get("removed").and_then(Value::as_bool).unwrap_or_default());
+        }
+        self.engine.clear_recent_searches(account).map_err(|error| op_error_copy(&error))
+    }
+
+    /// Attach bytes to a draft through the same op the CLI uses. The daemon path base64-encodes
+    /// into the bounded frame and refuses an oversized file before it writes anything.
+    fn add_draft_attachment(&mut self, draft_id: &str, filename: &str, mime: Option<&str>, bytes: &[u8]) -> Result<Message, String> {
+        if self.daemon_link.is_some() {
+            let data = daemon::base64_payload(bytes)?;
+            let args = serde_json::json!({ "draft": draft_id, "filename": filename, "mime": mime, "data_base64": data });
+            self.op("draft_attachment_add", args).map_err(|error| error.to_string())?;
+            self.reload_engine_after_sync(false);
+            return self.engine.message(draft_id).ok_or_else(|| "La bozza è stata aggiornata ma l'archivio non la rilegge.".to_owned());
+        }
+        self.engine.add_draft_attachment(draft_id, filename, mime, bytes).map_err(|error| op_error_copy(&error))
+    }
+
+    fn remove_draft_attachment(&mut self, draft_id: &str, attachment: &str) -> Result<Message, String> {
+        if self.daemon_link.is_some() {
+            let args = serde_json::json!({ "draft": draft_id, "attachment": attachment });
+            self.op("draft_attachment_remove", args).map_err(|error| error.to_string())?;
+            self.reload_engine_after_sync(false);
+            return self.engine.message(draft_id).ok_or_else(|| "La bozza è stata aggiornata ma l'archivio non la rilegge.".to_owned());
+        }
+        self.engine.remove_draft_attachment(draft_id, attachment).map_err(|error| op_error_copy(&error))
+    }
+
+    /// Copy a forwarded attachment into the new draft: bytes are read from the local archive and
+    /// written through the daemon op when a daemon owns the store.
+    fn copy_attachment_to_draft(&mut self, draft_id: &str, source: &str, metadata: Option<&Attachment>) -> Result<Message, String> {
+        if self.daemon_link.is_some() {
+            let bytes = self.engine.attachment_bytes(source).map_err(|error| op_error_copy(&error))?;
+            let filename = metadata.map_or_else(|| "allegato".to_owned(), |attachment| attachment.filename.clone());
+            let mime = metadata.map(|attachment| attachment.mime.clone());
+            return self.add_draft_attachment(draft_id, &filename, mime.as_deref(), &bytes);
+        }
+        self.engine.copy_attachment_to_draft(draft_id, source).map_err(|error| op_error_copy(&error))
     }
 
     /// Commit the typed search immediately (Enter). Empty text clears the search.
@@ -3743,7 +4270,9 @@ impl PostinoApp {
                 self.threads_view = false;
             }
             if record_recent && self.engine.validate_search_query(&self.search_committed, self.active_account.as_deref()).is_ok() {
-                let _ = self.engine.record_recent_search(self.active_account.as_deref(), &self.search_committed);
+                let account = self.active_account.clone();
+                let query = self.search_committed.clone();
+                self.remember_search(account.as_deref(), &query);
                 self.refresh_recent_searches();
             }
         }
@@ -3790,7 +4319,7 @@ impl PostinoApp {
             return;
         }
         let account = self.active_account.clone();
-        let summary = match self.engine.call("thread_get", json!({ "id": thread_id, "account": account, "limit": 1, "offset": 0 })) {
+        let summary = match self.op("thread_get", json!({ "id": thread_id, "account": account, "limit": 1, "offset": 0 })) {
             Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
                 Ok(detail) => detail,
                 Err(_) => return,
@@ -3798,7 +4327,7 @@ impl PostinoApp {
             Err(_) => return,
         };
         let start = summary.total.saturating_sub(200);
-        let page = match self.engine.call("thread_get", json!({ "id": summary.resolved_id, "account": account, "limit": 200, "offset": start })) {
+        let page = match self.op("thread_get", json!({ "id": summary.resolved_id, "account": account, "limit": 200, "offset": start })) {
             Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
                 Ok(detail) => detail,
                 Err(_) => return,
@@ -4250,7 +4779,7 @@ impl PostinoApp {
         {
             object.insert("account".to_owned(), json!(account));
         }
-        let result = self.engine.call("draft_save", args);
+        let result = self.op("draft_save", args);
         match result {
             Ok(value) => match serde_json::from_value::<DraftSave>(value) {
                 Ok(saved) => {
@@ -4317,7 +4846,8 @@ impl PostinoApp {
         let mut copied = Vec::new();
         let mut failures = Vec::new();
         for source in sources {
-            match self.engine.copy_attachment_to_draft(draft_id, source) {
+            let metadata = sources_metadata.iter().find(|attachment| attachment.id == *source);
+            match self.copy_attachment_to_draft(draft_id, source, metadata) {
                 Ok(draft) => copied = draft.attachments,
                 Err(error) => {
                     let metadata = sources_metadata.iter().find(|attachment| attachment.id == *source).cloned().unwrap_or(Attachment {
@@ -4381,7 +4911,7 @@ impl PostinoApp {
             self.composer.mark_failed("Aggiungi almeno un destinatario prima di inviare", self.now);
             return;
         };
-        match self.engine.call("message_send", json!({ "draft": id })) {
+        match self.op("message_send", json!({ "draft": id })) {
             Ok(value) => match serde_json::from_value::<SendQueued>(value) {
                 Ok(queued) => {
                     let row = queued.queued.outbox;
@@ -4552,7 +5082,7 @@ impl PostinoApp {
                 self.composer.mark_failed("Il server non ha una cartella Cestino.", self.now);
                 return;
             };
-            match self.engine.call("message_move", json!({ "id": id, "folder": trash })) {
+            match self.op("message_move", json!({ "id": id, "folder": trash })) {
                 Ok(_) => {
                     self.composer = ComposerState::closed();
                     self.status = "Bozza spostata nel cestino".to_owned();
@@ -4625,7 +5155,7 @@ impl PostinoApp {
         for path in paths {
             let filename = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
             match read_attachment_file(&path) {
-                Ok(bytes) => match self.engine.add_draft_attachment(&draft_id, &filename, None, &bytes) {
+                Ok(bytes) => match self.add_draft_attachment(&draft_id, &filename, None, &bytes) {
                     Ok(draft) => {
                         self.composer.attachments = draft.attachments;
                         added = added.saturating_add(1);
@@ -4680,7 +5210,7 @@ impl PostinoApp {
         let Some(draft_id) = self.composer.draft_id.clone() else {
             return;
         };
-        match self.engine.remove_draft_attachment(&draft_id, attachment) {
+        match self.remove_draft_attachment(&draft_id, attachment) {
             Ok(draft) => {
                 self.composer.attachments = draft.attachments;
                 if self.composer.failed_attachment_ids.is_empty() {
@@ -4746,6 +5276,12 @@ impl PostinoApp {
         }
         if self.add_account_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        self.handle_sync_events();
+        self.poll_daemon();
+        self.poll_daemon_job();
+        if self.daemon_job.is_some() || self.connection.remote() && !self.connection.is_live() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -7334,14 +7870,14 @@ impl PostinoApp {
             self.open_settings(ui.ctx(), None);
         }
         match action {
-            Some(OutboxUiAction::Cancel(id)) => match self.engine.call("outbox_cancel", json!({ "id": id })) {
+            Some(OutboxUiAction::Cancel(id)) => match self.op("outbox_cancel", json!({ "id": id })) {
                 Ok(_) => {
                     self.refresh_outbox();
                     self.push_info_toast("Invio annullato: la bozza resta in Bozze.", ToastKind::Success);
                 }
                 Err(_) => self.push_info_toast("Non è stato possibile annullare: l'invio potrebbe essere già partito.", ToastKind::Error),
             },
-            Some(OutboxUiAction::Discard(id)) => match self.engine.call("outbox_cancel", json!({ "id": id })) {
+            Some(OutboxUiAction::Discard(id)) => match self.op("outbox_cancel", json!({ "id": id })) {
                 Ok(_) => {
                     self.refresh_outbox();
                     self.push_info_toast("Riga scartata: la bozza resta in Bozze e si può correggere.", ToastKind::Success);
@@ -7483,8 +8019,8 @@ impl PostinoApp {
             return;
         }
         let result = match &confirm {
-            OutboxConfirm::Retry { id, .. } => self.engine.call("outbox_retry", json!({ "id": id, "confirm": true })),
-            OutboxConfirm::MarkSent { id, .. } => self.engine.call("outbox_mark_sent", json!({ "id": id, "confirm": true })),
+            OutboxConfirm::Retry { id, .. } => self.op("outbox_retry", json!({ "id": id, "confirm": true })),
+            OutboxConfirm::MarkSent { id, .. } => self.op("outbox_mark_sent", json!({ "id": id, "confirm": true })),
         };
         self.outbox_confirm = None;
         let marked_sent = matches!(confirm, OutboxConfirm::MarkSent { .. });
@@ -7916,7 +8452,7 @@ impl PostinoApp {
         }
         if let Some(account_id) = signature_save {
             let text = self.signature_editor.as_ref().map(|editor| editor.text.clone()).unwrap_or_default();
-            let result = self.engine.call("account_signature_set", json!({ "account": account_id, "signature": text }));
+            let result = self.op("account_signature_set", json!({ "account": account_id, "signature": text }));
             match result {
                 Ok(_) => {
                     self.signature_editor = None;
@@ -8106,6 +8642,29 @@ impl PostinoApp {
                     }
                     ui.add_space(space::SM);
                     ui.label(typography::mono(format!("Postino {}", env!("CARGO_PKG_VERSION")), 10.5, t.text_faint));
+                    // Who owns the store is part of the product surface: the window must never
+                    // look like the only writer while a daemon holds the archive.
+                    if !self.demo && self.boot_failure.is_none() {
+                        ui.add_space(space::MD);
+                        let color = match self.connection {
+                            daemon::Connection::Connected(_) => t.success,
+                            daemon::Connection::Reconnecting { .. } | daemon::Connection::Lost => t.gold_ink,
+                            _ => t.text_muted,
+                        };
+                        let chip = ui.add(egui::Label::new(typography::text(Role::Meta, self.connection.label(), color)).truncate());
+                        chip.on_hover_text(self.connection.detail());
+                        if self.connection.can_start(self.demo) {
+                            ui.add_space(space::XS);
+                            if Button::ghost("Avvia daemon").size(ButtonSize::Sm).show(ui).clicked() {
+                                self.request_start_daemon();
+                            }
+                        } else if self.connection.remote() {
+                            ui.add_space(space::XS);
+                            if Button::ghost("Ferma daemon").size(ButtonSize::Sm).show(ui).clicked() {
+                                self.request_stop_daemon();
+                            }
+                        }
+                    }
                     if self.boot_failure.is_none()
                         && self.onboarding.is_none()
                         && let Some(text) = self.sync_text()
@@ -8785,7 +9344,7 @@ impl PostinoApp {
             }
             "saved_search_clear_recent" => {
                 let account = self.active_account.clone();
-                match self.engine.clear_recent_searches(account.as_deref()) {
+                match self.clear_recent_searches(account.as_deref()) {
                     Ok(true) => {
                         self.refresh_recent_searches();
                         self.status = "Ricerche recenti cancellate".to_owned();
@@ -8814,6 +9373,9 @@ impl PostinoApp {
             }
             "undo" => self.undo_last(),
             "sync" => self.request_sync(),
+            "daemon_start" => self.request_start_daemon(),
+            "daemon_stop" => self.request_stop_daemon(),
+            "daemon_status" => self.status = self.daemon_status_text(),
             "settings" => self.open_settings(ctx, self.account_switcher_id),
             "add_account" => {
                 if self.can_add_account() {
@@ -9737,6 +10299,9 @@ const COMMANDS: &[Command] = &[
     Command { id: "sync", label: "Aggiorna la posta", icon: icons::SYNC, shortcut: "", rule: CommandRule::Sync, in_palette: true },
     Command { id: "settings", label: "Impostazioni", icon: icons::SETTINGS, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command { id: "add_account", label: "Aggiungi account", icon: icons::PLUS, shortcut: "", rule: CommandRule::Store, in_palette: true },
+    Command { id: "daemon_start", label: "Avvia il daemon", icon: icons::SYNC, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "daemon_stop", label: "Ferma il daemon", icon: icons::CLOSE, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "daemon_status", label: "Stato del daemon", icon: icons::INFO, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command { id: "reduced_motion", label: "Riduci le animazioni", icon: icons::CLOCK, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
         id: "mark_folder_read",
@@ -15014,6 +15579,48 @@ mod tests {
         app
     }
 
+    /// A window that is really a daemon client: the store is seeded, a live daemon owns it, and the
+    /// app boots through the same probe a person's launch uses.
+    fn daemon_app(
+        name: &str,
+        seed: impl FnOnce(&postino_store::Store),
+    ) -> (PostinoApp, postino_daemon::Daemon, PathBuf, Arc<postino_store::StoreKey>, Arc<MemoryVault>) {
+        let (path, key, vault) = fresh_store(name);
+        {
+            let store = postino_store::Store::open(&path, key.as_ref()).expect("seed store");
+            seed(&store);
+        }
+        let daemon = spawn_daemon(&path, &key, &vault);
+        let vault_dyn: Arc<dyn CredentialVault> = Arc::clone(&vault) as Arc<dyn CredentialVault>;
+        let booted = boot::boot(Launch::Store(Some(path.clone())), KeySource::Fixed { key: Arc::clone(&key), vault: vault_dyn }, Utc::now())
+            .expect("a daemon-owned store boots");
+        let mut app = PostinoApp::from_booted(booted, false, Utc::now(), Launch::Store(Some(path.clone())), Vec::new());
+        app.threads_view = false;
+        (app, daemon, path, key, vault)
+    }
+
+    fn spawn_daemon(path: &std::path::Path, key: &Arc<postino_store::StoreKey>, vault: &Arc<MemoryVault>) -> postino_daemon::Daemon {
+        let vault_dyn: Arc<dyn CredentialVault> = Arc::clone(vault) as Arc<dyn CredentialVault>;
+        let mut config = postino_daemon::DaemonConfig::new(path.to_path_buf(), Arc::clone(key), vault_dyn);
+        config.sync_on_start = false;
+        config.sync_jitter = false;
+        config.outbox_on_start = false;
+        postino_daemon::Daemon::spawn(config).expect("the daemon starts")
+    }
+
+    /// Poll the window's daemon channel until `done` holds, with a bounded wall clock.
+    fn poll_until(app: &mut PostinoApp, mut done: impl FnMut(&PostinoApp) -> bool) -> bool {
+        for _ in 0..400 {
+            app.poll_daemon();
+            app.poll_daemon_job();
+            if done(app) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     fn wait_for_sync(app: &mut PostinoApp) {
         for _ in 0..1500 {
             app.handle_sync_events();
@@ -16489,5 +17096,212 @@ mod tests {
 
     fn has_label(app: &PostinoApp, message_id: &str, label_id: &str) -> bool {
         app.engine.message(message_id).is_some_and(|message| message.summary.labels.iter().any(|candidate| candidate == label_id))
+    }
+
+    #[test]
+    fn a_daemon_write_repaints_the_list_without_a_local_revision() {
+        let (mut app, daemon, _path, _key, _vault) =
+            daemon_app("p10a2-daemon-writes", |store| seed_account_rows(store, "acc_w", "w@example.com", None));
+        assert!(app.daemon_link.is_some(), "the window must be a daemon client, not in-process");
+        let (rows, _, unread) = app.visible_messages();
+        assert_eq!(unread, 1, "the seeded message is unread");
+        let id = rows.first().map(|message| message.id.clone()).expect("a seeded message");
+
+        app.op("message_flag", json!({ "id": id, "unread": false })).expect("the daemon flags the message");
+        let (rows, _, unread) = app.visible_messages();
+        assert!(!rows[0].unread, "the row the daemon flagged must repaint");
+        assert_eq!(unread, 0, "the unread counter must follow the daemon write");
+
+        app.op("message_flag", json!({ "id": id, "starred": true })).expect("the daemon stars the message");
+        let (rows, _, _) = app.visible_messages();
+        assert!(rows[0].starred, "the star the daemon wrote must repaint");
+
+        let label = app.op("label_create", json!({ "name": "Da rivedere", "color": "gold" })).expect("a label over the daemon");
+        let label_id = label["label"]["id"].as_str().expect("the label id").to_owned();
+        app.op("label_apply", json!({ "id": label_id, "message_ids": [id], "apply": true })).expect("the daemon applies the label");
+        let (rows, _, _) = app.visible_messages();
+        assert!(rows[0].labels.iter().any(|candidate| candidate == &label_id), "the label the daemon wrote must repaint");
+
+        daemon.shutdown().expect("the daemon stops");
+    }
+
+    #[test]
+    fn a_daemon_index_event_updates_the_building_banner() {
+        let mut app = PostinoApp::demo_at(true, screenshot_clock().expect("clock"));
+        app.apply_daemon_event(json!({
+            "kind": "index",
+            "data": { "state": "building", "indexed": 7, "total": 9, "ready": false, "last_error": null, "size_bytes": 4096, "updated_at": 42 },
+        }));
+        let progress = app.index_progress.as_ref().expect("the daemon's index progress is kept");
+        assert_eq!((progress.indexed, progress.total), (7, 9));
+        assert_eq!(progress.size_bytes, 4096, "the full status shape must deserialize");
+        assert!(!progress.ready);
+        // A daemon that publishes only the counters still moves the banner: it must never stall.
+        app.apply_daemon_event(json!({
+            "kind": "index",
+            "data": { "state": "building", "indexed": 9, "total": 9, "ready": false },
+        }));
+        assert_eq!(app.index_progress.as_ref().map(|progress| progress.indexed), Some(9));
+    }
+
+    #[test]
+    fn a_rules_run_by_another_client_repaints_the_labels() {
+        let (mut app, daemon, path, _key, _vault) = daemon_app("p10a2-daemon-rules", |store| {
+            seed_account_rows(store, "acc_r", "rules@example.com", None);
+            // Rules only scan mail ingested after the rule existed: write the rule first, then the
+            // message it labels, exactly as a sync would deliver it.
+            let created_at = Utc::now().timestamp_millis() - 60_000;
+            store
+                .create_label(&postino_store::Label {
+                    id: "lbl_rules".to_owned(),
+                    account_id: None,
+                    name: "Da rivedere".to_owned(),
+                    color: "gold".to_owned(),
+                })
+                .expect("a label");
+            store
+                .create_rule_limited(
+                    &postino_store::Rule {
+                        id: "rule_rules".to_owned(),
+                        account_id: "acc_r".to_owned(),
+                        name: "Oggetto locale".to_owned(),
+                        enabled: true,
+                        priority: 0,
+                        stop: false,
+                        query: "subject:Messaggio".to_owned(),
+                        actions_json: r#"[{"kind":"label","label":"lbl_rules"}]"#.to_owned(),
+                        created_at,
+                        updated_at: created_at,
+                    },
+                    200,
+                )
+                .expect("a rule");
+            store.upsert_message(&store_message("fld_acc_r_inbox", "acc_r", "msg_acc_r_2", "Messaggio di oggi")).expect("a message row");
+        });
+        // Another client of the same daemon: the window never sees the op, only the event.
+        let mut other = daemon::Link::connect(&path).expect("a second client");
+        let id = "msg_acc_r_2".to_owned();
+        assert!(!has_label(&app, &id, "lbl_rules"), "the rule has not run yet");
+        let report = other.call("rules_run", json!({ "scope": "all" })).expect("the manual rules pass");
+        assert!(report["run"]["matched"].as_u64().unwrap_or(0) > 0, "the seeded message must match: {report}");
+        assert!(
+            poll_until(&mut app, |app| has_label(app, &id, "lbl_rules")),
+            "the daemon must publish the rules pass, or the labels stay stale until the next GC"
+        );
+        let rows = app.visible_messages().0;
+        let row = rows.iter().find(|message| message.id == id).expect("the labelled message stays in the list");
+        assert!(row.labels.iter().any(|candidate| candidate == "lbl_rules"), "the list must repaint with the rule's label");
+        drop(other);
+        daemon.shutdown().expect("the daemon stops");
+    }
+
+    #[test]
+    fn a_failed_daemon_start_returns_to_a_coherent_window() {
+        let mut app = booted_app("p10a2-start-failure", Vec::new(), |store| seed_account_rows(store, "acc_f", "fail@example.com", None));
+        let path = app.store_path.clone().expect("a store path");
+        // The start command has already released the writer lock and silenced the workers.
+        app.writer_lock = None;
+        app.recover_after_failed_start("Il daemon non è partito: la prima prova".to_owned());
+        assert!(matches!(app.connection, daemon::Connection::InProcess), "a free archive returns to the in-process mode");
+        assert!(app.writer_lock.is_some(), "the writer lock comes back");
+        assert!(app.sync_worker.is_some(), "the in-process sync worker comes back");
+        assert!(app.send_worker.is_some(), "the in-process send worker comes back");
+
+        // The archive is still owned by another writer (a daemon finishing its start): the window
+        // must stay a readable client labelled as lost, never "reconnecting" with no workers.
+        app.writer_lock = None;
+        let foreign = postino_store::WriterLock::acquire_as(&path, "other", None).expect("another writer owns the archive");
+        app.recover_after_failed_start("Il daemon non è partito: la seconda prova".to_owned());
+        assert!(matches!(app.connection, daemon::Connection::Lost), "an owned archive is labelled lost, not in-process");
+        assert!(app.writer_lock.is_none(), "the window must not fight for the lock");
+        assert_eq!(app.connection.label(), "Daemon · non raggiungibile");
+        assert!(app.sync_worker.is_some(), "a readable client keeps a daemon sync worker");
+        assert!(app.daemon_events.is_some(), "a readable client keeps listening for the daemon");
+        drop(foreign);
+    }
+
+    #[test]
+    fn an_explicit_start_is_refused_in_demo_and_spawns_nothing() {
+        let mut app = PostinoApp::demo_at(true, screenshot_clock().expect("clock"));
+        app.request_start_daemon();
+        assert!(app.daemon_job.is_none(), "the demo must never spawn a daemon");
+        assert!(matches!(app.connection, daemon::Connection::Demo));
+        assert!(app.status.to_lowercase().contains("demo"), "the refusal must say why: {}", app.status);
+    }
+
+    #[test]
+    fn a_real_daemon_restart_keeps_the_view_and_the_explicit_stop_takes_over() {
+        let (mut app, daemon, path, key, vault) =
+            daemon_app("p10a2-lost-channel", |store| seed_account_rows(store, "acc_l", "lost@example.com", None));
+        assert!(matches!(app.connection, daemon::Connection::Connected(_)), "the window must really be a daemon client");
+        let account = app.active_account.clone().expect("the seeded account is active");
+        let folder = app.folder.clone();
+        app.unread_only = true;
+        app.label_filter = None;
+        let open = app.visible_messages().0.first().map(|message| message.id.clone());
+        assert!(open.is_some(), "the seeded message is on screen");
+        app.selected = open.clone();
+        app.reading_open = true;
+        app.threads_view = true;
+        app.selected_thread = Some("thr_msg_acc_l_1".to_owned());
+        app.thread_open = Some("thr_msg_acc_l_1".to_owned());
+        app.composer = ComposerState::new(ComposeMode::New);
+        app.composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
+
+        daemon.shutdown().expect("the daemon stops");
+        assert!(
+            poll_until(&mut app, |app| matches!(app.connection, daemon::Connection::Lost)),
+            "four failed reconnects are the lost state, not a spinner that never settles"
+        );
+        assert_eq!(app.connection.label(), "Daemon · non raggiungibile");
+        assert!(!app.visible_messages().0.is_empty(), "the read-only archive stays readable while the daemon is away");
+
+        let restarted = spawn_daemon(&path, &key, &vault);
+        assert!(poll_until(&mut app, |app| app.connection.is_live()), "the event worker must reconnect to the restarted daemon");
+        assert_eq!(app.active_account.as_deref(), Some(account.as_str()));
+        assert_eq!(app.folder, folder, "the selected folder survives the restart");
+        assert!(app.unread_only, "the filters survive the restart");
+        assert_eq!(app.selected, open, "the open message survives the restart");
+        assert!(app.reading_open);
+        assert!(app.threads_view, "the thread view survives the restart");
+        assert_eq!(app.selected_thread.as_deref(), Some("thr_msg_acc_l_1"));
+        assert_eq!(app.thread_open.as_deref(), Some("thr_msg_acc_l_1"));
+        assert_eq!(app.composer.to, "Giulia <giulia.ferri@example.com>", "the draft is the window's, not the daemon's");
+
+        app.request_stop_daemon();
+        assert!(app.daemon_job.is_some(), "the stop is explicit command, not automatic");
+        assert!(poll_until(&mut app, |app| matches!(app.connection, daemon::Connection::InProcess)), "the stop hands the archive back");
+        assert!(app.writer_lock.is_some(), "the window owns the archive again after the stop");
+        drop(restarted);
+        assert_eq!(app.folder, folder, "the folder survives the explicit stop");
+        assert!(app.unread_only);
+        assert_eq!(app.composer.to, "Giulia <giulia.ferri@example.com>");
+    }
+
+    #[test]
+    fn an_account_add_over_the_local_channel_reaches_the_engine_without_leaking_the_password() {
+        let (mut app, daemon, _path, _key, _vault) =
+            daemon_app("p10a2-account-add", |store| seed_account_rows(store, "acc_a", "add@example.com", None));
+        let secret = "correct-horse-battery-staple";
+        let result = app.op(
+            "account_add",
+            json!({
+                "provider": "custom",
+                "email": "nuovo@example.com",
+                "name": "Nuovo",
+                "password": secret,
+                "host": "127.0.0.1",
+                "port": 1,
+                "tls": "implicit",
+            }),
+        );
+        assert!(result.is_err(), "an unreachable server must fail the add");
+        let sentence = result.err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(!sentence.is_empty(), "the failure must be readable");
+        assert!(!sentence.contains(secret), "the password must never appear in a sentence");
+        assert!(!app.status.contains(secret), "the status line must never carry the password");
+        let accounts = app.op("accounts_list", json!({})).expect("a read after the refused add");
+        assert_eq!(accounts["accounts"].as_array().map(Vec::len), Some(1), "the refused add must not create an account");
+        daemon.shutdown().expect("the daemon stops");
     }
 }

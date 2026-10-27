@@ -188,6 +188,82 @@ impl SyncBackend for StoreSyncBackend {
     }
 }
 
+/// The daemon-backed sync (P10a2). The window asks the daemon for `sync_now` over `postino-ipc`;
+/// the daemon owns the IMAP session, the write connection and the store lock. Cancellation is a
+/// second connection: the protocol's `cancel` is accepted across connections, so the window never
+/// waits for the running request to return before it can be stopped.
+pub struct DaemonSyncBackend {
+    store: std::path::PathBuf,
+}
+
+impl DaemonSyncBackend {
+    pub fn new(store: std::path::PathBuf) -> Self {
+        Self { store }
+    }
+}
+
+impl SyncBackend for DaemonSyncBackend {
+    fn run(&mut self, account: Option<&str>, cancel: &Arc<AtomicBool>, _progress: Arc<ProgressSink>) -> Result<SyncReport, SyncFailure> {
+        let paths = crate::daemon::paths(&self.store).map_err(|message| SyncFailure::new(message, false, true))?;
+        let mut client = postino_ipc::client::BlockingClient::connect_with(
+            &paths,
+            crate::daemon::CLIENT_NAME,
+            true,
+            Duration::from_secs(2),
+            Duration::from_secs(600),
+        )
+        .map_err(|error| SyncFailure::new(crate::daemon::describe(&error), false, error.is_absent()))?;
+        let params = serde_json::json!({ "name": "sync_now", "args": { "account": account } });
+        let id = client
+            .start_request(postino_ipc::protocol::method::OP, params)
+            .map_err(|error| SyncFailure::new(crate::daemon::describe(&error), false, error.is_absent()))?;
+
+        // Stop the daemon's request through a second connection while the first one is still
+        // waiting. A failure here only means the sync runs to the end; it never invents a result.
+        let cancel_flag = Arc::clone(cancel);
+        let cancel_paths = paths.clone();
+        let request = id.to_string();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_thread = Arc::clone(&done);
+        let canceller = std::thread::Builder::new().name("postino-app-cancel".to_owned()).spawn(move || {
+            loop {
+                if done_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !cancel_flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                if let Ok(mut second) = postino_ipc::client::BlockingClient::connect(
+                    &cancel_paths,
+                    crate::daemon::CLIENT_NAME,
+                    Duration::from_secs(2),
+                    Duration::from_secs(10),
+                ) {
+                    let _ = second.call(postino_ipc::protocol::method::CANCEL, serde_json::json!({ "request": request }), Duration::from_secs(10));
+                }
+                // The cancelled request returns on its own; this thread has nothing left to do.
+                return;
+            }
+        });
+
+        let result = client.wait_for(id, Duration::from_secs(600));
+        done.store(true, Ordering::Relaxed);
+        drop(canceller);
+        match result {
+            Ok(value) => serde_json::from_value::<SyncReport>(value)
+                .map_err(|_| SyncFailure::new("Il daemon ha risposto in un modo che questa finestra non sa leggere.", false, false)),
+            Err(error) => {
+                if matches!(error, postino_ipc::IpcError::Cancelled) {
+                    Err(SyncFailure::new("Sincronizzazione annullata. I messaggi già salvati restano disponibili.", true, false))
+                } else {
+                    Err(SyncFailure::new(crate::daemon::describe(&error), false, error.is_absent()))
+                }
+            }
+        }
+    }
+}
+
 /// Reduce a typed sync error to Italian copy. Server-supplied text is never shown: a hostile or
 /// broken server can echo a credential in a tagged reply.
 pub fn failure_from_sync(error: SyncError) -> SyncFailure {

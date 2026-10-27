@@ -40,21 +40,49 @@ pub struct Booted {
     pub demo: bool,
     /// The store's single-writer lock. The app holds it until it exits or retries into another
     /// store; the sync worker's extra connection is in the same process and is not a second owner.
+    /// `None` whenever a daemon owns the store: the window is a client and must never hold it.
     pub writer_lock: Option<WriterLock>,
+    /// The live daemon that answered during boot, if any. `Some` means the store is opened
+    /// read-only and every mutation goes through `postino-ipc`.
+    pub daemon: Option<crate::daemon::Hello>,
 }
 
 /// An openable store: the path, a copyable key handle and the credential seam. Opening a second
 /// connection is how the sync worker and the post-sync reload stay off the UI thread.
+///
+/// `read_only` is set when a daemon owns the store: the window then opens `Store::open_read_only`
+/// for reads and never acquires the writer lock.
 #[derive(Clone)]
 pub struct StoreHandle {
     path: PathBuf,
     key: Arc<StoreKey>,
     vault: Arc<dyn CredentialVault>,
+    read_only: bool,
 }
 
 impl StoreHandle {
     pub fn new(path: PathBuf, key: Arc<StoreKey>, vault: Arc<dyn CredentialVault>) -> Self {
-        Self { path, key, vault }
+        Self { path, key, vault, read_only: false }
+    }
+
+    /// The handle the window keeps while a daemon owns the store.
+    pub fn read_only(path: PathBuf, key: Arc<StoreKey>, vault: Arc<dyn CredentialVault>) -> Self {
+        Self { path, key, vault, read_only: true }
+    }
+
+    /// Whether every write must go through the daemon instead of this handle.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The same store opened for reading only: used when a daemon takes over the write side.
+    pub fn as_read_only(&self) -> Self {
+        Self { path: self.path.clone(), key: Arc::clone(&self.key), vault: Arc::clone(&self.vault), read_only: true }
+    }
+
+    /// The same store opened for writing: used when this window takes the lock back.
+    pub fn as_writable(&self) -> Self {
+        Self { path: self.path.clone(), key: Arc::clone(&self.key), vault: Arc::clone(&self.vault), read_only: false }
     }
 
     pub fn path(&self) -> &Path {
@@ -73,7 +101,11 @@ impl StoreHandle {
 
     pub fn open_store(&self) -> Result<Store, String> {
         let key = StoreKey::from_bytes(*self.key.as_bytes());
-        Store::open(&self.path, &key).map_err(|error| error.to_string())
+        if self.read_only {
+            Store::open_read_only(&self.path, &key).map_err(|error| error.to_string())
+        } else {
+            Store::open(&self.path, &key).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -83,7 +115,7 @@ impl StoreHandle {
 pub enum BootStage {
     DataDirectory,
     Keyring,
-    /// Another Postino process owns the store. In P10a1 the app cannot share the daemon yet.
+    /// Another Postino process owns the store and is not a daemon that answers on the channel.
     Daemon,
     Store,
     Engine,
@@ -109,7 +141,7 @@ impl BootStage {
                 "La chiave dell'archivio vive nel portachiavi di sistema. Sbloccalo o controlla di essere nella sessione giusta, poi riprova: nessuna mail viene toccata."
             }
             Self::Daemon => {
-                "Un daemon o un'altra finestra Postino sta usando l'archivio: due processi non devono scrivere insieme. Chiudi il daemon con `postino daemon stop` (o l'altra finestra) e riapri l'app; il collegamento diretto dell'app al daemon arriva con P10a2."
+                "Un altro processo Postino sta scrivendo l'archivio e non risponde sul canale locale: due processi non devono scrivere insieme. Chiudi l'altra finestra con `postino daemon stop` e riapri l'app."
             }
             Self::Store => {
                 "Il file è danneggiato oppure la chiave nel portachiavi non è quella con cui è stato cifrato. Non cancellarlo: riprova dopo aver sbloccato il portachiavi."
@@ -160,7 +192,7 @@ pub fn boot(launch: Launch, keys: KeySource, now: DateTime<Utc>) -> Result<Boote
 /// Retry an existing app into the same store without dropping the writer lock it already owns.
 pub fn boot_with_lock(launch: Launch, keys: KeySource, now: DateTime<Utc>, existing_lock: Option<WriterLock>) -> Result<Booted, BootFailure> {
     match launch {
-        Launch::Demo => Ok(Booted { engine: Engine::demo_at(now), store: None, demo: true, writer_lock: None }),
+        Launch::Demo => Ok(Booted { engine: Engine::demo_at(now), store: None, demo: true, writer_lock: None, daemon: None }),
         Launch::Store(path) => {
             let (path, key, vault) = match keys {
                 KeySource::Keyring => {
@@ -193,6 +225,16 @@ pub fn boot_with_lock(launch: Launch, keys: KeySource, now: DateTime<Utc>, exist
             }
             let path = postino_store::canonical_store_path(&path)
                 .map_err(|error| BootFailure::new(BootStage::Store, Some(path.clone()), error.to_string()))?;
+            // A live daemon owns the store: probe before taking any lock. The window then opens the
+            // store read-only and never writes beside it (P10a2). Absent is normal and means the
+            // documented in-process mode.
+            if let Some(daemon) = crate::daemon::probe(&path) {
+                let handle = StoreHandle::read_only(path.clone(), Arc::clone(&key), Arc::clone(&vault));
+                let store = handle.open_store().map_err(|error| BootFailure::new(BootStage::Store, Some(path.clone()), error))?;
+                let engine = Engine::open_with_vault(store, Arc::clone(&vault))
+                    .map_err(|error| BootFailure::new(BootStage::Engine, Some(path.clone()), error.to_string()))?;
+                return Ok(Booted { engine, store: Some(handle), demo: false, writer_lock: None, daemon: Some(daemon) });
+            }
             let store_key = StoreKey::from_bytes(*key.as_bytes());
             let writer_lock = match existing_lock {
                 Some(lock) if lock.path() == postino_store::lock_path(&path) => lock,
@@ -219,7 +261,7 @@ pub fn boot_with_lock(launch: Launch, keys: KeySource, now: DateTime<Utc>, exist
             let engine = Engine::open_with_vault(store, Arc::clone(&vault))
                 .map_err(|error| BootFailure::new(BootStage::Engine, Some(path.clone()), error.to_string()))?;
             let handle = StoreHandle::new(path, key, vault);
-            Ok(Booted { engine, store: Some(handle), demo: false, writer_lock: Some(writer_lock) })
+            Ok(Booted { engine, store: Some(handle), demo: false, writer_lock: Some(writer_lock), daemon: None })
         }
     }
 }
@@ -454,5 +496,65 @@ mod tests {
         let handle = booted.store.expect("handle");
         let reopened = handle.open_engine().expect("a second connection");
         assert_eq!(reopened.accounts().len(), 1);
+    }
+
+    #[test]
+    fn a_live_daemon_answers_the_reads_writes_and_status_the_window_uses() {
+        let directory = directory("boot-live-channel");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the test directory exists");
+        let path = directory.join("mail.db");
+        let (key, vault) = fixed([0x73; 32]);
+        seed_account(&path, &key);
+        let mut config = postino_daemon::DaemonConfig::new(path.clone(), Arc::clone(&key), Arc::clone(&vault));
+        config.sync_on_start = false;
+        config.sync_jitter = false;
+        config.outbox_on_start = false;
+        let daemon = postino_daemon::Daemon::spawn(config).expect("the daemon starts");
+
+        // The window's write path is the CLI's path: `op {name, args}` over the same-user channel.
+        let mut link = crate::daemon::Link::connect(&path).expect("the channel opens lazily");
+        let accounts = link.call("accounts_list", serde_json::json!({})).expect("a read through the daemon");
+        assert_eq!(accounts["accounts"].as_array().map(Vec::len), Some(1), "the daemon serves the seeded account");
+        let written = link
+            .call("account_signature_set", serde_json::json!({ "account": "acc_test", "signature": "Da Postino" }))
+            .expect("a write through the daemon");
+        assert!(written.is_object(), "the daemon returns a typed result");
+        let status = link.status().expect("daemon_status");
+        assert!(status["pid"].as_u64().is_some_and(|pid| pid > 0));
+        assert!(status["store_root"].as_str().is_some_and(|root| !root.is_empty()));
+        // Reading and writing through the channel never means taking the store for this process.
+        assert!(WriterLock::acquire_as(&path, "other", None).is_err(), "the daemon is still the writer");
+
+        daemon.shutdown().expect("the daemon stops");
+    }
+
+    #[test]
+    fn a_live_daemon_makes_the_window_a_read_only_client_without_the_writer_lock() {
+        let path = directory("boot-daemon-client").join("mail.db");
+        let _ = std::fs::remove_file(&path);
+        let (key, vault) = fixed([0x72; 32]);
+        seed_account(&path, &key);
+        let mut config = postino_daemon::DaemonConfig::new(path.clone(), Arc::clone(&key), Arc::clone(&vault));
+        config.sync_on_start = false;
+        config.sync_jitter = false;
+        config.outbox_on_start = false;
+        let daemon = postino_daemon::Daemon::spawn(config).expect("the daemon starts");
+
+        let booted = boot(Launch::Store(Some(path.clone())), KeySource::Fixed { key: Arc::clone(&key), vault: Arc::clone(&vault) }, Utc::now())
+            .expect("a daemon-owned store boots");
+        assert!(booted.writer_lock.is_none(), "the window must not take the writer lock beside a daemon");
+        assert!(booted.daemon.is_some(), "the boot must know which daemon it is talking to");
+        let handle = booted.store.clone().expect("handle");
+        assert!(handle.is_read_only(), "the window opens the store read-only");
+        assert_eq!(booted.engine.accounts().len(), 1);
+        // The daemon still owns the lock: another writer is refused while the window is a client.
+        assert!(WriterLock::acquire_as(&path, "other", None).is_err());
+        // A read-only engine refuses a write instead of forking the store.
+        let mut engine = handle.open_engine().expect("a read-only engine");
+        assert!(engine.call("message_flag", serde_json::json!({ "id": "missing", "unread": true })).is_err());
+        drop(booted);
+        daemon.shutdown().expect("the daemon stops");
+        assert!(WriterLock::acquire_as(&path, "app", None).is_ok(), "the lock is free after a clean daemon stop");
     }
 }

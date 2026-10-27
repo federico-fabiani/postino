@@ -106,6 +106,10 @@ impl DaemonState {
         };
         self.mark_index_dirty();
         self.wake_scheduler();
+        if matches!(name.as_str(), "rules_run" | "rules_undo" | "rules_create" | "rules_update" | "rules_delete") {
+            // A manual rules run moves messages and labels inside the engine; the clients reload.
+            self.publish("rules", json!({ "source": name }));
+        }
         match result {
             Ok(value) => {
                 self.clear_error();
@@ -193,6 +197,11 @@ impl DaemonState {
         match result {
             Ok(report) => {
                 self.publish("sync", sync_event("finished", &report));
+                if !report.account.is_empty() && self.rules_enabled(&report.account).await {
+                    // The engine runs the post-sync rules pass inside `sync_now`: tell the clients
+                    // the labels changed, without waiting for the next GC event.
+                    self.publish("rules", json!({ "account": report.account, "source": "sync" }));
+                }
                 if let Ok(mut status) = self.status.lock() {
                     status.gc_due = true;
                 }
