@@ -86,7 +86,8 @@ Status: `todo` · `active` · `review` · `done`.
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, v7 inert tables | done |
 | P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | done |
 | P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | done |
-| P10 | M4 daemon | `postino-daemon`, named pipe/UDS + token, tray, autostart, clients | todo |
+| P10a | M4 daemon | IPC + daemon + scheduler + single writer + clients | active |
+| P10b | M4 tray | tray, autostart, notifications, packaging seams | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
 
@@ -123,7 +124,9 @@ encrypted meta, a durable dedupe marker that survives outbox pruning and a 50-ne
 remainder is deferred. MCP gates `rules_run`, forward payloads, enabling a stored forward rule and the
 `sync_now` rule pass behind `--allow-send`; the Rules page has list/editor/preview/run/undo at 980×600
 in both themes and blocks every shell shortcut behind it. Rule runs were measured at 20k and 100k
-(empty `new` 67/327 ms, one `all` page 184/455 ms; a 2 000-action page 7.3/10.0 s).
+(empty `new` 67/327 ms, one `all` page 184/455 ms; a 2 000-action page 7.3/10.0 s). M3 is complete.
+P10a starts the M4 daemon: one writer, same-user IPC with a per-launch token, scheduler, GC and
+app/CLI/MCP clients; P10b adds tray, autostart and notifications.
 
 ## 5. Delighters backlog
 
