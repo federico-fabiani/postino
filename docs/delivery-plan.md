@@ -87,10 +87,12 @@ Status: `todo` · `active` · `review` · `done`.
 | P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | done |
 | P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | done |
 | P10a1 | M4 daemon | IPC + daemon + scheduler + single writer + CLI/MCP clients | done |
-| P10a2 | M4 daemon | desktop app daemon client, reconnect, view preservation | active |
-| P10b1 | M4 tray | platform seams, daemon tray/notifier, autostart | todo |
-| P10b2 | M4 tray | app settings, close-to-tray, activation | todo |
-| P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
+| P10a2 | M4 daemon | desktop app daemon client, reconnect, view preservation | done |
+| P10b1 | M4 tray | platform seams, daemon tray/notifier, autostart | done |
+| P10b2 | M4 tray | app settings, close-to-tray, activation | done |
+| P11a1 | M5 render | bounded sanitized block model/parser in `crates/mime` | done |
+| P11a2 | M5 render | egui mapping, link sheet, text fallback | active |
+| P11b | M5 render | optional sandboxed WebView2 backend | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
 
 P0-P2 close U0. P3-P6d make M1 real; P7-P8 close M2. Each package may split when the brief is too
@@ -133,10 +135,13 @@ app/CLI/MCP clients; P10b adds tray, autostart and notifications.
 handshake, 16 MiB frames, bounded queues, cancel and ping), `postino-daemon` with the store lock,
 scheduler, outbox crash recovery, rules-after-sync, index batches and blob GC, plus the CLI/`postino
 mcp` clients and the app's readable daemon-owned state.
-**P10a2** is active: connect the desktop app through the same `DaemonClient` and preserve its view
-state across reconnect. P10b is split: **P10b1** owns the platform seams and the daemon-hosted tray,
-notifier and autostart (no `app.rs`), so it can run beside P10a2; **P10b2** owns the app settings,
-close-to-tray and activation after P10a2.
+**P10a2** merged the desktop app as a daemon client (read-only fallback, reconnect, preserved view
+state); **P10b1** added the daemon-owned tray, privacy-preserving notices, HKCU autostart and the
+platform seams; **P10b2** added live settings, `--open outbox`, close-to-tray and daemon-brokered
+activation/quit. M4 is complete at `2dcd612`.
+**P11a1** merged the bounded sanitized block model in `crates/mime`; **P11a2** is active: map the
+blocks to egui in the reading pane, keep the link sheet/text fallback and the 980×600 budget.
+P11b (optional sandboxed WebView2) remains after P11a2.
 
 ## 5. Delighters backlog
 
