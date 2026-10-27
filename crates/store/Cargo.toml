@@ -9,6 +9,7 @@ description = "Encrypted local store: SQLCipher schema, migrations, repository a
 [dependencies]
 postino-crypto.workspace = true
 blake3.workspace = true
+fs4.workspace = true
 getrandom.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -17,8 +18,15 @@ thiserror.workspace = true
 zeroize.workspace = true
 zstd.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

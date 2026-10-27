@@ -14,14 +14,19 @@ postino --store <path> mcp --allow-send
 - Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout.
 - It opens no port, starts nothing else, and stops at EOF.
 - Logs, if any, go to stderr. stdout carries protocol messages only.
-- Without `--demo` and `--store`, `postino mcp` opens the default encrypted store at
+- When a daemon is running, this process is a daemon client: it reads `<store>.token`, speaks the
+  same JSON-RPC 2.0 over the per-user pipe/socket and calls `op`. The tools, schemas and error shape
+  are the daemon's single registry.
+- When the daemon is absent, reads use the local encrypted cache directly and **every mutation returns
+  a readable `isError` tool result** ("il daemon non è in esecuzione…"). MCP never starts a daemon
+  implicitly and never opens a TCP port. The local reader is opened read-only.
+- Without `--demo` and `--store`, `postino mcp` targets the default encrypted store at
   `%LOCALAPPDATA%\Postino\mail.db` on Windows. Windows Credential Manager is the only keyring backend
   in this build; macOS and Linux fail at the platform seam until their native keychains land with
-  packaging, so there is no platform-equivalent default store yet. `--store` picks another database;
-  the app's workers open their own connections and the outbox lease coordinates concurrent passes, but
-  do not point two clients at the same file expecting independent mailboxes. `--demo` stays synthetic
-  and never touches the store.
-- The process needs the store key from the OS keyring. It never prints it.
+  packaging, so there is no platform-equivalent default store yet. `--store` picks another database.
+  `--demo` stays synthetic and never touches the store.
+- The process needs the store key from the OS keyring only when it reads the store locally. A daemon
+  client needs the token file, not the key. Neither is ever printed.
 
 Client configuration:
 
@@ -121,8 +126,9 @@ action is refused before the typed parser runs, and so is an enable-only `rules_
 rule whose actions already include `forward`: the server reads the rule id from the raw arguments and
 checks the stored action list, so a client cannot arm a dormant forward rule without the flag. The
 automatic `new` pass inside `sync_now` obeys the same gate: with `--allow-send` absent, a forward is
-recorded as deferred and the sync still succeeds. Create or enable the forward rule from the CLI or
-the desktop instead.
+recorded as deferred and the sync still succeeds. The daemon client carries the flag in its
+handshake, so a daemon-side sync cannot bypass this client gate. Create or enable the forward rule
+from the CLI or the desktop instead.
 
 **MCP only queues.** The server has no timer and never runs the outbox pass. A `message_send` or
 `send_schedule` call writes the journal row and returns; the message leaves the machine when the
@@ -343,13 +349,14 @@ an alias of `postino send --draft <id>`, and both now submit for real.
 ## Safety
 
 - The server is opt-in and stdio-only; there is no network listener.
-- The daemon pipe (M4) will be same-user and token-authenticated.
+- The daemon pipe/socket is same-user and token-authenticated; a stale token is a readable refusal,
+  never a fallback to a second writer. MCP never starts the daemon.
 - Sending is off unless `postino mcp --allow-send`; `message_send`, `send_schedule`, `outbox_retry`,
   `outbox_mark_sent` and `rules_run` are refused before the arguments are read, an enable-only update
   of a stored forward rule is refused the same way, and a rule payload
   containing a forward action is refused before parsing. The server never runs the outbox pass: it
-  only queues. An uncertain submission is never retried automatically; a manual retry requires
-  `confirm: true`.
+  only queues, and the daemon scheduler submits due rows. An uncertain submission is never retried
+  automatically; a manual retry requires `confirm: true`.
 - Tool arguments are validated against `deny_unknown_fields`; typos are rejected rather than
   ignored.
 - Account credentials live only in the OS keyring. They are never in the database, a tool result, a

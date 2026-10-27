@@ -112,9 +112,8 @@ What is still demo or missing:
   in the same process; SQLite WAL and the busy timeout serialise them, and the outbox lease, the append
   claim and their guarded transitions make two passes (app + CLI) safe row by row. Every lease and
   append claim is stamped when it is taken, so a row leased after an earlier row spent time in SMTP, or
-  an APPEND that follows a long submission, still owns a full window. There is no daemon, pipe or
-  cross-process lock yet (M4): do not copy or move the database while a command runs, and do not treat
-  two clients as two independent mailboxes.
+  an APPEND that follows a long submission, still owns a full window. This paragraph describes the
+  pre-P10a P7 state; P10a adds the daemon, the local pipe and the cross-process writer lock.
 - IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox, compose depth,
   encrypted search, conversations, saved searches and local rules (attachment bytes, per-account
   signatures, reply/forward headers, P5-P9c) exist. Still missing: the daemon and a scheduled send
@@ -271,6 +270,35 @@ they have a reason to exist.
   opens a browser, a native dialog or a shell.
 - **Test infrastructure:** the fake IMAP/SMTP servers and TLS fixture live in `postino-testkit` and
   run in CI. Property tests for the network parsers and fuzzing for MIME remain future work.
+- **IPC (P10a):** the real pipe/socket, token accept/refuse, stale-token rotation, version mismatch,
+  16 MiB requests and responses (including a readable oversized-response error that keeps the
+  connection), a greedily drained oversized line, a ping heartbeat, an idle close only when no work is
+  live, a 2.5 s dispatch outliving a 300 ms idle timeout, an idle subscriber kept by the heartbeat, 32
+  real clients plus 31 unauthenticated pipes without killing the listener, one in-flight mutation,
+  same-connection cancel and cross-connection refusal, a duplicate live id, subscription caps and
+  `kinds` filtering, bounded event delivery, unknown methods and owner-only ACL/mode checks.
+  `cargo test -p postino-ipc`. The 16 MiB test writes a real 16 MiB line and takes a few seconds on the
+  Windows debug build.
+- **Daemon (P10a):** two clients mutate one store; a scheduled message is submitted while no client is
+  connected; the index advances in 500-row batches; a due outbox row runs between sync chunks; blob GC
+  removes only an orphan; rules run after a sync; an MCP session without `--allow-send` cannot forward
+  during sync; a real child daemon is killed and restarted at every P7 outbox crash state (including
+  append retry); a disconnect/shutdown during sync releases the active marker and the writer lock; two
+  daemons cannot own one store; a direct writer is refused; token rotation; scheduler idle wake count;
+  no TCP listener; and a capture logger proves no token, address, subject or body reaches a log.
+  `cargo test -p postino-daemon` and `cargo test -p postino-daemon --test restart_crash` use a
+  temporary store, a fixed key and an in-memory vault, never the OS keyring or
+  `%LOCALAPPDATA%\Postino`.
+- **Daemon clients (P10a):** the CLI reads and mutates through a live daemon, `daemon status/start/stop`,
+  `--in-process` refusal, the absent-daemon mutation policy, and an MCP stdio call through the daemon.
+  `cargo test -p postino-cli --test daemon_client`. The MCP unit test proves the absent-daemon local
+  backend refuses a mutation while reads stay available.
+- **Headless daemon fixture.** A test starts the library daemon with `DaemonConfig::new(path, key,
+  vault)`, `sync_on_start = false`, a fixed key and a mock vault, then connects with
+  `postino_ipc::Client`. The daemon binary is not needed for these tests; the CLI test starts the same
+  library and exercises `daemon status/start (idempotent)/stop`. Starting a *new* daemon process is a
+  manual step in development because the binary takes the store key from the real OS keyring.
+
 
 ### Desktop OS seams (P6c, P8)
 
@@ -481,6 +509,41 @@ its engine from the store without clearing selection, filters or the open messag
 failure keeps the cached list and turns the offline state on, while a credential or store failure
 shows its own reason with Retry. The tests cover a real fake-server onboarding, the test CA hook,
 cancellation, progress, a second request, and reload preservation.
+
+## 9.3 Daemon, single writer and IPC (P10a)
+
+`postino-daemon` is the only process that writes the store while it runs. It acquires the OS lock on
+`<store>.lock` and records `<store>.owner`; the lock file is just the lock because Windows byte-range
+locks are mandatory (a locked file cannot be read to report its owner). A direct `postino --store`
+writer takes the same lock; the app takes it in `boot.rs` and keeps it for its lifetime. When the
+daemon owns the store, the app shows `BootStage::Daemon` ("the store is owned by the daemon") instead
+of opening a second writer; P10a2 replaces that screen with a daemon client. Do not delete
+`.lock`/`.owner`/`.token` while a process is running; a stale set is harmless and overwritten at the
+next launch.
+
+The endpoint is a Windows named pipe or a Unix domain socket, never TCP. The Windows pipe is created
+with an explicit one-ACE DACL for the current user SID and `reject_remote_clients`; the Unix socket is
+0600 inside a 0700 directory. The token file is 0600 on Unix and has one full-control ACE for the
+current user on Windows; the client rechecks it before connecting. On Windows,
+`GetNamedSecurityInfoW` is used for the token ACL and the tests that assert it; the small
+`crates/ipc/src/platform.rs` adapter also owns the Unix `getuid`/`SO_PEERCRED` calls and the Windows
+atomic replace, and `crates/store/src/links.rs` owns the Windows link-count call. Those are the only
+`unsafe` modules; the workspace keeps `unsafe_code = "forbid"` everywhere else.
+
+To run the daemon in development, build both binaries first (`cargo build -p postino-daemon -p
+postino-cli`), then `postino daemon start`; the CLI looks for the daemon as a sibling of its own
+executable and honours `POSTINO_DAEMON_BIN` for tests. A temp store with a fixed key is the headless
+fixture: `cargo test -p postino-daemon` and `cargo test -p postino-cli --test daemon_client` never
+take the real keyring or create `%LOCALAPPDATA%\Postino`.
+
+The daemon's crash matrix is exercised by a child process that starts a real daemon on a store seeded
+with `sending` (fresh and stale), `append_pending`, `uncertain`, `failed`, `sent` or `cancelled`; the
+parent kills that process, waits for the OS lock release, starts a replacement daemon and asserts the
+row survives in the documented state. A stale submission lease becomes `uncertain`; the independent
+Sent append is retried; a queued/scheduled row is kept. `cargo test -p postino-daemon --test
+restart_crash` is the executable form. The seeded in-process matrix remains as an additional fast
+check. A scheduled send is submitted with no client connected; the app's closed-window case is the
+same scheduler path.
 
 ## 10. Style
 

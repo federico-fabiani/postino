@@ -8,9 +8,10 @@ If a rule here conflicts with a habit from another project, this file wins.
 Postino is a local-first, agent-first mail client written in Rust. The desktop app, the `postino`
 CLI and the `postino mcp` server are three clients of **one operation registry**. The engine runs on
 synthetic demo mail in memory or on the encrypted local store (`postino --store <path>`); accounts,
-credentials, IMAP sync, SMTP submission with the outbox and the desktop onboarding exist (P6/P7),
-there is no daemon yet, and the desktop app boots on the encrypted store with `--demo` as the
-synthetic fallback.
+credentials, IMAP sync, SMTP submission with the outbox and the desktop onboarding exist (P6/P7), the
+daemon IPC, scheduler and CLI/MCP clients exist (P10a1), and the desktop app boots on the encrypted
+store with `--demo` as the synthetic fallback. The app's daemon client is P10a2; tray/autostart are
+P10b.
 
 **The current milestone is the only source of truth for scope.** Read `ROADMAP.md` before
 starting. Do not build M1 features into M0.
@@ -62,6 +63,8 @@ crates/store       encrypted store, repository    L1
 crates/crypto      HKDF subkeys, XChaCha20-Poly1305 L1
 crates/platform    keyring seam                   L1
 crates/mime        MIME, HTML sanitizer, RFC 5322 L1
+crates/ipc         JSON-RPC over pipe/socket      foundation/transport
+apps/postino-daemon one writer + scheduler + IPC   L3
 xtask              build/quality tasks            tooling
 ```
 
@@ -72,6 +75,8 @@ Rules enforced by `cargo xtask layers`:
   never depends back on core; sync may use core only as a dev-dependency for its offline-read test.
 - `postino-crypto`, `postino-mime`, `postino-platform` and `postino-store` are foundation: no
   workspace dependency and no UI. `postino-net` is network: it depends on no other workspace crate.
+  `postino-ipc` is foundation/transport: no workspace crate and no UI. `postino-daemon` is L3: it may
+  use core, ipc, net, platform, store and the testkit only as a dev-dependency, never egui.
 - The credential seam is explicit: core defines `CredentialVault` and never calls a keyring crate;
   `postino-platform` owns the OS keyring and the `account:<id>:imap` / `account:<id>:smtp` scopes; the
   CLI adapts one to the other. Do not move a keyring call into core or a password into the store.
@@ -225,3 +230,20 @@ Append one line when significant time is lost to an issue likely to recur. Forma
 - [SQLite/WAL] the main database file alone under-reports size: committed FTS pages can still be in
   `mail.db-wal` (4 KiB vs 241 KiB in the review probe). fix/avoid: sum main+wal+shm for status and
   measure the index with `dbstat`, not the file size alone.
+- [Windows/fs4] an exclusive byte-range lock is mandatory: another handle cannot read the locked file,
+  so owner metadata stored in `<store>.lock` is unreadable while it is held. fix/avoid: keep the lock
+  file empty and write pid/endpoint to a separate `<store>.owner` file.
+- [Windows/named pipes] `Get-Acl` cannot address `\\.\pipe\...`; the pipe security must be asserted
+  from the explicit SDDL/DACL before creation. fix/avoid: create with
+  `ServerOptions::create_with_security_attributes_raw` and a one-ACE SDDL; test the SDDL and the token
+  file ACL, not `Get-Acl` on the pipe.
+- [Windows/named pipes] a listener that creates only `MAX_CONNECTIONS` instances dies when the last
+  spare is consumed, and the client sees `ERROR_PIPE_BUSY`/`ERROR_PIPE_CLOSING` if instances are not
+  pre-created fast enough. fix/avoid: `max_instances(254)`, create the next instance before returning
+  the accepted one, retry connect on 231/232, and keep accept errors non-fatal.
+- [Windows/canonicalize] `std::fs::canonicalize` returns a `\\?\` verbatim path, which changes lock,
+  token and endpoint names and breaks visible path comparisons. fix/avoid: strip the local `\\?\`
+  prefix (and map `\\?\UNC\` back to `\\`) before deriving names.
+- [fs4/Windows] a hard link to a SQLCipher file derives a different `.lock` path for the same inode.
+  fix/avoid: refuse a database with more than one link (`GetFileInformationByHandle` on Windows,
+  `nlink` on Unix) before taking the lock.

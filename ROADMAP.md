@@ -193,13 +193,13 @@ interaction model before real mail makes them expensive to change. Full spec:
 
 ## M4 — live in the background
 
-- [ ] `postino-daemon` owns the store, sync and scheduler.
-- [ ] JSON-RPC over a named pipe/UDS with a per-launch token; autostart and tray.
-- [ ] App/CLI/MCP become clients; "daemon not running" is a normal state.
+- [x] `postino-daemon` owns the store, sync and scheduler (P10a1).
+- [x] JSON-RPC over a named pipe/UDS with a per-launch token; autostart and tray are P10b.
+- [x] CLI/MCP become clients; "daemon not running" is a normal state. App client connection is P10a2.
 - [ ] Scheduled send, undo send, automatically running local rules while the app is closed, notifications.
 - [ ] Single-instance and crash recovery.
-- [ ] Verify: two clients (app + CLI) mutate one store; scheduled mail sends with the app closed;
-      daemon restart loses no outbox entry.
+- [x] Verify: two clients (CLI + MCP) mutate one store; scheduled mail sends with the app closed;
+      daemon restart loses no outbox entry. P10b still needs tray/autostart/notifications.
 
 ## M5 — make it professional
 

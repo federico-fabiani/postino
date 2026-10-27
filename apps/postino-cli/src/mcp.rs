@@ -30,8 +30,40 @@ const SEND_GATED: [&str; 5] = ["message_send", "send_schedule", "outbox_retry", 
 
 const SEND_DISABLED_REASON: &str = "sending is disabled: start `postino mcp --allow-send` to allow message_send, send_schedule, outbox_retry, outbox_mark_sent and rules_run (including rule forwards)";
 
+/// The smallest mailbox surface the MCP handlers need. `Engine` is the in-process implementation;
+/// the CLI's daemon client is a second one. Tool names, descriptions and schemas still come from the
+/// one registry.
+pub trait McpBackend {
+    fn tools(&self) -> Vec<postino_core::OpDef>;
+    fn call(&mut self, name: &str, args: Value) -> std::result::Result<Value, String>;
+    fn rule_has_forward(&self, id: &str) -> std::result::Result<Option<bool>, String>;
+    fn set_allow_send(&mut self, allow_send: bool);
+}
+
+impl McpBackend for Engine {
+    fn tools(&self) -> Vec<postino_core::OpDef> {
+        Engine::tools(self)
+    }
+
+    fn call(&mut self, name: &str, args: Value) -> std::result::Result<Value, String> {
+        postino_core::ops::dispatch(self, name, args).map_err(|error| error.to_string())
+    }
+
+    fn rule_has_forward(&self, id: &str) -> std::result::Result<Option<bool>, String> {
+        Engine::rule_has_forward(self, id).map_err(|error| error.to_string())
+    }
+
+    fn set_allow_send(&mut self, allow_send: bool) {
+        Engine::set_allow_send(self, allow_send);
+    }
+}
+
 pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
-    engine.set_allow_send(allow_send);
+    serve_backend(engine, allow_send)
+}
+
+pub fn serve_backend<B: McpBackend + ?Sized>(backend: &mut B, allow_send: bool) -> Result<()> {
+    backend.set_allow_send(allow_send);
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
@@ -57,7 +89,7 @@ pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => handle(engine, &request, allow_send),
+            Ok(request) => handle(backend, &request, allow_send),
             Err(error) => Some(error_response(Value::Null, -32700, &format!("parse error: {error}"))),
         };
         if let Some(response) = response {
@@ -102,7 +134,7 @@ fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<B
     }
 }
 
-fn handle(engine: &mut Engine, request: &Value, allow_send: bool) -> Option<Value> {
+fn handle<B: McpBackend + ?Sized>(backend: &mut B, request: &Value, allow_send: bool) -> Option<Value> {
     let id = request.get("id").cloned();
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return id.map(|id| error_response(id, -32600, "invalid request: missing method"));
@@ -113,8 +145,8 @@ fn handle(engine: &mut Engine, request: &Value, allow_send: bool) -> Option<Valu
     let outcome = match method {
         "initialize" => Ok(initialize(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools_list(engine, allow_send)),
-        "tools/call" => tools_call(engine, &params, allow_send),
+        "tools/list" => Ok(tools_list(backend, allow_send)),
+        "tools/call" => tools_call(backend, &params, allow_send),
         "notifications/initialized" | "notifications/cancelled" => return None,
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -140,12 +172,12 @@ fn initialize(params: &Value) -> Value {
             "title": "Postino",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Postino is a local-first, agent-first mail client. Tools share the same operation registry as the desktop app and the CLI. The mailbox is the configured store when the server was started with one, otherwise it is synthetic demo data. message_send and send_schedule only queue a submission: the message leaves the machine when the desktop app (or `postino send`) runs the outbox pass, and this server never drains the queue itself. Use outbox_list to see the journal; outbox_cancel discards a queued or failed row; an uncertain row needs a person. Sending tools are refused unless the server was started with --allow-send."
+        "instructions": "Postino is a local-first, agent-first mail client. Tools share the same operation registry as the desktop app and the CLI. The mailbox is the configured store when the server was started with one, otherwise it is synthetic demo data. message_send and send_schedule only queue a submission: the message leaves the machine when the Postino daemon processes the outbox (or, without a daemon, the desktop app or `postino send`). This server never drains the queue itself. Use outbox_list to see the journal; outbox_cancel discards a queued or failed row; an uncertain row needs a person. Sending tools are refused unless the server was started with --allow-send."
     })
 }
 
-fn tools_list(engine: &Engine, allow_send: bool) -> Value {
-    let tools = engine
+fn tools_list<B: McpBackend + ?Sized>(backend: &B, allow_send: bool) -> Value {
+    let tools = backend
         .tools()
         .into_iter()
         // A sensitive operation handles a credential. It is not advertised and cannot be called over
@@ -178,14 +210,14 @@ fn tools_list(engine: &Engine, allow_send: bool) -> Value {
     json!({ "tools": tools })
 }
 
-fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<Value, (i64, String)> {
-    engine.set_allow_send(allow_send);
+fn tools_call<B: McpBackend + ?Sized>(backend: &mut B, params: &Value, allow_send: bool) -> Result<Value, (i64, String)> {
+    backend.set_allow_send(allow_send);
     let name = params.get("name").and_then(Value::as_str).ok_or_else(|| (-32602, "tools/call needs a string `name`".to_owned()))?;
     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     if !arguments.is_object() {
         return Err((-32602, "tools/call `arguments` must be a JSON object".to_owned()));
     }
-    if engine.tools().into_iter().any(|def| def.name == name && def.sensitive) {
+    if backend.tools().into_iter().any(|def| def.name == name && def.sensitive) {
         return Ok(sensitive_refusal(name));
     }
     if SEND_GATED.contains(&name) && !allow_send {
@@ -197,11 +229,20 @@ fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<V
     if !allow_send && matches!(name, "rules_create" | "rules_update") && requests_rule_forward(&arguments) {
         return Ok(send_disabled_refusal(name));
     }
-    if !allow_send && name == "rules_update" && rule_update_enables_forward(engine, &arguments) {
-        return Ok(send_disabled_refusal(name));
+    if !allow_send && name == "rules_update" {
+        match rule_update_enables_forward(backend, &arguments) {
+            Ok(true) => return Ok(send_disabled_refusal(name)),
+            Ok(false) => {}
+            Err(error) => {
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("operation {name:?} is refused: {error}; start `postino mcp --allow-send` to update it") }],
+                    "isError": true
+                }));
+            }
+        }
     }
 
-    match engine.call(name, arguments) {
+    match backend.call(name, arguments) {
         Ok(value) => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             Ok(json!({
@@ -210,7 +251,7 @@ fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<V
             }))
         }
         Err(error) => Ok(json!({
-            "content": [{ "type": "text", "text": error.to_string() }],
+            "content": [{ "type": "text", "text": error }],
             "isError": true
         })),
     }
@@ -228,12 +269,17 @@ fn requests_rule_forward(arguments: &Value) -> bool {
 /// An enable-only `rules_update` can arm a stored forward rule without ever sending an `actions`
 /// payload. Read the rule before the typed parser sees the request and refuse it without
 /// `--allow-send`.
-fn rule_update_enables_forward(engine: &Engine, arguments: &Value) -> bool {
+fn rule_update_enables_forward<B: McpBackend + ?Sized>(backend: &B, arguments: &Value) -> std::result::Result<bool, String> {
     if arguments.get("enabled").and_then(Value::as_bool) != Some(true) {
-        return false;
+        return Ok(false);
     }
-    let Some(id) = arguments.get("id").and_then(Value::as_str) else { return false };
-    engine.rule_has_forward(id).ok().flatten() == Some(true)
+    let Some(id) = arguments.get("id").and_then(Value::as_str) else { return Ok(false) };
+    match backend.rule_has_forward(id)? {
+        Some(has_forward) => Ok(has_forward),
+        // Unknown rule or an unreadable list: fail closed. The update is refused rather than
+        // arming a forward we could not inspect.
+        None => Err(format!("cannot verify whether rule {id:?} has a forward action")),
+    }
 }
 
 fn send_disabled_refusal(name: &str) -> Value {
@@ -1080,5 +1126,36 @@ mod tests {
         let encoded = serde_json::to_string(&accounts).expect("JSON");
         assert!(!encoded.contains(postino_testkit::PASSWORD), "an MCP response contained the password");
         server.finish();
+    }
+
+    #[test]
+    fn a_failed_rule_inspection_fails_closed_when_enabling_a_forward_rule() {
+        struct Failing;
+        impl McpBackend for Failing {
+            fn tools(&self) -> Vec<postino_core::OpDef> {
+                postino_core::op_defs()
+            }
+            fn call(&mut self, _name: &str, _args: Value) -> std::result::Result<Value, String> {
+                panic!("the update reached the backend");
+            }
+            fn rule_has_forward(&self, _id: &str) -> std::result::Result<Option<bool>, String> {
+                Err("rules_list is unavailable".to_owned())
+            }
+            fn set_allow_send(&mut self, _allow_send: bool) {}
+        }
+        let mut backend = Failing;
+        let response = raw_handle(
+            &mut backend,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 30,
+                "method": "tools/call",
+                "params": { "name": "rules_update", "arguments": { "id": "rule_1", "enabled": true } }
+            }),
+            false,
+        )
+        .expect("response");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(response["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("refused")), "{response}");
     }
 }

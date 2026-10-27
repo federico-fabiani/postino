@@ -84,7 +84,15 @@ fn layers() -> Result<()> {
         // repository, speaks IMAP through the network crate and runs reconciliation through sync.
         // The credential itself stays behind the engine's vault seam (the CLI's platform adapter).
         ("postino-core", &["postino-net", "postino-store", "postino-sync", "postino-testkit"][..]),
+        // The daemon is the one process that owns the store, the scheduler and the network. It is a
+        // headless L3 frontend; the testkit is a test-only fake server.
+        (
+            "postino-daemon",
+            &["postino-core", "postino-ipc", "postino-net", "postino-platform", "postino-store", "postino-sync", "postino-testkit"][..],
+        ),
         ("postino-crypto", &[][..]),
+        // The transport knows JSON-RPC, a pipe/socket and a token; it has no workspace dependency.
+        ("postino-ipc", &[][..]),
         ("postino-mime", &[][..]),
         // The network layer knows nothing above it. Its tests use the shared fake server, which is a
         // dev-dependency and is checked as such below.
@@ -103,8 +111,12 @@ fn layers() -> Result<()> {
         // onboarding. It never depends on the CLI.
         ("postino-app", &["postino-core", "postino-net", "postino-platform", "postino-store", "postino-sync", "postino-testkit"][..]),
         // The CLI is the production adapter between the engine's vault seam and the OS keyring; it
-        // uses the network types only in its account/sync tests.
-        ("postino-cli", &["postino-core", "postino-net", "postino-store", "postino-platform", "postino-testkit"][..]),
+        // uses the network types only in its account/sync tests. It is also a daemon client; the
+        // daemon library is a dev-dependency for the end-to-end client test.
+        (
+            "postino-cli",
+            &["postino-core", "postino-daemon", "postino-ipc", "postino-net", "postino-store", "postino-platform", "postino-testkit"][..],
+        ),
         ("xtask", &[][..]),
     ]);
     let ui_crates = ["eframe", "egui", "egui_extras", "winit", "rfd"];
@@ -115,7 +127,7 @@ fn layers() -> Result<()> {
     let dev_only: HashMap<&str, &[&str]> = HashMap::from([
         ("postino-net", &["postino-testkit"][..]),
         ("postino-sync", &["postino-core", "postino-testkit"][..]),
-        ("postino-cli", &["postino-net"][..]),
+        ("postino-cli", &["postino-daemon", "postino-net"][..]),
     ]);
 
     for package in &metadata.packages {
@@ -137,7 +149,14 @@ fn layers() -> Result<()> {
         }
         if matches!(
             package.name.as_str(),
-            "postino-core" | "postino-mime" | "postino-platform" | "postino-store" | "postino-sync" | "postino-testkit"
+            "postino-core"
+                | "postino-ipc"
+                | "postino-daemon"
+                | "postino-mime"
+                | "postino-platform"
+                | "postino-store"
+                | "postino-sync"
+                | "postino-testkit"
         ) {
             for dependency in &package.dependencies {
                 if ui_crates.contains(&dependency.name.as_str()) {

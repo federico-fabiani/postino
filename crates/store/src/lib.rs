@@ -46,6 +46,9 @@
 //! stored once. The directory belongs to the file, so two stores in one folder never share it.
 
 mod blob;
+mod gc;
+mod links;
+mod lock;
 mod model;
 mod repo;
 mod rules;
@@ -54,6 +57,8 @@ mod search;
 mod threads;
 
 pub use blob::BlobStore;
+pub use gc::BlobGcReport;
+pub use lock::{WriterLock, WriterOwner, lock_path, owner_path, read_writer, writer_lock_is_free};
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
     Label, LabelCount, MAX_REMOTE_IMAGES, MAX_RULE_CANDIDATES, Message, MessageCounts, MessageFilter, MessageFlags, MessageOrigin, MessagePage,
@@ -549,6 +554,14 @@ pub enum StoreError {
     Compression(#[source] std::io::Error),
     #[error("the OS random source failed: {0}")]
     Random(#[from] getrandom::Error),
+    #[error("the store at {path} is owned by another Postino process{owner}; stop it before opening a second writer")]
+    StoreBusy { path: String, owner: String },
+    #[error("the writer lock at {path} could not be taken: {reason}")]
+    Lock { path: String, reason: String },
+    #[error("this store connection is read-only")]
+    ReadOnly,
+    #[error("the store at {path} has more than one hard link; one file cannot have two independent writer locks")]
+    HardLinked { path: String },
     #[error("blob cryptography failed: {0}")]
     Crypto(#[from] postino_crypto::CryptoError),
 }
@@ -579,6 +592,10 @@ pub struct Store {
     /// True for [`Store::open_read_only`]. Read paths that would normally repair a derived cache must
     /// not write; the caller gets an explicit error instead.
     read_only: bool,
+    /// Present when this connection is the one writer that owns the store. A daemon holds it for its
+    /// whole lifetime; a direct CLI/app writer holds it for one process. `Store::open` (tests and
+    /// read paths) has no lock, so the guard is explicit rather than implicit.
+    writer_lock: Option<WriterLock>,
 }
 
 /// The blob directory that belongs to a database file: `mail.db` → `mail.db.blobs`.
@@ -597,6 +614,58 @@ pub fn blob_root(path: &Path) -> PathBuf {
     }
 }
 
+/// Resolve a store path before deriving a lock, token or endpoint. Symlinks are followed; for a file
+/// that does not exist yet the existing parent is canonicalised and the file name appended. A
+/// hard-linked database is refused by [`ensure_single_link`] because two names would otherwise have
+/// two independent `.lock` files for one inode.
+pub fn canonical_store_path(path: &Path) -> Result<PathBuf, StoreError> {
+    let absolute = std::path::absolute(path).map_err(|source| StoreError::Io { path: path.display().to_string(), source })?;
+    match std::fs::canonicalize(&absolute) {
+        Ok(canonical) => Ok(normalize_windows_path(canonical)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = absolute.parent() else { return Ok(absolute) };
+            let Some(name) = absolute.file_name() else { return Ok(absolute) };
+            match std::fs::canonicalize(parent) {
+                Ok(canonical_parent) => Ok(normalize_windows_path(canonical_parent).join(name)),
+                Err(parent_error) if parent_error.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
+                Err(parent_error) => Err(StoreError::Io { path: parent.display().to_string(), source: parent_error }),
+            }
+        }
+        Err(source) => Err(StoreError::Io { path: absolute.display().to_string(), source }),
+    }
+}
+
+/// Windows canonicalisation returns a verbatim `\\?\` path; strip it for stable lock/token/path
+/// names while keeping the resolved components. UNC paths keep their `\\server` form.
+#[cfg(windows)]
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+fn ensure_single_link(path: &Path) -> Result<(), StoreError> {
+    let Ok(metadata) = std::fs::metadata(path) else { return Ok(()) };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    match links::link_count(path) {
+        Ok(count) if count > 1 => Err(StoreError::HardLinked { path: path.display().to_string() }),
+        Ok(_) => Ok(()),
+        Err(source) => Err(StoreError::Io { path: path.display().to_string(), source }),
+    }
+}
+
 impl Store {
     /// Open or create the database at `path`, apply pending migrations and open its blob directory.
     ///
@@ -604,7 +673,29 @@ impl Store {
     /// leave a stray `mail.db.blobs/` next to somebody else's database. A blob directory that cannot
     /// be created fails the open: losing attachments later is worse than failing now.
     pub fn open(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
-        let mut conn = Connection::open(path)?;
+        Self::open_inner(path, key, None)
+    }
+
+    /// Open the store as its **one writer**. The lock is acquired before the database is touched, so
+    /// a second daemon or a direct CLI writer is refused with the owner's pid instead of racing
+    /// SQLite. The lock lives as long as this `Store`.
+    pub fn open_locked(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
+        let path = canonical_store_path(path)?;
+        let lock = WriterLock::acquire(&path)?;
+        Self::open_inner(&path, key, Some(lock))
+    }
+
+    /// Open the store with an already acquired writer lock, for the daemon that needs to record its
+    /// endpoint before the engine takes the store.
+    pub fn open_with_lock(path: &Path, key: &StoreKey, lock: WriterLock) -> Result<Self, StoreError> {
+        let path = canonical_store_path(path)?;
+        Self::open_inner(&path, key, Some(lock))
+    }
+
+    fn open_inner(path: &Path, key: &StoreKey, writer_lock: Option<WriterLock>) -> Result<Self, StoreError> {
+        let path = canonical_store_path(path)?;
+        ensure_single_link(&path)?;
+        let mut conn = Connection::open(&path)?;
         conn.execute_batch(&key.pragma()).map_err(translate)?;
         // Fail closed if the codec is missing: without SQLCipher the pragma is a no-op and the file
         // would be written in plaintext.
@@ -649,13 +740,25 @@ impl Store {
              CREATE INDEX IF NOT EXISTS messages_rules_all ON messages(account_id, origin, ingested_at, id);",
         )
         .map_err(translate)?;
-        let blobs = BlobStore::open(blob_root(path), key)?;
-        Ok(Self { conn, blobs, path: path.to_path_buf(), read_only: false })
+        let blobs = BlobStore::open(blob_root(&path), key)?;
+        Ok(Self { conn, blobs, path: path.to_path_buf(), read_only: false, writer_lock })
     }
 
     /// The encrypted attachment blob store that lives next to this database.
     pub fn blobs(&self) -> &BlobStore {
         &self.blobs
+    }
+
+    /// The writer lock when this connection is the store's one writer.
+    pub fn writer_owner(&self) -> Option<&WriterOwner> {
+        self.writer_lock.as_ref().map(WriterLock::owner)
+    }
+
+    pub fn set_writer_endpoint(&mut self, endpoint: &str) -> Result<(), StoreError> {
+        match &mut self.writer_lock {
+            Some(lock) => lock.set_endpoint(endpoint),
+            None => Ok(()),
+        }
     }
 
     /// True for a connection opened with [`Store::open_read_only`]. Derived-cache repair must skip its
@@ -673,7 +776,29 @@ impl Store {
     /// opened read-write once. The blob directory next to the database is opened through the normal
     /// blob seam (which may create it if it is missing), but no blob is written by this call.
     pub fn open_read_only(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
-        let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::open_read_only_inner(path, key, None)
+    }
+
+    /// A read-only connection that still holds the store's writer lock. `--in-process` uses it for
+    /// every command: it never migrates or repairs a derived cache, and it is refused while a
+    /// daemon/app owns the store.
+    pub fn open_read_only_locked(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
+        let path = canonical_store_path(path)?;
+        let lock = WriterLock::acquire(&path)?;
+        Self::open_read_only_with_lock(&path, key, lock)
+    }
+
+    /// The read-only open with an already acquired writer lock. The CLI uses it after taking the
+    /// lock before the keyring, so a daemon-owned store is refused without touching the vault.
+    pub fn open_read_only_with_lock(path: &Path, key: &StoreKey, lock: WriterLock) -> Result<Self, StoreError> {
+        let path = canonical_store_path(path)?;
+        Self::open_read_only_inner(&path, key, Some(lock))
+    }
+
+    fn open_read_only_inner(path: &Path, key: &StoreKey, writer_lock: Option<WriterLock>) -> Result<Self, StoreError> {
+        let path = canonical_store_path(path)?;
+        ensure_single_link(&path)?;
+        let mut conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.execute_batch(&key.pragma()).map_err(translate)?;
         let cipher: Option<String> = conn.query_row("PRAGMA cipher_version", [], |row| row.get(0)).optional().map_err(translate)?;
         if cipher.as_deref().unwrap_or_default().is_empty() {
@@ -689,8 +814,8 @@ impl Store {
         if version < SCHEMA_VERSION {
             return Err(StoreError::SchemaTooOld { found: version, supported: SCHEMA_VERSION });
         }
-        let blobs = BlobStore::open(blob_root(path), key)?;
-        Ok(Self { conn, blobs, path: path.to_path_buf(), read_only: true })
+        let blobs = BlobStore::open(blob_root(&path), key)?;
+        Ok(Self { conn, blobs, path: path.to_path_buf(), read_only: true, writer_lock })
     }
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {

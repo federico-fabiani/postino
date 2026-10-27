@@ -18,6 +18,7 @@ use std::io::{BufRead, IsTerminal, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -26,11 +27,14 @@ use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
-    LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OpError, OutboxAction, OutboxListResult,
-    Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult,
-    SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow,
-    SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
+    LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OpDef, OpError, OutboxAction,
+    OutboxListResult, OutboxRunReport, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
+    RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult,
+    SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
 };
+use postino_ipc::client::BlockingClient;
+use postino_ipc::protocol::method;
+use postino_ipc::{DaemonPaths, IpcError, MAX_FRAME_BYTES};
 use postino_platform::Keyring;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -48,6 +52,10 @@ struct Cli {
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
+    /// Diagnostic only: open the store in this process instead of using a running daemon. Refused
+    /// while a daemon owns the store.
+    #[arg(long, global = true)]
+    in_process: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -419,6 +427,16 @@ enum OutboxCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Show whether the daemon is running and what it is doing.
+    Status,
+    /// Start the daemon in the background and wait for its endpoint.
+    Start,
+    /// Ask the daemon to stop and wait for the writer lock to be released.
+    Stop,
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Version, platform, data directory and whether the mailbox is demo, store-backed or empty.
     Info,
@@ -590,6 +608,11 @@ enum Command {
         #[arg(long)]
         allow_send: bool,
     },
+    /// Inspect or control the background daemon.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
 }
 
 /// Keyring scope the CLI uses for its store. A different scope is a different key and therefore a
@@ -644,23 +667,526 @@ impl CredentialVault for PlatformVault {
     }
 }
 
+/// The command surface's view of one mailbox. The same commands work against an in-process engine
+/// (demo or `--in-process`) and against a running daemon; no command knows which one it has.
+trait CliBackend {
+    fn accounts(&self) -> Result<Vec<postino_core::Account>>;
+    fn tools(&self) -> Vec<OpDef> {
+        postino_core::op_defs()
+    }
+    fn is_persistent(&self) -> bool;
+    fn is_daemon(&self) -> bool {
+        false
+    }
+    fn call(&mut self, name: &str, args: Value) -> Result<Value>;
+    /// Validate an account request before a password is read. A daemon owns the account list, so its
+    /// client lets the operation validate; the CLI still refuses an invalid address from the local
+    /// path before stdin is consumed.
+    fn check_account_request(&self, _request: &AccountRequest) -> Result<()> {
+        Ok(())
+    }
+    fn process_outbox(&mut self, now_ms: i64) -> Result<OutboxRunReport>;
+}
+
+impl CliBackend for Engine {
+    fn accounts(&self) -> Result<Vec<postino_core::Account>> {
+        Ok(Engine::accounts(self).to_vec())
+    }
+
+    fn tools(&self) -> Vec<OpDef> {
+        Engine::tools(self)
+    }
+
+    fn is_persistent(&self) -> bool {
+        Engine::is_persistent(self)
+    }
+
+    fn call(&mut self, name: &str, args: Value) -> Result<Value> {
+        postino_core::ops::dispatch(self, name, args).map_err(anyhow::Error::new)
+    }
+
+    fn check_account_request(&self, request: &AccountRequest) -> Result<()> {
+        Engine::check_account_request(self, request).map_err(anyhow::Error::new)
+    }
+
+    fn process_outbox(&mut self, now_ms: i64) -> Result<OutboxRunReport> {
+        Engine::process_outbox(self, now_ms).map_err(anyhow::Error::new)
+    }
+}
+
+/// A CLI session whose mailbox lives in the daemon. The operation names, schemas and results are the
+/// same; only the transport changes.
+struct DaemonSession {
+    client: BlockingClient,
+    paths: DaemonPaths,
+}
+
+impl DaemonSession {
+    fn try_connect(paths: &DaemonPaths) -> std::result::Result<Self, IpcError> {
+        Self::try_connect_with(paths, "cli", true)
+    }
+
+    fn try_connect_with(paths: &DaemonPaths, client: &str, allow_send: bool) -> std::result::Result<Self, IpcError> {
+        let blocking = BlockingClient::connect_with(paths, client, allow_send, Duration::from_secs(2), Duration::from_secs(600))?;
+        Ok(Self { client: blocking, paths: paths.clone() })
+    }
+
+    fn call_value(&mut self, name: &str, args: Value) -> Result<Value> {
+        if let Some(refusal) = ipc_frame_refusal(name, &args) {
+            return Err(anyhow::anyhow!(refusal));
+        }
+        self.client.call(method::OP, json!({ "name": name, "args": args }), Duration::from_secs(600)).map_err(daemon_error)
+    }
+}
+
+impl CliBackend for DaemonSession {
+    fn accounts(&self) -> Result<Vec<postino_core::Account>> {
+        // `accounts_list` is read-only; a fresh short call is enough and keeps this method `&self`.
+        let mut client = BlockingClient::connect(&self.paths, "cli", Duration::from_secs(2), Duration::from_secs(30)).map_err(daemon_error)?;
+        let value = client.call(method::OP, json!({ "name": "accounts_list", "args": {} }), Duration::from_secs(30)).map_err(daemon_error)?;
+        let accounts = value.get("accounts").cloned().unwrap_or_else(|| json!([]));
+        let views: Vec<postino_core::AccountView> =
+            serde_json::from_value(accounts).map_err(|error| anyhow::anyhow!("the daemon returned unreadable accounts: {error}"))?;
+        Ok(views.into_iter().map(|view| view.account).collect())
+    }
+
+    fn is_persistent(&self) -> bool {
+        true
+    }
+
+    fn is_daemon(&self) -> bool {
+        true
+    }
+
+    fn call(&mut self, name: &str, args: Value) -> Result<Value> {
+        self.call_value(name, args)
+    }
+
+    fn process_outbox(&mut self, _now_ms: i64) -> Result<OutboxRunReport> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let value = self.call_value("outbox_list", json!({ "limit": 500 }))?;
+            let list: OutboxListResult =
+                serde_json::from_value(value).map_err(|error| anyhow::anyhow!("the daemon returned an unreadable outbox: {error}"))?;
+            let busy = list.outbox.entries.iter().any(|entry| {
+                matches!(
+                    entry.state,
+                    postino_store::OutboxState::Queued | postino_store::OutboxState::Sending | postino_store::OutboxState::AppendPending
+                )
+            });
+            let report = OutboxRunReport { entries: list.outbox.entries.clone(), ..OutboxRunReport::default() };
+            if !busy || std::time::Instant::now() >= deadline {
+                return Ok(report);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn ipc_frame_refusal(name: &str, args: &Value) -> Option<String> {
+    let request = json!({ "name": name, "args": args });
+    let size = serde_json::to_vec(&request).ok()?.len();
+    if size.saturating_add(128) <= MAX_FRAME_BYTES {
+        return None;
+    }
+    Some(if name == "draft_attachment_add" {
+        "l'allegato supera il limite di 16 MiB del canale IPC del daemon; usa un file più piccolo oppure attendi il canale blob fuori banda di P10a2"
+            .to_owned()
+    } else {
+        format!("la richiesta {name} supera il limite di 16 MiB del canale IPC del daemon; riduci i dati o usa --in-process mentre il daemon è fermo")
+    })
+}
+
+fn daemon_error(error: IpcError) -> anyhow::Error {
+    match error {
+        IpcError::Rpc(rpc) if rpc.code == postino_ipc::error_code::FRAME_TOO_LARGE => anyhow::anyhow!(
+            "la risposta del daemon supera il limite di 16 MiB: {}; restringi la pagina o usa --in-process mentre il daemon è fermo",
+            rpc.message
+        ),
+        IpcError::Rpc(rpc) => {
+            let invalid = rpc.data.as_ref().and_then(|data| data.get("kind")).and_then(Value::as_str) == Some("invalid_args");
+            if invalid {
+                anyhow::Error::new(UsageError(rpc.message))
+            } else {
+                anyhow::anyhow!("il daemon ha rifiutato l'operazione: {}", rpc.message)
+            }
+        }
+        IpcError::Unauthorized => anyhow::anyhow!("il daemon ha rifiutato il token: riavvialo con `postino daemon stop` e `postino daemon start`"),
+        IpcError::Version { client, daemon } => {
+            anyhow::anyhow!("la versione del protocollo non corrisponde (client {client}, daemon {daemon}); aggiorna Postino e riavvia il daemon")
+        }
+        IpcError::Busy(message) => anyhow::anyhow!("un'altra operazione è già in corso su questa connessione: {message}"),
+        IpcError::Cancelled => anyhow::anyhow!("l'operazione è stata annullata"),
+        IpcError::Overloaded => anyhow::anyhow!("il daemon è occupato; riprova tra poco"),
+        IpcError::FrameTooLarge { limit } => anyhow::anyhow!(
+            "la richiesta supera il limite di {limit} byte del canale IPC del daemon; riduci i dati o usa --in-process mentre il daemon è fermo"
+        ),
+        other => anyhow::anyhow!("il daemon non è raggiungibile: {other}"),
+    }
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).target(env_logger::Target::Stderr).init();
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Daemon { .. }) {
+        return finish(run_daemon_command(cli));
+    }
+    if let Command::Mcp { allow_send } = &cli.command {
+        return finish(run_mcp_command(&cli, *allow_send));
+    }
+    let paths = match daemon_paths(&cli) {
+        Ok(paths) => paths,
+        Err(error) => return finish(Err(error)),
+    };
+    if !cli.demo
+        && !cli.in_process
+        && let Some(paths) = paths.as_ref()
+    {
+        let reads_only = command_reads_only(&cli.command);
+        match DaemonSession::try_connect(paths) {
+            Ok(mut session) => return finish(run(cli, &mut session)),
+            Err(error) if !daemon_absent(&error, paths) => {
+                return finish(Err(daemon_error(error)));
+            }
+            Err(_) if reads_only => {}
+            Err(_) => {
+                if let Err(start) = start_daemon(paths) {
+                    let advice = "il daemon non è in esecuzione e non riesco ad avviarlo; avvialo con `postino daemon start` oppure usa `--in-process` mentre il daemon è fermo";
+                    return finish(Err(anyhow::anyhow!("{advice}: {start}")));
+                }
+                match DaemonSession::try_connect(paths) {
+                    Ok(mut session) => return finish(run(cli, &mut session)),
+                    Err(error) => return finish(Err(daemon_error(error))),
+                }
+            }
+        }
+    }
     let mut engine = match open_engine(&cli) {
         Ok(engine) => engine,
-        Err(error) => {
-            eprintln!("postino: {error:#}");
-            return error_exit_code(&error);
-        }
+        Err(error) => return finish(Err(error)),
     };
-    match run(cli, &mut engine) {
+    finish(run(cli, &mut engine))
+}
+
+fn finish(result: Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("postino: {error:#}");
             error_exit_code(&error)
         }
     }
+}
+
+/// The daemon endpoint/token for the selected store. `None` for the synthetic demo mailbox.
+fn daemon_paths(cli: &Cli) -> Result<Option<DaemonPaths>> {
+    if cli.demo {
+        return Ok(None);
+    }
+    let store = match &cli.store {
+        Some(path) => path.clone(),
+        None => Engine::data_dir().context("the platform data directory is unavailable")?.join("mail.db"),
+    };
+    DaemonPaths::for_store(&store).map(Some).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+fn daemon_absent(error: &IpcError, paths: &DaemonPaths) -> bool {
+    if error.is_absent() {
+        return true;
+    }
+    // A missing token file means no daemon ever started. A malformed or insecure existing file is a
+    // readable configuration failure, not an absent daemon.
+    matches!(error, IpcError::TokenFile(_)) && !paths.token_file.exists()
+}
+
+/// Start a daemon process and wait for its endpoint. The binary is a sibling of the CLI, so a
+/// workspace build and an installed layout both work; `POSTINO_DAEMON_BIN` is the test hook.
+fn start_daemon(paths: &DaemonPaths) -> Result<()> {
+    let binary = daemon_binary()?;
+    let mut command = std::process::Command::new(&binary);
+    command.arg("--store").arg(&paths.store).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().with_context(|| format!("starting {}", binary.display()))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(_session) = DaemonSession::try_connect(paths) {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().with_context(|| format!("checking {}", binary.display()))? {
+            bail!("il processo del daemon è uscito subito ({status}); l'archivio potrebbe essere già aperto da un'altra finestra");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            bail!("il daemon non ha aperto il suo endpoint entro 10 secondi");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn daemon_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("POSTINO_DAEMON_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!("POSTINO_DAEMON_BIN points to {}, which is not a file", path.display());
+    }
+    let current = std::env::current_exe().context("locating the postino executable")?;
+    let name = if cfg!(windows) { "postino-daemon.exe" } else { "postino-daemon" };
+    let sibling = current.parent().map(|parent| parent.join(name)).unwrap_or_else(|| PathBuf::from(name));
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    Ok(PathBuf::from(name))
+}
+
+fn run_daemon_command(cli: Cli) -> Result<()> {
+    let Command::Daemon { command } = &cli.command else {
+        bail!("not a daemon command");
+    };
+    let paths = daemon_paths(&cli)?.ok_or_else(|| usage("--demo has no daemon; remove --demo or use a store"))?;
+    match command {
+        DaemonCommand::Status => match DaemonSession::try_connect(&paths) {
+            Ok(mut session) => {
+                let status = session.client.call(method::DAEMON_STATUS, json!({}), Duration::from_secs(10)).map_err(daemon_error)?;
+                if cli.json {
+                    print_json(&status)?;
+                } else {
+                    say(format_daemon_status(&status))?;
+                }
+            }
+            Err(error) if daemon_absent(&error, &paths) => {
+                if cli.json {
+                    print_json(&json!({ "running": false, "store": paths.store }))?;
+                } else {
+                    say("Il daemon non è in esecuzione. Avvialo con `postino daemon start`.")?;
+                }
+            }
+            Err(error) => return Err(daemon_error(error)),
+        },
+        DaemonCommand::Start => match DaemonSession::try_connect(&paths) {
+            Ok(session) => {
+                if cli.json {
+                    print_json(&json!({ "running": true, "already_running": true, "pid": session.client.hello().pid }))?;
+                } else {
+                    say(format!("Il daemon è già in esecuzione (pid {}).", session.client.hello().pid))?;
+                }
+            }
+            Err(error) if daemon_absent(&error, &paths) => {
+                start_daemon(&paths)?;
+                let session = DaemonSession::try_connect(&paths).map_err(daemon_error)?;
+                if cli.json {
+                    print_json(&json!({ "running": true, "pid": session.client.hello().pid, "store_root": session.client.hello().store_root }))?;
+                } else {
+                    say(format!(
+                        "Daemon avviato (pid {}). Archivio: {}. Sincronizzazione e coda di invio ora girano anche con l'app chiusa.",
+                        session.client.hello().pid,
+                        session.client.hello().store_root
+                    ))?;
+                }
+            }
+            Err(error) => return Err(daemon_error(error)),
+        },
+        DaemonCommand::Stop => match DaemonSession::try_connect(&paths) {
+            Ok(mut session) => {
+                let _ = session.client.call(method::DAEMON_SHUTDOWN, json!({}), Duration::from_secs(5));
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let absent = matches!(DaemonSession::try_connect(&paths), Err(error) if daemon_absent(&error, &paths));
+                    if absent && postino_store::writer_lock_is_free(&paths.store) {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        bail!("il daemon non ha rilasciato l'archivio entro 10 secondi");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if cli.json {
+                    print_json(&json!({ "running": false }))?;
+                } else {
+                    say("Daemon fermato. L'archivio può essere aperto di nuovo da un processo diretto o dall'app.")?;
+                }
+            }
+            Err(error) if daemon_absent(&error, &paths) => {
+                if cli.json {
+                    print_json(&json!({ "running": false }))?;
+                } else {
+                    say("Il daemon non era in esecuzione.")?;
+                }
+            }
+            Err(error) => return Err(daemon_error(error)),
+        },
+    }
+    Ok(())
+}
+
+fn run_mcp_command(cli: &Cli, allow_send: bool) -> Result<()> {
+    if cli.demo {
+        let mut engine = Engine::demo();
+        return mcp::serve(&mut engine, allow_send);
+    }
+    if cli.in_process {
+        let mut engine = open_engine(cli)?;
+        return mcp::serve(&mut engine, allow_send);
+    }
+    let Some(paths) = daemon_paths(cli)? else {
+        let mut engine = Engine::demo();
+        return mcp::serve(&mut engine, allow_send);
+    };
+    match DaemonSession::try_connect_with(&paths, "mcp", allow_send) {
+        Ok(session) => {
+            let mut backend = DaemonMcp::new(session.client, paths);
+            mcp::serve_backend(&mut backend, allow_send)
+        }
+        Err(error) if daemon_absent(&error, &paths) => {
+            let engine = open_engine_read_only(cli)?;
+            let mut backend = LocalMcp { engine, mutations: false };
+            mcp::serve_backend(&mut backend, allow_send)
+        }
+        Err(error) => Err(daemon_error(error)),
+    }
+}
+
+/// Read-only engine for an MCP process when the daemon is absent. It deliberately does not take the
+/// writer lock: MCP is a server, not the owner, and its mutations must fail readably.
+fn open_engine_read_only(cli: &Cli) -> Result<Engine> {
+    if cli.demo {
+        return Ok(Engine::demo());
+    }
+    let path = match &cli.store {
+        Some(path) => path.clone(),
+        None => match Engine::data_dir() {
+            Some(directory) => directory.join("mail.db"),
+            None => return Ok(Engine::empty()),
+        },
+    };
+    if !path.exists() {
+        return Ok(Engine::empty());
+    }
+    let keyring = Keyring::system().map_err(|error| anyhow::anyhow!("the OS keyring is unavailable: {error}"))?;
+    let key =
+        keyring.load_or_create_key(STORE_KEY_SCOPE).map_err(|error| anyhow::anyhow!("the OS keyring could not provide the store key: {error}"))?;
+    let store = postino_store::Store::open_read_only(&path, &postino_store::StoreKey::from_bytes(*key.as_bytes()))
+        .map_err(|error| anyhow::anyhow!("opening the store at {} read-only: {error}", path.display()))?;
+    Engine::open_with_vault(store, Arc::new(PlatformVault::new(keyring))).map_err(anyhow::Error::new)
+}
+
+struct LocalMcp {
+    engine: Engine,
+    mutations: bool,
+}
+
+impl mcp::McpBackend for LocalMcp {
+    fn tools(&self) -> Vec<OpDef> {
+        Engine::tools(&self.engine)
+    }
+
+    fn call(&mut self, name: &str, args: Value) -> std::result::Result<Value, String> {
+        if !self.mutations {
+            let read_only = postino_core::op_defs().iter().find(|definition| definition.name == name).is_some_and(|definition| definition.read_only);
+            if !read_only {
+                return Err(
+                    "il daemon non è in esecuzione: questa operazione modifica l'archivio. Avvialo con `postino daemon start` e riprova; le letture possono usare la cache locale."
+                        .to_owned(),
+                );
+            }
+        }
+        postino_core::ops::dispatch(&mut self.engine, name, args).map_err(|error| error.to_string())
+    }
+
+    fn rule_has_forward(&self, id: &str) -> std::result::Result<Option<bool>, String> {
+        Engine::rule_has_forward(&self.engine, id).map_err(|error| error.to_string())
+    }
+
+    fn set_allow_send(&mut self, allow_send: bool) {
+        Engine::set_allow_send(&mut self.engine, allow_send);
+    }
+}
+
+struct DaemonMcp {
+    client: BlockingClient,
+    registry: Vec<OpDef>,
+    paths: DaemonPaths,
+}
+
+impl DaemonMcp {
+    fn new(client: BlockingClient, paths: DaemonPaths) -> Self {
+        Self { client, registry: postino_core::op_defs(), paths }
+    }
+}
+
+impl mcp::McpBackend for DaemonMcp {
+    fn tools(&self) -> Vec<OpDef> {
+        self.registry.clone()
+    }
+
+    fn call(&mut self, name: &str, args: Value) -> std::result::Result<Value, String> {
+        if let Some(refusal) = ipc_frame_refusal(name, &args) {
+            return Err(refusal);
+        }
+        self.client.call(method::OP, json!({ "name": name, "args": args }), Duration::from_secs(600)).map_err(|error| daemon_error(error).to_string())
+    }
+
+    fn rule_has_forward(&self, id: &str) -> std::result::Result<Option<bool>, String> {
+        // The daemon owns the rules; read the list through the same registry and inspect the stored
+        // actions. This is only the MCP gate, never a second rule table. Every transport/parse error
+        // is returned, so the caller can fail closed instead of arming an uninspected rule.
+        let mut client = BlockingClient::connect(&self.paths, "mcp", Duration::from_secs(2), Duration::from_secs(10))
+            .map_err(|error| daemon_error(error).to_string())?;
+        let value = client
+            .call(method::OP, json!({ "name": "rules_list", "args": {} }), Duration::from_secs(10))
+            .map_err(|error| daemon_error(error).to_string())?;
+        let rules = value.get("rules").and_then(Value::as_array).ok_or_else(|| "rules_list returned no rule array".to_owned())?;
+        let Some(rule) = rules.iter().find(|rule| rule.get("id").and_then(Value::as_str) == Some(id)) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            rule.get("actions")
+                .and_then(Value::as_array)
+                .is_some_and(|actions| actions.iter().any(|action| action.get("kind").and_then(Value::as_str) == Some("forward"))),
+        ))
+    }
+
+    fn set_allow_send(&mut self, _allow_send: bool) {
+        // The send gate is enforced by this MCP process before the call; the daemon always serves the
+        // registry operation.
+    }
+}
+
+fn format_daemon_status(status: &Value) -> String {
+    let running = status["pid"].as_u64().unwrap_or(0);
+    let mut text = format!(
+        "Daemon in esecuzione (pid {running})\nversione: {}\nprotocollo: {}\navvio: {}\narchivio: {}\nendpoint: {}\n",
+        status["version"].as_str().unwrap_or("?"),
+        status["protocol"].as_u64().unwrap_or(0),
+        status["started_at"].as_i64().unwrap_or(0),
+        status["store_root"].as_str().unwrap_or("?"),
+        status["endpoint_kind"].as_str().unwrap_or("?")
+    );
+    if let Some(syncing) = status["accounts_syncing"].as_array().filter(|accounts| !accounts.is_empty()) {
+        text.push_str(&format!("account in sincronizzazione: {}\n", syncing.len()));
+    }
+    if let Some(index) = status["index"].as_object() {
+        text.push_str(&format!(
+            "indice: {} ({}/{}), pronto: {}\n",
+            index.get("state").and_then(Value::as_str).unwrap_or("?"),
+            index.get("indexed").and_then(Value::as_u64).unwrap_or(0),
+            index.get("total").and_then(Value::as_u64).unwrap_or(0),
+            index.get("ready").and_then(Value::as_bool).unwrap_or(false)
+        ));
+    }
+    if let Some(wake) = status["outbox_next_wake"].as_i64() {
+        text.push_str(&format!("prossimo risveglio coda: {wake}\n"));
+    }
+    if let Some(error) = status["last_error"].as_str() {
+        text.push_str(&format!("ultimo errore: {error}\n"));
+    }
+    text.push_str(&format!("risvegli scheduler: {}\n", status["scheduler_wakes"].as_u64().unwrap_or(0)));
+    text
 }
 
 /// A command-line usage mistake: exit code 2, like clap. Operations that reject their arguments with
@@ -688,6 +1214,15 @@ fn error_exit_code(error: &anyhow::Error) -> ExitCode {
     }
 }
 
+/// How a direct CLI command opens the store. A read command never gets a writable connection; a
+/// diagnostic `--in-process` command takes the writer lock even when it only reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreMode {
+    ReadOnly,
+    ReadOnlyLocked,
+    Write,
+}
+
 /// Build the engine the command asked for: demo, encrypted store, or the default local store.
 ///
 /// The store key never leaves this function except inside the store connection. The credential vault
@@ -702,19 +1237,25 @@ fn open_engine(cli: &Cli) -> Result<Engine> {
 /// A read-only command never creates a missing default store and never constructs the keyring: it
 /// gets an empty engine and reports that no account is configured. A mutation may create it. An
 /// explicit `--store` that does not exist is a usage error for a read-only command. Tests pass a
-/// temporary profile and a factory that fails if it is called.
+/// temporary profile and a factory that fails if it is called. The mode says whether to open
+/// read-only, read-only while holding the writer lock, or read-write while holding it.
 fn open_engine_in<F>(cli: &Cli, data_dir: Option<&Path>, open: F) -> Result<Engine>
 where
-    F: FnOnce(&Path) -> Result<Engine>,
+    F: FnOnce(&Path, StoreMode) -> Result<Engine>,
 {
     let reads_only = command_reads_only(&cli.command);
+    let mode = match (reads_only, cli.in_process) {
+        (true, true) => StoreMode::ReadOnlyLocked,
+        (true, false) => StoreMode::ReadOnly,
+        (false, _) => StoreMode::Write,
+    };
     match (&cli.store, cli.demo) {
         (Some(_), true) => Err(usage("--demo e --store non possono essere usati insieme: scegli la mailbox sintetica o il database cifrato")),
         (Some(path), false) => {
             if reads_only && !path.exists() {
                 return Err(usage(format!("the store at {} does not exist; create it with a write command or omit --store", path.display())));
             }
-            open(path)
+            open(path, mode)
         }
         (None, true) => Ok(Engine::demo()),
         (None, false) => {
@@ -725,7 +1266,7 @@ where
                 bail!("the platform data directory is unavailable, so the default store cannot be placed");
             };
             let path = default_store_path_in(dir);
-            if reads_only && !path.exists() { Ok(Engine::empty()) } else { open(&path) }
+            if reads_only && !path.exists() { Ok(Engine::empty()) } else { open(&path, mode) }
         }
     }
 }
@@ -748,7 +1289,9 @@ fn command_reads_only(command: &Command) -> bool {
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
         // operation is refused before dispatch and must not create one either.
         Command::Run { op, .. } => postino_core::op_defs().iter().find(|def| def.name == op).is_none_or(|def| def.read_only || def.sensitive),
-        Command::Flag { .. } | Command::Draft { .. } | Command::Send { .. } | Command::Mcp { .. } | Command::SearchReindex => false,
+        Command::Daemon { command } => matches!(command, DaemonCommand::Status),
+        Command::Mcp { .. } => false,
+        Command::Flag { .. } | Command::Draft { .. } | Command::Send { .. } | Command::SearchReindex => false,
     }
 }
 
@@ -756,28 +1299,42 @@ fn default_store_path_in(dir: &Path) -> PathBuf {
     dir.join("mail.db")
 }
 
-fn open_store(path: &Path) -> Result<Engine> {
+fn open_store(path: &Path, mode: StoreMode) -> Result<Engine> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(|error| anyhow::anyhow!("creating the store directory {}: {error}", parent.display()))?;
     }
+    // The writer lock is taken before the keyring: a daemon-owned store is refused without touching
+    // the vault, and `--in-process` can never open a second writer.
+    let lock = match mode {
+        StoreMode::ReadOnly => None,
+        StoreMode::ReadOnlyLocked | StoreMode::Write => {
+            Some(postino_store::WriterLock::acquire(path).map_err(|error| anyhow::anyhow!("opening the store at {}: {error}", path.display()))?)
+        }
+    };
     let keyring = Keyring::system().map_err(|error| anyhow::anyhow!("the OS keyring is unavailable: {error}"))?;
     let key =
         keyring.load_or_create_key(STORE_KEY_SCOPE).map_err(|error| anyhow::anyhow!("the OS keyring could not provide the store key: {error}"))?;
-    let store = postino_store::Store::open(path, &postino_store::StoreKey::from_bytes(*key.as_bytes()))
-        .map_err(|error| anyhow::anyhow!("opening the store at {}: {error}", path.display()))?;
+    let store_key = postino_store::StoreKey::from_bytes(*key.as_bytes());
+    let store = match (mode, lock) {
+        (StoreMode::ReadOnly, _) => postino_store::Store::open_read_only(path, &store_key),
+        (StoreMode::ReadOnlyLocked, Some(lock)) => postino_store::Store::open_read_only_with_lock(path, &store_key, lock),
+        (StoreMode::Write, Some(lock)) => postino_store::Store::open_with_lock(path, &store_key, lock),
+        _ => return Err(anyhow::anyhow!("internal error: writer lock missing for {mode:?}")),
+    }
+    .map_err(|error| anyhow::anyhow!("opening the store at {}: {error}", path.display()))?;
     Engine::open_with_vault(store, Arc::new(PlatformVault::new(keyring))).map_err(anyhow::Error::new)
 }
 
-fn run(cli: Cli, engine: &mut Engine) -> Result<()> {
+fn run<B: CliBackend>(cli: Cli, engine: &mut B) -> Result<()> {
     run_with_input(cli, engine, &mut std::io::stdin().lock(), std::io::stdin().is_terminal())
 }
 
 /// The command dispatcher with the password source injected. `input` is the `--password-stdin`
 /// stream; `interactive` says whether a no-echo terminal prompt is possible. Production calls
 /// [`run`], tests pass a cursor so the stdin path is exercised exactly as a script would.
-fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, interactive: bool) -> Result<()> {
+fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRead, interactive: bool) -> Result<()> {
     let json_output = cli.json;
     let needs_mail = matches!(
         &cli.command,
@@ -795,7 +1352,7 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             | Command::Thread { .. }
             | Command::Saved { .. }
     );
-    if needs_mail && engine.accounts().is_empty() {
+    if needs_mail && engine.accounts()?.is_empty() {
         bail!(
             "nessun account configurato; riprova con --demo per i dati sintetici oppure apri un --store già configurato (l'onboarding arriva con P6)"
         );
@@ -1649,7 +2206,8 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
             let result = call(engine, &op, object)?;
             print_json(&result)?;
         }
-        Command::Mcp { allow_send } => mcp::serve(engine, allow_send)?,
+        Command::Mcp { .. } => bail!("the MCP server is started by `main`, not by the command dispatcher"),
+        Command::Daemon { .. } => bail!("daemon commands are handled by `main`, not by the command dispatcher"),
     }
     Ok(())
 }
@@ -1696,7 +2254,7 @@ fn smtp_setup(provider: Provider, email: &str, request: &AccountRequest, passwor
 
 /// Dispatch `account_add` through the registry. The passwords travel in the request to the engine,
 /// which hands them to the keyring adapter after the login check; they are never printed here.
-fn account_add(engine: &mut Engine, request: AccountAddRequest) -> Result<AccountView> {
+fn account_add<B: CliBackend>(engine: &mut B, request: AccountAddRequest) -> Result<AccountView> {
     let AccountAddRequest { provider, email, name, host, port, tls, smtp, password } = request;
     let mut args = json!({
         "provider": provider,
@@ -1725,8 +2283,8 @@ fn account_add(engine: &mut Engine, request: AccountAddRequest) -> Result<Accoun
 /// Build `account_update` arguments. A known provider fills its preset when the user gives no
 /// endpoint; a custom account has no default and must supply host, port and TLS together.
 #[allow(clippy::too_many_arguments)]
-fn account_update_args(
-    engine: &Engine,
+fn account_update_args<B: CliBackend>(
+    engine: &B,
     id: &str,
     host: Option<String>,
     port: Option<u16>,
@@ -1741,11 +2299,9 @@ fn account_update_args(
         }
         return Ok(json!({ "id": id, "clear_smtp": true }));
     }
-    let account = engine
-        .accounts()
-        .iter()
-        .find(|account| account.id == id)
-        .ok_or_else(|| usage(format!("unknown account {id:?}; run `postino account list`")))?;
+    let accounts = engine.accounts()?;
+    let account =
+        accounts.iter().find(|account| account.id == id).ok_or_else(|| usage(format!("unknown account {id:?}; run `postino account list`")))?;
     let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
     let (host, port, tls) = match (host, port, tls) {
         (None, None, None) => match provider.smtp_discovery() {
@@ -2066,7 +2622,7 @@ fn format_rule(rule: &Rule) -> String {
     text
 }
 
-fn labels_note(engine: &Engine) -> &'static str {
+fn labels_note<B: CliBackend>(engine: &B) -> &'static str {
     if engine.is_persistent() {
         "Etichette locali, salvate nel database cifrato: nessun server viene aggiornato.\n"
     } else {
@@ -2074,7 +2630,7 @@ fn labels_note(engine: &Engine) -> &'static str {
     }
 }
 
-fn draft_note(engine: &Engine) -> &'static str {
+fn draft_note<B: CliBackend>(engine: &B) -> &'static str {
     if engine.is_persistent() {
         "Bozza salvata nel database cifrato: riapri con lo stesso --store per ritrovarla."
     } else {
@@ -2087,7 +2643,7 @@ fn draft_note(engine: &Engine) -> &'static str {
 /// Only an explicit `--at` in the future leaves the row queued: there is no daemon in this build, so
 /// the CLI says when it will be attempted. A plain `postino send` always waits out the 5-second undo
 /// window and runs the pass; the undo window is not a scheduled time.
-fn send_now(engine: &mut Engine, draft: &str, at: Option<&str>, json_output: bool) -> Result<()> {
+fn send_now<B: CliBackend>(engine: &mut B, draft: &str, at: Option<&str>, json_output: bool) -> Result<()> {
     let (operation, args) = match at {
         Some(at) => ("send_schedule", json!({ "draft": draft, "send_at": at })),
         None => ("message_send", json!({ "draft": draft })),
@@ -2106,6 +2662,10 @@ fn send_now(engine: &mut Engine, draft: &str, at: Option<&str>, json_output: boo
     if scheduled {
         if json_output {
             print_json(&queued)?;
+        } else if engine.is_daemon() {
+            say(
+                "Invio programmato: il daemon lo invierà all'ora indicata anche con l'app e il terminale chiusi. `postino outbox list` mostra lo stato.",
+            )?;
         } else {
             say(
                 "Invio programmato: nessun tentativo è partito ora. La riga parte quando un processo della coda è aperto e l'ora è arrivata: lascia aperta l'app desktop, oppure lancia `postino send --draft <id>` quando è ora. `postino outbox list` è in sola lettura e non invia.",
@@ -2327,8 +2887,8 @@ fn parse_run_args(args: Option<String>, params: Vec<String>) -> Result<Value> {
     Ok(object)
 }
 
-fn call(engine: &mut Engine, name: &str, args: Value) -> Result<Value> {
-    engine.call(name, args).map_err(anyhow::Error::new)
+fn call<B: CliBackend>(engine: &mut B, name: &str, args: Value) -> Result<Value> {
+    engine.call(name, args)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
@@ -2406,6 +2966,37 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn read_only_and_in_process_modes_select_the_read_only_store() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("mail.db");
+        std::fs::write(&path, b"placeholder").expect("placeholder");
+        let read = Cli { demo: false, store: Some(path.clone()), json: true, in_process: false, command: Command::Folders { account: None } };
+        open_engine_in(&read, Some(dir.path()), |_, mode| {
+            assert_eq!(mode, StoreMode::ReadOnly);
+            Ok(Engine::empty())
+        })
+        .expect("read-only mode");
+        let diagnostic = Cli { in_process: true, ..read };
+        open_engine_in(&diagnostic, Some(dir.path()), |_, mode| {
+            assert_eq!(mode, StoreMode::ReadOnlyLocked);
+            Ok(Engine::empty())
+        })
+        .expect("read-only locked mode");
+    }
+
+    #[test]
+    fn the_mcp_local_backend_refuses_mutations_without_a_daemon() {
+        let mut backend = LocalMcp { engine: Engine::demo(), mutations: false };
+        let read = mcp::McpBackend::call(&mut backend, "messages_list", json!({ "folder": "inbox", "limit": 1 }));
+        assert!(read.is_ok(), "reads use the local cache: {read:?}");
+        let mutation = mcp::McpBackend::call(&mut backend, "message_flag", json!({ "id": "msg_001", "read": false }));
+        match mutation {
+            Err(error) => assert!(error.contains("daemon non è in esecuzione"), "{error}"),
+            Ok(value) => panic!("a mutation without a daemon succeeded: {value}"),
+        }
+    }
 
     #[test]
     fn the_cli_read_names_the_stored_blocked_remote_count_only_when_positive() {
@@ -2613,7 +3204,7 @@ mod tests {
     }
 
     fn cli(command: Command) -> Cli {
-        Cli { demo: true, store: None, json: true, command }
+        Cli { demo: true, store: None, json: true, in_process: false, command }
     }
 
     #[test]
@@ -3025,14 +3616,15 @@ mod tests {
         // Reads work on the empty store; the mail commands need an account.
         let info: AppInfo = decode(call(&mut engine, "app_info", json!({})).expect("app_info")).expect("app info");
         assert!(info.store && !info.demo);
-        let error = run(Cli { demo: false, store: Some(path), json: true, command: Command::Folders { account: None } }, &mut engine);
+        let error =
+            run(Cli { demo: false, store: Some(path), json: true, in_process: false, command: Command::Folders { account: None } }, &mut engine);
         assert!(error.is_err_and(|error| error.to_string().contains("nessun account")));
     }
 
     #[test]
     fn demo_and_store_cannot_be_combined() {
         let fixture = TempStore::new();
-        let cli = Cli { demo: true, store: Some(fixture.path()), json: true, command: Command::Info };
+        let cli = Cli { demo: true, store: Some(fixture.path()), json: true, in_process: false, command: Command::Info };
         let error = open_engine(&cli).err().expect("both modes at once must be refused");
         assert!(error.to_string().contains("--demo e --store"), "{error}");
     }
@@ -3160,10 +3752,10 @@ mod tests {
         ];
         for command in commands {
             let dir = tempfile::tempdir().expect("profile");
-            let cli = Cli { demo: false, store: None, json: true, command };
+            let cli = Cli { demo: false, store: None, json: true, in_process: false, command };
             // `open_store` is the only place that constructs a Keyring, so an opener that fails if
             // called proves the read-only path neither creates a store nor touches the vault.
-            let engine = open_engine_in(&cli, Some(dir.path()), |_| Err(anyhow::anyhow!("the store must not be opened")))
+            let engine = open_engine_in(&cli, Some(dir.path()), |_, _| Err(anyhow::anyhow!("the store must not be opened")))
                 .expect("a read-only command must not open a missing store");
             assert!(!engine.is_persistent(), "a missing default store was opened");
             assert!(engine.accounts().is_empty());
@@ -3175,8 +3767,8 @@ mod tests {
     fn a_read_only_command_refuses_a_missing_explicit_store_and_does_not_create_it() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("missing.db");
-        let cli = Cli { demo: false, store: Some(path.clone()), json: true, command: Command::Info };
-        let error = open_engine_in(&cli, None, |_| Err(anyhow::anyhow!("the store must not be opened")))
+        let cli = Cli { demo: false, store: Some(path.clone()), json: true, in_process: false, command: Command::Info };
+        let error = open_engine_in(&cli, None, |_, _| Err(anyhow::anyhow!("the store must not be opened")))
             .map(|_| ())
             .expect_err("a missing explicit store is a usage error");
         assert!(error.downcast_ref::<UsageError>().is_some(), "{error}");
@@ -3190,11 +3782,12 @@ mod tests {
             demo: false,
             store: None,
             json: true,
+            in_process: false,
             command: Command::Account { command: AccountCommand::Remove { id: "acc_missing".to_owned(), yes: true } },
         };
         let opened = std::cell::Cell::new(false);
         let expected = dir.path().join("mail.db");
-        let engine = open_engine_in(&cli, Some(dir.path()), |path| {
+        let engine = open_engine_in(&cli, Some(dir.path()), |path, _| {
             assert_eq!(path, expected.as_path());
             opened.set(true);
             Ok(Engine::empty())

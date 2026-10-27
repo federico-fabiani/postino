@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
-default-members = ["crates/*", "apps/postino-app", "apps/postino-cli", "xtask"]
+default-members = ["crates/*", "apps/postino-app", "apps/postino-cli", "apps/postino-daemon", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,8 @@ repository = "https://github.com/federicopostino/postino"
 # internal
 postino-core = { path = "crates/core", version = "0.1.0" }
 postino-crypto = { path = "crates/crypto", version = "0.1.0" }
+postino-daemon = { path = "apps/postino-daemon", version = "0.1.0" }
+postino-ipc = { path = "crates/ipc", version = "0.1.0" }
 postino-mime = { path = "crates/mime", version = "0.1.0" }
 postino-net = { path = "crates/net", version = "0.1.0" }
 postino-platform = { path = "crates/platform", version = "0.1.0" }
@@ -38,7 +40,7 @@ getrandom = { version = "0.3", features = ["std"] }
 zeroize = "1"
 
 # network
-tokio = { version = "=1.53.1", features = ["rt", "net", "time", "io-util", "macros"] }
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
 tokio-rustls = { version = "=0.26.5", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-platform-verifier = "=0.7.1"
@@ -76,6 +78,18 @@ hkdf = "=0.12.4"
 sha2 = "=0.10.9"
 blake3 = "=1.8.7"
 zstd = "=0.14.3"
+
+# daemon IPC. Both crates are already in the lockfile: libc arrives with the keyring stack,
+# windows-sys with windows-native-keyring-store. See docs/decisions/0005-daemon-dependencies.md.
+libc = "0.2"
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_SystemServices",
+] }
 
 # test-only
 tempfile = "3"

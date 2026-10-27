@@ -481,14 +481,62 @@ crash-dump entry above.
   names and actions live only in SQLCipher; no query, subject, address or body is logged. The only
   network path a rule can reach is the user's own SMTP server through P7, and only after the explicit
   run (MCP: `--allow-send`).
-- **Residual.** A local rule is not a server filter: it runs only when the app, CLI or MCP invokes it
-  (there is no daemon), so it does not act while Postino is closed and does not apply to a phone or
-  another mail client. Forwarding can still reach an external address the user configured; the loop
-  guard only stops this client's own forwards and messages that declare `Auto-Submitted` or
-  `X-Postino-Rule`. `all` reads 2 000 candidates per page, so a backlog larger than that needs
-  repeated runs; the cursor advances and wraps, but a single run is still bounded. Forward recall is
-  out of scope. A rule target deleted and later re-created with the same id is treated as the same
-  target, as ids are never reused by this build.
+- **Residual.** A local rule is not a server filter: P10a's daemon runs the P9c rules after each
+  successful sync while it is running, so a rule acts with Postino closed but only while the daemon is
+  alive; it still does not apply to a phone or another mail client. Forwarding can still reach an
+  external address the user configured; the loop guard only stops this client's own forwards and
+  messages that declare `Auto-Submitted` or `X-Postino-Rule`. `all` reads 2 000 candidates per page, so
+  a backlog larger than that needs repeated runs; the cursor advances and wraps, but a single run is
+  still bounded. Forward recall is out of scope. A rule target deleted and later re-created with the
+  same id is treated as the same target, as ids are never reused by this build.
+
+### 4.11 Daemon, IPC and the single writer (P10a)
+
+- **Token file.** `<store>.token` is 32 random bytes, rewritten at every daemon launch, with mode 0600
+  on Unix and a one-ACE DACL for the current user SID on Windows. The client refuses a file that is not
+  owner-only. The token is never in argv, environment, a log line or `daemon_status`; a wrong token is
+  the same generic refusal as a missing one. Residual: any process already running as the same user can
+  read the file, connect and act as that user. That is the trust boundary, not a new escalation: the
+  same process can read the store key from the keyring and the database itself.
+- **Pipe/socket.** Windows creates the named pipe with an explicit DACL (current user only) and
+  `reject_remote_clients`; Unix binds a 0600 socket inside a 0700 per-user directory. The endpoint name
+  is the user id plus a hash of the canonical store path, so two stores never share a channel. The
+  store path is canonicalised before the lock, token and endpoint are derived; a hard-linked database
+  is refused because two names would otherwise have two independent locks. On Linux the accepted socket
+  peer's uid is checked with `SO_PEERCRED`, and a pre-created/symlinked fallback runtime directory is
+  rejected. There is no TCP, WebSocket or remote endpoint variant. Residual: a same-user debugger can
+  attach to the daemon process; operating-system process isolation is out of scope.
+- **Framing and queues.** Both directions cap a frame at 16 MiB. The reader drains an oversized line
+  without storing it, a writer refuses to emit one, and an oversized response becomes a same-id
+  `FRAME_TOO_LARGE` error without closing the connection. Eight in-flight requests and a 64-value
+  write queue per connection, 16 dispatches globally, 32 connections, one in-flight mutation per
+  client, at most four subscriptions per connection and 64 globally, a 64-event subscription window,
+  a 10 s handshake timeout, a 120 s idle timeout that applies only when no work/subscription is live,
+  a 15 s heartbeat while work is live and a 30 s write timeout for a stalled reader. A client cannot
+  hold a slot by sending a frame slowly forever or by opening unlimited subscriptions; it cannot make
+  the daemon allocate the frame twice or queue an unbounded backlog.
+- **Operation dispatch.** `op` is the same registry, schema and `deny_unknown_fields` parser as the CLI
+  and MCP. Sensitive account operations are refused for `client = "mcp"` at the daemon too, in addition
+  to the MCP tool filter. A per-session `allow_send` flag is carried in the handshake, so an MCP
+  `sync_now` cannot queue a rule forward without `--allow-send`; the client-side gate fails closed when
+  a rule cannot be inspected. Request ids are namespaced by connection; a client cannot cancel another
+  client's work, and a disconnected request is cleaned up by RAII. Every request is bounded before the
+  engine lock; the engine mutex serialises one writer and the scheduler, and a panic in a handler
+  becomes an internal error, not a daemon death.
+- **Cancellation and shutdown.** `cancel` sets a cooperative flag checked by sync before each message,
+  between batches and between folders; it cannot interrupt an in-flight SMTP `DATA` or bypass a write
+  that already committed. Any token holder can call `daemon_shutdown`; that is the user's authority,
+  not a privilege boundary. The daemon stops accepting, cancels subscribers, drops the writer lock and
+  leaves every outbox row in the store.
+- **Scheduler/GC.** The scheduler sleeps to the next due instant; no busy loop. One bounded GC batch
+  rechecks `attachments.blob_hash` and `outbox.raw_blob_hash` before each unlink, so a draft, a sent
+  snapshot or a forwarded attachment cannot be collected. A failed sync/GC is retried after a delay,
+  never in a tight loop.
+- **Logs and status.** Logs and `daemon_status` carry counters, pids, categories and the store root;
+  never a token, body, subject, address, query or credential. `last_error` is the category sentence,
+  not raw server text.
+- **Out of scope here.** Tray, autostart and notifications are P10b; this build makes no claim about
+  them and installs no OS integration.
 
 - A compromised operating system, kernel, firmware or keylogger.
 - A compromised mail provider.

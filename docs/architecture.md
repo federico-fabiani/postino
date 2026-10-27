@@ -113,6 +113,67 @@ The daemon:
 M0 runs everything in-process because there is nothing to synchronise yet. ADR-0002 records the
 decision and the migration path.
 
+### Process model, IPC and scheduler (P10a)
+
+`postino-daemon` is the owner. It acquires `<store>.lock` with an OS advisory lock before SQLite is
+opened, writes a readable owner record to `<store>.owner` (pid, launch token, start instant, role,
+endpoint), opens the one write connection and builds the `Engine`. The lock is separate from SQLite:
+a direct `postino --store` writer, the desktop app or a second daemon is refused with the owner's pid
+before it can race a transaction. A crash needs no repair: the kernel releases the lock, the next
+owner overwrites the stale record, and the fixed restart sentence says that every outbox row is kept
+and an expired submission lease becomes `uncertain` rather than being resent. The app holds the same
+lock in P10a1 and shows a readable "the daemon owns the store" state instead of opening a second
+writer; P10a2 replaces that with a daemon client.
+
+The endpoint is derived from the current user id (SID on Windows, uid on Unix) and a BLAKE3 hash of
+the absolute store path. Windows uses a named pipe whose DACL is one generic-all ACE for the current
+user and `reject_remote_clients`; Unix uses a 0600 socket in a 0700 directory. A fresh 32-byte token
+is written per launch to `<store>.token` with an owner-only ACL/mode; the first frame is
+`hello {protocol, client, token}`, a bad token is one generic refusal, a version mismatch is readable,
+and a stale token is replaced at the next start. There is no TCP listener, no WebSocket and no remote
+variant in the endpoint type.
+
+Frames are newline-delimited JSON-RPC 2.0 capped at 16 MiB in both directions. A reader drains an
+over-long line without allocating it; a writer refuses to produce one. Each connection has eight
+in-flight requests and a 64-value write queue, one in-flight mutation, at most four event
+subscriptions, and the server caps total dispatches (16), subscriptions (64) and connections (32).
+The 120-second idle timeout applies only when no request is in flight and no subscription is active;
+while work is live the server sends a heartbeat and a 30-second write timeout closes a stalled reader.
+An oversized response is replaced by a same-id `FRAME_TOO_LARGE` error without closing the
+connection. Request ids are namespaced by connection, so a client cannot cancel another client's work;
+`op {name,args}` dispatches the same registry as the CLI
+and MCP; `daemon_status`, `daemon_shutdown`, `events_subscribe`, `cancel` and `ops_list` are control
+methods. Progress notifications are counters only (sync folder/message counts, index x/y, outbox
+state); a slow subscriber loses events instead of growing a backlog. `cancel` sets the engine's
+cooperative sync flag, so it cannot bypass a completed write; an operation already inside a network
+transfer stops at the next safe checkpoint.
+
+The scheduler wakes on the next due instant, not on a poll loop. It runs the P7 outbox pass (due,
+lease, append) as soon as a row is due or a mutation notifies it; sync on start and on a jittered
+interval with no parallel run per account; P9c rules after each successful sync (inside
+`Engine::sync_now_with_cancel`); one 500-row P9a index batch per tick while the index is pending, with
+an `index` event per batch; and a bounded, resumable blob-GC batch after a successful sync and on the
+GC interval. A sync is split into message-bounded chunks (default 1 000); the engine mutex is released
+between chunks and the scheduler drains a due outbox row and one index batch before the next chunk.
+GC rechecks `attachments.blob_hash` and `outbox.raw_blob_hash` for every candidate before unlinking,
+so a draft, a sent snapshot or a forwarded attachment is never deleted.
+
+Fallback matrix (P10a1):
+
+| Client | Daemon absent | Daemon present |
+|---|---|---|
+| App | in-process, holds the writer lock | readable "store owned by daemon" state; P10a2 connects it |
+| CLI read | local store, opened read-only, no writer lock | through `op` |
+| CLI mutation | starts the daemon, then through `op`; `--in-process` locks and is refused if the daemon owns the store | through `op`; `--in-process` is refused |
+| MCP read | local cache, opened read-only | through `op` |
+| MCP mutation | readable tool error, never starts a daemon | through `op`, send gate still applied |
+
+A 25 MiB attachment is ~35 MB of base64 and does not fit the 16 MiB IPC frame. P10a1 preflights the
+request before writing a frame and refuses an oversized attachment with a specific readable sentence;
+it also replaces an oversized response (for example a dry-run of a large draft) with a same-id
+`FRAME_TOO_LARGE` error and keeps the connection. The effective over-IPC attachment size is roughly
+12 MiB of bytes; an out-of-band blob path is future work (P10a2).
+
 ### Planned crates
 
 | Crate | Responsibility |
@@ -125,6 +186,7 @@ decision and the migration path.
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
 | `postino-rules` | Sieve generation later; P9c's local rules deliberately live in `postino-store` and `postino-core`, not in a new crate |
 | `postino-ipc` | JSON-RPC over pipe/socket, token, versioning |
+| `postino-daemon` | the one writer: store ownership, scheduler, outbox, rules-after-sync, index batches, blob GC, IPC server (P10a) |
 | `postino-platform` | keyring (P3b); paths, notifications, tray, autostart, single instance later |
 | `postino-testkit` | fake IMAP/SMTP, TLS fixture, response builders and synthetic messages (P5b; dev-dependency only) |
 
@@ -309,11 +371,11 @@ failure cannot leave the store one step ahead of memory within an operation. Act
 desktop app both use the store now; the engine writes attachment bytes only through the P4b seam, and
 it writes local drafts with `uid`, `Message-ID` and `size` empty. Received mail is different:
 `postino-sync` (P5b) fills those columns, parses the MIME body and stores attachment bytes through
-the same seam. The keyring lock protects every keyring access, not the store file itself. There is no
-cross-process locking story beyond SQLite's WAL, busy timeout and the keyring lock: one app process
-owns the store, and the background sync worker opens a second connection in that same process until
-the daemon (M4). The repository returns folders and labels ordered by name; onboarding writes the
-server's folder tree in that order.
+the same seam. The keyring lock protects every keyring access, not the store file itself. P10a adds
+the independent `<store>.lock` writer guard and the daemon that holds it; in P10a1 the app still owns
+the store in-process and its sync worker opens a second connection in that same process. The
+repository returns folders and labels ordered by name; onboarding writes the server's folder tree in
+that order.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
 a store. **Still missing:** the daemon scheduler (M4) and HTML rendering (M5). Server-side
@@ -668,7 +730,8 @@ or sent mail, `CONDSTORE`/`QRESYNC` increments, a folder-removal pass (a folder 
 keeps its cached rows until a later package decides) and any periodic
 scheduler. Threading is derived locally from the synced references (P9b), not requested from the
 server; there is no `THREAD` command. P9a adds the FTS trigger path to every synced message; P6a adds the operations and the CLI/MCP bindings; P6b adds the worker, so a run starts on
-launch, on Refresh, or from onboarding. There is still no daemon and no timer inside the process.
+launch, on Refresh, or from onboarding. P10a adds the daemon's interval scheduler; the desktop worker
+stays in-process in P10a1.
 
 **Evidence.** The scripted server moved to `postino-testkit`, and the sync tests script real protocol
 exchanges: initial sync, incremental UIDs, UIDVALIDITY, deletion, flag drift, oversized attachment,
@@ -820,7 +883,8 @@ its engine from disk before reporting. Duplicate requests coalesce and a second 
 “Sincronizzazione già in corso”. The UI thread polls events, never calls egui from the worker and
 reloads the account without losing selection, filters or the open message. Events from an account the
 user switched away from are ignored for the UI while the store is still refreshed. Two connections
-live in one process until the daemon (M4); SQLite WAL and the busy timeout serialise them.
+live in one process in P10a1 (the app is not yet a daemon client); SQLite WAL and the busy timeout
+serialise them, and the app holds the store's writer lock so a daemon cannot start beside it.
 
 **Mailbox.** Folders, messages and counts come from the store; the account switcher carries the
 active identity and offers add/manage; Refresh runs the worker; the status bar shows syncing with
@@ -992,7 +1056,8 @@ gates `message_send`, `send_schedule`, `outbox_retry` and `outbox_mark_sent` beh
 `account_add`/`account_remove`, and only queues: the MCP server does not drain the outbox. The CLI adds
 `postino send --draft <id> [--at …] [--dry-run]` and `postino outbox list [--limit N] [--offset N] |
 cancel|retry|mark-sent`; a plain `postino send` (no `--at`) waits out the 5-second undo window and runs
-one outbox pass, while only a future `--at` leaves the row queued because there is no daemon yet. The
+one outbox pass, while a future `--at` leaves the row for the daemon scheduler (or the next app/CLI
+pass when no daemon is running). The
 desktop app has a send worker on its own thread, a 5-second undo toast, and an outbox dialog
 (`Ctrl+Shift+O`, status-bar `Coda · N`) that shows every state, the fixed error sentence, the warnings,
 a “Scarta” action for a failed row and the two uncertain resolutions. The app polls the store every two
@@ -1469,9 +1534,8 @@ IMAP is the synchronization protocol. There is no Postino server.
 P5a ships the client (`postino-net`): one connection, TLS, the commands in §4.4, typed data out. P5b
 ships the reconciler (`postino-sync`) described in §4.6: one account, one store connection, one run at
 a time. P6a wires it to the engine: `sync_now` is the only operation that calls it, and the CLI, MCP
-and the desktop worker reach it through the same registry. It is still not scheduled: there is no
-periodic loop and no daemon, so a sync starts on app launch, on Refresh, from onboarding or when a
-CLI/MCP caller asks for one.
+and the desktop worker reach it through the same registry. P10a's daemon runs it on start, on a
+jittered interval and on a manual request; the app's in-process worker remains for P10a1.
 
 The target loop, most of which does not exist yet:
 
@@ -1492,8 +1556,8 @@ The target loop, most of which does not exist yet:
   two devices can briefly create two copies. This is a protocol limit, documented rather than
   hidden. Not implemented.
 - Two devices converge through the server: IDLE pushes within seconds when the network and provider
-  cooperate; otherwise polling (default 60 s) is the floor. Not implemented; P5b is a one-shot run
-  with no scheduler.
+  cooperate; otherwise polling (default 60 s) is the floor. P5b is a one-shot run; P10a's daemon adds
+  the interval scheduler and IDLE remains optional and unimplemented.
 
 ADR-0003 records the decision and the rejected alternatives (POP3, a custom sync service, Gmail API
 as the primary protocol).
@@ -1572,3 +1636,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-26 | major | P9b closure: `messages(account_id,message_id)` and `subject_norm` indexes (1.29 s/ref → 2.7 ms/insert), sent-draft ghost removed, store-backed thread flag counts, live thread pages and paging, subject-fallback re-fetch stability, saved-search freshness/account cleanup/atomic cap/account scope, conversation Enter, partial-batch undo, read-only cache guard |
 | 2026-10-27 | major | P9c: local rules on the v7 tables (no migration), validated query + 1–5 actions, priority/stop, received-only new-vs-all runs with `ingested_at`/`rules_applied_at`, 2 000-candidate and 50-forward caps, idempotent actions, journal with ids/booleans only and 20-run retention, state-checked undo, standalone rule forward through the P7 outbox with `Auto-Submitted`/`X-Postino-Rule` loop guard in encrypted meta, eight operations, CLI/MCP/UI parity and 980 rules screenshots |
 | 2026-10-27 | minor | P9c closure: MCP `--allow-send` now also gates sync-triggered forwards and enabling a stored forward rule; the rules page joins the modal guard; `all` keeps a per-rule cursor; `new` marks only completed actions; the 50-forward budget counts only new deduped rows and defers the rest; a durable forward marker survives outbox pruning; `messages.origin` and Unicode `name_key` extend v7 in place; checked store actions re-read origin/folder; `rules_update` is revision-checked; guard keys are account-scoped and bulk-cleaned; candidate indexes and 20k/100k evidence; starred-aware undo, bounded errors, preview horizon/SMTP effects, all 20 runs in the UI and `rules_undo` marked destructive |
+| 2026-10-27 | major | P10a1: `postino-ipc` (per-user named pipe/DACL or 0600 UDS, per-launch owner-only token, 16 MiB JSON-RPC frames, bounded queues, cancel, heartbeat), `postino-daemon` (independent `<store>.lock`/owner record, outbox recovery at every P7 state, sync/rules/index batches/GC scheduler, `daemon_status`), single-writer refusal for direct CLI/app writers, CLI and MCP daemon clients, absent-daemon fallback matrix; tray/autostart/notifications remain P10b and the app client is P10a2 |

@@ -1,0 +1,36 @@
+[package]
+name = "postino-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Postino background daemon: one writer, the scheduler and the local IPC server"
+
+[[bin]]
+name = "postino-daemon"
+path = "src/main.rs"
+
+[dependencies]
+postino-core.workspace = true
+postino-ipc.workspace = true
+postino-net.workspace = true
+postino-platform.workspace = true
+postino-store.workspace = true
+postino-sync.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+postino-testkit.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

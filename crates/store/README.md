@@ -267,18 +267,38 @@ cargo test -p postino-store
   horizon, `after` and ordering; `EXPLAIN QUERY PLAN` uses both rule indexes; the 20-run journal
   retention; guard cleanup on message delete, bulk sync delete, folder reset and account removal;
   and a durable forward marker that survives an outbox prune.
+- `tests/lock_crash.rs`: a child test process holds the writer lock, the parent kills it, and the next
+  writer acquires the store; the owner record is separate from the locked file.
 - unit tests in `src/repo.rs`: a temporary SQLite trigger aborts the `drafts` or `draft_seq` insert,
   proving the whole save rolls back (message, attachment, draft, sequence and folder counts) and
   that the same save succeeds once the trigger is dropped.
 
+## Writer lock and blob GC (P10a)
+
+`Store::open_locked(path, key)` canonicalises the path before acquiring `<store>.lock` with `fs4` and
+records `<store>.owner` (pid, launch token, start instant, role, endpoint). A second writer is
+`StoreError::StoreBusy` with the owner's pid; a crash releases the OS lock and the next owner
+overwrites the stale record. A symlink resolves to the same canonical lock; a hard-linked database is
+refused with `StoreError::HardLinked` because two names would otherwise have two independent locks for
+one inode. The lock file is separate from the owner record because Windows byte-range locks are
+mandatory: a locked file cannot be read to report who holds it. `Store::open` remains the unlocked form
+for tests and read paths; the daemon and the app use `open_locked`/`WriterLock`, and the CLI's
+read-only command uses `Store::open_read_only` (or `open_read_only_locked` for `--in-process`).
+
+`Store::gc_unreferenced_blobs(limit)` lists `<root>/<shard>/<hash>.blob`, builds the referenced set from
+`attachments.blob_hash` and `outbox.raw_blob_hash`, rechecks each candidate immediately before
+unlinking, and deletes at most `limit` (≤4096) per call. It is bounded and resumable: the next call sees
+the remaining files. A read-only store refuses it. It never deletes a file whose name is not exactly
+64 lowercase hex characters plus `.blob`.
+
 ## Not here yet
 
-Desktop-app wiring (P6 onboarding), raw-message blobs, the daemon scheduler (M4), key rotation and
-blob garbage collection. P9c's rules live here as data and candidate queries; their action engine
-and forward-through-P7 policy live in `postino-core`. `sync_state` and the sync-status `meta` key have writers
-now: `postino-sync` (P5b) is the client of this crate for received mail. Parsing MIME is not here:
-sync parses and hands over rows and blob hashes. The engine (P3c, P4b) is another client; this crate
-never depends on it.
+Desktop-app daemon wiring (P10a2), raw-message blobs, key rotation. P9c's rules live here as data and
+candidate queries; their action engine and forward-through-P7 policy live in `postino-core`.
+`sync_state` and the sync-status `meta` key have writers now: `postino-sync` (P5b) is the client of this
+crate for received mail. Parsing MIME is not here: sync parses and hands over rows and blob hashes. The
+engine (P3c, P4b) is another client; this crate never depends on it. The daemon owns scheduling, not
+this crate; the GC sweep is the one storage-side maintenance entry point.
 
 ## Build prerequisite (Windows GNU)
 

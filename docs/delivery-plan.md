@@ -127,6 +127,12 @@ in both themes and blocks every shell shortcut behind it. Rule runs were measure
 (empty `new` 67/327 ms, one `all` page 184/455 ms; a 2 000-action page 7.3/10.0 s). M3 is complete.
 P10a starts the M4 daemon: one writer, same-user IPC with a per-launch token, scheduler, GC and
 app/CLI/MCP clients; P10b adds tray, autostart and notifications.
+P10a is split in two green halves. **P10a1** is implemented: the `postino-ipc` transport
+(named pipe/UDS, token file, version handshake, 16 MiB frames, bounded queues, cancel and ping),
+`postino-daemon` with the store lock, scheduler, outbox crash recovery, rules-after-sync, index
+batches and blob GC, plus the CLI/`postino mcp` clients and the app's readable daemon-owned state.
+**P10a2** remains: connect the desktop app through the same `DaemonClient` and preserve its view state
+across reconnect. Tray, autostart and notifications stay in P10b and are not claimed here.
 
 ## 5. Delighters backlog
 

@@ -27,7 +27,8 @@ registry shared by the desktop app, the CLI and an MCP server.
 > sanitization and serialization exist as `postino-mime`; `postino-net` is an IMAP4rev1 client and
 > the SMTP submission client; and `postino-sync` reconciles one account into the encrypted store.
 > Attachment bytes are encrypted at rest in a content-addressed blob directory next to the database.
-> Gmail OAuth is P12 and the background daemon lands in M4; inline `cid:` images, HTML compose and
+> Gmail OAuth is P12 and the background daemon is P10a; the tray, autostart and notifications are
+> P10b; inline `cid:` images, HTML compose and
 > server-side signatures are explicitly out of scope for M2.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
@@ -207,7 +208,8 @@ MCP      ─┘
   incremental, UIDVALIDITY, deletion, flags, oversized attachments, three network-drop points,
   cancellation + reopen, `BODY.PEEK`-only and an offline read through `Engine::open`), with a
   2 000-message test in CI and 10 000 behind `POSTINO_SLOW_TESTS=1`. P6a wires it to `sync_now`, so
-  the CLI (`postino sync run`) and MCP can run it on demand; there is still no scheduler or daemon.
+  the CLI (`postino sync run`) and MCP can run it on demand; P10a's daemon runs the same sync on an
+  interval and after a manual request, with no parallel run for one account.
 - **SMTP submission and the outbox (P7).** `postino-net` now also speaks SMTP over implicit TLS or
   STARTTLS: `EHLO`, `AUTH PLAIN`/`LOGIN`, `MAIL`/`RCPT`/`DATA`, `SIZE`, `8BITMIME`, `SMTPUTF8`, DSN,
   dot-stuffing, bounded lines/replies/messages and typed errors. Before the final `.`, a 4xx is
@@ -388,6 +390,36 @@ id) and malformed `postino run` arguments. The `add | test | list | remove` acco
 `sync run | status`, `send` and the desktop onboarding all use the same encrypted store; Gmail OAuth
 is P12. Sending opens the account's SMTP server; a dry run never connects.
 
+### Daemon (P10a)
+
+The daemon is the one process allowed to write the store, run sync, the outbox scheduler, local rules,
+the search-index batches and blob GC. It listens only on a per-user Windows named pipe or Unix domain
+socket; it opens no TCP port and never talks to a cloud service.
+
+```sh
+# Build both binaries once: the CLI starts the daemon as its sibling.
+cargo build -p postino-cli -p postino-daemon
+cargo run -p postino-cli -- daemon status
+cargo run -p postino-cli -- daemon start
+cargo run -p postino-cli -- --store "$env:TEMP\postino\mail.db" draft save \
+  --to "Giulia <giulia.ferri@example.com>" --subject "Ciao" --body "Ci sentiamo domani."
+cargo run -p postino-cli -- daemon stop
+```
+
+While the daemon is running, every existing command is a client: the CLI reads the owner-only token
+file, speaks JSON-RPC 2.0 over the local endpoint and prints the same results as before. A scheduled
+`postino send --at …` now leaves the machine even when no app or CLI is connected. When the daemon is
+absent, read-only commands use the local cache directly; a mutation **starts the daemon** (that is the
+documented fallback) and never opens a second writer. `--in-process` is a diagnostic for a stopped
+daemon; it is refused while the daemon owns the store. The app stays in-process in P10a1: if the
+daemon is running it shows "the store is owned by the daemon" instead of opening a second writer;
+P10a2 connects the app to the same client. The tray, autostart and notifications are P10b and are not
+implemented here.
+
+`daemon status` answers with version, pid, start instant, store root, endpoint kind, accounts syncing,
+the next outbox wake, search-index state, the scheduler wake count and the last redacted error. The
+token is never in argv, environment, logs or status.
+
 ### MCP
 
 ```sh
@@ -395,15 +427,19 @@ cargo run -p postino-cli -- --demo mcp
 ```
 
 The server speaks newline-delimited JSON-RPC 2.0 on stdin/stdout, implements `initialize`,
-`ping`, `tools/list` and `tools/call`, and stops at EOF. It is never started automatically.
+`ping`, `tools/list` and `tools/call`, and stops at EOF. It is never started automatically, and it
+opens no listening port. When a daemon is running, `postino mcp` reads the token file and becomes a
+daemon client: tools, schemas and results are exactly the daemon's registry. When the daemon is
+absent, reads use the local encrypted cache directly and every mutation returns a readable tool error
+("il daemon non è in esecuzione…"); MCP never starts a background process. A mutation queued through
+MCP is submitted by the daemon's scheduler, not by this process.
 `postino mcp --allow-send` enables `message_send`, `send_schedule`, `outbox_retry`,
 `outbox_mark_sent` and `rules_run`; without the flag those tools are listed as disabled with the
 reason and refused. `rules_run` is gated because an enabled rule may forward, and a
 `rules_create`/`rules_update` payload that contains a forward action is refused before the typed
 parser runs; non-forward rule CRUD and `rules_preview` stay available. `outbox_list`, `outbox_cancel`
 and `send_dry_run` also stay available: a dry run is read-only and a cancel discards a queued or
-permanently failed row rather than sending one. The MCP server never runs the outbox pass — it only
-queues; the desktop app or `postino send` is what submits.
+permanently failed row rather than sending one.
 
 Example client configuration:
 
@@ -418,12 +454,13 @@ Example client configuration:
 }
 ```
 
-Without `--demo` and `--store`, `postino mcp` opens the default store. The tools are the same
-registry as the CLI, but `account_add`, `account_update` and `account_remove` are marked sensitive:
-they are absent from `tools/list` and refused by `tools/call`, so an agent can neither set nor see a
-password and cannot create, reconfigure or remove an account. `accounts_list`, `account_test`,
-`sync_now` and `sync_status` are available; none of their results contains a credential. Sending is a
-separate, explicit opt-in: `postino mcp --allow-send`.
+Without `--demo` and `--store`, `postino mcp` targets the default store. With no daemon it opens it
+read-only and mutations fail readably; with a daemon every call goes through the local pipe. The tools
+are the same registry as the CLI, but `account_add`, `account_update` and `account_remove` are marked
+sensitive: they are absent from `tools/list` and refused by `tools/call`, so an agent can neither set
+nor see a password and cannot create, reconfigure or remove an account. `accounts_list`,
+`account_test`, `sync_now` and `sync_status` are available; none of their results contains a
+credential. Sending is a separate, explicit opt-in: `postino mcp --allow-send`.
 
 ## Quality gates
 
@@ -494,7 +531,7 @@ The GNU toolchain plus MSYS2 is the path documented here.
 - [Store spike](docs/store-spike.md): P3a encrypted-SQLite evaluation, numbers and decision.
 - [Briefs](docs/briefs/): the package contracts, including P3c engine wiring.
 - [Roadmap](ROADMAP.md): M0 to M6.
-- [Decisions](docs/decisions/): UI, runtime and sync ADRs.
+- [Decisions](docs/decisions/): UI, runtime, sync and daemon-dependency ADRs.
 
 ## Licence
 

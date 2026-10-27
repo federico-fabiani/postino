@@ -186,6 +186,9 @@ pub struct PostinoApp {
     /// The store handle a demo opened from onboarding or recovery can return to. `None` for a
     /// real `--demo` launch and after the user has left the demo.
     demo_return: Option<StoreHandle>,
+    /// The store's single-writer lock when the app is in its in-process mode. P10a2 replaces this
+    /// with a daemon client; until then the app owns the store and refuses to start beside a daemon.
+    writer_lock: Option<postino_store::WriterLock>,
     /// True for the synthetic mailbox, including a screenshot that seeds the store UI.
     demo: bool,
     /// The command line choice, so the recovery screen can retry the same store.
@@ -434,8 +437,10 @@ impl PostinoApp {
     }
 
     fn from_booted(booted: boot::Booted, custom_chrome: bool, now: DateTime<Utc>, launch: Launch, extra_roots: Vec<CertificateDer<'static>>) -> Self {
-        let boot::Booted { engine, store, demo } = booted;
-        Self::with_engine(engine, store, demo, None, launch, custom_chrome, now, extra_roots)
+        let boot::Booted { engine, store, demo, writer_lock } = booted;
+        let mut app = Self::with_engine(engine, store, demo, None, launch, custom_chrome, now, extra_roots);
+        app.writer_lock = writer_lock;
+        app
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -469,6 +474,7 @@ impl PostinoApp {
             store,
             store_path,
             demo_return: None,
+            writer_lock: None,
             demo,
             launch,
             boot_failure,
@@ -980,6 +986,7 @@ impl PostinoApp {
         self.demo = false;
         self.store = None;
         self.store_path = None;
+        self.writer_lock = None;
         self.active_account = None;
         self.folder.clear();
         self.labels_cache.clear();
@@ -1592,9 +1599,19 @@ impl PostinoApp {
 
     fn retry_boot(&mut self) {
         let launch = self.launch.clone();
-        match boot::boot(launch.clone(), boot::KeySource::Keyring, self.now_utc) {
+        let lock = self.writer_lock.take();
+        match boot::boot_with_lock(launch.clone(), boot::KeySource::Keyring, self.now_utc, lock) {
             Ok(booted) => self.adopt_booted(booted, launch),
-            Err(failure) => self.boot_failure = Some(failure),
+            Err(failure) => {
+                // The old engine is still open. If boot failed after releasing the lock, take it back
+                // so a daemon cannot start beside the window during the error screen.
+                if self.writer_lock.is_none()
+                    && let Some(path) = self.store_path.as_deref()
+                {
+                    self.writer_lock = postino_store::WriterLock::acquire_as(path, "app", None).ok();
+                }
+                self.boot_failure = Some(failure);
+            }
         }
     }
 
@@ -1608,18 +1625,24 @@ impl PostinoApp {
         let launch = self.launch.clone();
         let settings_path = self.settings_path.clone();
         let settings = self.settings_snapshot();
-        let reopened = self.demo_return.take().and_then(|store| match store.open_engine() {
-            Ok(engine) => Some(boot::Booted { engine, store: Some(store), demo: false }),
-            Err(_) => None,
-        });
+        let lock = self.writer_lock.take();
+        let reopened = match (self.demo_return.take(), lock) {
+            (Some(store), Some(writer_lock)) => match store.open_engine() {
+                Ok(engine) => Some(boot::Booted { engine, store: Some(store), demo: false, writer_lock: Some(writer_lock) }),
+                Err(_) => None,
+            },
+            (store, None) => {
+                self.demo_return = store;
+                None
+            }
+            (None, Some(_)) => None,
+        };
         match reopened {
             Some(booted) => {
                 *self = Self::from_booted(booted, self.custom_chrome, self.now_utc, launch, self.extra_roots.clone());
                 self.settings_path = settings_path;
                 self.apply_settings(settings);
             }
-            // Recovery never had a handle to keep: re-run the original boot, which also re-reads
-            // the keyring and may now succeed.
             None => self.retry_boot(),
         }
     }

@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use chrono::Utc;
 use postino_net::{CertificateDer, ImapConfig, NetError, Secret, SmtpConfig, SmtpEnvelope, SmtpError, SmtpLimits};
 use postino_store::{FlagUpdate, OutboxEntry, OutboxState, Store};
-use postino_sync::{SyncError, SyncLimits};
+use postino_sync::SyncError;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -453,7 +453,7 @@ impl Engine {
         self.allow_send = allow;
     }
 
-    pub(crate) fn allow_send(&self) -> bool {
+    pub fn allow_send(&self) -> bool {
         self.allow_send
     }
 
@@ -649,6 +649,12 @@ impl Engine {
         let Some(store) = &self.store else { return Ok(None) };
         let _ = store.ensure_search_index_batch();
         store.search_progress().map(Some).map_err(store_map::read_error)
+    }
+
+    /// One bounded blob-GC batch. The daemon runs it after a successful sync and on its idle timer;
+    /// the store rechecks every reference before unlinking, so a row added concurrently is safe.
+    pub fn gc_blobs(&self, limit: usize) -> Result<postino_store::BlobGcReport, OpError> {
+        self.require_store("blob_gc")?.gc_unreferenced_blobs(limit).map_err(store_map::write_error)
     }
     /// True for the synthetic demo mailbox. Data written by a store-backed engine is real local
     /// data even while no server is connected.
@@ -1836,6 +1842,26 @@ impl Engine {
     /// that was committed before the failure and never loses one. Labels are reloaded from the store
     /// and are preserved by the reconciler, so a sync does not detach them.
     pub fn sync_now(&mut self, account: Option<&str>) -> Result<crate::ops::SyncReport, OpError> {
+        self.sync_now_with_cancel(account, &AtomicBool::new(false))
+    }
+
+    /// The same sync with a caller-owned cancellation flag. The daemon registers the flag with the
+    /// request id before dispatch, so a `cancel` frame can stop a long folder or body transfer. A
+    /// cancelled sync keeps every message committed before the stop, exactly like the desktop
+    /// worker; the caller maps [`postino_sync::SyncError::Cancelled`] to a readable sentence.
+    pub fn sync_now_with_cancel(&mut self, account: Option<&str>, cancel: &AtomicBool) -> Result<crate::ops::SyncReport, OpError> {
+        self.sync_now_with_cancel_limits(account, cancel, postino_sync::SyncLimits::default())
+    }
+
+    /// A sync with a per-run message ceiling. The daemon uses a chunk ceiling and calls this again
+    /// while the cursor still has mail, so the engine mutex is released between chunks and the
+    /// outbox/index can run during a long initial sync.
+    pub fn sync_now_with_cancel_limits(
+        &mut self,
+        account: Option<&str>,
+        cancel: &AtomicBool,
+        limits: postino_sync::SyncLimits,
+    ) -> Result<crate::ops::SyncReport, OpError> {
         let account = self.requested_account(account, "sync_now")?;
         let store = self.require_store("sync_now")?;
         let server = store.get_account_server(&account.id).map_err(store_map::read_error)?.ok_or_else(|| {
@@ -1848,7 +1874,7 @@ impl Engine {
         let password = self.load_password(&account.id, "sync_now")?;
         let config = imap_config(&server, &password, self.extra_roots.clone());
         let provider = Provider::parse(&account.provider).unwrap_or(Provider::Custom);
-        let result = postino_sync::sync_account(store, &row, &config, &SyncLimits::default(), &AtomicBool::new(false)).map_err(|error| {
+        let result = postino_sync::sync_account(store, &row, &config, &limits, cancel).map_err(|error| {
             account_error(
                 error,
                 provider,

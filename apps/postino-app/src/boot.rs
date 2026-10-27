@@ -12,7 +12,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use postino_core::{CredentialVault, Engine, VaultError};
 use postino_platform::{Keyring, STORE_SCOPE};
-use postino_store::{Store, StoreKey};
+use postino_store::{Store, StoreError, StoreKey, WriterLock};
 use zeroize::Zeroizing;
 
 /// What the command line asked for. `Store(None)` is the standard local mailbox.
@@ -38,6 +38,9 @@ pub struct Booted {
     pub engine: Engine,
     pub store: Option<StoreHandle>,
     pub demo: bool,
+    /// The store's single-writer lock. The app holds it until it exits or retries into another
+    /// store; the sync worker's extra connection is in the same process and is not a second owner.
+    pub writer_lock: Option<WriterLock>,
 }
 
 /// An openable store: the path, a copyable key handle and the credential seam. Opening a second
@@ -80,6 +83,8 @@ impl StoreHandle {
 pub enum BootStage {
     DataDirectory,
     Keyring,
+    /// Another Postino process owns the store. In P10a1 the app cannot share the daemon yet.
+    Daemon,
     Store,
     Engine,
 }
@@ -89,6 +94,7 @@ impl BootStage {
         match self {
             Self::DataDirectory => "La cartella dati non è disponibile",
             Self::Keyring => "Il portachiavi di sistema non risponde",
+            Self::Daemon => "L'archivio è in uso da un altro processo",
             Self::Store => "L'archivio locale non si apre",
             Self::Engine => "L'archivio è aperto ma non si può leggere",
         }
@@ -101,6 +107,9 @@ impl BootStage {
             }
             Self::Keyring => {
                 "La chiave dell'archivio vive nel portachiavi di sistema. Sbloccalo o controlla di essere nella sessione giusta, poi riprova: nessuna mail viene toccata."
+            }
+            Self::Daemon => {
+                "Un daemon o un'altra finestra Postino sta usando l'archivio: due processi non devono scrivere insieme. Chiudi il daemon con `postino daemon stop` (o l'altra finestra) e riapri l'app; il collegamento diretto dell'app al daemon arriva con P10a2."
             }
             Self::Store => {
                 "Il file è danneggiato oppure la chiave nel portachiavi non è quella con cui è stato cifrato. Non cancellarlo: riprova dopo aver sbloccato il portachiavi."
@@ -115,6 +124,7 @@ impl BootStage {
         match self {
             Self::DataDirectory => "Cartella dati",
             Self::Keyring => "Portachiavi",
+            Self::Daemon => "Daemon",
             Self::Store => "Archivio cifrato",
             Self::Engine => "Lettura dell'archivio",
         }
@@ -144,8 +154,13 @@ impl BootFailure {
 /// Open the mailbox the command line asked for. `now` seeds the synthetic demo mail with a stable
 /// instant; store mode never reads it.
 pub fn boot(launch: Launch, keys: KeySource, now: DateTime<Utc>) -> Result<Booted, BootFailure> {
+    boot_with_lock(launch, keys, now, None)
+}
+
+/// Retry an existing app into the same store without dropping the writer lock it already owns.
+pub fn boot_with_lock(launch: Launch, keys: KeySource, now: DateTime<Utc>, existing_lock: Option<WriterLock>) -> Result<Booted, BootFailure> {
     match launch {
-        Launch::Demo => Ok(Booted { engine: Engine::demo_at(now), store: None, demo: true }),
+        Launch::Demo => Ok(Booted { engine: Engine::demo_at(now), store: None, demo: true, writer_lock: None }),
         Launch::Store(path) => {
             let (path, key, vault) = match keys {
                 KeySource::Keyring => {
@@ -176,12 +191,35 @@ pub fn boot(launch: Launch, keys: KeySource, now: DateTime<Utc>) -> Result<Boote
                     BootFailure::new(BootStage::DataDirectory, Some(path.clone()), format!("Non riesco a creare {}: {error}", parent.display()))
                 })?;
             }
+            let path = postino_store::canonical_store_path(&path)
+                .map_err(|error| BootFailure::new(BootStage::Store, Some(path.clone()), error.to_string()))?;
             let store_key = StoreKey::from_bytes(*key.as_bytes());
+            let writer_lock = match existing_lock {
+                Some(lock) if lock.path() == postino_store::lock_path(&path) => lock,
+                other => {
+                    drop(other);
+                    match WriterLock::acquire_as(&path, "app", None) {
+                        Ok(lock) => lock,
+                        Err(StoreError::StoreBusy { owner, .. }) => {
+                            return Err(BootFailure::new(
+                                BootStage::Daemon,
+                                Some(path.clone()),
+                                format!(
+                                    "Un altro processo Postino possiede già l'archivio{owner}. Ferma il daemon con `postino daemon stop` e riapri l'app."
+                                ),
+                            ));
+                        }
+                        Err(error) => return Err(BootFailure::new(BootStage::Store, Some(path.clone()), error.to_string())),
+                    }
+                }
+            };
+            // The lock is held outside the Store handle so `retry_boot` can move it into the
+            // replacement app instead of trying to acquire it twice in one process.
             let store = Store::open(&path, &store_key).map_err(|error| BootFailure::new(BootStage::Store, Some(path.clone()), error.to_string()))?;
             let engine = Engine::open_with_vault(store, Arc::clone(&vault))
                 .map_err(|error| BootFailure::new(BootStage::Engine, Some(path.clone()), error.to_string()))?;
             let handle = StoreHandle::new(path, key, vault);
-            Ok(Booted { engine, store: Some(handle), demo: false })
+            Ok(Booted { engine, store: Some(handle), demo: false, writer_lock: Some(writer_lock) })
         }
     }
 }
@@ -368,6 +406,22 @@ mod tests {
         assert_eq!(booted.engine.accounts()[0].email, "test@example.com");
         assert!(!booted.engine.is_demo());
         assert_eq!(booted.engine.accounts().len(), 1);
+    }
+
+    #[test]
+    fn a_daemon_owned_store_is_a_readable_boot_failure_not_a_second_writer() {
+        let path = directory("boot-daemon-owned").join("mail.db");
+        let _ = std::fs::remove_file(&path);
+        seed_account(&path, &StoreKey::from_bytes([0x26; 32]));
+        let lock = WriterLock::acquire_as(&path, "daemon", Some(1)).expect("daemon lock");
+        let (key, vault) = fixed([0x26; 32]);
+        let error = match boot(Launch::Store(Some(path)), KeySource::Fixed { key, vault }, Utc::now()) {
+            Err(error) => error,
+            Ok(_) => panic!("the daemon-owned store booted a second writer"),
+        };
+        assert_eq!(error.stage, BootStage::Daemon, "{error:?}");
+        assert!(error.reason.contains("daemon") || error.reason.contains("processo"), "{}", error.reason);
+        drop(lock);
     }
 
     #[test]

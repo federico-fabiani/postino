@@ -309,6 +309,37 @@ impl BlobStore {
         }
     }
 
+    /// Every blob name, sorted. Names that are not exactly 64 lowercase hex characters plus
+    /// `.blob` are ignored: a temporary file or a foreign file is not a blob and is never deleted by
+    /// the garbage collector. The scan is bounded by the directory tree, not by a caller's input;
+    /// deleting is bounded separately by the GC batch.
+    pub fn list_hashes(&self) -> Result<Vec<String>, StoreError> {
+        let mut hashes = Vec::new();
+        let shards = fs::read_dir(&self.root).map_err(|error| io_error(&self.root, error))?;
+        for shard in shards {
+            let shard = shard.map_err(|error| io_error(&self.root, error))?;
+            let path = shard.path();
+            let file_type = shard.file_type().map_err(|error| io_error(&path, error))?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                // A symlinked shard could make a sweep unlink outside the blob root.
+                continue;
+            }
+            let entries = fs::read_dir(&path).map_err(|error| io_error(&path, error))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| io_error(&path, error))?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(hash) = name.strip_suffix(".blob") else { continue };
+                if hash.len() == HASH_HEX_LEN && hash.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+                    hashes.push(hash.to_owned());
+                }
+            }
+        }
+        hashes.sort_unstable();
+        hashes.dedup();
+        Ok(hashes)
+    }
+
     /// Delete one blob. Returns `false` when it was already gone. The shard directory is removed
     /// when it becomes empty; a failure to do so is ignored because it only costs an empty folder.
     ///
