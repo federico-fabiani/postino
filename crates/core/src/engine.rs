@@ -3216,6 +3216,7 @@ impl Engine {
         // queued, so it can never be submitted twice here. Each append is claimed (its lease and its
         // attempt count are written) before the network: a second process cannot append the same row
         // concurrently, and a crash leaves a claim that expires.
+        let mut appended = BTreeSet::new();
         for _ in 0..100 {
             let claimed_at = self.claim_now(pass_start);
             let Some(entry) = store.claim_outbox_append(claimed_at, APPEND_LEASE_MS).map_err(store_map::read_error)? else {
@@ -3223,6 +3224,17 @@ impl Engine {
             };
             let lease = entry.lease_at.unwrap_or(claimed_at);
             let now = self.claim_now(pass_start);
+            if !appended.insert(entry.id.clone()) {
+                // A slow network failure can leave the row due again while this pass is still
+                // running. Never append the same row twice in one pass.
+                let _ = store.reschedule_outbox_append(
+                    &entry.id,
+                    now.saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                    Some("la copia in Inviati resta da fare"),
+                    lease,
+                );
+                break;
+            }
             report.processed = report.processed.saturating_add(1);
             match self.append_entry(store, &entry, lease, now) {
                 Ok(()) => report.sent = report.sent.saturating_add(1),
@@ -3407,7 +3419,12 @@ impl Engine {
     fn append_entry(&mut self, store: &Store, entry: &OutboxEntry, lease: i64, now_ms: i64) -> Result<(), String> {
         let Some(envelope) = OutboxEnvelope::decode(&entry.envelope_json) else {
             let sentence = "l'inviluppo salvato non è leggibile";
-            let _ = store.reschedule_outbox_append(&entry.id, now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))), Some(sentence), lease);
+            let _ = store.reschedule_outbox_append(
+                &entry.id,
+                self.claim_now(now_ms).saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                Some(sentence),
+                lease,
+            );
             return Err(format!("riga {:?}: {sentence}; la copia in Inviati resta da fare.", entry.id));
         };
         let server = match store.get_account_server(&entry.account_id) {
@@ -3415,7 +3432,7 @@ impl Engine {
             Ok(None) => {
                 let _ = store.reschedule_outbox_append(
                     &entry.id,
-                    now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                    self.claim_now(now_ms).saturating_add(backoff_ms(entry.append_attempts.max(1))),
                     Some("l'account non è più configurato"),
                     lease,
                 );
@@ -3428,7 +3445,7 @@ impl Engine {
             Err(_) => {
                 let _ = store.reschedule_outbox_append(
                     &entry.id,
-                    now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                    self.claim_now(now_ms).saturating_add(backoff_ms(entry.append_attempts.max(1))),
                     Some("i byte salvati del messaggio non sono leggibili"),
                     lease,
                 );
@@ -3440,7 +3457,7 @@ impl Engine {
             Err(_) => {
                 let _ = store.reschedule_outbox_append(
                     &entry.id,
-                    now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                    self.claim_now(now_ms).saturating_add(backoff_ms(entry.append_attempts.max(1))),
                     Some("la credenziale IMAP non è disponibile"),
                     lease,
                 );
@@ -3452,7 +3469,12 @@ impl Engine {
         if postino_sync::append_sent(&config, raw.as_slice()).is_err() {
             // No server text: the IMAP server holds the password and can echo it in a `NO`.
             let sentence = "la copia in Inviati non è stata salvata; il messaggio è già stato inviato e non viene rinviato";
-            let _ = store.reschedule_outbox_append(&entry.id, now_ms.saturating_add(backoff_ms(entry.append_attempts.max(1))), Some(sentence), lease);
+            let _ = store.reschedule_outbox_append(
+                &entry.id,
+                self.claim_now(now_ms).saturating_add(backoff_ms(entry.append_attempts.max(1))),
+                Some(sentence),
+                lease,
+            );
             return Err(format!("outbox row {:?}: {sentence}.", entry.id));
         }
         if !store.finish_outbox_append(&entry.id, lease).map_err(|_| format!("outbox row {:?}: lo stato non è aggiornabile.", entry.id))? {
