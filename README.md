@@ -271,9 +271,9 @@ MCP      ─┘
 
 ![Postino label menu: the modal label picker with its scrim over the list, Lavoro already applied and visible in the reading-pane chip](docs/images/postino-u05-label-menu.png)
 
-![Postino reading pane: sender and recipients, label chip, the text view note, a safe link and a pinned attachment strip with Save](docs/images/postino-p6c-reading-attachments.png)
+![Postino reading pane: sender and recipients, label chip, a block-rendered body with its formatted caption and a pinned attachment strip with Save](docs/images/postino-p6c-reading-attachments.png)
 
-![Postino reading pane at 980×600: the text view and the pinned attachment strip with Save above the status bar](docs/images/postino-p6c-reading-attachments-980.png)
+![Postino reading pane at 980×600: the block-rendered body with its formatted caption and the pinned attachment strip with Save above the status bar](docs/images/postino-p6c-reading-attachments-980.png)
 
 ![Postino settings: accounts with the active badge, appearance choices, store and blob paths, last sync, and the licences and shortcut entries](docs/images/postino-p6c-settings.png)
 

@@ -22,6 +22,9 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::background;
+use crate::body;
+use crate::body::BodyRenderer;
+use crate::body_ui;
 use crate::boot::{self, BootFailure, Launch, StoreHandle};
 use crate::daemon;
 use crate::onboarding::{self, ConnectionError, ErrorKind, FocusField, FolderPreview, FolderRole, FoldersPreview, Onboarding, ProviderChoice, Stage};
@@ -458,6 +461,10 @@ pub struct PostinoApp {
     folder_opener: Arc<dyn FolderOpener>,
     /// A link waiting for the confirmation sheet. The URL has already passed the allowlist.
     pending_link: Option<PendingLink>,
+    /// The block view of the message currently open. Bodies are immutable while a message is open,
+    /// so the pane parses once per body instead of once per frame. A sync refresh that replaces the
+    /// row changes the fragment and invalidates this.
+    body_cache: Option<BodyCache>,
     /// A dangerous attachment waiting for the explicit warning.
     attachment_warning: Option<PendingAttachment>,
     /// An attachment whose chosen path already exists and waits for overwrite confirmation.
@@ -1132,6 +1139,7 @@ impl PostinoApp {
             file_picker: Arc::new(UnavailableFilePicker),
             folder_opener: Arc::new(UnavailableFolderOpener),
             pending_link: None,
+            body_cache: None,
             attachment_warning: None,
             attachment_overwrite: None,
             attachment_save_ids: BTreeMap::new(),
@@ -1402,10 +1410,18 @@ impl PostinoApp {
                         message.body_text = "Ciao Federico,\n\nho caricato il PDF del preventivo nella cartella condivisa.\n\nDettaglio: https://example.com/preventivo/postino-2026?token=anteprima\n\nScrivimi a mailto:giulia.ferri@example.com.\n\nGrazie,\nGiulia"
                             .to_owned();
                         // Stored truth, not a live tracker: the sanitizer removed the remote image and
-                        // sync stored the count. This HTML is already the sanitized form and contains
-                        // no remote `src`, so a screenshot can never load anything.
+                        // sync stored the count. This HTML is already the sanitized form the block
+                        // renderer consumes: a heading, emphasis, a list, two safe anchors and a local
+                        // `cid:` image shown as its alt text, with no remote `src` and no script.
                         message.body_html = Some(
-                            "<p>Ciao Federico,</p><p>ho caricato il PDF del preventivo nella cartella condivisa.</p>".to_owned(),
+                            concat!(
+                                "<h1>Preventivo postino 2026</h1>",
+                                "<p>Ciao Federico, ho caricato il <strong>PDF del preventivo</strong> nella cartella condivisa.</p>",
+                                "<ul><li>Preventivo firmato</li><li>Dettaglio dei costi</li></ul>",
+                                "<p><a href=\"https://example.com/preventivo/postino-2026?token=anteprima\">Apri il preventivo</a> oppure scrivimi a <a href=\"mailto:giulia.ferri@example.com\">giulia.ferri@example.com</a>.</p>",
+                                "<p><img src=\"cid:logo@postino\" alt=\"Logo Postino\"></p>",
+                            )
+                            .to_owned(),
                         );
                         message.remote_images = 1;
                         if message.attachments.is_empty() {
@@ -7258,6 +7274,32 @@ impl PostinoApp {
         });
     }
 
+    /// The block view of one message, parsed from the stored sanitized fragment once per body.
+    /// The reading pane must never re-parse raw HTML: `body_html` is already the sanitized form.
+    fn rendered_body(&mut self, message: &Message) -> Arc<body::View> {
+        let stale = match self.body_cache.as_ref() {
+            None => true,
+            Some(cache) => {
+                cache.message_id != message.summary.id || cache.html.as_deref() != message.body_html.as_deref() || cache.text != message.body_text
+            }
+        };
+        if stale {
+            let view = Arc::new(body::SubsetBodyRenderer.render(&body::StoredBody { html: message.body_html.as_deref(), text: &message.body_text }));
+            self.body_cache = Some(BodyCache {
+                message_id: message.summary.id.clone(),
+                html: message.body_html.clone(),
+                text: message.body_text.clone(),
+                view: Arc::clone(&view),
+            });
+            return view;
+        }
+        match &self.body_cache {
+            Some(cache) => Arc::clone(&cache.view),
+            // `stale` already filled the cache; this arm only keeps the function total.
+            None => Arc::new(body::View::Text { text: String::new(), reason: body::TextReason::NoHtml }),
+        }
+    }
+
     fn reading_content(&mut self, ui: &mut Ui, t: &Tokens, full: bool) {
         let content_bottom = ui.max_rect().bottom();
         let selected = self.selected.clone();
@@ -7486,7 +7528,8 @@ impl PostinoApp {
         ui.add_space(space::SM);
         ui.separator();
         ui.add_space(space::XS);
-        ui.label(typography::text(Role::Caption, "Vista testo · il rendering HTML arriverà con il visualizzatore isolato.", t.text_faint));
+        let view = self.rendered_body(&message);
+        ui.label(typography::text(Role::Caption, body::caption(view.as_ref()), t.text_faint));
         ui.add_space(space::SM);
         // A pinned strip keeps the attachment and its Save button visible at 980×600, where the body
         // scroll would otherwise push it below the fold. One budget covers banner, header, chips and
@@ -7513,30 +7556,38 @@ impl PostinoApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let mut clicked_link = None;
-                    for paragraph in message.body_text.split("\n\n") {
-                        let paragraph = paragraph.trim();
-                        if paragraph.is_empty() {
-                            continue;
+                    match view.as_ref() {
+                        body::View::Blocks(body) => {
+                            clicked_link = body_ui::blocks(ui, body, t, &mut link_budget);
                         }
-                        if paragraph.starts_with('>') {
-                            Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
-                                ui,
-                                |ui| {
-                                    let (link, used) = link_paragraph(ui, paragraph, t, true, link_budget);
+                        body::View::Text { text, .. } => {
+                            for paragraph in text.split("\n\n") {
+                                let paragraph = paragraph.trim();
+                                if paragraph.is_empty() {
+                                    continue;
+                                }
+                                if paragraph.starts_with('>') {
+                                    Frame::new()
+                                        .fill(t.panel_alt)
+                                        .corner_radius(radius::CONTROL)
+                                        .inner_margin(Margin::symmetric(inset::LG, inset::MD))
+                                        .show(ui, |ui| {
+                                            let (link, used) = link_paragraph(ui, paragraph, t, true, link_budget);
+                                            if let Some(link) = link {
+                                                clicked_link = Some(link);
+                                            }
+                                            link_budget = link_budget.saturating_sub(used);
+                                        });
+                                } else {
+                                    let (link, used) = link_paragraph(ui, paragraph, t, false, link_budget);
                                     if let Some(link) = link {
                                         clicked_link = Some(link);
                                     }
                                     link_budget = link_budget.saturating_sub(used);
-                                },
-                            );
-                        } else {
-                            let (link, used) = link_paragraph(ui, paragraph, t, false, link_budget);
-                            if let Some(link) = link {
-                                clicked_link = Some(link);
+                                }
+                                ui.add_space(space::LG);
                             }
-                            link_budget = link_budget.saturating_sub(used);
                         }
-                        ui.add_space(space::LG);
                     }
                     // The last line breathes above the fade instead of ending exactly on the clip.
                     ui.add_space(space::SM);
@@ -10210,6 +10261,17 @@ struct PendingLink {
     focus_cancel: bool,
 }
 
+/// The block view of the open message, keyed by the stored fragment and text it was built from.
+struct BodyCache {
+    message_id: String,
+    html: Option<String>,
+    /// The stored text alternative the view was built from. An oversized body with empty stored
+    /// text falls back to the parser's prefix, so the view text cannot be compared with
+    /// `body_text`; the key must hold the input instead.
+    text: String,
+    view: Arc<body::View>,
+}
+
 /// An attachment whose bytes are already read from the blob store and whose destination is being
 /// confirmed. The bytes are kept only for the lifetime of the dialog.
 #[derive(Clone, Debug)]
@@ -10762,7 +10824,7 @@ fn window_control(ui: &mut Ui, glyph: &str, label: &str, close: bool) -> egui::R
 
 /// A hostile body can carry a 10 KB URL. The inline label is capped; the hover tooltip and the
 /// confirmation sheet still show the full destination.
-fn truncate_link_label(label: &str) -> String {
+pub(crate) fn truncate_link_label(label: &str) -> String {
     if label.chars().count() <= reading::MAX_LINK_LABEL_CHARS {
         return label.to_owned();
     }
@@ -10772,7 +10834,7 @@ fn truncate_link_label(label: &str) -> String {
 }
 
 /// A hover tooltip is capped; the sheet has the full URL in a scrollable body.
-fn truncate_tooltip_url(url: &str) -> String {
+pub(crate) fn truncate_tooltip_url(url: &str) -> String {
     if url.chars().count() <= reading::MAX_LINK_TOOLTIP_CHARS {
         return url.to_owned();
     }
@@ -11738,12 +11800,24 @@ pub(crate) mod probe {
 
     pub fn clear_links(ui: &Ui) {
         ui.ctx().data_mut(|data| data.insert_temp(id("link-widgets"), BTreeMap::<String, Rect>::new()));
+        ui.ctx().data_mut(|data| data.insert_temp(id("link-focus"), BTreeMap::<String, Id>::new()));
     }
 
     pub fn link_widget(ui: &Ui, url: &str, rect: Rect) {
         ui.ctx().data_mut(|data| {
             data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("link-widgets")).insert(url.to_owned(), rect);
         });
+    }
+
+    /// The widget id of a painted link, so a test can put keyboard focus on it.
+    pub fn link_focus(ui: &Ui, url: &str, widget: Id) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Id>>(id("link-focus")).insert(url.to_owned(), widget);
+        });
+    }
+
+    pub fn link_id(ctx: &Context, url: &str) -> Option<Id> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Id>>(id("link-focus"))).and_then(|links| links.get(url).copied())
     }
 
     pub fn link_rect(ctx: &Context, url: &str) -> Option<Rect> {
@@ -12466,6 +12540,17 @@ mod tests {
     /// reached the screen rather than only the state.
     fn painted_text(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2) -> Vec<String> {
         painted_runs(ctx, app, size).into_iter().map(|run| run.text).collect()
+    }
+
+    /// The first painted run containing `needle`, asserting its scroll clip does not cut it. A run
+    /// outside its clip is still in the shape list but never reaches the eye.
+    fn painted_visible(runs: &[PaintedRun], needle: &str) -> String {
+        let run = runs
+            .iter()
+            .find(|run| run.text.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not painted: {:?}", runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>()));
+        assert!(run.clip.contains_rect(run.rect), "{needle:?} is painted outside its clip: {run:?}");
+        run.text.clone()
     }
 
     fn frame_at(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, events: Vec<egui::Event>) {
@@ -17202,15 +17287,23 @@ mod tests {
     }
 
     #[test]
-    fn the_text_view_label_explains_the_mode_for_plain_text_mail_too() {
+    fn the_text_view_names_the_reason_plain_text_mail_is_not_rendered() {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         theme::apply(&ctx, false);
         let mut app = PostinoApp::demo(true);
-        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        let id = app
+            .visible_messages()
+            .0
+            .iter()
+            .map(|row| row.id.clone())
+            .find(|id| app.engine.message(id).is_some_and(|message| message.body_html.is_none()))
+            .expect("a demo message without an HTML part");
         app.open_message(id);
         let text = painted_text(&ctx, &mut app, Vec2::new(1280.0, 720.0));
         assert!(text.iter().any(|line| line.contains("Vista testo")), "the reading pane names its text view: {text:?}");
+        assert!(text.iter().any(|line| line.contains("non ha una versione HTML")), "the fallback names its reason: {text:?}");
+        assert!(!text.iter().any(|line| line.contains("Vista formattata")), "plain text must not claim the block view: {text:?}");
     }
 
     #[test]
@@ -17323,6 +17416,7 @@ mod tests {
         let mut app = PostinoApp::demo_at(true, clock);
         let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
         let mut message = app.engine.message(&id).expect("the open message");
+        message.body_html = None;
         message.body_text = (0..100).map(|index| format!("https://example.com/{index}")).collect::<Vec<_>>().join("\n\n");
         app.screenshot_message = Some(message);
         app.open_message(id);
@@ -17368,7 +17462,10 @@ mod tests {
             let fixture = app.screenshot_message.as_ref().expect("the stored-truth screenshot fixture");
             assert_eq!(fixture.remote_images, 1, "dark={dark}: the fixture must carry the stored count");
             let html = fixture.body_html.as_deref().expect("sanitized HTML");
-            assert!(!html.contains("http") && !html.contains("<img"), "dark={dark}: the fixture must not inject a tracker: {html}");
+            assert!(
+                !html.contains("<script") && !html.contains("<iframe") && !html.contains("<form") && !html.contains("src=\"http"),
+                "dark={dark}: the fixture must be stored sanitized truth with no live source: {html}"
+            );
             let content = ctx.content_rect();
             let strip = probe::reading_attachments_rect(&ctx).expect("the pinned attachment strip");
             let save = probe::attachment_save_rect(&ctx, "att_001").expect("the attachment Save button");
@@ -17379,12 +17476,265 @@ mod tests {
             let text = painted_text(&ctx, &mut app, size);
             assert!(text.iter().any(|line| line.contains("ALLEGATI")), "dark={dark}: {text:?}");
             assert!(text.iter().any(|line| line == "Salva"), "the Salva label must be painted in dark={dark}: {text:?}");
+            assert!(text.iter().any(|line| line.contains("Preventivo postino 2026")), "the heading block is missing in dark={dark}: {text:?}");
+            assert!(text.iter().any(|line| line.contains("PDF del preventivo")), "the paragraph block is missing in dark={dark}: {text:?}");
+            assert!(text.iter().any(|line| line.contains("Vista formattata")), "the block caption is missing in dark={dark}: {text:?}");
             let remote = text.iter().position(|line| line.contains("1 immagine remota bloccata")).expect("the stored count line");
-            let mode = text.iter().position(|line| line.contains("Vista testo")).expect("the text-view line");
-            assert!(remote < mode, "the remote line must sit above Vista testo in dark={dark}: {text:?}");
+            let mode = text.iter().position(|line| line.contains("Vista formattata")).expect("the block-view line");
+            assert!(remote < mode, "the remote line must sit above the body caption in dark={dark}: {text:?}");
             let line = &text[remote];
             assert!(!line.contains("http") && !line.contains("tracker"), "the line must not name a URL: {line:?}");
         }
+    }
+
+    #[test]
+    fn the_block_view_renders_every_supported_block() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        app.open_message(id.clone());
+        let mut message = app.engine.message(&id).expect("the open message");
+        message.body_text = "alternativa semplice".to_owned();
+        message.body_html = Some(
+            concat!(
+                "<h1>Titolo uno</h1><h2>Titolo due</h2><h3>Titolo tre</h3>",
+                "<p>Testo <em>enfasi</em> e <strong>forte</strong> e <code>mono</code>.</p>",
+                "<ul><li>Punto primo</li><li>Punto secondo</li></ul><ol><li>Passo uno</li></ol>",
+                "<blockquote><p>Citazione salvata</p></blockquote>",
+                "<pre>riga mono</pre>",
+                "<table><caption>Voci</caption><tr><th>Voce</th><th>Importo</th></tr><tr><td>Setup</td><td>480 euro</td></tr></table>",
+                "<hr><p><img src=\"cid:logo@postino\" alt=\"Logo Postino\"></p>",
+                "<p><a href=\"https://example.com/preventivo\">Apri il preventivo</a></p>",
+            )
+            .to_owned(),
+        );
+        app.screenshot_message = Some(message);
+        app.reading_full = true;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(1280.0, 1400.0);
+        let text = painted_text(&ctx, &mut app, size);
+        for expected in [
+            "Titolo uno",
+            "Titolo due",
+            "Titolo tre",
+            "enfasi",
+            "forte",
+            "mono",
+            "Punto primo",
+            "Punto secondo",
+            "Passo uno",
+            "Citazione salvata",
+            "riga mono",
+            "Voci",
+            "Setup",
+            "480 euro",
+            "Logo Postino",
+            "Apri il preventivo",
+        ] {
+            assert!(text.iter().any(|line| line.contains(expected)), "{expected} is missing: {text:?}");
+        }
+        assert!(text.iter().any(|line| line.contains("Vista formattata")), "the caption names the block view: {text:?}");
+        assert!(
+            !text.iter().any(|line| line.contains("<p>") || line.contains("<h1>") || line.contains("<table>") || line.contains("<li>")),
+            "no markup may be painted: {text:?}"
+        );
+        assert!(!text.iter().any(|line| line.contains("cid:")), "a cid source must never be painted: {text:?}");
+        assert!(!text.iter().any(|line| line.contains("http")), "no destination is painted as text: {text:?}");
+        assert_eq!(probe::link_count(&ctx), 1, "the safe anchor is the only link widget");
+    }
+
+    #[test]
+    fn a_reloaded_body_replaces_the_cached_view_once() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        app.open_message(id.clone());
+        let mut message = app.engine.message(&id).expect("the open message");
+        message.body_text = String::new();
+        message.body_html = Some("<p>prima versione</p>".to_owned());
+        let first = app.rendered_body(&message);
+        assert!(matches!(first.as_ref(), body::View::Blocks(body) if body.plain_text().contains("prima versione")), "{first:?}");
+        assert!(Arc::ptr_eq(&first, &app.rendered_body(&message)), "an unchanged body must reuse the parsed view");
+
+        // A sync refresh can replace only the fragment; the cached block view must not survive it.
+        message.body_html = Some("<p>seconda versione</p>".to_owned());
+        let reloaded = app.rendered_body(&message);
+        assert!(!Arc::ptr_eq(&first, &reloaded), "a new fragment must invalidate the cache");
+        assert!(matches!(reloaded.as_ref(), body::View::Blocks(body) if body.plain_text().contains("seconda versione")), "{reloaded:?}");
+
+        // An oversized fragment with empty stored text falls back to the parser's prefix: the view
+        // text never equals `body_text`, so the cache key must hold the stored input.
+        message.body_html = Some(format!("<p>{}</p>", "a".repeat(postino_mime::MAX_BODY_BYTES + 1)));
+        let fallback = app.rendered_body(&message);
+        assert!(matches!(fallback.as_ref(), body::View::Text { reason: body::TextReason::TooLarge, .. }), "{fallback:?}");
+        assert!(Arc::ptr_eq(&fallback, &app.rendered_body(&message)), "an oversized body with empty text must be cached too");
+    }
+
+    #[test]
+    fn a_block_body_cannot_exceed_the_per_message_link_budget() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        app.open_message(id.clone());
+        let mut message = app.engine.message(&id).expect("the open message");
+        let html: String = (0..80).map(|index| format!("<p><a href=\"https://example.com/{index}\">link {index}</a></p>")).collect();
+        message.body_html = Some(html);
+        message.body_text = "ottanta link".to_owned();
+        app.screenshot_message = Some(message);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        painted_text(&ctx, &mut app, Vec2::new(1280.0, 800.0));
+        assert_eq!(probe::link_count(&ctx), reading::MAX_LINKS_PER_MESSAGE, "the block path must honour the per-message budget");
+        assert!(probe::link_rect(&ctx, "https://example.com/0").is_some(), "the first anchors stay widgets");
+        assert!(probe::link_rect(&ctx, "https://example.com/64").is_none(), "an anchor over the budget stays readable text");
+    }
+
+    #[test]
+    fn a_hostile_or_oversized_body_never_panics_and_names_the_fallback() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        app.open_message(id.clone());
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(1280.0, 800.0);
+
+        // 2 MiB of hostile markup under the parser's byte cap: the view is bounded and truncated.
+        let mut message = app.engine.message(&id).expect("the open message");
+        message.body_text = "alternativa semplice".to_owned();
+        message.body_html = Some("<p onmouseover=\"alert(1)\">riga</p><script>alert(1)</script>".repeat(50_000));
+        let hostile = message.clone();
+        app.screenshot_message = Some(message);
+        let started = std::time::Instant::now();
+        let runs = painted_runs(&ctx, &mut app, size);
+        // A bounded body must not turn one frame into an unbounded paint loop.
+        assert!(started.elapsed() < Duration::from_secs(5), "a bounded large body took {:?} to paint", started.elapsed());
+        let text: Vec<String> = runs.iter().map(|run| run.text.clone()).collect();
+        assert!(text.iter().any(|line| line.contains("riga")), "the bounded body still renders: {text:?}");
+        assert!(!text.iter().any(|line| line.contains("alert(") || line.contains("<script") || line.contains("onmouseover")), "{text:?}");
+        let note = painted_visible(&runs, "Messaggio troncato");
+        assert!(note.contains("Messaggio troncato"), "the truncation note must be honest and unclipped: {note:?}");
+        let view = app.rendered_body(&hostile);
+        assert!(
+            matches!(view.as_ref(), body::View::Blocks(body) if body.blocks.len() <= postino_mime::MAX_BLOCKS),
+            "the paint model must stay within the block budget: {view:?}"
+        );
+
+        // Over the parser's byte cap the pane keeps the stored text alternative and says why.
+        let mut message = app.engine.message(&id).expect("the open message");
+        message.body_text = "alternativa semplice".to_owned();
+        message.body_html = Some(format!("<p>{}</p>", "a".repeat(postino_mime::MAX_BODY_BYTES + 1)));
+        app.screenshot_message = Some(message);
+        let runs = painted_runs(&ctx, &mut app, size);
+        let caption = painted_visible(&runs, "Vista testo");
+        assert!(caption.contains("supera il limite"), "the fallback names the reason and is unclipped: {caption:?}");
+        let alternative = painted_visible(&runs, "alternativa semplice");
+        assert!(alternative.contains("alternativa semplice"), "the stored alternative is painted and unclipped: {alternative:?}");
+    }
+
+    #[test]
+    fn block_links_open_only_through_the_existing_confirmation_sheet() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+        app.open_message(id.clone());
+        let mut message = app.engine.message(&id).expect("the open message");
+        message.body_text = "alternativa semplice".to_owned();
+        let idn = "https://xn--bcher-kva.example/acquisto";
+        let backslash = "https://evil.example\\@bank.example/";
+        let mailto = "mailto:help@example.com?subject=Preventivo";
+        message.body_html = Some(format!(
+            concat!(
+                "<p><a href=\"javascript:alert(1)\">Non aprire</a>, <a href=\"https://bank.example@evil.example/\">Userinfo</a>, ",
+                "<a href=\"https://example.com/sicuro\">Sicuro</a>, <a href=\"{idn}\">IDN</a>, ",
+                "<a href=\"{backslash}\">Barra</a> e <a href=\"{mailto}\">Posta</a>.</p>",
+            ),
+            idn = idn,
+            backslash = backslash,
+            mailto = mailto,
+        ));
+        app.screenshot_message = Some(message);
+        let opener = RecordingLinkOpener::new();
+        app.link_opener = opener.clone();
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        settle_at(&ctx, &mut app, size);
+        let text = painted_text(&ctx, &mut app, size);
+        assert!(text.iter().any(|line| line.contains("Non aprire")), "a rejected anchor stays readable text: {text:?}");
+        assert!(!text.iter().any(|line| line.contains("javascript:")), "a hostile destination is never painted: {text:?}");
+        assert_eq!(probe::link_count(&ctx), 4, "only the safe, IDN, backslash and mailto destinations become widgets");
+        assert!(probe::link_rect(&ctx, "https://bank.example@evil.example/").is_none(), "userinfo is never a widget");
+
+        // The plain https anchor: the sheet names the exact host and only Apri opens it.
+        let link = probe::link_rect(&ctx, "https://example.com/sicuro").expect("the safe anchor");
+        click_at(&ctx, &mut app, link.center(), size);
+        let pending = app.pending_link.as_ref().expect("the confirmation sheet opens");
+        assert_eq!(pending.url, "https://example.com/sicuro");
+        assert_eq!(pending.host, "example.com");
+        assert!(opener.opened().is_empty(), "the click alone must not open a browser");
+        app.confirm_pending_link();
+        assert_eq!(opener.opened(), vec!["https://example.com/sicuro".to_owned()]);
+
+        // An IDN anchor keeps the punycode warning instead of claiming the spelling is the host.
+        app.pending_link = None;
+        settle_at(&ctx, &mut app, size);
+        let link = probe::link_rect(&ctx, idn).expect("the IDN anchor");
+        click_at(&ctx, &mut app, link.center(), size);
+        let pending = app.pending_link.as_ref().expect("the IDN sheet opens");
+        assert!(pending.idn, "the IDN flag survives the block path");
+        let sheet = painted_text(&ctx, &mut app, size);
+        assert!(sheet.iter().any(|line| line.contains("Host di destinazione: xn--bcher-kva.example")), "{sheet:?}");
+        assert!(sheet.iter().any(|line| line.contains("punycode")), "{sheet:?}");
+        assert_eq!(opener.opened().len(), 1, "the IDN sheet must not open without Apri");
+
+        // A backslash anchor is presented with the authority a browser would really use.
+        app.pending_link = None;
+        settle_at(&ctx, &mut app, size);
+        let link = probe::link_rect(&ctx, backslash).expect("the backslash anchor");
+        click_at(&ctx, &mut app, link.center(), size);
+        let pending = app.pending_link.as_ref().expect("the backslash sheet opens");
+        assert!(pending.backslash, "the backslash flag survives the block path");
+        let sheet = painted_text(&ctx, &mut app, size);
+        assert!(sheet.iter().any(|line| line.contains("Host di destinazione: evil.example")), "{sheet:?}");
+        assert!(sheet.iter().any(|line| line.contains("barra rovesciata")), "{sheet:?}");
+
+        // A mailto anchor names its explicit recipient and reaches the mail client only on Apri.
+        app.pending_link = None;
+        settle_at(&ctx, &mut app, size);
+        let link = probe::link_rect(&ctx, mailto).expect("the mailto anchor");
+        click_at(&ctx, &mut app, link.center(), size);
+        let pending = app.pending_link.as_ref().expect("the mailto sheet opens");
+        assert!(pending.mailto, "the mailto flag survives the block path");
+        assert_eq!(pending.recipient.as_deref(), Some("help@example.com"));
+        let sheet = painted_text(&ctx, &mut app, size);
+        assert!(sheet.iter().any(|line| line.contains("client di posta")), "{sheet:?}");
+        assert!(sheet.iter().any(|line| line.contains("Destinatario: help@example.com")), "{sheet:?}");
+        app.confirm_pending_link();
+        assert_eq!(opener.opened(), vec!["https://example.com/sicuro".to_owned(), mailto.to_owned()]);
+    }
+
+    #[test]
+    fn the_keyboard_reaches_a_block_link_and_its_sheet() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        app.seed_screenshot(ScreenshotState::ReadingAttachments);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(1280.0, 800.0);
+        settle_at(&ctx, &mut app, size);
+        let url = "https://example.com/preventivo/postino-2026?token=anteprima";
+        let link = probe::link_id(&ctx, url).expect("the block link widget");
+        ctx.memory_mut(|memory| memory.request_focus(link));
+        frame_at(&ctx, &mut app, size, vec![key(Key::Enter, Modifiers::NONE)]);
+        let pending = app.pending_link.as_ref().expect("Enter on a focused link opens the sheet");
+        assert_eq!(pending.url, url);
     }
 
     #[test]

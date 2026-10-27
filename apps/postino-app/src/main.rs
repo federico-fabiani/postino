@@ -6,6 +6,8 @@
 
 mod app;
 mod background;
+mod body;
+mod body_ui;
 mod boot;
 mod daemon;
 mod onboarding;

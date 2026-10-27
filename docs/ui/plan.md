@@ -580,15 +580,20 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   use the deterministic demo mailbox with seeded sync states; no real address, credential or store
   is captured.
 - **Closed by P6c.** Link opening, attachment Save, the full settings page and the remaining
-  reading-pane attachment affordances. HTML rendering, SMTP and OAuth remain later milestones.
+  reading-pane attachment affordances. The sandboxed HTML viewer (P11b), SMTP and OAuth remain
+  later milestones.
 
 ### P6c Reading pane, attachments and settings — done
 
-- **Reading pane.** The body is the plain-text alternative (already HTML-to-text when only HTML
-  exists) under a quiet `Vista testo` line that explains the HTML renderer arrives with the isolated
-  viewer. The header shows sender, recipients, a content-sized Cc line truncated with a tooltip,
+- **Reading pane.** The stored sanitized fragment is rendered through the bounded P11a1 block model
+  (P11a2) under a quiet `Vista formattata` line: paragraphs, h1–h3, emphasis/strong/code, lists,
+  blockquote, pre, basic tables, links and `cid:` alt text as text. Floats, media, forms, web fonts
+  and background images are not rendered; nothing is fetched and no script runs. A fragment that is
+  plain text only, empty or over the parser's byte cap keeps the `Vista testo` alternative and names
+  the reason; a body cut by a model bound is marked `Messaggio troncato` above the first block. The
+  header shows sender, recipients, a content-sized Cc line truncated with a tooltip,
   date, subject and label chips; selecting a label chip filters the mailbox. Below the chips and above
-  `Vista testo`, a message whose stored count is greater than zero names `N immagini remote bloccate`
+  the body caption, a message whose stored count is greater than zero names `N immagini remote bloccate`
   (`1 immagine remota bloccata` in the singular) with “il contenuto arriva dal server e non viene
   caricato”. The attachment row is a pinned strip above the body scroll, so it stays visible at
   980×600.
@@ -663,13 +668,14 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   980; the stored count line in singular, plural and zero states with no URL painted; compose/reply
   identity. No test opens a browser, a native dialog or a shell.
 - **Screenshots.** `docs/images/postino-p6c-reading-attachments.png` and
-  `-reading-attachments-980.png` (text view, stored blocked-image line, safe link, pinned attachment
-  Save at 1280 and 980), `postino-p6c-link-confirm.png` and `-980.png`,
+  `-reading-attachments-980.png` (block-rendered body, stored blocked-image line, pinned
+  attachment Save at 1280 and 980), `postino-p6c-link-confirm.png` and `-980.png`,
   `postino-p6c-settings.png`, `-settings-dark.png`, `-settings-980.png` and
   `-settings-980-dark.png`. The P6b mailbox and offline images were regenerated for the single
   identity, the `N non letti` badge and the single Retry.
-- **Honest limits.** HTML is not rendered in this slice: the pane shows the text alternative and
-  never requests remote images. The MIME sanitizer removes remote images before storage and counts
+- **Honest limits.** The pane renders only the stored sanitized block subset: no floats, media,
+  forms, web fonts or background images, and no URL is ever fetched. The MIME sanitizer removes
+  remote images before storage and counts
   them; P6d carries that stored count through sync, so the pane names it without re-deriving it from
   the sanitized HTML, which no longer contains the references. Save writes the exact bytes to the
   path the person chooses and never opens or executes the file; the extension warning is advisory.

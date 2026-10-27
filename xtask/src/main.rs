@@ -109,11 +109,22 @@ fn layers() -> Result<()> {
         // The desktop app is the second production adapter of the credential seam: it opens the
         // default store from the keyring, runs sync on its worker thread and probes a server during
         // onboarding. It never depends on the CLI; since P10a2 it is a `postino-ipc` client of the
-        // daemon (functions only, no listener of its own).
+        // daemon (functions only, no listener of its own). Since P11a2 it renders the stored
+        // sanitized body through `postino-mime`'s bounded block model: the crate stays headless and
+        // the app is its only UI consumer.
         (
             "postino-app",
-            &["postino-core", "postino-daemon", "postino-ipc", "postino-net", "postino-platform", "postino-store", "postino-sync", "postino-testkit"]
-                [..],
+            &[
+                "postino-core",
+                "postino-daemon",
+                "postino-ipc",
+                "postino-mime",
+                "postino-net",
+                "postino-platform",
+                "postino-store",
+                "postino-sync",
+                "postino-testkit",
+            ][..],
         ),
         // The CLI is the production adapter between the engine's vault seam and the OS keyring; it
         // uses the network types only in its account/sync tests. It is also a daemon client; the

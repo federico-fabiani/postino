@@ -14,6 +14,7 @@ path = "src/main.rs"
 base64.workspace = true
 postino-core.workspace = true
 postino-ipc.workspace = true
+postino-mime.workspace = true
 postino-net.workspace = true
 postino-platform.workspace = true
 postino-store.workspace = true

@@ -477,8 +477,8 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "22ced0eb49ca93dbc04ee0fee7e9036202317cdc071e2530a03e028d2fc9593f"
-usage = "Documentation screenshot of the text reading pane, the stored blocked-image line, a safe link and attachment Save chip"
+sha256 = "4effc508300bd7c8281b0c02a360cabbe327cfd6e61878377cdd383e79bb9edf"
+usage = "Documentation screenshot of the block-rendered reading pane, the stored blocked-image line and attachment Save chip"
 
 [[asset]]
 path = "docs/images/postino-p6c-link-confirm.png"
@@ -527,8 +527,8 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "5645e67a3e27d7ec1eb100e43d32087aa8448a6361f80dc1132f94d1ae5ef04f"
-usage = "Documentation screenshot of the stored blocked-image line, pinned attachment strip and Save button at the minimum window"
+sha256 = "d447481717ee09e63ed1113e7c114fd8a607c396720e7a0f26dadcc5d2926e20"
+usage = "Documentation screenshot of the block-rendered body, stored blocked-image line, pinned attachment strip and Save button at the minimum window"
 
 [[asset]]
 path = "docs/images/postino-p6c-link-confirm-980.png"
