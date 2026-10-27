@@ -58,7 +58,7 @@ const ALLOWED_TAGS: &[&str] = &[
 
 /// Tags whose content is removed with the tag, not unwrapped. A `<script>` body must never become
 /// visible text, and an `<svg>` payload must never survive as markup.
-const CLEAN_CONTENT_TAGS: &[&str] =
+pub(crate) const CLEAN_CONTENT_TAGS: &[&str] =
     &["script", "style", "iframe", "object", "embed", "svg", "math", "template", "noscript", "video", "audio", "canvas"];
 
 /// Markers that mean "the sanitizer had something to remove", used only for the warning.

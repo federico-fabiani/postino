@@ -225,7 +225,7 @@ fn is_block(name: &str) -> bool {
     )
 }
 
-fn tag_end(html: &str, start: usize) -> Option<usize> {
+pub(crate) fn tag_end(html: &str, start: usize) -> Option<usize> {
     let mut quote: Option<char> = None;
     for (offset, character) in html.get(start..)?.char_indices() {
         if offset == 0 {
@@ -241,19 +241,19 @@ fn tag_end(html: &str, start: usize) -> Option<usize> {
     None
 }
 
-struct Tag {
-    name: String,
-    closing: bool,
+pub(crate) struct Tag {
+    pub(crate) name: String,
+    pub(crate) closing: bool,
     attributes: Vec<(String, String)>,
 }
 
 impl Tag {
-    fn attribute(&self, name: &str) -> Option<&str> {
+    pub(crate) fn attribute(&self, name: &str) -> Option<&str> {
         self.attributes.iter().find(|(field, _)| field == name).map(|(_, value)| value.as_str())
     }
 }
 
-fn parse_tag(raw: &str) -> Option<Tag> {
+pub(crate) fn parse_tag(raw: &str) -> Option<Tag> {
     let inner = raw.strip_prefix('<')?.strip_suffix('>')?.trim();
     if inner.starts_with('!') || inner.starts_with('?') {
         return None;
@@ -311,18 +311,17 @@ fn parse_tag(raw: &str) -> Option<Tag> {
     Some(Tag { name, closing, attributes })
 }
 
-fn decode_entities(input: &str, out: &mut String) {
+pub(crate) fn decode_entities(input: &str, out: &mut String) {
     let mut rest = input;
     while let Some(amp) = rest.find('&') {
         if let Some(head) = rest.get(..amp) {
             out.push_str(head);
         }
         let tail = rest.get(amp..).unwrap_or_default();
-        let decoded = tail.find(';').filter(|semicolon| *semicolon <= 12).and_then(|semicolon| tail.get(1..semicolon).and_then(decode_entity));
-        match decoded {
-            Some(character) => {
+        match entity_at(tail) {
+            Some((character, length)) => {
                 out.push(character);
-                rest = tail.get(tail.find(';').unwrap_or(tail.len()).saturating_add(1)..).unwrap_or_default();
+                rest = tail.get(length..).unwrap_or_default();
             }
             None => {
                 out.push('&');
@@ -331,6 +330,24 @@ fn decode_entities(input: &str, out: &mut String) {
         }
     }
     out.push_str(rest);
+}
+
+/// Furthest byte offset of the `;` that closes a character reference.
+const ENTITY_MAX_SEMICOLON: usize = 12;
+
+/// Decode the character reference that starts `tail` (which begins with `&`).
+///
+/// The search for the closing `;` is capped at [`ENTITY_MAX_SEMICOLON`], so a run of lone
+/// ampersands costs a constant per `&` instead of rescanning the whole rest of the string.
+fn entity_at(tail: &str) -> Option<(char, usize)> {
+    let mut limit = tail.len().min(ENTITY_MAX_SEMICOLON.saturating_add(1));
+    while limit > 0 && !tail.is_char_boundary(limit) {
+        limit = limit.saturating_sub(1);
+    }
+    let window = tail.get(..limit)?;
+    let semicolon = window.find(';')?;
+    let character = window.get(1..semicolon).and_then(decode_entity)?;
+    Some((character, semicolon.saturating_add(1)))
 }
 
 fn decode_entity(entity: &str) -> Option<char> {
@@ -351,7 +368,7 @@ fn decode_entity(entity: &str) -> Option<char> {
     }
 }
 
-fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+pub(crate) fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     let haystack = haystack.as_bytes();
     let needle = needle.as_bytes();
     if needle.is_empty() || needle.len() > haystack.len() {

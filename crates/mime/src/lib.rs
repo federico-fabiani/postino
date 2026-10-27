@@ -22,6 +22,7 @@
 
 #![deny(missing_docs)]
 
+mod blocks;
 mod encode;
 mod error;
 mod headers;
@@ -33,6 +34,11 @@ mod sanitize;
 mod serialize;
 mod util;
 
+pub use blocks::{
+    Block, Body, BodyView, HeadingLevel, Image, Inline, Link, List, MAX_ALT_BYTES, MAX_BLOCKS, MAX_BODY_BYTES, MAX_DEPTH, MAX_LINK_BYTES,
+    MAX_LIST_ITEMS, MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, MAX_TEXT_CHARS, Style, Table, TableCell, TableRow, TextFallback, TextReason, TextRun,
+    render_body,
+};
 pub use error::MimeError;
 pub use headers::Headers;
 pub use html_text::html_to_text;

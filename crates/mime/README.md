@@ -91,6 +91,24 @@ are decoded and no tag survives. It is a single linear scan with no recursion an
 `html2text` was rejected because it renders tables as box-drawing art and drops an `<img alt>` whose
 `src` is missing, both of which violate this contract.
 
+## Block model
+
+`render_body(&str) -> BodyView` turns the **stored, already-sanitized** fragment into a bounded,
+UI-independent block tree; it is not a second sanitizer and never parses raw mail.
+
+- Blocks: `Paragraph`, `Heading{1..3}`, `List{ordered}`, `Quote`, `Pre`, `Table` (caption, header
+  cells, rows), `Rule`. Inlines: `Text{style}`, `Link{text, href}`, `Image{alt, src}`, `Break`.
+- Unknown or unwrapped elements keep their text; `script`/`style`-class content is skipped.
+- Links keep only absolute `http`/`https`/`mailto` destinations, verbatim; images keep only a
+  non-empty `cid:` source and expose `alt` for display. No URL is fetched or resolved.
+- When nothing structured remains, `BodyView::Text` carries the `html_to_text` fallback and a
+  reason (`Empty`, `TooLarge`).
+- Bounds: 8 MiB input (the sanitizer's hard ceiling), depth 32, 4096 blocks, 1 Mi visible chars
+  (text, link labels and image alt text together), 256 list items / rows, 32 columns, 4096-byte
+  links, 1024-byte alt text; any clip — including a dropped over-long link or an unclosed tail —
+  sets `truncated`.
+- The scan is iterative and linear, tolerates unclosed/stray/malformed tags and never panics.
+
 ## Serializer
 
 `serialize(&OutgoingMessage)` writes the bytes itself; a MIME library would hide the rules that
