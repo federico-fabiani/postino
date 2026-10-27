@@ -218,7 +218,8 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [ ] Sieve/ManageSieve for server-side filters and vacation responder where supported (deferred:
       no confirmed provider; Gmail has none).
 - [ ] PGP via an external agent/library; S/MIME later.
-- [ ] `.ics` invites (read card + organizer-only reply draft done in P12d), unsubscribe, export/import `.eml`/`.mbox`, Thunderbird import.
+- [x] `.ics` invite parsing and organizer-only reply drafts (P12d).
+- [ ] Unsubscribe, export/import `.eml`/`.mbox`, Thunderbird import.
 - [ ] MCP compact mode, resources, send guardrails, audit log.
 - [x] Windows per-user packaging source: MSI/ZIP, manifest, external signing (P12e).
 - [ ] Signing/clean-VM verification and DMG/AppImage/deb/rpm.
