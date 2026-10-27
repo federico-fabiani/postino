@@ -86,8 +86,10 @@ Status: `todo` · `active` · `review` · `done`.
 | P9a | M3 search | read path without bodies, FTS5 query language, search ops/UI, v7 inert tables | done |
 | P9b | M3 threads | thread derivation/merge/alias, conversation view, saved searches UI | done |
 | P9c | M3 rules | local rules, preview, idempotent runs, undo, forward through P7 | done |
-| P10a | M4 daemon | IPC + daemon + scheduler + single writer + clients | active |
-| P10b | M4 tray | tray, autostart, notifications, packaging seams | todo |
+| P10a1 | M4 daemon | IPC + daemon + scheduler + single writer + CLI/MCP clients | done |
+| P10a2 | M4 daemon | desktop app daemon client, reconnect, view preservation | active |
+| P10b1 | M4 tray | platform seams, daemon tray/notifier, autostart | todo |
+| P10b2 | M4 tray | app settings, close-to-tray, activation | todo |
 | P11 | M5 render | `BodyRenderer`, sandboxed webview, block/HTML composer, templates | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
 
@@ -127,12 +129,14 @@ in both themes and blocks every shell shortcut behind it. Rule runs were measure
 (empty `new` 67/327 ms, one `all` page 184/455 ms; a 2 000-action page 7.3/10.0 s). M3 is complete.
 P10a starts the M4 daemon: one writer, same-user IPC with a per-launch token, scheduler, GC and
 app/CLI/MCP clients; P10b adds tray, autostart and notifications.
-P10a is split in two green halves. **P10a1** is implemented: the `postino-ipc` transport
-(named pipe/UDS, token file, version handshake, 16 MiB frames, bounded queues, cancel and ping),
-`postino-daemon` with the store lock, scheduler, outbox crash recovery, rules-after-sync, index
-batches and blob GC, plus the CLI/`postino mcp` clients and the app's readable daemon-owned state.
-**P10a2** remains: connect the desktop app through the same `DaemonClient` and preserve its view state
-across reconnect. Tray, autostart and notifications stay in P10b and are not claimed here.
+**P10a1** is merged at `688863b`: the `postino-ipc` transport (named pipe/UDS, token file, version
+handshake, 16 MiB frames, bounded queues, cancel and ping), `postino-daemon` with the store lock,
+scheduler, outbox crash recovery, rules-after-sync, index batches and blob GC, plus the CLI/`postino
+mcp` clients and the app's readable daemon-owned state.
+**P10a2** is active: connect the desktop app through the same `DaemonClient` and preserve its view
+state across reconnect. P10b is split: **P10b1** owns the platform seams and the daemon-hosted tray,
+notifier and autostart (no `app.rs`), so it can run beside P10a2; **P10b2** owns the app settings,
+close-to-tray and activation after P10a2.
 
 ## 5. Delighters backlog
 
