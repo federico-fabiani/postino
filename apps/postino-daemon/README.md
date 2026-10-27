@@ -18,10 +18,20 @@ builds the `Engine`, binds the per-user pipe/socket and runs the scheduler. The 
   and outbox snapshot reference before unlinking.
 - The local JSON-RPC server: `op`, `ops_list`, `daemon_status`, `daemon_shutdown`,
   `events_subscribe` and `cancel`. No TCP listener, no remote endpoint.
+- The Windows tray, its three P10b1 menu actions and new-mail/send-failure notices. The tray is one
+  `Shell_NotifyIcon` icon state (quiet, syncing, offline, failed) and never a badge count. Menu
+  actions open the sibling app with `--store`, request a sync or stop the daemon. A missing
+  notification area is one log line; the daemon keeps serving.
+- The opt-in per-user autostart value (`HKCU\...\Run\Postino`) written and read back by
+  `postino daemon autostart on|off|status`. No service and no elevation; ADR-0006 records the
+  registry-Run choice.
+- `%APPDATA%\Postino\daemon.json`: `tray`, `notify_enabled`, `notify_previews` (default false) and
+  `debounce_secs` (minimum 60), written atomically with `deny_unknown_fields`. Watermarks live in
+  the encrypted store `meta`, so a restart never repeats an old notice. Release builds have no
+  console and write a bounded `%APPDATA%\Postino\daemon.log` when stderr is absent.
 
-It does **not** own the tray, autostart or notifications: those are P10b and are not implemented here.
 The app still runs in-process in P10a1 and refuses to boot when this daemon owns the store; P10a2
-connects it.
+connects it. App settings rows and close-to-tray remain P10b2.
 
 ## Run it
 
@@ -29,8 +39,13 @@ connects it.
 cargo build -p postino-daemon -p postino-cli
 postino daemon start
 postino daemon status
+postino daemon autostart status
+postino daemon autostart on
 postino daemon stop
 ```
+
+`autostart on` stores the exact quoted daemon and store command for this user; `off` removes it and
+`status` reads it back. Settings live in `%APPDATA%\Postino\daemon.json`.
 
 The binary takes `--store <path>`; without it the default is `<data dir>/mail.db`. The store key and
 account credentials come from the OS keyring, never from argv or a file. `--sync-interval`,
@@ -48,6 +63,11 @@ The library half is what the tests use:
   token/address/subject/body.
 - `cargo test -p postino-daemon --test restart_crash` kills a real child daemon at every P7 outbox
   crash state and starts a replacement.
+- `cargo test -p postino-daemon --test tray` exercises tray menu actions, the app launcher recorder
+  and a failing tray through the real daemon; no test opens a notification area.
+- `cargo test -p postino-platform` covers the recorder seams, notification privacy/debounce,
+  autostart quoting and a throwaway `HKCU\Software\Postino\Tests` round trip. The real
+  `Shell_NotifyIcon` probe runs only with `POSTINO_WIN32_UI_TESTS=1` and never in CI.
 - `cargo test -p postino-cli --test daemon_client` drives the real CLI binary and the MCP stdio server
   against the daemon, including `daemon status/start/stop`, the `--in-process` refusal, the 16 MiB
   attachment/dry-run refusals and the absent-daemon mutation policy.

@@ -311,6 +311,16 @@ sha256 = "f0657daa2d48f63178a1d8d4c54bff009e093631a4fa4c4f2e3eb51e0514579b"
 usage = "Desktop window and taskbar icon"
 
 [[asset]]
+path = "assets/app-icon/postino.ico"
+title = "Postino application icon (Windows ICO)"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "72e5aa6216ccb0c87dfb94f76538a0aa89b297402a30cfe864c815a9e2d576ee"
+usage = "Daemon tray icon and Windows executable icon"
+
+[[asset]]
 path = "assets/brand/proposta-logo.svg"
 title = "Postino logo sketch"
 author = "Postino contributors"

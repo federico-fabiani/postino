@@ -27,7 +27,8 @@ state,schedule}.rs`, `crates/ipc/src/platform.rs` (the scoped-unsafe precedent),
 ## Decisions (accepted)
 
 - **Tray owner is the daemon.** `Shell_NotifyIcon` on a daemon-owned HWND and message loop; menu
-  `Apri Postino`, `Sincronizza ora`, `Coda di invio`, `Esci`. `Apri` launches the sibling app with
+  `Apri Postino`, `Sincronizza ora`, `Esci` in P10b1 (`Coda di invio` needs app activation and is
+  P10b2). `Apri` launches the sibling app with
   `--store <store>` and optionally `--open outbox`; no shell and no remote command.
 - **No new dependency.** Use the pinned `windows-sys 0.61.2` with the required features:
   `Win32_UI_Shell`, `Win32_UI_WindowsAndMessaging`, `Win32_Graphics_Gdi`,
@@ -42,7 +43,8 @@ state,schedule}.rs`, `crates/ipc/src/platform.rs` (the scoped-unsafe precedent),
   quiet/sync/offline/failed; no badge noise. `TaskbarCreated` re-adds the icon.
 - **Persistence:** `%APPDATA%\Postino\daemon.json` (atomic replace, `deny_unknown_fields`) with
   `tray`, `notify_enabled`, `notify_previews` (default false), `debounce_secs >= 60`. The new-mail
-  watermark and last failed outbox id live in encrypted `meta`, so restart never repeats a notice.
+  scalar horizon (`daemon.notify.horizon`) and last failed outbox id live in encrypted `meta`, so
+  restart never repeats a notice.
 - **Privacy:** no body/address/subject in logs; notifications are one per debounce window and one per
   message id; failure text is one fixed sentence with the outbox action.
 - **Failure modes:** no Explorer/session 0 → one log line, tray disabled, daemon serves; registry
@@ -64,7 +66,7 @@ state,schedule}.rs`, `crates/ipc/src/platform.rs` (the scoped-unsafe precedent),
 ## Tests and acceptance
 
 - Recorder tests: menu actions, icon state transitions, preview-off payload has no PII, debounce and
-  watermark dedupe, failure notice, autostart on/off/read-back, registry-denied mode, no Explorer.
+  scalar horizon dedupe, failure notice, autostart on/off/read-back, registry-denied mode, no Explorer.
 - One real Win32 probe behind `POSTINO_WIN32_UI_TESTS=1`, never CI; daemon still serves when the tray
   cannot start.
 - `cargo test -p postino-platform -p postino-daemon -p postino-cli` targeted; no full `cargo xtask ci`.

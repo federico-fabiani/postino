@@ -3405,6 +3405,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "directories",
  "env_logger",
  "log",
  "postino-core",
@@ -3477,6 +3478,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "windows-native-keyring-store",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -434,6 +434,21 @@ enum DaemonCommand {
     Start,
     /// Ask the daemon to stop and wait for the writer lock to be released.
     Stop,
+    /// Opt in or out of starting the daemon at login (per user; no service).
+    Autostart {
+        #[command(subcommand)]
+        command: AutostartCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AutostartCommand {
+    /// Show whether this user's autostart value exists and its exact command.
+    Status,
+    /// Write the current daemon and store path to the per-user Run key.
+    On,
+    /// Remove the per-user autostart value.
+    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1020,8 +1035,91 @@ fn run_daemon_command(cli: Cli) -> Result<()> {
             }
             Err(error) => return Err(daemon_error(error)),
         },
+        DaemonCommand::Autostart { command } => run_autostart(&cli, &paths, command)?,
     }
     Ok(())
+}
+
+fn run_autostart(cli: &Cli, paths: &DaemonPaths, command: &AutostartCommand) -> Result<()> {
+    use postino_platform::{Autostart, RegistryAutostart, autostart_command};
+    // `status` and `off` read or delete the registry value only: they must work when the daemon
+    // binary is missing or was started from a relative path. Only `on` needs a launch command.
+    let (command_line, registry_command) = match command {
+        AutostartCommand::On => {
+            let executable = daemon_binary()?;
+            let executable = absolute_path(&executable, "il percorso del daemon")?;
+            let store = absolute_path(&paths.store, "il percorso dell'archivio")?;
+            let line = autostart_command(&executable, &store).map_err(|error| anyhow::anyhow!("Autostart non disponibile: {error}"))?;
+            (Some(line.clone()), line)
+        }
+        AutostartCommand::Status | AutostartCommand::Off => (None, String::new()),
+    };
+    let autostart = match autostart_test_key() {
+        Some(key) => RegistryAutostart::for_key(registry_command, key),
+        None => RegistryAutostart::for_current_user(registry_command),
+    };
+    let status = match command {
+        AutostartCommand::Status => autostart.status(),
+        AutostartCommand::On => autostart.enable(),
+        AutostartCommand::Off => autostart.disable(),
+    }
+    .map_err(|error| anyhow::anyhow!("Autostart non disponibile: {error}"))?;
+    if cli.json {
+        let action = match command {
+            AutostartCommand::Status => "status",
+            AutostartCommand::On => "enabled",
+            AutostartCommand::Off => "disabled",
+        };
+        print_json(&json!({
+            "action": action,
+            "enabled": status.enabled,
+            "command": status.command,
+            "store": paths.store,
+            "scope": "current_user",
+        }))?;
+        return Ok(());
+    }
+    match command {
+        AutostartCommand::Status if status.enabled => {
+            let stored = status.command.unwrap_or_default();
+            say(format!("Autostart attivo per questo utente: {stored}"))?;
+        }
+        AutostartCommand::Status => {
+            say("Autostart non attivo. Attivalo con `postino daemon autostart on` (solo questo utente, nessun servizio).")?;
+        }
+        AutostartCommand::On => {
+            if let Some(command_line) = command_line {
+                say(format!("Autostart attivo per questo utente: {command_line}"))?;
+            }
+            say("Il daemon partirà al prossimo accesso. Disattivalo con `postino daemon autostart off`.")?;
+        }
+        AutostartCommand::Off => {
+            say("Autostart disattivato. Il daemon non partirà più all'accesso.")?;
+        }
+    }
+    Ok(())
+}
+
+/// A path written to the Run key must survive a different working directory: absolutize without
+/// requiring the file to exist (a fresh install may not have started the daemon yet).
+fn absolute_path(path: &std::path::Path, what: &str) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path).with_context(|| format!("{what} non è un percorso valido: {}", path.display()))?;
+    if !absolute.is_absolute() {
+        bail!("Autostart non disponibile: {what} non è assoluto");
+    }
+    Ok(absolute)
+}
+
+/// Debug builds let the CLI integration tests redirect the Run key to a throwaway HKCU key. Release
+/// builds always use the real per-user value.
+#[cfg(debug_assertions)]
+fn autostart_test_key() -> Option<String> {
+    std::env::var("POSTINO_AUTOSTART_KEY").ok().filter(|key| !key.is_empty())
+}
+
+#[cfg(not(debug_assertions))]
+fn autostart_test_key() -> Option<String> {
+    None
 }
 
 fn run_mcp_command(cli: &Cli, allow_send: bool) -> Result<()> {
@@ -1289,7 +1387,11 @@ fn command_reads_only(command: &Command) -> bool {
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
         // operation is refused before dispatch and must not create one either.
         Command::Run { op, .. } => postino_core::op_defs().iter().find(|def| def.name == op).is_none_or(|def| def.read_only || def.sensitive),
-        Command::Daemon { command } => matches!(command, DaemonCommand::Status),
+        Command::Daemon { command } => match command {
+            DaemonCommand::Status => true,
+            DaemonCommand::Autostart { command } => matches!(command, AutostartCommand::Status),
+            DaemonCommand::Start | DaemonCommand::Stop => false,
+        },
         Command::Mcp { .. } => false,
         Command::Flag { .. } | Command::Draft { .. } | Command::Send { .. } | Command::SearchReindex => false,
     }

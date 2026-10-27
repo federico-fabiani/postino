@@ -30,6 +30,8 @@ pub struct DaemonStatus {
     pub last_error: Option<String>,
     pub recovery: Option<String>,
     pub scheduler_wakes: u64,
+    /// Explicit manual-sync requests the scheduler consumed (tray "Sincronizza ora").
+    pub manual_syncs: u64,
 }
 
 impl Dispatcher for DaemonState {
@@ -240,6 +242,7 @@ impl DaemonState {
             last_error,
             recovery,
             scheduler_wakes,
+            manual_syncs: self.manual_syncs(),
         };
         let mut value = serde_json::to_value(status).map_err(internal)?;
         if let Some(object) = value.as_object_mut() {

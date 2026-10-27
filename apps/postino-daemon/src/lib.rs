@@ -10,7 +10,9 @@
 
 pub mod dispatch;
 pub mod schedule;
+pub mod settings;
 pub mod state;
+pub mod tray_host;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,11 +21,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use postino_core::{CredentialVault, Engine};
 use postino_ipc::{DaemonPaths, Endpoint, IpcError, SharedToken, TokenFile};
 use postino_net::CertificateDer;
+use postino_platform::{Notifier, Tray};
 use postino_store::{Store, StoreError, StoreKey, WriterLock};
 use thiserror::Error;
 
 pub use dispatch::DaemonStatus;
+pub use settings::DaemonSettings;
 pub use state::DaemonState;
+pub use tray_host::{AppLauncher, ProcessLauncher};
 
 /// Why the daemon could not start or why a scheduler step failed.
 #[derive(Debug, Error)]
@@ -76,6 +81,14 @@ pub struct DaemonConfig {
     pub max_connections: usize,
     pub started_at: i64,
     pub daemon_version: String,
+    /// Daemon-owned preferences from `daemon.json`; P10b2 adds the editor.
+    pub settings: DaemonSettings,
+    /// A tray seam. Production injects the Windows tray; tests inject a recorder or nothing.
+    pub tray: Option<Arc<dyn Tray>>,
+    /// An explicit notifier seam. When absent, a started tray may provide its own.
+    pub notifier: Option<Arc<dyn Notifier>>,
+    /// How "Apri Postino" launches the app; tests record the store path instead of spawning.
+    pub app_launcher: Arc<dyn AppLauncher>,
 }
 
 impl DaemonConfig {
@@ -101,6 +114,10 @@ impl DaemonConfig {
             max_connections: 32,
             started_at: now_ms(),
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            settings: DaemonSettings::default(),
+            tray: None,
+            notifier: None,
+            app_launcher: Arc::new(ProcessLauncher),
         }
     }
 
@@ -122,6 +139,7 @@ pub struct Daemon {
     store_root: String,
     shutdown: postino_ipc::CancellationToken,
     active_requests: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    tray: Option<Arc<dyn Tray>>,
     thread: Option<std::thread::JoinHandle<Result<(), DaemonError>>>,
 }
 
@@ -147,6 +165,7 @@ impl Daemon {
         let store_root = paths.store.parent().map(|parent| parent.display().to_string()).unwrap_or_default();
         let state = Arc::new(DaemonState::new(engine, Arc::new(postino_ipc::EventHub::new()), config, paths.clone(), token, store_root.clone()));
         let shutdown = state.shutdown();
+        let tray = state.tray.clone();
         let server_config = state.server_config()?;
         let dispatcher: Arc<dyn postino_ipc::Dispatcher> = state.clone();
         let server = postino_ipc::Server::new(server_config, dispatcher, state.hub());
@@ -164,12 +183,24 @@ impl Daemon {
                     }
                 };
                 let result = runtime.block_on(async move {
+                    let tray_running = crate::tray_host::start(&thread_state);
+                    if !tray_running {
+                        log::info!("daemon tray is disabled or unavailable; serving headless");
+                    }
+                    let tray_task = tray_running.then(|| tokio::spawn(crate::tray_host::run(Arc::clone(&thread_state))));
                     let bound = match server.bind().await {
                         Ok(bound) => {
                             let _ = ready_tx.send(Ok(()));
                             bound
                         }
                         Err(error) => {
+                            if let Some(task) = tray_task {
+                                task.abort();
+                                let _ = task.await;
+                            }
+                            if let Some(tray) = &thread_state.tray {
+                                tray.stop();
+                            }
                             let _ = ready_tx.send(Err(DaemonError::Ipc(error)));
                             return Ok(());
                         }
@@ -179,6 +210,10 @@ impl Daemon {
                     thread_shutdown.cancel();
                     scheduler.abort();
                     let _ = scheduler.await;
+                    if let Some(task) = tray_task {
+                        task.abort();
+                        let _ = task.await;
+                    }
                     result.map_err(DaemonError::Ipc)
                 });
                 // Give an in-flight blocking operation a bounded grace period; a cancelled sync
@@ -195,6 +230,7 @@ impl Daemon {
                 store_root,
                 shutdown,
                 active_requests: state.active_requests(),
+                tray,
                 thread: Some(thread),
             }),
             Ok(Err(error)) => {
@@ -249,10 +285,14 @@ impl Daemon {
             }
         }
         self.shutdown.cancel();
-        match self.thread.take() {
+        let joined = match self.thread.take() {
             Some(thread) => thread.join().map_err(|_| DaemonError::Runtime("the daemon thread panicked".to_owned()))?,
             None => Ok(()),
+        };
+        if let Some(tray) = &self.tray {
+            tray.stop();
         }
+        joined
     }
 }
 

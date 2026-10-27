@@ -41,8 +41,13 @@ pub async fn run(state: Arc<DaemonState>) {
         }
         let wake = deadline.max(Instant::now());
         let mut outbox_notified = false;
+        let mut sync_requested = false;
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
+            _ = state.sync_notify.notified() => {
+                sync_requested = true;
+                state.count_manual_sync();
+            }
             _ = state.outbox_notify.notified() => {
                 outbox_notified = true;
             }
@@ -53,7 +58,7 @@ pub async fn run(state: Arc<DaemonState>) {
         if outbox_notified || now >= outbox_wake {
             outbox_wake = run_outbox(&state).await;
         }
-        if now >= next_sync {
+        if sync_requested || now >= next_sync {
             run_sync(&state).await;
             next_sync = Instant::now() + state.config.sync_interval + jitter(&state);
         }
@@ -116,6 +121,8 @@ async fn recover(state: &DaemonState) {
         log::info!("{sentence}");
         state.note_recovery(sentence);
     }
+    // An outbox failure that happened before the restart still owns the tray icon and one notice.
+    crate::tray_host::after_outbox(state).await;
 }
 
 async fn run_outbox(state: &DaemonState) -> Instant {
@@ -141,6 +148,7 @@ async fn run_outbox(state: &DaemonState) -> Instant {
     match report {
         Ok(report) => {
             publish_outbox(state, &report);
+            crate::tray_host::after_outbox(state).await;
             if report.has_due_work() { Instant::now() + OUTBOX_DRAIN } else { instant_for(next) }
         }
         Err(error) => {
@@ -257,10 +265,13 @@ async fn run_sync(state: &DaemonState) {
                     status.last_sync_at = Some(crate::now_ms());
                     status.gc_due = true;
                 }
+                state.set_network_error(false);
+                crate::tray_host::after_sync(state).await;
             }
             Err(error) => {
                 let sentence = error_category(&error);
                 state.note_error(format!("sync failed: {sentence}"));
+                state.set_network_error(true);
                 log::warn!("daemon scheduled sync failed: {sentence}");
                 state.publish("sync", json!({ "phase": "failed", "account": account, "error": sentence }));
             }

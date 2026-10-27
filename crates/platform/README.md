@@ -59,6 +59,29 @@ not read back is refused and that no error contains the bytes.
 The native Windows path is not part of the default suite. Before a release, run a manual smoke test
 with a throwaway scope and delete the credential afterwards.
 
+## Tray, autostart and notifications
+
+P10b1 adds three more seams behind the same rule: no crate outside this one calls the OS.
+
+- [`tray::Tray`] owns a daemon tray icon and a bounded channel of `TrayAction`s (`Open`, `SyncNow`,
+  `Quit`). `TrayState` is quiet, syncing, offline or failed; there is no badge count. `RecorderTray`
+  is the headless implementation. `Win32Tray` lives in the one `#[allow(unsafe_code)]` module and
+  uses a hidden window plus `Shell_NotifyIconW`; a missing Explorer is a normal `Unavailable` error.
+- [`autostart::Autostart`] reads, enables and disables the per-user Run value
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Postino` with the exact quoted command from
+  `autostart_command`. `RecorderAutostart` is the headless implementation. No service and no
+  elevation; ADR-0006 records why this replaces Task Scheduler. Tests only write
+  `HKCU\Software\Postino\Tests\<pid>-<counter>`.
+- [`notify::Notifier`] shows one bounded `Notice` (title <= 63 chars, body <= 255, newlines and
+  control characters stripped). `RecorderNotifier` records it. Previews are off by default, so the
+  daemon sends a fixed sentence with no sender, subject or body; the daemon owns debounce and the
+  scalar new-mail horizon, not this crate.
+- [`atomic_replace`] writes a sibling file and replaces the target (`MoveFileExW` with write-through
+  on Windows); the daemon uses it for `daemon.json`.
+
+The real Win32 tray probe is opt-in with `POSTINO_WIN32_UI_TESTS=1`; the default suite only parses the
+bundled ICO and records actions.
+
 ## Why the app does not call the keyring itself
 
 One owner of the policy: which service name, which scope, what happens on failure and how the secret

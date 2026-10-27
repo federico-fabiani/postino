@@ -103,7 +103,8 @@ One process owns the store and the network: `postino-daemon`. The app, CLI and M
 clients. This avoids two writers, two sync loops and a draft race between the GUI and an agent.
 The daemon:
 
-- starts at login (Task Scheduler, LaunchAgent, `systemd --user`) and lives in the tray;
+- starts at login when the user opts in (per-user registry `Run` value on Windows, LaunchAgent,
+  `systemd --user`) and lives in the tray;
 - holds the SQLite connection in WAL mode and the IMAP/SMTP connections;
 - runs the outbox scheduler and local rules;
 - listens on a named pipe (Windows) or Unix domain socket, accepts the same user only, and
@@ -187,7 +188,7 @@ it also replaces an oversized response (for example a dry-run of a large draft) 
 | `postino-rules` | Sieve generation later; P9c's local rules deliberately live in `postino-store` and `postino-core`, not in a new crate |
 | `postino-ipc` | JSON-RPC over pipe/socket, token, versioning |
 | `postino-daemon` | the one writer: store ownership, scheduler, outbox, rules-after-sync, index batches, blob GC, IPC server (P10a) |
-| `postino-platform` | keyring (P3b); paths, notifications, tray, autostart, single instance later |
+| `postino-platform` | keyring (P3b); tray, desktop notifications and per-user autostart (P10b1); paths, single instance later |
 | `postino-testkit` | fake IMAP/SMTP, TLS fixture, response builders and synthetic messages (P5b; dev-dependency only) |
 
 Layers: foundation (platform, store, mime, crypto) → network (net) and sync → features (compose,
@@ -1637,3 +1638,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-27 | major | P9c: local rules on the v7 tables (no migration), validated query + 1–5 actions, priority/stop, received-only new-vs-all runs with `ingested_at`/`rules_applied_at`, 2 000-candidate and 50-forward caps, idempotent actions, journal with ids/booleans only and 20-run retention, state-checked undo, standalone rule forward through the P7 outbox with `Auto-Submitted`/`X-Postino-Rule` loop guard in encrypted meta, eight operations, CLI/MCP/UI parity and 980 rules screenshots |
 | 2026-10-27 | minor | P9c closure: MCP `--allow-send` now also gates sync-triggered forwards and enabling a stored forward rule; the rules page joins the modal guard; `all` keeps a per-rule cursor; `new` marks only completed actions; the 50-forward budget counts only new deduped rows and defers the rest; a durable forward marker survives outbox pruning; `messages.origin` and Unicode `name_key` extend v7 in place; checked store actions re-read origin/folder; `rules_update` is revision-checked; guard keys are account-scoped and bulk-cleaned; candidate indexes and 20k/100k evidence; starred-aware undo, bounded errors, preview horizon/SMTP effects, all 20 runs in the UI and `rules_undo` marked destructive |
 | 2026-10-27 | major | P10a1: `postino-ipc` (per-user named pipe/DACL or 0600 UDS, per-launch owner-only token, 16 MiB JSON-RPC frames, bounded queues, cancel, heartbeat), `postino-daemon` (independent `<store>.lock`/owner record, outbox recovery at every P7 state, sync/rules/index batches/GC scheduler, `daemon_status`), single-writer refusal for direct CLI/app writers, CLI and MCP daemon clients, absent-daemon fallback matrix; tray/autostart/notifications remain P10b and the app client is P10a2 |
+| 2026-10-27 | major | P10b1: platform `Tray`/`Autostart`/`Notifier` seams with recorders and one scoped Win32 module (`Shell_NotifyIcon`, hidden daemon window, ICO asset), daemon-owned tray/menu state, per-user HKCU Run autostart and `postino daemon autostart status|on|off`, privacy-preserving debounced notices with one encrypted scalar horizon, atomic `%APPDATA%\Postino\daemon.json`, release GUI subsystem and bounded log; ADR-0006 records the Run-key deviation from Task Scheduler; app settings/close-to-tray remain P10b2 |

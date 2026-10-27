@@ -4,14 +4,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use postino_core::{Engine, OpDef};
 use postino_ipc::{CancellationToken, DaemonPaths, EventHub, ServerConfig, SharedToken};
+use postino_platform::{Notifier, Tray, TrayAction, TrayError};
 use postino_store::{Store, StoreKey};
 use tokio::sync::Notify;
 
+use crate::settings::DaemonSettings;
+use crate::tray_host::{AppLauncher, NoticePolicy};
 use crate::{DaemonConfig, DaemonError};
 
 /// Scheduler and request facts a status call can read without touching the engine.
@@ -27,6 +30,10 @@ pub(crate) struct LiveStatus {
     pub gc_due: bool,
     pub index_error: bool,
     pub last_index: Option<postino_store::SearchIndexStatus>,
+    /// The last sync failed for a network/session reason; the tray shows offline, not a badge.
+    pub network_error: bool,
+    /// At least one outbox row is failed or uncertain.
+    pub outbox_failed: bool,
 }
 
 #[derive(Clone)]
@@ -49,15 +56,45 @@ pub struct DaemonState {
     pub(crate) wake_count: Arc<AtomicU64>,
     pub(crate) index_dirty: Arc<AtomicBool>,
     pub(crate) account_count: usize,
+    /// Daemon-owned tray, if the platform seam was injected (tests use a recorder or none).
+    pub(crate) tray: Option<Arc<dyn Tray>>,
+    notifier: OnceLock<Option<Arc<dyn Notifier>>>,
+    pub(crate) notices: Arc<Mutex<NoticePolicy>>,
+    pub(crate) launcher: Arc<dyn AppLauncher>,
+    pub(crate) sync_notify: Arc<Notify>,
+    manual_syncs: Arc<AtomicU64>,
+    settings: Arc<Mutex<DaemonSettings>>,
+    tray_error_logged: Arc<AtomicBool>,
 }
 
 impl DaemonState {
-    pub(crate) fn new(engine: Engine, hub: Arc<EventHub>, config: DaemonConfig, paths: DaemonPaths, token: SharedToken, store_root: String) -> Self {
+    pub(crate) fn new(
+        mut engine: Engine,
+        hub: Arc<EventHub>,
+        config: DaemonConfig,
+        paths: DaemonPaths,
+        token: SharedToken,
+        store_root: String,
+    ) -> Self {
         let started_at = config.started_at;
         let account_count = engine.accounts().len();
+        let notices = Arc::new(Mutex::new(NoticePolicy::initialize(&mut engine)));
+        let notifier = OnceLock::new();
+        if config.notifier.is_some() {
+            let _ = notifier.set(config.notifier.clone());
+        }
+        let settings = config.settings.clone();
         Self {
             engine: Arc::new(Mutex::new(engine)),
             hub,
+            tray: config.tray.clone(),
+            notifier,
+            notices,
+            launcher: Arc::clone(&config.app_launcher),
+            sync_notify: Arc::new(Notify::new()),
+            manual_syncs: Arc::new(AtomicU64::new(0)),
+            settings: Arc::new(Mutex::new(settings)),
+            tray_error_logged: Arc::new(AtomicBool::new(false)),
             config,
             paths,
             token,
@@ -72,6 +109,51 @@ impl DaemonState {
             index_dirty: Arc::new(AtomicBool::new(true)),
             account_count,
         }
+    }
+
+    pub(crate) fn settings(&self) -> DaemonSettings {
+        self.settings.lock().map(|settings| settings.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn tray_action(&self) -> Option<TrayAction> {
+        self.tray.as_ref().and_then(|tray| tray.next_action())
+    }
+
+    pub(crate) fn install_notifier(&self, notifier: Option<Arc<dyn Notifier>>) {
+        if let Some(notifier) = notifier {
+            let _ = self.notifier.set(Some(notifier));
+        }
+    }
+
+    pub(crate) fn notifier(&self) -> Option<Arc<dyn Notifier>> {
+        self.notifier.get().and_then(|notifier| notifier.clone())
+    }
+
+    pub(crate) fn live_flags(&self) -> (bool, bool, bool) {
+        self.status.lock().map(|status| (status.sync_active, status.network_error, status.outbox_failed)).unwrap_or((false, false, false))
+    }
+
+    pub(crate) fn set_network_error(&self, error: bool) {
+        if let Ok(mut status) = self.status.lock() {
+            status.network_error = error;
+        }
+        crate::tray_host::refresh(self);
+    }
+
+    pub(crate) fn set_outbox_failed(&self, failed: bool) {
+        if let Ok(mut status) = self.status.lock() {
+            status.outbox_failed = failed;
+        }
+    }
+
+    pub(crate) fn note_tray_error(&self, error: TrayError) {
+        if !self.tray_error_logged.swap(true, Ordering::Relaxed) {
+            log::warn!("tray state could not be updated; the daemon keeps serving: {error}");
+        }
+    }
+
+    pub(crate) fn request_sync(&self) {
+        self.sync_notify.notify_one();
     }
 
     pub fn server_config(&self) -> Result<ServerConfig, DaemonError> {
@@ -142,6 +224,16 @@ impl DaemonState {
         }
     }
 
+    /// The scheduler consumed an explicit manual-sync request (tray "Sincronizza ora"). Distinct
+    /// from a timer wake: a test can prove the tray action reached the scheduler.
+    pub fn count_manual_sync(&self) {
+        self.manual_syncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn manual_syncs(&self) -> u64 {
+        self.manual_syncs.load(Ordering::Relaxed)
+    }
+
     /// Register a cancellable operation. The returned flag must be passed to the engine and removed
     /// with [`DaemonState::finish_request`] even when the operation fails.
     pub fn begin_request(&self, request_id: &str) -> Arc<AtomicBool> {
@@ -204,6 +296,7 @@ impl DaemonState {
                 (true, None) => {}
             }
         }
+        crate::tray_host::refresh(self);
     }
 
     /// Poll the persisted sync status on its own read-only connection while a sync runs. The engine

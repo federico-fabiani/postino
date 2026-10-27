@@ -656,6 +656,32 @@ impl Engine {
     pub fn gc_blobs(&self, limit: usize) -> Result<postino_store::BlobGcReport, OpError> {
         self.require_store("blob_gc")?.gc_unreferenced_blobs(limit).map_err(store_map::write_error)
     }
+
+    /// Read one internal `meta` value. Used by the daemon for notification watermarks; the demo
+    /// engine has no store and answers `None`. Keys and values are app-owned, never user input.
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, OpError> {
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(OpError::InvalidArgs("an internal meta key must be 1-128 characters".to_owned()));
+        }
+        match &self.store {
+            Some(store) => store.get_meta(key).map_err(store_map::read_error),
+            None => Ok(None),
+        }
+    }
+
+    /// Write one internal `meta` value. Bounded so a watermark list cannot grow without limit.
+    pub fn meta_set(&mut self, key: &str, value: &str) -> Result<(), OpError> {
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(OpError::InvalidArgs("an internal meta key must be 1-128 characters".to_owned()));
+        }
+        if value.chars().count() > 16 * 1024 {
+            return Err(OpError::InvalidArgs("an internal meta value is too long".to_owned()));
+        }
+        match &self.store {
+            Some(store) => store.set_meta(key, value).map_err(store_map::write_error),
+            None => Ok(()),
+        }
+    }
     /// True for the synthetic demo mailbox. Data written by a store-backed engine is real local
     /// data even while no server is connected.
     pub fn is_demo(&self) -> bool {

@@ -44,6 +44,37 @@
 //!
 //! Tests install `keyring_core::mock`, build a [`Keyring::at`] with a temporary lock path and never
 //! touch the real vault or `%LOCALAPPDATA%\Postino`.
+//!
+//! The same rule applies to the OS surfaces added in P10b1: [`tray`], [`autostart`] and [`notify`]
+//! are seams with recorder implementations. Headless tests never need Explorer, the notification
+//! area or the real Run key; the Windows adapter lives only in `src/win32.rs`.
+
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+pub mod autostart;
+pub mod notify;
+pub mod tray;
+#[cfg(windows)]
+mod win32;
+
+pub use autostart::{Autostart, AutostartError, AutostartStatus, RecorderAutostart, RegistryAutostart, autostart_command};
+pub use notify::{MAX_NOTICE_BODY_CHARS, MAX_NOTICE_TITLE_CHARS, Notice, Notifier, NotifyError, RecorderNotifier};
+pub use tray::{RecorderTray, Tray, TrayAction, TrayError, TrayLaunch, TrayState};
+#[cfg(windows)]
+pub use win32::Win32Tray;
+
+/// Replace `destination` with `source` in one step. On Windows this is `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING`; elsewhere it is `rename`. Both files must be on the same volume.
+pub fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        win32::replace_file(source, destination)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(source, destination)
+    }
+}
 
 use std::fmt;
 use std::fs::{File, OpenOptions};

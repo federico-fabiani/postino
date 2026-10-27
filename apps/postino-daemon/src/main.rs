@@ -1,6 +1,13 @@
 //! Production shell for the daemon. It reads the store key and account credentials from the OS
 //! keyring, then hands the store to [`postino_daemon::Daemon`]. It opens no TCP port and never
 //! prints a key, a token or a message body.
+//!
+//! The release binary uses the Windows GUI subsystem: started from the Run key it must not flash a
+//! console. When stderr is absent, logging goes to a bounded `%APPDATA%\Postino\daemon.log`.
+
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod logging;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use postino_core::{CredentialVault, Engine, VaultError};
-use postino_daemon::{Daemon, DaemonConfig};
+use postino_daemon::{Daemon, DaemonConfig, DaemonSettings};
 use postino_platform::{Keyring, STORE_SCOPE, account_scope, account_smtp_scope};
 use postino_store::StoreKey;
 use zeroize::Zeroizing;
@@ -37,7 +44,16 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).target(env_logger::Target::Stderr).init();
+    logging::init();
+    let result = run();
+    if let Err(error) = &result {
+        // The release binary has no console: keep the fatal reason in the bounded log file.
+        log::error!("postino-daemon exited: {error}");
+    }
+    result
+}
+
+fn run() -> Result<()> {
     let args = Args::parse();
     let store = match args.store {
         Some(path) => path,
@@ -54,6 +70,11 @@ fn main() -> Result<()> {
     config.sync_interval = std::time::Duration::from_secs(args.sync_interval.max(5));
     config.sync_on_start = !args.no_sync_on_start;
     config.gc_interval = std::time::Duration::from_secs(args.gc_interval.max(5));
+    config.settings = DaemonSettings::default_path().map(|path| DaemonSettings::load(&path)).unwrap_or_default();
+    #[cfg(windows)]
+    {
+        config.tray = Some(Arc::new(postino_platform::Win32Tray::new()));
+    }
     if let Some(endpoint) = args.endpoint {
         config.endpoint = Some(parse_endpoint(&endpoint)?);
     }

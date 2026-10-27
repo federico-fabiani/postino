@@ -16,9 +16,16 @@ zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store.workspace = true
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+# One minimal Win32 adapter is allowed: the tray, balloon notices and registry Run key in
+# `src/win32.rs`. Everything else in this crate is safe. `#![allow(unsafe_code)]` is scoped there.
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
