@@ -28,9 +28,10 @@ use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
     LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction,
-    OutboxListResult, OutboxRunReport, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
-    RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult,
-    SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
+    OutboxListResult, OutboxRunReport, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult,
+    RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult,
+    SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult,
+    ThreadsListResult, VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -397,6 +398,50 @@ enum AccountCommand {
     },
 }
 
+/// Manage stored OpenPGP keys. The key material stays in the encrypted store; import reads it from a
+/// file or stdin, never from argv.
+#[derive(Debug, Subcommand)]
+enum PgpCommand {
+    /// List, import, delete or export stored PGP keys.
+    Keys {
+        #[command(subcommand)]
+        command: PgpKeysCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PgpKeysCommand {
+    /// List key metadata; never key material.
+    List {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Import one armored public or private key. A private key must be passphrase-protected.
+    Import {
+        #[arg(long)]
+        account: Option<String>,
+        /// Read the armored key from this file instead of stdin.
+        #[arg(long, value_name = "PATH")]
+        armor_file: Option<PathBuf>,
+        /// Read the passphrase from one stdin line; requires --armor-file. There is deliberately no
+        /// --passphrase argument: a passphrase must not appear in argv or shell history.
+        #[arg(long, requires = "armor_file")]
+        passphrase_stdin: bool,
+    },
+    /// Delete one stored key by id, including its secret material.
+    Delete {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Print the armored public certificate of one key.
+    ExportPublic {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum SyncCommand {
     /// Run one sync for an account (or the only account).
@@ -507,6 +552,11 @@ enum Command {
     Account {
         #[command(subcommand)]
         command: AccountCommand,
+    },
+    /// List, import, delete or export stored OpenPGP keys.
+    Pgp {
+        #[command(subcommand)]
+        command: PgpCommand,
     },
     /// Run a sync or read its status.
     Sync {
@@ -1487,6 +1537,9 @@ fn command_reads_only(command: &Command) -> bool {
     match command {
         Command::Info | Command::Tools | Command::Schema { .. } | Command::Accounts => true,
         Command::Account { command } => matches!(command, AccountCommand::List | AccountCommand::Test { .. }),
+        Command::Pgp { command } => match command {
+            PgpCommand::Keys { command } => matches!(command, PgpKeysCommand::List { .. } | PgpKeysCommand::ExportPublic { .. }),
+        },
         Command::Sync { command } => matches!(command, SyncCommand::Status { .. }),
         Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } | Command::SearchStatus => true,
         Command::Read { mark_read, .. } => !mark_read,
@@ -1837,6 +1890,71 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     say(format_account_remove(&removed))?;
                 }
             }
+        },
+        Command::Pgp { command } => match command {
+            PgpCommand::Keys { command } => match command {
+                PgpKeysCommand::List { account } => {
+                    let keys: Vec<PgpKey> = decode(call(engine, "pgp_keys_list", json!({ "account": account }))?)?;
+                    if json_output {
+                        print_json(&keys)?;
+                    } else {
+                        say(format_pgp_keys(&keys))?;
+                    }
+                }
+                PgpKeysCommand::Import { account, armor_file, passphrase_stdin } => {
+                    let armored = match armor_file {
+                        Some(path) => read_pgp_armor_file(&path)?,
+                        None => read_pgp_armor_stdin(input)?,
+                    };
+                    let passphrase = if postino_core::pgp::is_private_armor(&armored) {
+                        if passphrase_stdin {
+                            read_password_stdin(input)?
+                        } else if interactive {
+                            let passphrase = rpassword::prompt_password("Passphrase della chiave PGP: ")
+                                .context("lettura della passphrase della chiave PGP dal terminale")?;
+                            if passphrase.is_empty() {
+                                return Err(usage("the passphrase of a private key must not be empty"));
+                            }
+                            Zeroizing::new(passphrase)
+                        } else {
+                            return Err(usage(
+                                "a private key needs --armor-file and --passphrase-stdin when stdin is not a terminal; the passphrase is never accepted in argv",
+                            ));
+                        }
+                    } else {
+                        if passphrase_stdin {
+                            return Err(usage("a public key needs no passphrase; drop --passphrase-stdin"));
+                        }
+                        Zeroizing::new(String::new())
+                    };
+                    let imported: PgpKey = decode(call(
+                        engine,
+                        "pgp_key_import",
+                        json!({ "account": account, "armored_key": armored.as_str(), "passphrase": passphrase.as_str() }),
+                    )?)?;
+                    if json_output {
+                        print_json(&imported)?;
+                    } else {
+                        say(format_pgp_key_imported(&imported))?;
+                    }
+                }
+                PgpKeysCommand::Delete { id, account } => {
+                    let deleted: PgpKey = decode(call(engine, "pgp_key_delete", json!({ "id": id, "account": account }))?)?;
+                    if json_output {
+                        print_json(&deleted)?;
+                    } else {
+                        say(format_pgp_key_deleted(&deleted))?;
+                    }
+                }
+                PgpKeysCommand::ExportPublic { id, account } => {
+                    let exported: PgpPublicKey = decode(call(engine, "pgp_key_export_public", json!({ "id": id, "account": account }))?)?;
+                    if json_output {
+                        print_json(&exported)?;
+                    } else {
+                        say(exported.public_armor.trim_end())?;
+                    }
+                }
+            },
         },
         Command::Sync { command } => match command {
             SyncCommand::Run { account } => {
@@ -2651,6 +2769,65 @@ struct CliAttachment {
     base64: String,
 }
 
+/// Read an armored PGP key from a file with the core import bound. The armored key is secret material
+/// for a private key, so the returned buffer zeroises on drop.
+fn read_pgp_armor_file(path: &Path) -> Result<Zeroizing<String>> {
+    let metadata = std::fs::metadata(path).with_context(|| format!("lettura del file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} non è un file", path.display());
+    }
+    let limit = postino_core::pgp::MAX_PGP_KEY_BYTES.saturating_add(1) as u64;
+    if metadata.len() > limit.saturating_sub(1) {
+        bail!("la chiave supera {} byte", postino_core::pgp::MAX_PGP_KEY_BYTES);
+    }
+    let mut raw = Zeroizing::new(String::new());
+    std::fs::File::open(path)
+        .with_context(|| format!("apertura del file {}", path.display()))?
+        .take(limit)
+        .read_to_string(&mut raw)
+        .with_context(|| format!("lettura del file {}", path.display()))?;
+    if raw.len() > postino_core::pgp::MAX_PGP_KEY_BYTES {
+        bail!("la chiave supera {} byte", postino_core::pgp::MAX_PGP_KEY_BYTES);
+    }
+    Ok(raw)
+}
+
+/// Read an armored PGP key from stdin until EOF, bounded before it reaches the operation.
+fn read_pgp_armor_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<Zeroizing<String>> {
+    let mut raw = Zeroizing::new(String::new());
+    let limit = postino_core::pgp::MAX_PGP_KEY_BYTES.saturating_add(1) as u64;
+    reader.take(limit).read_to_string(&mut raw).context("lettura della chiave PGP da stdin")?;
+    if raw.len() > postino_core::pgp::MAX_PGP_KEY_BYTES {
+        bail!("la chiave supera {} byte", postino_core::pgp::MAX_PGP_KEY_BYTES);
+    }
+    Ok(raw)
+}
+
+fn format_pgp_keys(keys: &[PgpKey]) -> String {
+    if keys.is_empty() {
+        return "Nessuna chiave PGP.".to_owned();
+    }
+    let mut out = String::new();
+    for key in keys {
+        out.push_str(&format!(
+            "{}  {}  {}  {}\n",
+            key.id,
+            key.fingerprint,
+            key.user_id.as_deref().unwrap_or("-"),
+            if key.has_secret { if key.protected { "privata protetta" } else { "privata" } } else { "pubblica" }
+        ));
+    }
+    out
+}
+
+fn format_pgp_key_imported(key: &PgpKey) -> String {
+    format!("Chiave {} ({}) importata come {}.", key.fingerprint, key.user_id.as_deref().unwrap_or("nessun user id"), key.id)
+}
+
+fn format_pgp_key_deleted(key: &PgpKey) -> String {
+    format!("Chiave {} ({}) eliminata.", key.fingerprint, key.id)
+}
+
 /// Read one attachment from a local path with the P8 per-file bound. The path never reaches an
 /// operation, a log line or an MCP client: only the sanitized filename and the bytes do.
 fn read_cli_attachment(path: &Path) -> Result<CliAttachment> {
@@ -2695,8 +2872,13 @@ fn read_signature_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<String> 
 }
 
 fn read_password_stdin(reader: &mut (impl BufRead + ?Sized)) -> Result<Zeroizing<String>> {
+    /// Bound the read before allocating, so an endless stdin cannot exhaust memory.
+    const MAX_SECRET_BYTES: usize = 4096;
     let mut line = Zeroizing::new(String::new());
-    reader.read_line(&mut line).context("reading the password from stdin")?;
+    std::io::Read::take(&mut *reader, MAX_SECRET_BYTES as u64 + 1).read_line(&mut line).context("reading the password from stdin")?;
+    if line.len() > MAX_SECRET_BYTES {
+        return Err(usage("the password read from stdin is too long"));
+    }
     let password = line.trim_end_matches(['\r', '\n']).to_owned();
     if password.is_empty() {
         return Err(usage("the password read from stdin is empty"));
@@ -3984,6 +4166,8 @@ mod tests {
         assert_eq!(read.as_str(), "app password");
         assert!(read_password_stdin(&mut std::io::Cursor::new(Vec::new())).is_err());
         assert!(read_password_stdin(&mut std::io::Cursor::new(b"\r\n".to_vec())).is_err());
+        let mut oversized = std::io::Cursor::new(vec![b'p'; 4097]);
+        assert!(read_password_stdin(&mut oversized).is_err(), "an oversized line must be refused");
     }
 
     #[test]
@@ -4630,5 +4814,68 @@ mod tests {
         for forbidden in [subject, address, query, "corpo riservato"] {
             assert!(!logged.contains(forbidden), "a log line contained private mail content: {logged}");
         }
+    }
+
+    const PGP_PRIVATE: &str = include_str!("../../../testdata/pgp/secret-passphrase.asc");
+    const PGP_PRIVATE_PASSPHRASE: &str = "postino-test-passphrase";
+    const PGP_FINGERPRINT: &str = "D529DDA09F683768022096EBA6079AAB69465D6D";
+
+    fn pgp_cli(command: PgpKeysCommand) -> Cli {
+        Cli { demo: false, store: None, json: true, in_process: true, command: Command::Pgp { command: PgpCommand::Keys { command } } }
+    }
+
+    #[test]
+    fn cli_pgp_keys_import_list_export_and_delete_round_trip() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        let vault = crate::test_support::MemoryVault::new();
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+
+        let dir = tempfile::tempdir().expect("key dir");
+        let key_path = dir.path().join("key.asc");
+        std::fs::write(&key_path, PGP_PRIVATE).expect("key file");
+        let mut input = std::io::Cursor::new(format!("{PGP_PRIVATE_PASSPHRASE}\n").into_bytes());
+        run_with_input(
+            pgp_cli(PgpKeysCommand::Import { account: None, armor_file: Some(key_path), passphrase_stdin: true }),
+            &mut engine,
+            &mut input,
+            false,
+        )
+        .expect("import");
+
+        let listed = call(&mut engine, "pgp_keys_list", json!({})).expect("list");
+        let keys = listed.as_array().expect("keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["fingerprint"], PGP_FINGERPRINT);
+        assert_eq!(keys[0]["has_secret"], json!(true));
+        assert_eq!(keys[0]["protected"], json!(true));
+
+        let id = keys[0]["id"].as_str().expect("id").to_owned();
+        run_with_input(pgp_cli(PgpKeysCommand::ExportPublic { id: id.clone(), account: None }), &mut engine, &mut std::io::empty(), false)
+            .expect("export public");
+
+        run_with_input(pgp_cli(PgpKeysCommand::Delete { id, account: None }), &mut engine, &mut std::io::empty(), false).expect("delete");
+        let listed = call(&mut engine, "pgp_keys_list", json!({})).expect("list empty");
+        assert!(listed.as_array().expect("keys").is_empty());
+    }
+
+    #[test]
+    fn cli_pgp_import_has_no_passphrase_argument_and_needs_armor_file_for_stdin_passphrases() {
+        let no_argument = Cli::try_parse_from(["postino", "pgp", "keys", "import", "--passphrase", "secret"]);
+        assert!(no_argument.is_err(), "a passphrase must never be accepted in argv");
+
+        assert!(Cli::try_parse_from(["postino", "pgp", "keys", "import", "--passphrase-stdin"]).is_err());
+        assert!(
+            Cli::try_parse_from(["postino", "pgp", "keys", "import", "--armor-file", "key.asc", "--passphrase-stdin"]).is_ok(),
+            "a file key can take a passphrase from the same stdin stream"
+        );
+    }
+
+    #[test]
+    fn pgp_list_and_export_are_read_only_but_import_and_delete_are_not() {
+        assert!(command_reads_only(&pgp_cli(PgpKeysCommand::List { account: None }).command));
+        assert!(command_reads_only(&pgp_cli(PgpKeysCommand::ExportPublic { id: "pgp_1".to_owned(), account: None }).command));
+        assert!(!command_reads_only(&pgp_cli(PgpKeysCommand::Delete { id: "pgp_1".to_owned(), account: None }).command));
+        assert!(!command_reads_only(&pgp_cli(PgpKeysCommand::Import { account: None, armor_file: None, passphrase_stdin: false }).command));
     }
 }

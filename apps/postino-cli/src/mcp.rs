@@ -342,6 +342,32 @@ mod tests {
         }
         assert!(tools.iter().all(|tool| tool["inputSchema"].is_object()));
         assert!(tools.iter().all(|tool| tool["name"] != "account_add" && tool["name"] != "account_remove"), "sensitive tools are never listed");
+        assert!(tools.iter().all(|tool| tool["name"] != "pgp_key_import"), "the passphrase-handling import is never listed");
+
+        for name in ["pgp_keys_list", "pgp_key_delete", "pgp_key_export_public"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap_or_else(|| panic!("{name} is missing"));
+            assert!(tool["inputSchema"].is_object());
+        }
+    }
+
+    #[test]
+    fn pgp_import_is_refused_without_echoing_the_key_or_passphrase() {
+        let mut engine = Engine::demo();
+        let refused = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": { "name": "pgp_key_import", "arguments": {
+                    "armored_key": "SENTINEL-ARMORED-KEY",
+                    "passphrase": "SENTINEL-PASSPHRASE"
+                }}
+            }),
+        )
+        .expect("a response");
+        let text = refused.to_string();
+        assert_eq!(refused["result"]["isError"], json!(true));
+        assert!(!text.contains("SENTINEL"), "a refusal must not repeat the arguments: {text}");
+        assert!(text.contains("credential"), "the refusal explains why: {text}");
     }
 
     #[test]

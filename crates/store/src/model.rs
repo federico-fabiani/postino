@@ -5,6 +5,7 @@
 //! booleans are stored as `0`/`1` in SQLite but are `bool` here.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// A configured mail account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,6 +547,66 @@ pub struct SavedSearch {
     pub created_at: i64,
     /// Unix milliseconds.
     pub updated_at: i64,
+}
+
+/// A PGP key row exactly as it is inserted. `secret_armor` is passphrase-protected OpenPGP armor and
+/// is only ever bound into the encrypted store; it is never selected back into a caller-facing value.
+/// Debug redacts it so a stray log line cannot print key material.
+pub struct PgpKeyInsert {
+    pub id: String,
+    pub account_id: String,
+    pub fingerprint: String,
+    pub key_id: String,
+    pub user_id: Option<String>,
+    pub public_armor: String,
+    pub secret_armor: Option<Zeroizing<String>>,
+    pub protected: bool,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub updated_at: i64,
+}
+
+impl std::fmt::Debug for PgpKeyInsert {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PgpKeyInsert")
+            .field("id", &self.id)
+            .field("account_id", &self.account_id)
+            .field("fingerprint", &self.fingerprint)
+            .field("key_id", &self.key_id)
+            .field("user_id", &self.user_id)
+            .field("public_armor_len", &self.public_armor.len())
+            .field("secret_armor", &self.secret_armor.as_ref().map(|_| "[redacted]"))
+            .field("protected", &self.protected)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+/// The non-secret metadata of a stored PGP key, safe to return from a list operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgpKeySummary {
+    pub id: String,
+    pub account_id: String,
+    pub fingerprint: String,
+    pub key_id: String,
+    pub user_id: Option<String>,
+    pub protected: bool,
+    pub has_secret: bool,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub updated_at: i64,
+}
+
+/// The public half of a stored key, as returned by an export operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgpPublicKeyRecord {
+    pub fingerprint: String,
+    pub key_id: String,
+    pub public_armor: String,
 }
 
 /// One search result row. `body_text` is a bounded prefix of the stored plain-text body (64 KiB at

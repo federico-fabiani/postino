@@ -50,6 +50,7 @@ mod gc;
 mod links;
 mod lock;
 mod model;
+mod pgp;
 mod repo;
 mod rules;
 mod saved;
@@ -62,9 +63,9 @@ pub use lock::{WriterLock, WriterOwner, lock_path, owner_path, read_writer, writ
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
     Label, LabelCount, MAX_REMOTE_IMAGES, MAX_RULE_CANDIDATES, Message, MessageCounts, MessageFilter, MessageFlags, MessageOrigin, MessagePage,
-    MessageSummary, OutboxEntry, OutboxState, Rule, RuleActionRecord, RuleCandidateFilter, RuleCandidatePage, RuleGuard, RuleMessageState, RuleRun,
-    SEARCH_TOTAL_CAP, SavedSearch, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer,
-    SyncState, ThreadDetail, ThreadFilter, ThreadPage, ThreadSummary, UidEntry,
+    MessageSummary, OutboxEntry, OutboxState, PgpKeyInsert, PgpKeySummary, PgpPublicKeyRecord, Rule, RuleActionRecord, RuleCandidateFilter,
+    RuleCandidatePage, RuleGuard, RuleMessageState, RuleRun, SEARCH_TOTAL_CAP, SavedSearch, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus,
+    SearchPage, SearchReindexOutcome, SearchSort, SmtpServer, SyncState, ThreadDetail, ThreadFilter, ThreadPage, ThreadSummary, UidEntry,
 };
 pub use repo::{MAX_OUTBOX_ROWS, UNCERTAIN_AFTER_CRASH};
 pub use rules::{RULE_ALL_CURSOR_KEY_PREFIX, RULE_FORWARD_KEY_PREFIX, RULE_GUARD_KEY_PREFIX, RULE_RUN_MODE_KEY_PREFIX, RULE_RUN_UNDONE_KEY_PREFIX};
@@ -77,7 +78,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
 /// label id is never handed out again.
@@ -444,6 +445,28 @@ FROM messages
 WHERE 1
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 "#,
+    // v8 (P12c1): OpenPGP key material. Secret armor is passphrase-protected and lives only inside
+    // the SQLCipher file; the passphrase itself is never stored. `protected` must agree with whether
+    // a secret row exists, so an unprotected private key cannot be recorded as if it were safe.
+    // A fingerprint identifies one key store-wide; importing the same key twice is refused instead
+    // of creating two rows that could drift apart.
+    r#"
+CREATE TABLE pgp_keys(
+    id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    fingerprint  TEXT NOT NULL,
+    key_id       TEXT NOT NULL,
+    user_id      TEXT NULL,
+    public_armor TEXT NOT NULL,
+    secret_armor TEXT NULL,
+    protected    INTEGER NOT NULL DEFAULT 0 CHECK(protected IN (0, 1)),
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    CHECK((secret_armor IS NULL AND protected = 0) OR (secret_armor IS NOT NULL AND protected = 1))
+);
+CREATE UNIQUE INDEX pgp_keys_fingerprint ON pgp_keys(fingerprint);
+CREATE INDEX pgp_keys_account ON pgp_keys(account_id, created_at);
+"#,
 ];
 
 /// A 256-bit store key.
@@ -518,6 +541,10 @@ pub enum StoreError {
     SavedSearchLimit { limit: u32 },
     #[error("this account already has {limit} rules; delete one before adding another")]
     RuleLimit { limit: u32 },
+    #[error("a PGP key with fingerprint {fingerprint} is already stored; delete it before importing it again")]
+    DuplicatePgpFingerprint { fingerprint: String },
+    #[error("this account already has {limit} PGP keys; delete one before importing another")]
+    PgpKeyLimit { limit: u32 },
     #[error("rule {id:?} changed in another session; reload it before editing")]
     StaleRule { id: String },
     #[error("attachment id {id:?} is repeated in the same draft; every attachment needs a unique id")]

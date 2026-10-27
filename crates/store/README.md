@@ -3,7 +3,7 @@
 **Layer:** foundation. Depends on `postino-crypto` (the blob subkey) and on no other workspace crate;
 no UI toolkit.
 
-The encrypted local store. One SQLCipher database with schema **v7**, a migration runner on
+The encrypted local store. One SQLCipher database with schema **v8**, a migration runner on
 `PRAGMA user_version`, a typed repository for the mailbox and outbox, and a content-addressed encrypted
 blob store for attachment bytes. The engine drives it through `Engine::open` (P3c), the attachment
 seam (P4b) and the outbox (P7); `postino-sync` (P5b) is the writer for received mail and P7's Sent
@@ -95,6 +95,18 @@ mail.db.blobs/<first two hex chars>/<64 lowercase hex>.blob
   `Random`, `Crypto`. None carries plaintext or key material.
 - The blob directory has no garbage collector yet: deleting a message leaves its blob, because
   another message may reference the same content.
+
+## Schema v8
+
+v8 is additive from v7: the `pgp_keys` table (`id`, `account_id` foreign key with cascade delete,
+uppercase `fingerprint` with a unique index, `key_id`, optional `user_id`, `public_armor`, optional
+`secret_armor`, `protected`, `created_at`, `updated_at`) and an account/date index. A `CHECK` permits
+secret armor only on a protected row. The secret column lives only inside SQLCipher and remains
+passphrase-protected; import writes it and no read path (list, get, export) selects it again, and
+`PgpKeyInsert` redacts it in `Debug`.
+Import rejects a duplicate fingerprint, caps a key at 1 MiB, a passphrase at 256 bytes and an account
+at 64 keys in one immediate transaction. No passphrase and no plaintext secret is stored. The
+library decision is ADR-0007.
 
 ## Schema v7
 

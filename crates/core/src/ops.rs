@@ -286,6 +286,39 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
+            "pgp_keys_list",
+            "List PGP keys",
+            "Metadata of the OpenPGP keys stored for one account: id, fingerprint, key id, primary user id, whether the row holds a private key and whether it is passphrase-protected. Never returns key material; use pgp_key_export_public for the public certificate. Keys live only in the encrypted store, there is no keyserver lookup and nothing leaves the machine. Read-only and offline.",
+            PgpKeysListArgs,
+            true,
+            false
+        ),
+        def!(
+            "pgp_key_import",
+            "Import a PGP key",
+            "Sensitive: import one armored OpenPGP public or private key for one account. The armor is capped at 1 MiB, the passphrase at 256 bytes and an account holds at most 64 keys. A private key must be passphrase-protected; the passphrase is used only to verify it, is never stored, logged or returned, and a wrong or missing passphrase stores nothing. The secret armor is kept inside the encrypted store and never selected back by a read operation. A duplicate fingerprint is refused. Passphrases must come from stdin or a no-echo prompt, never argv. MCP never lists or dispatches this operation.",
+            PgpKeyImportArgs,
+            false,
+            false,
+            true
+        ),
+        def!(
+            "pgp_key_delete",
+            "Delete a PGP key",
+            "Delete one stored PGP key of one account by id. `account` is required when the mailbox has several accounts and the row must belong to it. This removes both the public and any passphrase-protected secret material from the encrypted store; it cannot be undone. Returns the deleted metadata, never key material.",
+            PgpKeyDeleteArgs,
+            false,
+            true
+        ),
+        def!(
+            "pgp_key_export_public",
+            "Export a public PGP key",
+            "Return the armored public certificate of one stored key: always the public half, also when the stored row holds a private key. Secret material is never exported. Use it to share the user's public key or to paste it into a correspondent's client. Read-only and offline.",
+            PgpKeyExportPublicArgs,
+            true,
+            false
+        ),
+        def!(
             "rules_list",
             "List rules",
             "Local rules of one account in execution order (`priority ASC, id ASC`), with their validated query, 1-5 actions, stop/enabled flags and a computed `valid`/`error`. A rule whose target folder or label was deleted stays visible as stale; it fails with a readable error at run time. Read-only and offline.",
@@ -809,6 +842,56 @@ pub struct SavedSearchDeleteArgs {
 #[serde(deny_unknown_fields)]
 pub struct SavedSearchRecentClearArgs {
     /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PgpKeysListArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PgpKeyImportArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// One armored OpenPGP key block, at most 1 MiB. A private key must already be protected by
+    /// `passphrase`.
+    pub armored_key: String,
+    /// Passphrase of a private key, at most 256 bytes. Never stored, logged or returned, and never
+    /// accepted on a command line. Empty for a public key.
+    #[serde(default)]
+    pub passphrase: String,
+}
+
+impl std::fmt::Debug for PgpKeyImportArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PgpKeyImportArgs")
+            .field("account", &self.account)
+            .field("armored_key", &"[redacted]")
+            .field("passphrase", &if self.passphrase.is_empty() { "[empty]" } else { "[redacted]" })
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PgpKeyDeleteArgs {
+    /// Key id returned by pgp_keys_list.
+    pub id: String,
+    /// Account that owns the key. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PgpKeyExportPublicArgs {
+    /// Key id returned by pgp_keys_list.
+    pub id: String,
+    /// Account that owns the key. Required when the mailbox has several accounts.
     pub account: Option<String>,
 }
 
@@ -1604,6 +1687,24 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let account = engine.requested_account_id(args.account.as_deref(), "saved_search_recent_clear")?;
             let cleared = engine.clear_recent_searches(Some(&account))?;
             value(SavedSearchRecentClearResult { account, cleared })
+        }
+        "pgp_keys_list" => {
+            let args: PgpKeysListArgs = parse(args)?;
+            value(engine.pgp_keys_list(args.account.as_deref())?)
+        }
+        "pgp_key_import" => {
+            let args: PgpKeyImportArgs = parse(args)?;
+            let armored = Zeroizing::new(args.armored_key);
+            let passphrase = Zeroizing::new(args.passphrase);
+            value(engine.pgp_key_import(args.account.as_deref(), &armored, passphrase.as_bytes())?)
+        }
+        "pgp_key_delete" => {
+            let args: PgpKeyDeleteArgs = parse(args)?;
+            value(engine.pgp_key_delete(args.account.as_deref(), &args.id)?)
+        }
+        "pgp_key_export_public" => {
+            let args: PgpKeyExportPublicArgs = parse(args)?;
+            value(engine.pgp_key_export_public(args.account.as_deref(), &args.id)?)
         }
         "rules_list" => {
             let args: RulesListArgs = parse(args)?;

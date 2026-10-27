@@ -46,6 +46,11 @@ impl Harness {
         Store::open(&self.path(), &self.key).expect("open the store")
     }
 
+    /// The key that encrypts the throwaway database, for raw SQLCipher assertions.
+    pub fn store_key(&self) -> &StoreKey {
+        &self.key
+    }
+
     /// Open the same database read-only after it has been created and migrated by [`Harness::open`].
     pub fn read_only(&self) -> Store {
         Store::open_read_only(&self.path(), &self.key).expect("open the store read-only")

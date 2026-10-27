@@ -15,14 +15,14 @@ use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
 use postino_net::{CertificateDer, NetError, SmtpEnvelope, SmtpError, SmtpLimits};
-use postino_store::{FlagUpdate, OutboxEntry, OutboxState, Store};
+use postino_store::{FlagUpdate, OutboxEntry, OutboxState, PgpKeyInsert, Store};
 use postino_sync::SyncError;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::model::{
     Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
-    MailTls, Message, MessageSummary, Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
+    MailTls, Message, MessageSummary, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::outbox::{
@@ -1151,6 +1151,85 @@ impl Engine {
         let take = usize::try_from(limit).unwrap_or(0);
         threads = threads.into_iter().skip(start).take(take).collect();
         ThreadPageResult { threads, total, unread_threads, unread_messages }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // PGP keys (P12c1)
+    // -----------------------------------------------------------------------------------------
+
+    /// Key metadata for one account. The secret armor is never read back; the response carries
+    /// fingerprints and flags, not key material.
+    pub fn pgp_keys_list(&self, account: Option<&str>) -> Result<Vec<PgpKey>, OpError> {
+        let account = self.requested_account(account, "pgp_keys_list")?;
+        let store = self.require_store("pgp_keys_list")?;
+        let keys = store.list_pgp_keys(&account.id).map_err(store_map::read_error)?;
+        Ok(keys.into_iter().map(PgpKey::from).collect())
+    }
+
+    /// Parse, verify and store one armored key. A private key must be passphrase-protected and the
+    /// passphrase must unlock it before anything is written; a public key needs no passphrase.
+    pub fn pgp_key_import(&mut self, account: Option<&str>, armored: &str, passphrase: &[u8]) -> Result<PgpKey, OpError> {
+        let account = self.requested_account(account, "pgp_key_import")?;
+        let store = self.require_store("pgp_key_import")?;
+        let parsed = crate::pgp::parse_import(armored, passphrase).map_err(|error| OpError::InvalidArgs(error.message().to_owned()))?;
+        let id = store.allocate_pgp_key_id().map_err(store_map::write_error)?;
+        let now = Utc::now().timestamp_millis();
+        let insert = PgpKeyInsert {
+            id: id.clone(),
+            account_id: account.id.clone(),
+            fingerprint: parsed.fingerprint.clone(),
+            key_id: parsed.key_id.clone(),
+            user_id: parsed.user_id.clone(),
+            public_armor: parsed.public_armor,
+            secret_armor: parsed.secret_armor,
+            protected: parsed.protected,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_pgp_key_limited(&insert, crate::pgp::MAX_PGP_KEYS_PER_ACCOUNT).map_err(store_map::write_error)?;
+        self.bump_revision();
+        Ok(PgpKey {
+            id,
+            account_id: account.id,
+            fingerprint: parsed.fingerprint,
+            key_id: parsed.key_id,
+            user_id: parsed.user_id,
+            protected: parsed.protected,
+            has_secret: parsed.protected,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// Delete one key of one account. The deleted metadata is returned, never the key material.
+    pub fn pgp_key_delete(&mut self, account: Option<&str>, id: &str) -> Result<PgpKey, OpError> {
+        let account = self.requested_account(account, "pgp_key_delete")?;
+        let store = self.require_store("pgp_key_delete")?;
+        let key = store
+            .get_pgp_key(&account.id, id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::InvalidArgs(format!("unknown PGP key {id:?}; use an id returned by pgp_keys_list")))?;
+        if !store.delete_pgp_key(&account.id, id).map_err(store_map::write_error)? {
+            return Err(OpError::InvalidArgs(format!("unknown PGP key {id:?}; use an id returned by pgp_keys_list")));
+        }
+        self.bump_revision();
+        Ok(PgpKey::from(key))
+    }
+
+    /// The public armor of one stored key, scoped to its account. A private key is exported as its
+    /// public certificate only.
+    pub fn pgp_key_export_public(&self, account: Option<&str>, id: &str) -> Result<PgpPublicKey, OpError> {
+        let account = self.requested_account(account, "pgp_key_export_public")?;
+        let store = self.require_store("pgp_key_export_public")?;
+        let key = store
+            .get_pgp_key(&account.id, id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::InvalidArgs(format!("unknown PGP key {id:?}; use an id returned by pgp_keys_list")))?;
+        let public = store
+            .export_pgp_public(&account.id, id)
+            .map_err(store_map::read_error)?
+            .ok_or_else(|| OpError::InvalidArgs(format!("unknown PGP key {id:?}; use an id returned by pgp_keys_list")))?;
+        Ok(PgpPublicKey { fingerprint: public.fingerprint, key_id: public.key_id, public_armor: public.public_armor, user_id: key.user_id })
     }
 
     // -----------------------------------------------------------------------------------------

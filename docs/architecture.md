@@ -6,7 +6,8 @@
 > submission and the outbox (P7) + compose depth: attachment bytes, signatures per account and
 > reply/forward headers (P8) + encrypted FTS5 search, the body-free read path and schema v7 (P9a) +
 > conversation derivation/merge/alias, the conversation view and saved searches (P9b) + local rules
-> with preview, idempotent runs, undo and forwarding through P7 (P9c) ·
+> with preview, idempotent runs, undo and forwarding through P7 (P9c) + PGP key storage and schema v8
+> (P12c1).
 > **Last updated:** 2026-10-27 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
@@ -21,7 +22,7 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounds, typed errors |
 | `crates/platform` | OS seams: store key and account credentials in the OS keyring |
-| `crates/store` | SQLCipher schema v7, migrations, the repository, FTS5 search, the conversation cache, saved searches, local rules and their journal, the outbox journal and the encrypted blob store (P3b, P4b, P6a, P6d, P7, P9a, P9b, P9c) |
+| `crates/store` | SQLCipher schema v8, migrations, the repository, FTS5 search, the conversation cache, saved searches, local rules and their journal, the outbox journal, the encrypted blob store and PGP keys (P3b, P4b, P6a, P6d, P7, P9a, P9b, P9c, P12c1) |
 | `crates/sync` | One account from IMAP into the store, plus submission serialization and the Sent append (P5b, P7) |
 | `crates/testkit` | Test-only fake IMAP/SMTP servers, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -180,7 +181,7 @@ it also replaces an oversized response (for example a dry-run of a large draft) 
 | Crate | Responsibility |
 |---|---|
 | `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
-| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b); local rules, candidate query and journal (P9c) |
+| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b); local rules, candidate query and journal (P9c); PGP key rows and schema v8 (P12c1) |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
 | `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. Autodiscovery and QRESYNC later |
 | `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler later |
@@ -1526,6 +1527,22 @@ The write actions dominate a full page; the query-only and empty passes stay und
 fixture is intentionally write-heavy (2 000 unread messages changed per page), so these numbers are an
 upper bound for a read-only rule and a lower bound for a page of forwards. `crates/store/tests/rules.rs`
 asserts both candidate queries use `messages_rules_new` / `messages_rules_all` in `EXPLAIN QUERY PLAN`.
+
+### 4.14 Implemented in P12c1: OpenPGP keys in the encrypted store
+
+Schema v8 is additive from v7: one `pgp_keys` table keyed by account, with an uppercase fingerprint
+unique across the store, key id, optional primary user id, public armor, optional secret armor,
+`protected`, created/updated timestamps and a `CHECK` that only a protected row may carry a secret.
+The secret column is written by import and never selected again; list, get and export do not read it,
+and it is never returned to the engine, CLI, MCP or logs. PGP secrets do not use the OS keyring: the SQLCipher store
+is the encryption boundary, and the private key stays passphrase-protected even inside it. Parsing is
+bounded to 1 MiB and re-armored; import verifies every secret packet with the passphrase (256-byte
+cap) before writing, refuses unprotected private keys, and treats a duplicate fingerprint as a
+conflict. Imports are capped at 64 keys per account in one immediate transaction. The registry adds
+`pgp_keys_list` (read-only, metadata), `pgp_key_import` (sensitive), `pgp_key_delete` (destructive)
+and `pgp_key_export_public` (read-only); MCP excludes the import. The library decision and its
+licence review are in `docs/decisions/0007-pgp-key-storage.md`. P12c1 does not verify, decrypt, sign,
+encrypt, fetch keys or downgrade to plaintext; P12c2 owns MIME and UI.
 
 ## 5. Synchronization
 

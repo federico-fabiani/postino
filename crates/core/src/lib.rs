@@ -18,6 +18,7 @@ pub mod model;
 pub mod oauth;
 pub mod ops;
 pub mod outbox;
+pub mod pgp;
 mod reply;
 mod rules;
 pub mod search;
@@ -30,8 +31,8 @@ pub use engine::{
 };
 pub use model::{
     Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
-    MailTls, Message, MessageSummary, Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect, RulePreviewRow, RuleRun, RuleRunScope,
-    SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
+    MailTls, Message, MessageSummary, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect, RulePreviewRow, RuleRun,
+    RuleRunScope, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
 };
 pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{

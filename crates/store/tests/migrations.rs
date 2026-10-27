@@ -19,9 +19,9 @@ fn raw_open(path: &Path, key: &StoreKey) -> Connection {
     connection
 }
 
-/// Remove every v7 object from a current store so a test can forge the schema a shipped build
-/// left behind. The order matters: the FTS triggers reference the virtual table.
-const DROP_V7: &str = "
+/// Remove every v7 and v8 object from a current store so a test can forge the schema a shipped
+/// build left behind. The order matters: the FTS triggers reference the virtual table.
+const DROP_V7_AND_V8: &str = "
 DROP TRIGGER IF EXISTS messages_fts_insert;
 DROP TRIGGER IF EXISTS messages_fts_delete;
 DROP TRIGGER IF EXISTS messages_fts_update;
@@ -50,6 +50,9 @@ ALTER TABLE messages DROP COLUMN references_json;
 ALTER TABLE messages DROP COLUMN ingested_at;
 ALTER TABLE messages DROP COLUMN rules_applied_at;
 ALTER TABLE messages DROP COLUMN origin;
+DROP INDEX IF EXISTS pgp_keys_fingerprint;
+DROP INDEX IF EXISTS pgp_keys_account;
+DROP TABLE IF EXISTS pgp_keys;
 DELETE FROM meta WHERE key = 'search_index';
 DELETE FROM meta WHERE key = 'search_updated_at';
 DELETE FROM meta WHERE key = 'message_origin_backfilled';
@@ -89,14 +92,14 @@ fn upgrades_a_v1_database_additively() {
 
     {
         let store = Store::open(&path, &key).expect("upgrade v1 to v6");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
         assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v1"), "the upgrade lost meta data");
         store.upsert_account(&account("acc_1")).expect("the v2 tables exist");
         store.set_meta("schema", "v4").expect("write");
     }
 
     let store = Store::open(&path, &key).expect("reopen");
-    assert_eq!(store.schema_version().expect("version"), 7);
+    assert_eq!(store.schema_version().expect("version"), 8);
     assert!(store.get_account("acc_1").expect("account").is_some());
     assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v4"));
 }
@@ -126,7 +129,7 @@ fn upgrades_a_v2_database_and_seeds_the_draft_sequence() {
         // Make the file look like the shipped v2 schema: the migration had not created draft_seq,
         // the v4 server table, the v5 outbox or the v6 remote-image column.
         let connection = raw_open(&path, &key);
-        connection.execute_batch(DROP_V7).expect("drop v7 objects");
+        connection.execute_batch(DROP_V7_AND_V8).expect("drop v7 objects");
         connection
             .execute_batch(
                 "DROP TABLE draft_seq; DROP TABLE account_servers; DROP TABLE outbox;
@@ -137,7 +140,7 @@ fn upgrades_a_v2_database_and_seeds_the_draft_sequence() {
 
     {
         let store = Store::open(&path, &key).expect("upgrade v2 to v6");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
         let saved = store.save_draft(&draft("terza")).expect("the seeded sequence must continue");
         assert_eq!(saved.revision, 3, "the v2 draft revision did not seed draft_seq");
     }
@@ -194,7 +197,7 @@ fn upgrades_a_v3_database_and_keeps_its_mail() {
         store.upsert_synced_message(&message, &[]).expect("message");
         // Make the file look like the shipped v3 schema: the v4 table and the v6 column did not exist.
         let connection = raw_open(&path, &key);
-        connection.execute_batch(DROP_V7).expect("drop v7 objects");
+        connection.execute_batch(DROP_V7_AND_V8).expect("drop v7 objects");
         connection
             .execute_batch(
                 "DROP TABLE account_servers; DROP TABLE outbox;
@@ -205,7 +208,7 @@ fn upgrades_a_v3_database_and_keeps_its_mail() {
 
     {
         let store = Store::open(&path, &key).expect("upgrade v3 to v6");
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
         let rows = store.list_all_messages().expect("messages");
         assert_eq!(rows.len(), 1, "the upgrade lost mail");
         assert_eq!(rows[0].remote_images, 0, "a v3 row did not default the remote-image count to 0");
@@ -277,12 +280,12 @@ fn upgrades_a_v5_database_and_defaults_every_remote_count_to_zero() {
         store.upsert_synced_message(&message("msg_2", 2), &[]).expect("second message");
         // Forge the shipped v5 shape: the v6 column did not exist yet, every other table does.
         let connection = raw_open(&path, &key);
-        connection.execute_batch(DROP_V7).expect("drop v7 objects");
+        connection.execute_batch(DROP_V7_AND_V8).expect("drop v7 objects");
         connection.execute_batch("ALTER TABLE messages DROP COLUMN remote_images; PRAGMA user_version = 5;").expect("forge v5");
     }
 
     let store = Store::open(&path, &key).expect("upgrade v5 to v6");
-    assert_eq!(store.schema_version().expect("version"), 7);
+    assert_eq!(store.schema_version().expect("version"), 8);
     let rows = store.list_all_messages().expect("messages");
     assert_eq!(rows.len(), 2, "the upgrade lost mail");
     assert!(rows.iter().all(|row| row.remote_images == 0), "a v5 row did not default the count to 0: {rows:?}");
@@ -291,7 +294,7 @@ fn upgrades_a_v5_database_and_defaults_every_remote_count_to_zero() {
 
     // Reopening a migrated store keeps the zero counts and does not add the column again.
     let reopened = Store::open(&path, &key).expect("reopen v6");
-    assert_eq!(reopened.schema_version().expect("version"), 7);
+    assert_eq!(reopened.schema_version().expect("version"), 8);
     assert!(reopened.list_all_messages().expect("messages").iter().all(|row| row.remote_images == 0));
 }
 
@@ -310,7 +313,7 @@ fn a_failed_v6_migration_rolls_back_and_keeps_the_v5_version() {
         // statement fail. The migration transaction must roll back: the version stays 5 and the
         // account row survives.
         let connection = raw_open(&path, &key);
-        connection.execute_batch(DROP_V7).expect("drop v7 objects");
+        connection.execute_batch(DROP_V7_AND_V8).expect("drop v7 objects");
         connection
             .execute_batch(
                 "ALTER TABLE messages DROP COLUMN remote_images;
@@ -448,12 +451,12 @@ fn upgrades_a_v6_database_to_v7_with_the_search_columns_and_index() {
         store.upsert_synced_message(&message, &[]).expect("message");
         store.upsert_synced_message(&sent, &[]).expect("sent message");
         let connection = raw_open(&path, &key);
-        connection.execute_batch(DROP_V7).expect("forge v6 objects");
+        connection.execute_batch(DROP_V7_AND_V8).expect("forge v6 objects");
         connection.execute_batch("PRAGMA user_version = 6;").expect("forge v6 version");
     }
 
     let store = Store::open(&path, &key).expect("upgrade v6 to v7");
-    assert_eq!(store.schema_version().expect("version"), 7);
+    assert_eq!(store.schema_version().expect("version"), 8);
     let pending = store.search_status().expect("pending status");
     assert!(!pending.ready, "the migrated v7 index must start pending");
     assert_eq!(pending.total, 2);
@@ -516,7 +519,7 @@ fn a_failed_v7_migration_rolls_back_and_keeps_v6() {
         let store = Store::open(&path, &key).expect("open v7");
         store.upsert_account(&account("acc_1")).expect("account");
         let connection = raw_open(&path, &key);
-        connection.execute_batch(DROP_V7).expect("forge v6 objects");
+        connection.execute_batch(DROP_V7_AND_V8).expect("forge v6 objects");
         // One v7 column already exists, so the additive v7 migration must fail and roll back.
         connection
             .execute_batch("ALTER TABLE messages ADD COLUMN search_sender TEXT; PRAGMA user_version = 6;")
@@ -536,6 +539,59 @@ fn a_failed_v7_migration_rolls_back_and_keeps_v6() {
 }
 
 #[test]
+fn upgrades_a_v7_database_to_v8_with_the_pgp_key_table() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("store.db");
+    let key = random_key();
+    {
+        let store = Store::open(&path, &key).expect("open the current schema");
+        store.upsert_account(&account("acc_1")).expect("account");
+        // Forge a v7 database by removing the only v8 object and rewinding the version.
+        let connection = raw_open(&path, &key);
+        connection.execute_batch("DROP TABLE pgp_keys; PRAGMA user_version = 7;").expect("forge v7");
+    }
+
+    let store = Store::open(&path, &key).expect("upgrade v7 to v8");
+    assert_eq!(store.schema_version().expect("version"), 8);
+    assert!(store.list_pgp_keys("acc_1").expect("empty key list").is_empty());
+    drop(store);
+
+    let connection = raw_open(&path, &key);
+    for name in ["pgp_keys", "pgp_keys_fingerprint", "pgp_keys_account"] {
+        let found: u32 = connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [name], |row| row.get(0)).expect("sqlite_master");
+        assert_eq!(found, 1, "v8 did not create {name}");
+    }
+}
+
+#[test]
+fn a_failed_v8_migration_rolls_back_and_keeps_v7() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("store.db");
+    let key = random_key();
+    {
+        let store = Store::open(&path, &key).expect("open the current schema");
+        store.upsert_account(&account("acc_1")).expect("account");
+        let connection = raw_open(&path, &key);
+        // A conflicting table with the v8 name makes the v8 migration fail before it can commit.
+        connection
+            .execute_batch("DROP TABLE pgp_keys; CREATE TABLE pgp_keys(dummy TEXT); PRAGMA user_version = 7;")
+            .expect("forge the failing v7 fixture");
+    }
+
+    let error = Store::open(&path, &key).err().expect("the conflicting table must abort the v8 migration");
+    assert!(error.to_string().contains("pgp_keys"), "{error}");
+    let connection = raw_open(&path, &key);
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0)).expect("version");
+    assert_eq!(version, 7, "the failed v8 transaction advanced the schema version");
+    let accounts: u32 = connection.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0)).expect("accounts");
+    assert_eq!(accounts, 1, "the failed v8 migration rolled back more than itself");
+    let dummy: u32 = connection
+        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pgp_keys'", [], |row| row.get(0))
+        .expect("pgp_keys");
+    assert_eq!(dummy, 1, "the failing v8 migration dropped the pre-existing table");
+}
+
+#[test]
 fn reopening_does_not_run_a_migration_twice() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("store.db");
@@ -543,7 +599,7 @@ fn reopening_does_not_run_a_migration_twice() {
 
     for round in 0..3 {
         let store = Store::open(&path, &key).unwrap_or_else(|error| panic!("open round {round}: {error}"));
-        assert_eq!(store.schema_version().expect("version"), 7);
+        assert_eq!(store.schema_version().expect("version"), 8);
         store.set_meta("rounds", &round.to_string()).expect("write");
         // Dropping the store closes the connection and checkpoints the WAL.
     }
@@ -568,7 +624,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     }
 
     let error = Store::open(&path, &key).err().expect("a newer schema must not be opened");
-    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 7 }), "{error}");
+    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 8 }), "{error}");
 }
 
 #[test]

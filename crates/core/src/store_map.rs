@@ -11,8 +11,8 @@ use postino_store::StoreError;
 
 use crate::engine::OpError;
 use crate::model::{
-    Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, MailTls, Message, MessageSummary, SavedSearch, ServerSettings, SmtpSettings,
-    ThreadSummary, snippet,
+    Account, Address, Attachment, Folder, FolderKind, Label, LabelColor, MailTls, Message, MessageSummary, PgpKey, SavedSearch, ServerSettings,
+    SmtpSettings, ThreadSummary, snippet,
 };
 
 /// Unix milliseconds: the store's only date format (see the `postino-store` crate docs).
@@ -41,6 +41,12 @@ pub(crate) fn write_error(error: StoreError) -> OpError {
             OpError::InvalidArgs(format!("this account already has {limit} saved searches; delete one before adding another"))
         }
         StoreError::RuleLimit { limit } => OpError::InvalidArgs(format!("this account already has {limit} rules; delete one before adding another")),
+        StoreError::DuplicatePgpFingerprint { fingerprint } => {
+            OpError::InvalidArgs(format!("a PGP key with fingerprint {fingerprint} is already stored; delete it before importing it again"))
+        }
+        StoreError::PgpKeyLimit { limit } => {
+            OpError::InvalidArgs(format!("this account already has {limit} PGP keys; delete one before importing another"))
+        }
         StoreError::StaleRule { id } => {
             OpError::InvalidArgs(format!("rule {id:?} changed in another session; reload the rules page or rules_list before editing it"))
         }
@@ -345,4 +351,20 @@ fn store_address(address: &Address) -> store::Address {
 
 pub(crate) fn attachment(row: store::Attachment) -> Attachment {
     Attachment { id: row.id, filename: row.filename, mime: row.mime, size: row.size }
+}
+
+impl From<store::PgpKeySummary> for PgpKey {
+    fn from(row: store::PgpKeySummary) -> Self {
+        Self {
+            id: row.id,
+            account_id: row.account_id,
+            fingerprint: row.fingerprint,
+            key_id: row.key_id,
+            user_id: row.user_id,
+            protected: row.protected,
+            has_secret: row.has_secret,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
 }

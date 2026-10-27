@@ -389,6 +389,38 @@ pub struct SavedSearch {
     pub index_pending: bool,
 }
 
+/// The public half of a stored key, returned by an explicit export. It never contains secret
+/// material, even when the row also holds a private key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgpPublicKey {
+    pub fingerprint: String,
+    pub key_id: String,
+    pub public_armor: String,
+    pub user_id: Option<String>,
+}
+
+/// One stored OpenPGP key as the operations and the UI see it. This view never carries key
+/// material: the public armor is exported explicitly and the secret armor never leaves the store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PgpKey {
+    pub id: String,
+    pub account_id: String,
+    /// Uppercase hexadecimal fingerprint.
+    pub fingerprint: String,
+    /// Uppercase hexadecimal legacy key id.
+    pub key_id: String,
+    /// The primary user id carried by the key, if any.
+    pub user_id: Option<String>,
+    /// True for a private key whose secret material is passphrase-protected.
+    pub protected: bool,
+    /// True when the row holds secret material (a private key).
+    pub has_secret: bool,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub updated_at: i64,
+}
+
 /// One action of a local rule (P9c). The tag is the action; a rule carries 1-5 actions and at most
 /// one of each kind. A forward carries 1-10 recipients and is only ever queued through P7.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
