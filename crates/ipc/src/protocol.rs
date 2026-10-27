@@ -25,6 +25,10 @@ pub mod method {
     /// The operation metadata: names, titles, descriptions, input schemas and annotations.
     pub const OPS_LIST: &str = "ops_list";
     pub const DAEMON_STATUS: &str = "daemon_status";
+    /// Read the persisted background settings (tray, notifications, previews, debounce).
+    pub const DAEMON_SETTINGS: &str = "daemon_settings";
+    /// Write a partial background-settings patch and return the sanitized result.
+    pub const DAEMON_SETTINGS_SET: &str = "daemon_settings_set";
     pub const DAEMON_SHUTDOWN: &str = "daemon_shutdown";
 }
 
@@ -224,6 +228,8 @@ pub fn is_known_method(name: &str) -> bool {
             | method::OP
             | method::OPS_LIST
             | method::DAEMON_STATUS
+            | method::DAEMON_SETTINGS
+            | method::DAEMON_SETTINGS_SET
             | method::DAEMON_SHUTDOWN
     )
 }

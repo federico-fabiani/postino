@@ -57,6 +57,8 @@ pub enum TrayAction {
     Open,
     /// Ask the daemon to sync every account now.
     SyncNow,
+    /// Launch the app straight into the outbox.
+    OpenOutbox,
     /// Ask the daemon to stop.
     Quit,
 }
@@ -66,6 +68,7 @@ impl TrayAction {
         match self {
             Self::Open => "Apri Postino",
             Self::SyncNow => "Sincronizza ora",
+            Self::OpenOutbox => "Coda di invio",
             Self::Quit => "Esci",
         }
     }
@@ -75,6 +78,7 @@ impl TrayAction {
         match self {
             Self::Open => "open",
             Self::SyncNow => "sync_now",
+            Self::OpenOutbox => "outbox",
             Self::Quit => "quit",
         }
     }
@@ -210,10 +214,12 @@ mod tests {
     }
 
     #[test]
-    fn menu_has_the_three_p10b1_entries() {
-        let labels: Vec<&str> = [TrayAction::Open, TrayAction::SyncNow, TrayAction::Quit].into_iter().map(TrayAction::label).collect();
-        assert_eq!(labels, ["Apri Postino", "Sincronizza ora", "Esci"]);
-        let ids: Vec<&str> = [TrayAction::Open, TrayAction::SyncNow, TrayAction::Quit].into_iter().map(TrayAction::as_str).collect();
-        assert_eq!(ids, ["open", "sync_now", "quit"]);
+    fn menu_has_the_four_p10b2_entries() {
+        let labels: Vec<&str> =
+            [TrayAction::Open, TrayAction::SyncNow, TrayAction::OpenOutbox, TrayAction::Quit].into_iter().map(TrayAction::label).collect();
+        assert_eq!(labels, ["Apri Postino", "Sincronizza ora", "Coda di invio", "Esci"]);
+        let ids: Vec<&str> =
+            [TrayAction::Open, TrayAction::SyncNow, TrayAction::OpenOutbox, TrayAction::Quit].into_iter().map(TrayAction::as_str).collect();
+        assert_eq!(ids, ["open", "sync_now", "outbox", "quit"]);
     }
 }

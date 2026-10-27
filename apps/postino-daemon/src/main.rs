@@ -70,7 +70,9 @@ fn run() -> Result<()> {
     config.sync_interval = std::time::Duration::from_secs(args.sync_interval.max(5));
     config.sync_on_start = !args.no_sync_on_start;
     config.gc_interval = std::time::Duration::from_secs(args.gc_interval.max(5));
-    config.settings = DaemonSettings::default_path().map(|path| DaemonSettings::load(&path)).unwrap_or_default();
+    let settings_path = DaemonSettings::default_path();
+    config.settings = settings_path.as_deref().map(DaemonSettings::load).unwrap_or_default();
+    config.settings_path = settings_path;
     #[cfg(windows)]
     {
         config.tray = Some(Arc::new(postino_platform::Win32Tray::new()));

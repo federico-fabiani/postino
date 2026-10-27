@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::DaemonState;
+use crate::settings::DaemonSettingsPatch;
 
 /// What `daemon_status` returns. It contains no token, credential, body, subject, address or query.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,6 +51,13 @@ impl DaemonState {
         match request.method.as_str() {
             method::OPS_LIST => serde_json::to_value(self.registry.as_ref()).map_err(internal),
             method::DAEMON_STATUS => self.status().await,
+            method::DAEMON_SETTINGS => serde_json::to_value(self.settings_view()).map_err(internal),
+            method::DAEMON_SETTINGS_SET => {
+                let patch: DaemonSettingsPatch =
+                    serde_json::from_value(request.params).map_err(|error| RpcError::invalid_params(format!("daemon_settings_set: {error}")))?;
+                let view = self.apply_settings(&patch).map_err(|reason| RpcError::operation(reason, "settings"))?;
+                serde_json::to_value(view).map_err(internal)
+            }
             method::DAEMON_SHUTDOWN => {
                 self.cancel_all();
                 let state = self.clone();

@@ -3,6 +3,7 @@
 //! no second `Engine` is ever constructed in this process.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -13,7 +14,7 @@ use postino_platform::{Notifier, Tray, TrayAction, TrayError};
 use postino_store::{Store, StoreKey};
 use tokio::sync::Notify;
 
-use crate::settings::DaemonSettings;
+use crate::settings::{DaemonSettings, DaemonSettingsPatch, DaemonSettingsView};
 use crate::tray_host::{AppLauncher, NoticePolicy};
 use crate::{DaemonConfig, DaemonError};
 
@@ -58,6 +59,13 @@ pub struct DaemonState {
     pub(crate) account_count: usize,
     /// Daemon-owned tray, if the platform seam was injected (tests use a recorder or none).
     pub(crate) tray: Option<Arc<dyn Tray>>,
+    /// The icon is installed right now. Separate from `tray` (the seam) and from the preference,
+    /// so the settings page can say "enabled but the notification area is not answering".
+    tray_running: Arc<AtomicBool>,
+    tray_start_logged: Arc<AtomicBool>,
+    /// The file this daemon reads and writes. `None` means the caller started it without one: the
+    /// settings page then refuses writes instead of pretending they were persisted.
+    settings_path: Option<PathBuf>,
     notifier: OnceLock<Option<Arc<dyn Notifier>>>,
     pub(crate) notices: Arc<Mutex<NoticePolicy>>,
     pub(crate) launcher: Arc<dyn AppLauncher>,
@@ -84,10 +92,14 @@ impl DaemonState {
             let _ = notifier.set(config.notifier.clone());
         }
         let settings = config.settings.clone();
+        let settings_path = config.settings_path.clone();
         Self {
             engine: Arc::new(Mutex::new(engine)),
             hub,
             tray: config.tray.clone(),
+            tray_running: Arc::new(AtomicBool::new(false)),
+            tray_start_logged: Arc::new(AtomicBool::new(false)),
+            settings_path,
             notifier,
             notices,
             launcher: Arc::clone(&config.app_launcher),
@@ -113,6 +125,54 @@ impl DaemonState {
 
     pub(crate) fn settings(&self) -> DaemonSettings {
         self.settings.lock().map(|settings| settings.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn settings_path(&self) -> Option<&PathBuf> {
+        self.settings_path.as_ref()
+    }
+
+    pub(crate) fn settings_view(&self) -> DaemonSettingsView {
+        self.settings().view(self.tray.is_some(), self.tray_running())
+    }
+
+    /// Persist a partial edit, then publish it. The file is written before the in-memory value, so a
+    /// caller that receives `Ok` can read back exactly what it wrote even after a restart.
+    pub(crate) fn apply_settings(&self, patch: &DaemonSettingsPatch) -> Result<DaemonSettingsView, String> {
+        if patch.is_empty() {
+            return Err("no setting was requested".to_owned());
+        }
+        let Some(path) = self.settings_path() else {
+            return Err("this daemon has no settings file: start it with `postino daemon start`".to_owned());
+        };
+        let mut next = self.settings();
+        next.sanitize();
+        patch.apply_to(&mut next);
+        next.sanitize();
+        next.save(path).map_err(|error| error.to_string())?;
+        match self.settings.lock() {
+            Ok(mut current) => *current = next,
+            Err(_) => return Err("the settings state is unavailable".to_owned()),
+        }
+        Ok(self.settings_view())
+    }
+
+    pub(crate) fn tray_running(&self) -> bool {
+        self.tray_running.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_tray_running(&self, running: bool) {
+        self.tray_running.store(running, Ordering::Relaxed);
+    }
+
+    /// One sentence per unavailable tray start, not one every retry.
+    pub(crate) fn note_tray_start_failed(&self, error: impl std::fmt::Display) {
+        if !self.tray_start_logged.swap(true, Ordering::Relaxed) {
+            log::warn!("tray unavailable; the daemon keeps serving: {error}");
+        }
+    }
+
+    pub(crate) fn note_tray_started(&self) {
+        self.tray_start_logged.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn tray_action(&self) -> Option<TrayAction> {
@@ -181,6 +241,22 @@ impl DaemonState {
 
     pub fn publish(&self, kind: &str, data: serde_json::Value) {
         self.hub.publish(kind, data);
+    }
+
+    /// Whether a window is listening. The desktop app is the only client that subscribes to the
+    /// daemon events, so an event subscription is the presence signal the tray may trust.
+    pub fn app_present(&self) -> bool {
+        self.hub.subscriber_count() > 0
+    }
+
+    /// Deliver one tray activation (`open`, `outbox`, `quit`) to a listening window. `false` means
+    /// nobody is listening, so the caller must start the app instead of leaving the action dead.
+    pub fn activate_app(&self, action: &str) -> bool {
+        if !self.app_present() {
+            return false;
+        }
+        self.publish("activation", serde_json::json!({ "action": action }));
+        true
     }
 
     pub fn note_error(&self, sentence: impl Into<String>) {

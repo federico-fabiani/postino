@@ -439,6 +439,33 @@ enum DaemonCommand {
         #[command(subcommand)]
         command: AutostartCommand,
     },
+    /// Read or change tray, notifications, previews and the notification debounce.
+    Settings {
+        /// Show or hide the daemon-owned tray icon.
+        #[arg(long, value_enum, value_name = "on|off")]
+        tray: Option<Switch>,
+        /// Enable or disable new-mail and send-failure notices.
+        #[arg(long, value_enum, value_name = "on|off")]
+        notify: Option<Switch>,
+        /// Include sender and subject in a new-mail notice.
+        #[arg(long, value_enum, value_name = "on|off")]
+        previews: Option<Switch>,
+        /// Minimum seconds between two notices (never below 60).
+        #[arg(long, value_name = "SECONDS")]
+        debounce: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl Switch {
+    fn bool(self) -> bool {
+        matches!(self, Self::On)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1036,7 +1063,58 @@ fn run_daemon_command(cli: Cli) -> Result<()> {
             Err(error) => return Err(daemon_error(error)),
         },
         DaemonCommand::Autostart { command } => run_autostart(&cli, &paths, command)?,
+        DaemonCommand::Settings { tray, notify, previews, debounce } => {
+            run_daemon_settings(&cli, &paths, *tray, *notify, *previews, *debounce)?;
+        }
     }
+    Ok(())
+}
+
+/// Read or patch the daemon-owned background settings. It never starts a daemon: a settings read
+/// that silently launches a process would change what the user opted into. Writes go through the
+/// daemon, which persists the file and returns the sanitized values that were actually stored.
+fn run_daemon_settings(
+    cli: &Cli,
+    paths: &DaemonPaths,
+    tray: Option<Switch>,
+    notify: Option<Switch>,
+    previews: Option<Switch>,
+    debounce: Option<u64>,
+) -> Result<()> {
+    let mut session = DaemonSession::try_connect(paths).map_err(daemon_error)?;
+    let mut patch = serde_json::Map::new();
+    if let Some(value) = tray {
+        patch.insert("tray".to_owned(), json!(value.bool()));
+    }
+    if let Some(value) = notify {
+        patch.insert("notify_enabled".to_owned(), json!(value.bool()));
+    }
+    if let Some(value) = previews {
+        patch.insert("notify_previews".to_owned(), json!(value.bool()));
+    }
+    if let Some(value) = debounce {
+        patch.insert("debounce_secs".to_owned(), json!(value));
+    }
+    let value = if patch.is_empty() {
+        session.client.call(method::DAEMON_SETTINGS, json!({}), Duration::from_secs(5)).map_err(daemon_error)?
+    } else {
+        session.client.call(method::DAEMON_SETTINGS_SET, Value::Object(patch), Duration::from_secs(10)).map_err(daemon_error)?
+    };
+    if cli.json {
+        return print_json(&value);
+    }
+    let on_off = |value: &Value| if value.as_bool().unwrap_or(false) { "attivo" } else { "disattivo" };
+    let tray_state = if value["tray_available"].as_bool() != Some(true) {
+        "non disponibile su questa piattaforma"
+    } else if value["tray"].as_bool() == Some(true) && value["tray_running"].as_bool() != Some(true) {
+        "attivo, ma l'area di notifica non risponde"
+    } else {
+        on_off(&value["tray"])
+    };
+    say(format!("Barra delle applicazioni: {tray_state}"))?;
+    say(format!("Notifiche: {}", on_off(&value["notify_enabled"])))?;
+    say(format!("Anteprime nelle notifiche: {}", on_off(&value["notify_previews"])))?;
+    say(format!("Intervallo tra avvisi: {} secondi", value["debounce_secs"].as_u64().unwrap_or(60)))?;
     Ok(())
 }
 
@@ -1390,6 +1468,9 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Daemon { command } => match command {
             DaemonCommand::Status => true,
             DaemonCommand::Autostart { command } => matches!(command, AutostartCommand::Status),
+            DaemonCommand::Settings { tray, notify, previews, debounce } => {
+                tray.is_none() && notify.is_none() && previews.is_none() && debounce.is_none()
+            }
             DaemonCommand::Start | DaemonCommand::Stop => false,
         },
         Command::Mcp { .. } => false,

@@ -27,22 +27,36 @@ const NEW_MAIL_BODY: &str = "Hai nuova posta. Apri Postino per leggerla.";
 const FAILURE_TITLE: &str = "Invio non riuscito";
 const FAILURE_BODY: &str = "Apri Postino e controlla la Coda di invio.";
 
-/// A launcher seam so a recorder test can prove which store the menu opens without starting a GUI.
-pub trait AppLauncher: Send + Sync {
-    fn open(&self, store: &Path) -> Result<(), String>;
+/// Which view the app should open after boot. The tray entry is the only caller that asks for the
+/// outbox, so a plain "Apri Postino" still starts on the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppOpen {
+    Mail,
+    Outbox,
 }
 
-/// Production launcher: the sibling `postino-app` binary, never a shell and never a URL.
+/// A launcher seam so a recorder test can prove which store and view the menu opens without
+/// starting a GUI.
+pub trait AppLauncher: Send + Sync {
+    fn open(&self, store: &Path, view: AppOpen) -> Result<(), String>;
+}
+
+/// Production launcher: the sibling `postino-app` binary, never a shell and never a URL. Only used
+/// when no window is listening on the daemon events; a connected window is activated instead.
 #[derive(Debug, Default)]
 pub struct ProcessLauncher;
 
 impl AppLauncher for ProcessLauncher {
-    fn open(&self, store: &Path) -> Result<(), String> {
+    fn open(&self, store: &Path, view: AppOpen) -> Result<(), String> {
         let Some(app) = app_binary() else {
             return Err("the app binary is not next to the daemon binary".to_owned());
         };
         let mut command = std::process::Command::new(app);
-        command.arg("--store").arg(store).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        command.arg("--store").arg(store);
+        if view == AppOpen::Outbox {
+            command.arg("--open").arg("outbox");
+        }
+        command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -190,31 +204,73 @@ pub(crate) fn start(state: &DaemonState) -> bool {
     match tray.start(&launch) {
         Ok(()) => {
             state.install_notifier(tray.notifier());
+            state.set_tray_running(true);
+            state.note_tray_started();
             refresh(state);
             true
         }
         Err(error) => {
-            log::warn!("tray unavailable; the daemon keeps serving: {error}");
+            state.set_tray_running(false);
+            state.note_tray_start_failed(error);
             false
         }
     }
 }
 
+pub(crate) fn stop(state: &DaemonState) {
+    if !state.tray_running() {
+        return;
+    }
+    if let Some(tray) = &state.tray {
+        tray.stop();
+    }
+    state.set_tray_running(false);
+}
+
+/// Keep the icon in sync with the preference. A failed start is retried on a slow cadence so a late
+/// Explorer does not require a daemon restart; a successful start is never repeated.
+fn reconcile(state: &DaemonState, next_attempt: &mut std::time::Instant) {
+    if state.settings().tray {
+        if !state.tray_running() && std::time::Instant::now() >= *next_attempt {
+            start(state);
+            *next_attempt = std::time::Instant::now() + Duration::from_secs(5);
+        }
+    } else {
+        stop(state);
+    }
+}
+
 /// Poll the bounded recorder channel and run menu actions. No busy loop and no unbounded queue.
 pub(crate) async fn run(state: Arc<DaemonState>) {
+    let mut next_attempt = std::time::Instant::now();
     loop {
+        reconcile(&state, &mut next_attempt);
         while let Some(action) = state.tray_action() {
             match action {
-                TrayAction::Open => match state.launcher.open(&state.config.store_path) {
-                    Ok(()) => log::info!("postino-app launch requested from the tray"),
-                    Err(error) => log::warn!("the app could not be started from the tray: {error}"),
-                },
+                TrayAction::Open | TrayAction::OpenOutbox => {
+                    let (view, activation) = if action == TrayAction::OpenOutbox { (AppOpen::Outbox, "outbox") } else { (AppOpen::Mail, "open") };
+                    // A running window is the only one that may answer: focus it instead of
+                    // starting a second process that would compete for the same store.
+                    if state.activate_app(activation) {
+                        log::info!("activation delivered to the running app");
+                    } else {
+                        match state.launcher.open(&state.config.store_path, view) {
+                            Ok(()) => log::info!("postino-app launch requested from the tray"),
+                            Err(error) => log::warn!("the app could not be started from the tray: {error}"),
+                        }
+                    }
+                }
                 TrayAction::SyncNow => {
                     log::info!("sync requested from the tray");
                     state.request_sync();
                 }
                 TrayAction::Quit => {
                     log::info!("shutdown requested from the tray");
+                    // A hidden window exits on this event before the pipe disappears; a window that
+                    // misses it reconnects, falls back to the offline state and reopens itself.
+                    if state.activate_app("quit") {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
                     state.shutdown.cancel();
                 }
             }
@@ -225,6 +281,7 @@ pub(crate) async fn run(state: Arc<DaemonState>) {
             _ = tokio::time::sleep(Duration::from_millis(150)) => {}
         }
     }
+    stop(&state);
 }
 
 pub(crate) fn refresh(state: &DaemonState) {

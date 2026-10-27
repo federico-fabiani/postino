@@ -21,6 +21,7 @@ use postino_net::CertificateDer;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::background;
 use crate::boot::{self, BootFailure, Launch, StoreHandle};
 use crate::daemon;
 use crate::onboarding::{self, ConnectionError, ErrorKind, FocusField, FolderPreview, FolderRole, FoldersPreview, Onboarding, ProviderChoice, Stage};
@@ -45,6 +46,56 @@ use crate::ui::widgets::{
     IconButton, IconButtonSize, ListRow, Menu, MenuItem, NO_SMTP_SEND_REASON, SearchField, SectionHeader, TextField, Toast, ToastKind, ToastResult,
 };
 
+/// Which view the command line asked for. Only the tray passes `Outbox`; a desktop launch keeps
+/// the mail list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartupView {
+    #[default]
+    Mail,
+    Outbox,
+}
+
+impl StartupView {
+    /// The one `--open` vocabulary, shared by the parser and the launch path so a new view cannot
+    /// parse but never open.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "outbox" => Some(Self::Outbox),
+            _ => None,
+        }
+    }
+}
+
+/// A tray request delivered over the daemon event subscription. It focuses one process instead of
+/// starting a second one, and it is the only way a hidden window comes back without a tray click
+/// landing on a dead icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    Open,
+    Outbox,
+    Quit,
+}
+
+impl Activation {
+    /// The bounded vocabulary the daemon publishes; anything else is ignored.
+    pub fn parse(action: &str) -> Option<Self> {
+        match action {
+            "open" => Some(Self::Open),
+            "outbox" => Some(Self::Outbox),
+            "quit" => Some(Self::Quit),
+            _ => None,
+        }
+    }
+}
+
+/// One row the user toggled, applied only after the settings page reads the result back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundChange {
+    Tray(bool),
+    Notify(bool),
+    Previews(bool),
+    Autostart(bool),
+}
 /// The shell scenes `--screenshot` can render. Add a label here and a branch in
 /// [`PostinoApp::seed_screenshot`] to grow the set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,12 +491,31 @@ pub struct PostinoApp {
     daemon_events: Option<daemon::EventWorker>,
     /// A start/stop request in flight: the window must never freeze for a process spawn.
     daemon_job: Option<DaemonJobState>,
+    /// The daemon/platform bridge behind the four background rows. Tests inject a recorder.
+    background: Box<dyn background::Bridge>,
+    /// The last successful read; `None` until the settings page opens.
+    background_rows: Option<background::Rows>,
+    /// A toggle waiting to be written to the daemon or the platform.
+    background_change: Option<BackgroundChange>,
+    /// The command line asked for a view other than the mail list.
+    startup_open: StartupView,
+    /// The one-time close-to-tray explanation is open.
+    close_prompt: bool,
+    /// Set only for an explicit exit, so eframe's next close request is not intercepted again.
+    allow_close: bool,
+    /// The first-hide notice was accepted; closing now hides without asking again.
+    tray_notice_shown: bool,
+    /// The window is minimized to the tray, so a lost daemon must bring it back instead of leaving
+    /// an orphan process with no icon.
+    hidden: bool,
+    /// A tray activation parsed from the daemon events, applied once per frame with the context.
+    pending_activation: Option<Activation>,
 }
 
 impl PostinoApp {
     /// Normal desktop launch. The command line chose demo or a store; a failure is a recovery
     /// screen, never a panic and never an empty mailbox.
-    pub fn launch(cc: &eframe::CreationContext<'_>, custom_chrome: bool, launch: Launch) -> Self {
+    pub fn launch(cc: &eframe::CreationContext<'_>, custom_chrome: bool, launch: Launch, startup: StartupView) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let settings_path = Settings::path();
         let settings = settings_path.as_deref().map_or_else(Settings::default, Settings::load_from);
@@ -481,9 +551,11 @@ impl PostinoApp {
         {
             app.start_sync_for(Some(account));
         }
+        // One path for the command line, the tray activation and the unit tests: a startup view is
+        // applied only after the first boot, including when the daemon connects a moment later.
+        app.apply_launch_view(startup);
         app
     }
-
     fn from_booted(booted: boot::Booted, custom_chrome: bool, now: DateTime<Utc>, launch: Launch, extra_roots: Vec<CertificateDer<'static>>) -> Self {
         let boot::Booted { engine, store, demo, writer_lock, daemon } = booted;
         let mut app = Self::with_engine(engine, store, demo, None, launch, custom_chrome, now, extra_roots);
@@ -564,8 +636,9 @@ impl PostinoApp {
     }
 
     /// Drain the daemon subscription once per frame. A dropped channel is a state, not a failure
-    /// toast: the mailbox stays readable and the composer keeps its draft.
-    fn poll_daemon(&mut self) {
+    /// toast: the mailbox stays readable and the composer keeps its draft. A hidden window whose
+    /// daemon is gone reopens itself, because from then on there is no tray icon that could.
+    fn poll_daemon(&mut self, ctx: &egui::Context) {
         let events = self.daemon_events.as_mut().map(daemon::EventWorker::poll).unwrap_or_default();
         for event in events {
             match event {
@@ -575,6 +648,9 @@ impl PostinoApp {
                     if !was_live {
                         self.reload_engine_after_sync(false);
                         self.status = "Daemon collegato: questa finestra scrive attraverso il canale locale.".to_owned();
+                        // The first launch may have probed before the daemon answered: a pending
+                        // startup view is applied once, now that the channel is real.
+                        self.after_launch();
                     }
                 }
                 daemon::Event::Reconnecting { attempt } => {
@@ -582,12 +658,47 @@ impl PostinoApp {
                 }
                 daemon::Event::Lost => {
                     self.connection = daemon::Connection::Lost;
-                    self.status = "Il daemon non risponde: la posta resta leggibile, le modifiche sono sospese.".to_owned();
+                    self.status = if self.hidden {
+                        "Il daemon non risponde: la finestra è tornata in primo piano, la posta resta leggibile e le modifiche sono sospese."
+                            .to_owned()
+                    } else {
+                        "Il daemon non risponde: la posta resta leggibile, le modifiche sono sospese.".to_owned()
+                    };
                     self.reload_engine_after_sync(false);
+                    if self.hidden {
+                        self.restore_window(ctx);
+                    }
                 }
                 daemon::Event::Daemon(value) => self.apply_daemon_event(value),
             }
         }
+        if let Some(activation) = self.pending_activation.take() {
+            self.run_activation(ctx, activation);
+        }
+    }
+
+    fn run_activation(&mut self, ctx: &egui::Context, activation: Activation) {
+        match activation {
+            Activation::Open => self.restore_window(ctx),
+            Activation::Outbox => {
+                self.open_outbox();
+                self.restore_window(ctx);
+            }
+            Activation::Quit => {
+                // An explicit tray exit closes the window even when it was hidden, so the daemon's
+                // shutdown never leaves a process behind with no icon.
+                self.allow_close = true;
+                self.close_prompt = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn restore_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
     }
 
     /// The same store-backed views the in-process workers refresh, driven by the daemon's bounded
@@ -596,6 +707,13 @@ impl PostinoApp {
         let kind = event.get("kind").and_then(Value::as_str).unwrap_or_default();
         let data = event.get("data").cloned().unwrap_or(Value::Null);
         match kind {
+            "activation" => {
+                // The tray asks the window it found, never a second process. A quit is explicit, so
+                // it does not go through the close prompt.
+                if let Some(activation) = data.get("action").and_then(Value::as_str).and_then(Activation::parse) {
+                    self.pending_activation = Some(activation);
+                }
+            }
             "sync" => {
                 let phase = data.get("phase").and_then(Value::as_str).unwrap_or_default();
                 let account = data.get("account").and_then(Value::as_str).map(str::to_owned);
@@ -899,6 +1017,8 @@ impl PostinoApp {
         let saved_searches = active_account.as_deref().and_then(|account| engine.saved_searches_list(Some(account)).ok()).unwrap_or_default();
         let recent_searches = active_account.as_deref().and_then(|account| engine.recent_searches(Some(account)).ok()).unwrap_or_default();
         let saved_revision = engine.revision();
+        // The bridge owns the store path for its daemon link; the shell keeps the same path.
+        let background = Box::new(background::LiveBridge::new(store_path.clone()));
         Self {
             engine,
             folder,
@@ -1030,6 +1150,15 @@ impl PostinoApp {
             daemon_link: None,
             daemon_events: None,
             daemon_job: None,
+            background,
+            background_rows: None,
+            background_change: None,
+            startup_open: StartupView::Mail,
+            close_prompt: false,
+            allow_close: false,
+            tray_notice_shown: false,
+            hidden: false,
+            pending_activation: None,
         }
     }
 
@@ -1061,6 +1190,24 @@ impl PostinoApp {
 
     /// Apply the state named on the command line. Every scene is deterministic: no timer, no
     /// pointer and no focus side effect may change it between the first frame and the capture.
+    /// The settings capture shows a live-looking but deterministic background state. It never reads
+    /// the registry or talks to a daemon: a docs image must not depend on the machine that builds it.
+    fn seed_background_rows(&mut self) {
+        let daemon = background::DaemonView {
+            tray: true,
+            notify_enabled: true,
+            notify_previews: false,
+            debounce_secs: 60,
+            tray_available: true,
+            tray_running: true,
+        };
+        let autostart = background::AutostartView {
+            enabled: true,
+            command: Some(r"C:\Program Files\Postino\postino-daemon.exe --store C:\Users\me\AppData\Roaming\Postino\mail.db".to_owned()),
+        };
+        self.background_rows = Some(background::Rows::read(Ok(daemon), Ok(autostart)));
+    }
+
     fn seed_screenshot(&mut self, state: ScreenshotState) {
         self.screenshot_message = None;
         match state {
@@ -1292,6 +1439,7 @@ impl PostinoApp {
                 self.clear_selection();
                 self.close_reading();
                 self.demo = false;
+                self.seed_background_rows();
                 let last = self.now_utc.timestamp_millis() - 12 * 60 * 1000;
                 self.sync_view = SyncView::Idle { last_sync: Some(last) };
                 self.last_sync = Some(last);
@@ -1304,6 +1452,7 @@ impl PostinoApp {
                 self.clear_selection();
                 self.close_reading();
                 self.demo = false;
+                self.seed_background_rows();
                 self.show_accounts_dialog = true;
                 self.settings_focus_pending = false;
                 if let Some(account) = self.engine.accounts().first().cloned() {
@@ -1454,6 +1603,26 @@ impl PostinoApp {
         app
     }
 
+    /// The launch path for `--open`: the parser produces a [`StartupView`], the window applies it
+    /// after the boot. Reused by the tray activation, which must focus the journal it opens.
+    fn apply_launch_view(&mut self, startup: StartupView) {
+        self.startup_open = startup;
+        self.after_launch();
+    }
+
+    /// Honour `--open` and a tray activation: one path, applied after the boot, so the journal is
+    /// refreshed against a live engine whether the daemon answered before or after the first frame.
+    fn after_launch(&mut self) {
+        self.apply_startup_view();
+    }
+
+    /// Honour `--open`: the tray's Coda di invio item launches the app straight onto the journal.
+    fn apply_startup_view(&mut self) {
+        if self.startup_open == StartupView::Outbox {
+            self.open_outbox();
+        }
+    }
+
     /// Adopt a loaded settings file. The account and the folder are only accepted when the engine
     /// knows them; a settings file from another mailbox falls back to the first account and its
     /// inbox instead of opening a blank view.
@@ -1477,6 +1646,7 @@ impl PostinoApp {
         self.folder = if folder_ok { settings.folder } else { default_folder_for(&self.engine, self.active_account.as_deref()) };
         self.reading_ratio = settings.reading_pane_ratio;
         self.reduced_motion = settings.reduced_motion;
+        self.tray_notice_shown = settings.tray_notice_shown;
         if !self.demo {
             self.sync_view = sync_view_for(&self.engine, self.active_account.as_deref());
             self.last_sync = last_sync_from(&self.sync_view);
@@ -1492,6 +1662,7 @@ impl PostinoApp {
             folder: self.folder.clone(),
             reduced_motion: self.reduced_motion,
             account: self.active_account.clone(),
+            tray_notice_shown: self.tray_notice_shown,
         }
     }
 
@@ -1511,6 +1682,112 @@ impl PostinoApp {
         }
         self.settings_dirty = false;
         self.settings_saved_at = self.now;
+    }
+
+    /// Read the four background rows. This never starts the daemon: a missing daemon is a row-level
+    /// reason, not a reason to launch a process behind the user's back.
+    fn refresh_background(&mut self) {
+        // Demo mode has no store and no daemon path, so the autostart row is disabled with its own
+        // reason instead of the wrong "daemon binary next to the app" sentence.
+        let autostart = if self.demo { Err(background::DEMO_AUTOSTART.to_owned()) } else { self.background.autostart() };
+        // Without a live daemon the three daemon rows are unavailable, but autostart is a platform
+        // value and is still read: it does not need the daemon to exist.
+        let daemon = if self.connection.remote() { self.background.daemon() } else { Err("Il daemon non è in esecuzione.".to_owned()) };
+        self.background_rows = Some(background::Rows::read(daemon, autostart));
+    }
+
+    /// Apply the toggle the user chose, then read back. The write is explicit; a failure leaves the
+    /// previous value visible and prints the daemon's sentence above the rows.
+    fn apply_background_change(&mut self) {
+        let Some(change) = self.background_change.take() else {
+            return;
+        };
+        let result = match change {
+            BackgroundChange::Tray(on) => self.background.patch(background::Patch { tray: Some(on), ..Default::default() }).map(|_| ()),
+            BackgroundChange::Notify(on) => self.background.patch(background::Patch { notify_enabled: Some(on), ..Default::default() }).map(|_| ()),
+            BackgroundChange::Previews(on) => {
+                self.background.patch(background::Patch { notify_previews: Some(on), ..Default::default() }).map(|_| ())
+            }
+            BackgroundChange::Autostart(on) => self.background.autostart_set(on).map(|_| ()),
+        };
+        match result {
+            Ok(_) => {
+                self.status = "Impostazione salvata.".to_owned();
+                self.refresh_background();
+            }
+            Err(error) => {
+                if let Some(rows) = self.background_rows.as_mut() {
+                    rows.error = Some(error.clone());
+                } else {
+                    self.background_rows = Some(background::Rows::unavailable(Some(error.clone())));
+                }
+                self.status = error;
+            }
+        }
+    }
+
+    /// Intercept eframe's close request. Without a daemon-owned store the window exits as before.
+    /// With one, hiding is allowed only when the preference is on and the icon is really running.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.allow_close || self.close_prompt || self.screenshot.is_some() {
+            return;
+        }
+        if !ctx.input(|input| input.viewport().close_requested()) || !self.connection.remote() {
+            return;
+        }
+        self.refresh_background();
+        let rows = self.background_rows.as_ref();
+        let tray_enabled = rows.is_some_and(|rows| rows.tray.available && rows.tray.on);
+        let tray_running = rows.is_some_and(|rows| rows.tray_running);
+        match background::close_action(tray_enabled, tray_running, self.connection.remote(), self.tray_notice_shown) {
+            background::CloseAction::Exit => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            background::CloseAction::Hide => {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.hide_to_tray(ctx);
+            }
+            background::CloseAction::Ask => {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.close_prompt = true;
+            }
+        }
+    }
+
+    /// Hide the window and remember that the explanation was accepted. The app keeps running
+    /// because the daemon keeps the store, the tray offers the way back and `Esci` is explicit.
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        self.close_prompt = false;
+        self.hidden = true;
+        if !self.tray_notice_shown {
+            self.tray_notice_shown = true;
+            self.mark_settings_dirty();
+            self.persist_settings();
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+    }
+
+    /// The first close-to-tray explanation. It is shown once per profile, never on every close.
+    fn close_notice(&mut self, ui: &mut egui::Ui) {
+        if !self.close_prompt {
+            return;
+        }
+        let response = crate::ui::widgets::Dialog::new(
+            "Postino resta nella barra delle applicazioni",
+            "Il daemon continua a sincronizzare e la finestra si nasconde. Per chiudere davvero usa Esci dal menu Postino o dalla barra delle applicazioni.",
+            "Nascondi nella barra",
+        )
+        .secondary("Esci da Postino")
+        .show(ui);
+        if response.primary {
+            let ctx = ui.ctx().clone();
+            self.hide_to_tray(&ctx);
+        } else if response.secondary {
+            self.close_prompt = false;
+            self.allow_close = true;
+            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        }
     }
 
     fn apply_theme(&mut self, ctx: &egui::Context) {
@@ -4345,6 +4622,13 @@ impl PostinoApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Ctrl+Q is the advertised quit shortcut: it works on every page and in front of every
+        // modal, because a person must always be able to leave the application from the keyboard.
+        if ctx.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::Q)) {
+            self.allow_close = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        }
         // Onboarding and account dialogs own their keyboard. The shell must not steal J/K/Enter
         // while a first-run form or a modal is in front of it.
         if self.boot_failure.is_some()
@@ -5022,6 +5306,14 @@ impl PostinoApp {
         transitioned || vanished
     }
 
+    /// Open the outbox through one path: the command table, the tray startup flag and any future
+    /// caller all land here, so they cannot drift on whether the journal is refreshed first.
+    fn open_outbox(&mut self) {
+        self.refresh_outbox();
+        self.outbox_open = true;
+        self.status.clear();
+    }
+
     /// One scheduler tick: refresh the journal, reload the mailbox if another process delivered
     /// something, then cache the next wake time and ask the worker if it is due. The 2 s poll (and
     /// the cached `pending_send`) is the only scheduler; no per-frame database query.
@@ -5278,7 +5570,7 @@ impl PostinoApp {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         self.handle_sync_events();
-        self.poll_daemon();
+        self.poll_daemon(ctx);
         self.poll_daemon_job();
         if self.daemon_job.is_some() || self.connection.remote() && !self.connection.is_live() {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -7674,6 +7966,10 @@ impl PostinoApp {
         self.show_accounts_menu = false;
         self.show_accounts_dialog = true;
         self.show_licences = false;
+        // Every open re-reads the rows: a tray or autostart change made by the CLI in the meantime
+        // must never be answered from the previous visit.
+        self.background_rows = None;
+        self.background_change = None;
     }
 
     fn close_settings(&mut self, ctx: &egui::Context) {
@@ -7682,6 +7978,10 @@ impl PostinoApp {
         // Closing Settings discards an unsaved signature editor; reopening must not show stale text.
         self.signature_editor = None;
         self.signature_focus_account = None;
+        // A dead icon or a daemon restart is invisible while the page is closed; the next open must
+        // read it again instead of serving the last bool.
+        self.background_rows = None;
+        self.background_change = None;
         self.focus_account_switcher = true;
         if let Some(id) = self.settings_return_focus.take() {
             ctx.memory_mut(|memory| memory.request_focus(id));
@@ -8130,6 +8430,11 @@ impl PostinoApp {
         if !self.show_accounts_dialog {
             return;
         }
+        // The page is live: every open (and every reopen after a close, since both clear the cache)
+        // reads the daemon and the platform once, then writes are confirmed by the next read.
+        if self.background_rows.is_none() {
+            self.refresh_background();
+        }
         // Escape closes the signature editor first; only a second Escape leaves Settings. Consuming
         // the key here keeps the modal's own close rule from seeing it.
         if self.signature_editor.is_some()
@@ -8331,6 +8636,51 @@ impl PostinoApp {
                         });
 
                         ui.add_space(space::XS);
+                        let _system = ui.label(typography::strong(Role::BodySmall, "SISTEMA", t.text_faint));
+                        #[cfg(test)]
+                        probe::settings_section(ui, "SISTEMA", _system.rect);
+                        ui.add_space(space::XS);
+                        if let Some(rows) = self.background_rows.clone() {
+                            if let Some(error) = rows.error.as_deref() {
+                                ui.label(typography::text(Role::Caption, error, t.danger));
+                            }
+                            for (key, title, description, row, change) in [
+                                (
+                                    "tray",
+                                    "Barra delle applicazioni",
+                                    "Icona e menu Apri, Sincronizza, Coda di invio ed Esci.",
+                                    &rows.tray,
+                                    BackgroundChange::Tray(!rows.tray.on),
+                                ),
+                                (
+                                    "notify",
+                                    "Notifiche",
+                                    "Avvisi per nuova posta e invii non riusciti.",
+                                    &rows.notify,
+                                    BackgroundChange::Notify(!rows.notify.on),
+                                ),
+                                (
+                                    "previews",
+                                    "Anteprime nelle notifiche",
+                                    "Mittente e oggetto nell'avviso; disattive, l'avviso non contiene dati.",
+                                    &rows.previews,
+                                    BackgroundChange::Previews(!rows.previews.on),
+                                ),
+                                (
+                                    "autostart",
+                                    "Avvio automatico",
+                                    "Avvia il daemon all'accesso con questo utente.",
+                                    &rows.autostart,
+                                    BackgroundChange::Autostart(!rows.autostart.on),
+                                ),
+                            ] {
+                                if let Some(change) = background_row(ui, key, title, description, row, change) {
+                                    self.background_change = Some(change);
+                                }
+                            }
+                        }
+
+                        ui.add_space(space::XS);
                         let path = self
                             .store_path
                             .as_ref()
@@ -8426,6 +8776,8 @@ impl PostinoApp {
                 #[cfg(test)]
                 probe::settings_footer(ui, _footer.response.rect);
             });
+        // A toggle was clicked inside the modal closure; write it now and read the stored value back.
+        self.apply_background_change();
         if let Some((system, dark)) = theme_choice {
             if system {
                 self.set_system_theme(ui.ctx(), true);
@@ -9223,9 +9575,7 @@ impl PostinoApp {
             }
             "send" => self.send_composer(),
             "outbox" => {
-                self.refresh_outbox();
-                self.outbox_open = true;
-                self.status.clear();
+                self.open_outbox();
             }
             "open" => {
                 if self.threads_view {
@@ -9375,6 +9725,11 @@ impl PostinoApp {
             "sync" => self.request_sync(),
             "daemon_start" => self.request_start_daemon(),
             "daemon_stop" => self.request_stop_daemon(),
+            "quit" => {
+                // Explicit exit: the close handler must not turn this into a hide.
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
             "daemon_status" => self.status = self.daemon_status_text(),
             "settings" => self.open_settings(ctx, self.account_switcher_id),
             "add_account" => {
@@ -9394,8 +9749,12 @@ impl PostinoApp {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         // The root UI can be wider than the window at fractional display scaling. Pin the whole
         // shell to the real content rect so right-aligned controls and the status bar stay inside.
+        self.handle_close_request(ui.ctx());
         let content = ui.ctx().content_rect();
-        ui.scope_builder(UiBuilder::new().max_rect(content), |ui| self.show_inner(ui));
+        ui.scope_builder(UiBuilder::new().max_rect(content), |ui| {
+            self.show_inner(ui);
+            self.close_notice(ui);
+        });
     }
 
     /// Drive the deterministic capture. Runs only when `--screenshot` built the app.
@@ -9549,6 +9908,43 @@ impl PostinoApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
         }
     }
+}
+
+/// One background setting row: title and explanation on the left, a truthful on/off button on the
+/// right. An unavailable row keeps its switch disabled and prints the reason from the daemon or the
+/// platform instead of pretending the value is off.
+fn background_row(
+    ui: &mut Ui,
+    key: &str,
+    title: &str,
+    description: &str,
+    row: &background::Row,
+    toggled: BackgroundChange,
+) -> Option<BackgroundChange> {
+    let t = tokens::tokens(ui.visuals().dark_mode);
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(typography::strong(Role::Body, title, t.text));
+            ui.label(typography::text(Role::Caption, description, t.text_muted));
+            if let Some(note) = row.reason.as_deref().or(row.detail.as_deref()) {
+                ui.label(typography::text(Role::Meta, note, t.text_faint));
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let response = Button::new(if row.on { "Attivo" } else { "Disattivo" })
+                .selected(row.on)
+                .enabled(row.available)
+                .disabled_reason(row.reason.as_deref().unwrap_or("Questa impostazione non è disponibile"))
+                .show(ui);
+            #[cfg(test)]
+            probe::settings_action(ui, key, response.rect);
+            #[cfg(not(test))]
+            let _ = key;
+            clicked = response.clicked();
+        });
+    });
+    clicked.then_some(toggled)
 }
 
 impl eframe::App for PostinoApp {
@@ -10301,6 +10697,7 @@ const COMMANDS: &[Command] = &[
     Command { id: "add_account", label: "Aggiungi account", icon: icons::PLUS, shortcut: "", rule: CommandRule::Store, in_palette: true },
     Command { id: "daemon_start", label: "Avvia il daemon", icon: icons::SYNC, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command { id: "daemon_stop", label: "Ferma il daemon", icon: icons::CLOSE, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: "quit", label: "Esci da Postino", icon: icons::CLOSE, shortcut: "Ctrl+Q", rule: CommandRule::Always, in_palette: true },
     Command { id: "daemon_status", label: "Stato del daemon", icon: icons::INFO, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command { id: "reduced_motion", label: "Riduci le animazioni", icon: icons::CLOCK, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
@@ -12076,8 +12473,32 @@ mod tests {
         let mut output = ctx.run_ui(raw, |ui| app.show(ui));
         output.textures_delta.clear();
     }
+
+    /// One frame that returns its viewport commands, for activation and quit assertions.
+    fn frame_output(ctx: &egui::Context, app: &mut PostinoApp, events: Vec<egui::Event>) -> egui::FullOutput {
+        let raw =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 800.0))), events, ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+        output
+    }
     fn frame(ctx: &egui::Context, app: &mut PostinoApp, events: Vec<egui::Event>) {
         frame_at(ctx, app, Vec2::new(1200.0, 800.0), events);
+    }
+
+    /// One frame where the window manager asks to close, the way the real close button does.
+    fn close_request(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2) -> egui::FullOutput {
+        let mut input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+        let mut info = egui::ViewportInfo::default();
+        info.events.push(egui::ViewportEvent::Close);
+        input.viewports.insert(egui::ViewportId::ROOT, info);
+        let mut output = ctx.run_ui(input, |ui| app.show(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    fn commands(output: &egui::FullOutput) -> &[egui::ViewportCommand] {
+        output.viewport_output.get(&egui::ViewportId::ROOT).map_or(&[], |output| output.commands.as_slice())
     }
 
     fn key(key: Key, modifiers: Modifiers) -> egui::Event {
@@ -15608,10 +16029,13 @@ mod tests {
         postino_daemon::Daemon::spawn(config).expect("the daemon starts")
     }
 
-    /// Poll the window's daemon channel until `done` holds, with a bounded wall clock.
+    /// Poll the window's daemon channel until `done` holds, with a bounded wall clock. The frame's
+    /// context is not needed for the state assertions these tests make; viewport commands are
+    /// asserted from a real `frame_output` instead.
     fn poll_until(app: &mut PostinoApp, mut done: impl FnMut(&PostinoApp) -> bool) -> bool {
+        let ctx = egui::Context::default();
         for _ in 0..400 {
-            app.poll_daemon();
+            app.poll_daemon(&ctx);
             app.poll_daemon_job();
             if done(app) {
                 return true;
@@ -16318,23 +16742,30 @@ mod tests {
         let (mut app, _, _) = seeded_attachment_app("p6c-settings-980", "report.pdf", None);
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
+        app.background = Box::new(background::tests::RecorderBridge::with_rows());
+        app.background_rows = None;
+        app.connection = daemon::Connection::Connected(daemon::Hello { pid: 7, version: "test".to_owned() });
         app.open_settings(&ctx, None);
         for dark in [false, true] {
             app.dark = dark;
             theme::apply(&ctx, dark);
+            // Start every mode at the top: the previous mode may have scrolled to the footer.
+            if let Some(scroll) = probe::settings_scroll_view(&ctx) {
+                frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), wheel_by(scroll.center(), 40, 6.0));
+            }
             let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
             // Capture after the first settled frame: `Context::default()` starts with a huge
             // placeholder viewport, which would make the light assertions vacuous.
             let content = ctx.content_rect();
             let text = runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>();
-            for section in ["ACCOUNT", "ASPETTO", "DATI", "INFORMAZIONI", "Licenze e attribuzioni", "Scorciatoie da tastiera"] {
+            for section in ["ACCOUNT", "ASPETTO", "SISTEMA", "Barra delle applicazioni", "Notifiche", "Anteprime", "Avvio automatico"] {
                 assert!(text.iter().any(|line| line.contains(section)), "missing {section}: {text:?}");
             }
             assert!(text.iter().any(|line| line.contains("Ultimo sync")), "the account row names its last sync: {text:?}");
             let scroll = probe::settings_scroll_view(&ctx).expect("the settings scroll viewport");
             assert_eq!(probe::settings_scroll_offset(&ctx), Some(0.0), "the settings shot starts at the top");
             let sections = probe::settings_sections(&ctx);
-            for section in ["ACCOUNT", "ASPETTO", "DATI", "INFORMAZIONI"] {
+            for section in ["ACCOUNT", "ASPETTO", "SISTEMA"] {
                 let rect = sections.get(section).copied().unwrap_or_else(|| panic!("{section} was not probed"));
                 assert!(content.contains_rect(rect), "{section} is outside the window: {rect:?}");
                 assert!(scroll.contains_rect(rect), "{section} is clipped by the scroll viewport: {rect:?} in {scroll:?}");
@@ -16343,6 +16774,21 @@ mod tests {
                     .find(|run| run.text == section || run.text.starts_with(section))
                     .unwrap_or_else(|| panic!("{section} text run missing: {text:?}"));
                 assert!(run.clip.contains_rect(run.rect), "{section} text is clipped: {run:?}");
+            }
+            for key in ["tray", "notify", "previews", "autostart"] {
+                let action = probe::settings_action_rect(&ctx, key).unwrap_or_else(|| panic!("the {key} switch was not probed"));
+                assert!(scroll.contains_rect(action), "the {key} switch is clipped at 980x600: {action:?} in {scroll:?}");
+            }
+            // The added section moves the last two sections below the fold; a real wheel scroll
+            // reaches them and the footer never leaves the window.
+            frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), wheel(scroll.center(), 40));
+            assert!(probe::settings_scroll_offset(&ctx).unwrap_or(0.0) > 0.0, "the settings page must scroll");
+            let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            let text = runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>();
+            let sections = probe::settings_sections(&ctx);
+            for section in ["DATI", "INFORMAZIONI"] {
+                let rect = sections.get(section).copied().unwrap_or_else(|| panic!("{section} was not probed"));
+                assert!(scroll.contains_rect(rect), "{section} is not reachable at 980x600: {rect:?} in {scroll:?}");
             }
             let footer = probe::settings_footer_rect(&ctx).expect("the settings footer");
             assert!(content.contains_rect(footer), "the footer is off-screen at 980x600: {footer:?}");
@@ -16356,6 +16802,207 @@ mod tests {
                 assert!(run.clip.contains_rect(run.rect), "{label} text is clipped: {run:?}");
             }
         }
+    }
+
+    #[test]
+    fn settings_background_rows_show_live_state_and_write_back() {
+        let (mut app, _, _) = seeded_attachment_app("p10b2-settings-rows", "report.pdf", None);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        app.background = Box::new(background::tests::RecorderBridge::with_rows());
+        app.background_rows = None;
+        app.connection = daemon::Connection::Connected(daemon::Hello { pid: 7, version: "test".to_owned() });
+        app.open_settings(&ctx, None);
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let rows = app.background_rows.clone().expect("the rows were read");
+        assert!(rows.tray.available && rows.tray.on);
+        assert!(rows.notify.available && rows.notify.on);
+        assert!(rows.previews.available && !rows.previews.on);
+        assert!(rows.autostart.available && !rows.autostart.on);
+
+        // A click writes through the bridge; the next frame shows the value read back from it.
+        let scroll = probe::settings_scroll_view(&ctx).expect("the settings scroll viewport");
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), wheel(scroll.center(), 12));
+        let rect = probe::settings_action_rect(&ctx, "tray").expect("the tray switch");
+        assert!(scroll.contains_rect(rect), "the tray switch must be clickable: {rect:?} in {scroll:?}");
+        click_at(&ctx, &mut app, rect.center(), Vec2::new(980.0, 600.0));
+        let rows = app.background_rows.clone().expect("the rows were re-read");
+        assert!(!rows.tray.on, "the switch must show the stored value, not the click");
+        assert!(rows.notify.on);
+
+        // Anteprime is a real dependent row, not a dead switch.
+        let mut off = background::tests::RecorderBridge::with_rows();
+        if let Some(daemon) = off.daemon.as_mut() {
+            daemon.notify_enabled = false;
+            daemon.notify_previews = true;
+        }
+        app.background = Box::new(off);
+        app.background_rows = None;
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let rows = app.background_rows.clone().expect("the rows were re-read");
+        assert!(!rows.previews.available);
+        assert_eq!(rows.previews.reason.as_deref(), Some("Attiva prima le notifiche."));
+
+        // No daemon: the three daemon rows are visibly unavailable, autostart still answers.
+        app.background = Box::new(background::tests::RecorderBridge::default());
+        app.background_rows = None;
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let rows = app.background_rows.clone().expect("the rows were re-read");
+        assert!(!rows.tray.available);
+        assert!(rows.tray.reason.as_deref().is_some_and(|reason| reason.contains("daemon")));
+        assert!(rows.autostart.available);
+    }
+
+    #[test]
+    fn the_first_hide_notice_is_persisted_and_read_back() {
+        let ctx = egui::Context::default();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("settings.json");
+        let mut app = PostinoApp::demo_at(true, screenshot_clock().expect("clock"));
+        app.settings_path = Some(path.clone());
+        assert!(!app.tray_notice_shown);
+
+        app.hide_to_tray(&ctx);
+        assert!(app.tray_notice_shown, "the explanation is accepted once");
+        assert!(app.hidden);
+        assert!(!app.settings_dirty, "the notice flag is written immediately, not with the next autosave");
+        let saved = Settings::load_from(&path);
+        assert!(saved.tray_notice_shown, "a relaunch must know the explanation was already shown");
+
+        // A second hide is silent and keeps the persisted flag: the dialog cannot come back.
+        let mut relaunched = PostinoApp::demo_at(true, screenshot_clock().expect("clock"));
+        relaunched.settings_path = Some(path.clone());
+        relaunched.apply_settings(saved);
+        assert!(relaunched.tray_notice_shown, "the flag reads back on the next launch");
+        relaunched.hide_to_tray(&ctx);
+        assert!(Settings::load_from(&path).tray_notice_shown);
+    }
+
+    #[test]
+    fn closing_hides_only_with_a_live_tray_and_exits_otherwise() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut app = PostinoApp::demo(true);
+        app.background = Box::new(background::tests::RecorderBridge::with_rows());
+        app.background_rows = None;
+        app.connection = daemon::Connection::Connected(daemon::Hello { pid: 7, version: "test".to_owned() });
+        app.tray_notice_shown = false;
+        let size = Vec2::new(980.0, 600.0);
+
+        // First close with the tray on asks once instead of hiding silently.
+        let output = close_request(&ctx, &mut app, size);
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
+        assert!(app.close_prompt);
+        assert!(!app.allow_close);
+
+        // Once explained, closing hides; the notice is persisted so it never asks again.
+        app.close_prompt = false;
+        app.tray_notice_shown = true;
+        let output = close_request(&ctx, &mut app, size);
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::Visible(false))));
+
+        // Tray disabled: the close is the exit, not a hide.
+        let mut off = background::tests::RecorderBridge::with_rows();
+        if let Some(daemon) = off.daemon.as_mut() {
+            daemon.tray = false;
+        }
+        app.background = Box::new(off);
+        app.background_rows = None;
+        app.tray_notice_shown = true;
+        let output = close_request(&ctx, &mut app, size);
+        assert!(app.allow_close);
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::Close)));
+    }
+
+    #[test]
+    fn the_open_flag_reaches_the_journal_through_the_launch_path() {
+        // The parser and the launch share one vocabulary, so `--open outbox` cannot parse into a
+        // view the window never applies.
+        let startup = StartupView::parse("outbox").expect("the parser accepts the tray view");
+        let mut app = PostinoApp::demo(true);
+        app.apply_launch_view(startup);
+        assert!(app.outbox_open, "--open outbox must open the Coda di invio");
+        assert!(StartupView::parse("sent").is_none(), "only the supported view parses");
+    }
+
+    #[test]
+    fn ctrl_q_is_a_real_quit_shortcut() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+        assert!(!app.allow_close);
+        let output = frame_output(&ctx, &mut app, vec![key(Key::Q, Modifiers::COMMAND)]);
+        assert!(app.allow_close, "Ctrl+Q is the advertised quit and must reach the handler");
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::Close)));
+    }
+
+    #[test]
+    fn a_tray_activation_focuses_the_hidden_window_and_quit_exits() {
+        let (ctx, mut app) = ready_app();
+        frame(&ctx, &mut app, vec![]);
+
+        app.hidden = true;
+        app.apply_daemon_event(json!({ "kind": "activation", "data": { "action": "open" } }));
+        let output = frame_output(&ctx, &mut app, vec![]);
+        assert!(!app.hidden, "Apri Postino must bring the hidden window back");
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::Visible(true))));
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::Focus)));
+
+        app.hidden = true;
+        app.outbox_open = false;
+        app.apply_daemon_event(json!({ "kind": "activation", "data": { "action": "outbox" } }));
+        let output = frame_output(&ctx, &mut app, vec![]);
+        assert!(app.outbox_open, "Coda di invio must open the journal it names");
+        assert!(!app.hidden);
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::Visible(true))));
+
+        app.apply_daemon_event(json!({ "kind": "activation", "data": { "action": "quit" } }));
+        let output = frame_output(&ctx, &mut app, vec![]);
+        assert!(app.allow_close, "Esci da Postino is explicit: it must not raise the close prompt");
+        assert!(commands(&output).iter().any(|command| matches!(command, egui::ViewportCommand::Close)));
+    }
+
+    #[test]
+    fn settings_rows_are_dropped_on_close_and_re_read_on_open() {
+        let (mut app, _, _) = seeded_attachment_app("p10b2-settings-cache", "report.pdf", None);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        app.background = Box::new(background::tests::RecorderBridge::with_rows());
+        app.connection = daemon::Connection::Connected(daemon::Hello { pid: 7, version: "test".to_owned() });
+
+        app.open_settings(&ctx, None);
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.background_rows.as_ref().is_some_and(|rows| rows.tray.available && rows.tray.on));
+
+        app.close_settings(&ctx);
+        assert!(app.background_rows.is_none(), "closing Settings must drop the cached rows");
+
+        // The daemon died while the page was closed: the next open must say so instead of serving
+        // the last live bool.
+        app.connection = daemon::Connection::InProcess;
+        app.background_rows = Some(background::Rows::read(
+            Ok(background::DaemonView { tray: true, tray_available: true, tray_running: true, ..background::DaemonView::default() }),
+            Ok(background::AutostartView::default()),
+        ));
+        app.open_settings(&ctx, None);
+        assert!(app.background_rows.is_none(), "opening Settings must not reuse the previous read");
+        frame(&ctx, &mut app, vec![]);
+        let rows = app.background_rows.as_ref().expect("the rows are re-read on open");
+        assert!(!rows.tray.available, "a dead daemon must disable the tray row, not show a stale switch");
+        assert!(rows.tray.reason.as_deref().is_some_and(|reason| reason.contains("daemon")));
+    }
+
+    #[test]
+    fn demo_mode_disables_autostart_with_its_own_reason() {
+        let mut app = PostinoApp::demo(true);
+        app.background = Box::new(background::tests::RecorderBridge::with_rows());
+        app.connection = daemon::Connection::Demo;
+        app.refresh_background();
+        let rows = app.background_rows.as_ref().expect("the demo still reads its platform row");
+        assert!(!rows.autostart.available, "the demo has no store to start the daemon with");
+        let reason = rows.autostart.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("archivio locale"), "the demo reason must name the missing archive: {reason}");
+        assert!(!reason.contains("accanto all'app"), "the demo must not get the missing-binary sentence: {reason}");
+        assert!(!rows.autostart.on, "a disabled demo row never claims to be on");
     }
 
     #[test]
@@ -16399,6 +17046,9 @@ mod tests {
         theme::install_fonts(&ctx);
         theme::apply(&ctx, false);
         app.open_settings(&ctx, None);
+        settle_at(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        let scroll = probe::settings_scroll_view(&ctx).expect("the settings scroll viewport");
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), wheel(scroll.center(), 40));
         let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
         assert!(text.iter().any(|line| line.contains("mail.db")), "the store path is visible: {text:?}");
         assert!(text.iter().any(|line| line.contains("mail.db.blobs")), "the blob path is visible: {text:?}");
@@ -16423,6 +17073,10 @@ mod tests {
         let _ = std::fs::create_dir_all(postino_store::blob_root(&store_path));
         app.open_settings(&ctx, None);
 
+        // The background section moved the data actions below the fold; a wheel reaches them.
+        settle_at(&ctx, &mut app, size);
+        let scroll = probe::settings_scroll_view(&ctx).expect("the settings scroll viewport");
+        frame_at(&ctx, &mut app, size, wheel(scroll.center(), 40));
         settle_at(&ctx, &mut app, size);
         let copy = probe::settings_copy_rect(&ctx, "store").expect("Copia archivio");
         let output = click_at_output(&ctx, &mut app, copy.center(), size);
@@ -16441,9 +17095,13 @@ mod tests {
         assert_eq!(opener.opened(), vec![postino_store::blob_root(&store_path)], "the real folder button calls the injected opener");
 
         settle_at(&ctx, &mut app, size);
+        let scroll = probe::settings_scroll_view(&ctx).expect("the settings scroll viewport");
+        frame_at(&ctx, &mut app, size, wheel(scroll.center(), 120));
+        settle_at(&ctx, &mut app, size);
         let licences = probe::settings_action_rect(&ctx, "licences").expect("Licenze e attribuzioni");
+        assert!(scroll.contains_rect(licences), "Licenze is clipped: {licences:?} in {scroll:?}");
         click_at(&ctx, &mut app, licences.center(), size);
-        assert!(app.show_licences, "the real Licenze button opens the local dialog");
+        assert!(app.show_licences, "the real Licenze button opens the local dialog: {licences:?}");
         frame_at(&ctx, &mut app, size, vec![key(Key::Escape, Modifiers::NONE)]);
         assert!(!app.show_licences);
         // Reopen settings: the nested licences modal and the settings modal both see Escape, so the
@@ -16451,6 +17109,9 @@ mod tests {
         app.open_settings(&ctx, None);
 
         settle_at(&ctx, &mut app, size);
+        if let Some(scroll) = probe::settings_scroll_view(&ctx) {
+            frame_at(&ctx, &mut app, size, wheel(scroll.center(), 40));
+        }
         let shortcuts = probe::settings_action_rect(&ctx, "shortcuts").expect("Scorciatoie da tastiera");
         click_at(&ctx, &mut app, shortcuts.center(), size);
         assert!(app.show_shortcuts, "the real shortcut button opens the sheet");
@@ -17276,6 +17937,23 @@ mod tests {
         assert_eq!(app.folder, folder, "the folder survives the explicit stop");
         assert!(app.unread_only);
         assert_eq!(app.composer.to, "Giulia <giulia.ferri@example.com>");
+    }
+
+    #[test]
+    fn a_hidden_window_reopens_when_the_daemon_disappears() {
+        let (mut app, daemon, _path, _key, _vault) =
+            daemon_app("p10b2-orphan", |store| seed_account_rows(store, "acc_o", "orphan@example.com", None));
+        assert!(matches!(app.connection, daemon::Connection::Connected(_)), "the window is a daemon client");
+        // The person closed to the tray: the icon is the only way back.
+        app.hidden = true;
+        daemon.shutdown().expect("the daemon stops");
+        assert!(
+            poll_until(&mut app, |app| matches!(app.connection, daemon::Connection::Lost)),
+            "the lost channel must settle instead of spinning forever"
+        );
+        assert!(!app.hidden, "a hidden window with no daemon and no tray must never stay unreachable");
+        assert!(app.status.contains("primo piano"), "the offline state must say the window came back: {}", app.status);
+        assert!(!app.visible_messages().0.is_empty(), "the mailbox stays readable in the restored window");
     }
 
     #[test]

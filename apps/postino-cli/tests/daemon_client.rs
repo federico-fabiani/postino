@@ -105,6 +105,8 @@ impl Fixture {
         config.sync_jitter = false;
         config.sync_interval = Duration::from_secs(3600);
         config.gc_interval = Duration::from_secs(3600);
+        // The settings bridge writes a real file next to the store, never a schema row.
+        config.settings_path = Some(self.store.with_file_name("daemon.json"));
         Daemon::spawn(config).expect("daemon")
     }
 
@@ -184,6 +186,32 @@ fn existing_commands_status_stop_and_mcp_go_through_the_daemon() {
     let (code, _stdout, stderr) = fixture.run(&["--json", "daemon", "status"], None, &[]);
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn settings_go_through_the_daemon_and_never_start_it() {
+    let fixture = Fixture::new();
+    let daemon = fixture.daemon();
+
+    let (code, stdout, stderr) = fixture.run(&["--json", "daemon", "settings"], None, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let view: serde_json::Value = serde_json::from_str(stdout.trim()).expect("settings JSON");
+    assert_eq!(view["tray"], serde_json::json!(true));
+    assert_eq!(view["notify_enabled"], serde_json::json!(true));
+    assert_eq!(view["notify_previews"], serde_json::json!(false));
+    assert_eq!(view["debounce_secs"], serde_json::json!(60));
+
+    let (code, stdout, stderr) = fixture.run(&["--json", "daemon", "settings", "--previews", "on"], None, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let view: serde_json::Value = serde_json::from_str(stdout.trim()).expect("settings JSON");
+    assert_eq!(view["notify_previews"], serde_json::json!(true));
+    let saved = std::fs::read_to_string(fixture.store.with_file_name("daemon.json")).expect("the daemon.json file");
+    assert!(saved.contains("\"notify_previews\": true"), "the write is persisted: {saved}");
+
+    daemon.shutdown().expect("shutdown");
+    let (code, _stdout, stderr) = fixture.run(&["daemon", "settings"], None, &[("POSTINO_DAEMON_BIN", r"C:\definitely\missing\postino-daemon.exe")]);
+    assert_ne!(code, 0, "settings without a daemon must fail");
+    assert!(stderr.contains("daemon"), "the failure names the daemon and no process was started: {stderr}");
 }
 
 #[test]

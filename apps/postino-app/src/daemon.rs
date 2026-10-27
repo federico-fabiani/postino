@@ -27,8 +27,11 @@ use serde_json::{Value, json};
 /// sends; MCP is the only client that may be refused.
 pub const CLIENT_NAME: &str = "app";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(900);
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+/// A settings read is a small encrypted-file read. It must never freeze a frame behind a wedged
+/// daemon: the settings page shows "unreachable" and the page stays interactive.
+pub const READ_TIMEOUT: Duration = Duration::from_millis(1500);
 const EVENT_WAIT: Duration = Duration::from_millis(250);
 /// Bounded reconnect backoff: five steps, then the last one repeats. Never a busy loop.
 const BACKOFF_MS: [u64; 5] = [250, 500, 1_000, 2_000, 4_000];
@@ -173,6 +176,12 @@ pub trait Transport: Send {
     /// Send one operation. `retry` is true only for an operation the registry calls read-only: a
     /// mutation whose answer was lost must never be replayed automatically.
     fn call(&mut self, name: &str, args: Value, retry: bool) -> Result<Value, String>;
+    /// Same contract as [`Transport::call`] with an explicit bound. The default keeps recorder
+    /// transports simple; the real client passes the bound to the pipe read.
+    fn call_bounded(&mut self, name: &str, args: Value, retry: bool, timeout: Duration) -> Result<Value, String> {
+        let _ = timeout;
+        self.call(name, args, retry)
+    }
     fn status(&mut self) -> Result<Value, String>;
     fn shutdown(&mut self) -> Result<(), String>;
     fn next_event(&mut self, wait: Duration) -> Result<Option<Value>, String>;
@@ -214,18 +223,22 @@ impl Transport for IpcTransport {
     }
 
     fn call(&mut self, name: &str, args: Value, retry: bool) -> Result<Value, String> {
+        self.call_bounded(name, args, retry, CALL_TIMEOUT)
+    }
+
+    fn call_bounded(&mut self, name: &str, args: Value, retry: bool, timeout: Duration) -> Result<Value, String> {
         let params = json!({ "name": name, "args": args });
         let method = postino_ipc::protocol::method::OP;
         // A retry of a mutation whose answer never arrived can apply it twice (a second account, a
         // second draft, a second send). Only a read is replayed; a mutation reports the uncertainty.
         let client = self.ensure()?;
-        let attempt = client.call(method, params.clone(), CALL_TIMEOUT);
+        let attempt = client.call(method, params.clone(), timeout);
         match attempt {
             Ok(value) => Ok(value),
             Err(error) if error.is_retryable() && retry => {
                 // A dropped connection is normal: retry once on a fresh one.
                 self.client = None;
-                self.ensure()?.call(method, params, CALL_TIMEOUT).map_err(|error| describe(&error))
+                self.ensure()?.call(method, params, timeout).map_err(|error| describe(&error))
             }
             Err(error) if error.is_retryable() => {
                 self.client = None;
@@ -270,6 +283,11 @@ impl Link {
 
     pub fn call(&mut self, name: &str, args: Value) -> Result<Value, String> {
         self.transport.call(name, args, is_read_only(name))
+    }
+
+    /// A read with a short bound: settings must not hold a frame behind a wedged daemon.
+    pub fn call_bounded(&mut self, name: &str, args: Value, timeout: Duration) -> Result<Value, String> {
+        self.transport.call_bounded(name, args, is_read_only(name), timeout)
     }
 
     pub fn status(&mut self) -> Result<Value, String> {
@@ -450,7 +468,7 @@ pub fn stop(link: &mut Link, store: &Path) -> Result<(), String> {
 
 /// The daemon binary next to this executable, or the test hook. Never a silent fallback: a
 /// missing binary is one readable sentence.
-fn binary_path() -> Result<PathBuf, String> {
+pub(crate) fn binary_path() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("POSTINO_DAEMON_BIN") {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -525,9 +543,14 @@ pub fn absent_or(paths: &DaemonPaths, error: &IpcError) -> String {
 }
 
 /// Whether an operation only reads. The classification comes from the one registry in
-/// `postino-core`: the app keeps no second list of names.
+/// `postino-core`: the app keeps no second list of names. The daemon-owned settings read is a
+/// control method, not an operation, and is read-only by construction: a dropped pipe may be
+/// retried and can never be reported as an uncertain mutation.
 pub fn is_read_only(name: &str) -> bool {
     use std::sync::OnceLock;
+    if name == postino_ipc::protocol::method::DAEMON_SETTINGS {
+        return true;
+    }
     static READ_ONLY: OnceLock<Vec<&'static str>> = OnceLock::new();
     let names = READ_ONLY.get_or_init(|| postino_core::op_defs().into_iter().filter(|def| def.read_only).map(|def| def.name).collect());
     names.contains(&name)

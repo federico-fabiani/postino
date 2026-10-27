@@ -5,6 +5,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod app;
+mod background;
 mod boot;
 mod daemon;
 mod onboarding;
@@ -36,7 +37,8 @@ const MIN_SIZE: [f32; 2] = [980.0, 600.0];
 /// A scripted capture must fail loudly instead of waiting forever for a window that never paints.
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Every flag the app understands. Used in the parse error so a typo is self-correcting.
-const ACCEPTED_FLAGS: &str = "--screenshot <state>, --out <path>, --dark, --native-chrome, --size WxH, --gallery, --demo, --store <path>";
+const ACCEPTED_FLAGS: &str =
+    "--screenshot <state>, --out <path>, --dark, --native-chrome, --size WxH, --gallery, --demo, --store <path>, --open outbox";
 
 #[derive(Debug, PartialEq)]
 struct ScreenshotRequest {
@@ -53,6 +55,7 @@ struct Args {
     dark: bool,
     native_chrome: bool,
     launch: boot::Launch,
+    open: app::StartupView,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +68,7 @@ struct ParsedArgs {
     native_chrome: bool,
     demo: bool,
     store: Option<PathBuf>,
+    open: Option<app::StartupView>,
 }
 
 impl ParsedArgs {
@@ -79,6 +83,9 @@ impl ParsedArgs {
         }
         if self.store.is_some() && self.state.is_some() {
             return Err("--store is only valid for a normal launch; a screenshot uses the deterministic demo mailbox".to_owned());
+        }
+        if self.open.is_some() && (self.state.is_some() || self.gallery) {
+            return Err("--open is only valid for a normal launch; a capture always starts on the shell".to_owned());
         }
         let screenshot = match self.state {
             Some(state) => {
@@ -96,7 +103,14 @@ impl ParsedArgs {
             }
         };
         let launch = if self.demo { boot::Launch::Demo } else { boot::Launch::Store(self.store) };
-        Ok(Args { screenshot, gallery: self.gallery, dark: self.dark, native_chrome: self.native_chrome, launch })
+        Ok(Args {
+            screenshot,
+            gallery: self.gallery,
+            dark: self.dark,
+            native_chrome: self.native_chrome,
+            launch,
+            open: self.open.unwrap_or_default(),
+        })
     }
 }
 
@@ -111,7 +125,7 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         }
     };
-    let Args { screenshot, gallery, dark, native_chrome, launch } = args;
+    let Args { screenshot, gallery, dark, native_chrome, launch, open } = args;
     // The normal window draws its own forest title bar. Screenshot mode obeys the same rule so it
     // captures what a user sees, and macOS keeps its native title bar.
     let custom_chrome = !native_chrome && !cfg!(target_os = "macos");
@@ -133,7 +147,7 @@ fn main() -> eframe::Result<()> {
         if gallery {
             return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(ui::gallery::GalleryApp::new(cc, dark)))));
         }
-        return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(app::PostinoApp::launch(cc, custom_chrome, launch)))));
+        return eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(app::PostinoApp::launch(cc, custom_chrome, launch, open)))));
     };
     let clock = match app::screenshot_clock() {
         Ok(clock) => clock,
@@ -240,6 +254,12 @@ fn parse_args(raw: &[OsString]) -> Result<Args, String> {
             "--store" => {
                 mark(&mut seen, "--store")?;
                 parsed.store = Some(PathBuf::from(raw_value(raw, &mut index, "--store")?));
+            }
+            "--open" => {
+                mark(&mut seen, "--open")?;
+                let value = text_value(raw, &mut index, "--open")?;
+                parsed.open =
+                    Some(app::StartupView::parse(&value).ok_or_else(|| format!("unknown --open view {value:?}; accepted views are: outbox"))?);
             }
             other => {
                 return Err(format!("unknown argument {other:?}; accepted flags are {ACCEPTED_FLAGS}"));
@@ -364,6 +384,18 @@ mod tests {
         assert!(parse(&["--store"]).is_err(), "the store needs a path");
         assert!(parse(&["--store", "a.db", "--store", "b.db"]).is_err(), "duplicate flags are refused");
         assert!(parse(&["--store", "a.db", "--screenshot", "shell", "--out", "a.png"]).is_err(), "a screenshot is always the demo");
+    }
+
+    #[test]
+    fn open_outbox_is_a_normal_launch_view() {
+        let parsed = parse(&["--store", "mail.db", "--open", "outbox"]).expect("the tray activation is a normal launch");
+        assert_eq!(parsed.launch, boot::Launch::Store(Some(PathBuf::from("mail.db"))));
+        assert_eq!(parsed.open, app::StartupView::Outbox);
+        assert_eq!(parse(&[]).expect("plain launch").open, app::StartupView::Mail);
+        assert!(parse(&["--open", "sent"]).is_err(), "only outbox is a supported view");
+        assert!(parse(&["--open"]).is_err(), "the view needs a value");
+        assert!(parse(&["--open", "outbox", "--gallery"]).is_err(), "a capture always starts on the shell");
+        assert!(parse(&["--open", "outbox", "--screenshot", "shell", "--out", "a.png"]).is_err());
     }
 
     #[test]

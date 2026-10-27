@@ -26,9 +26,9 @@ use postino_store::{Store, StoreError, StoreKey, WriterLock};
 use thiserror::Error;
 
 pub use dispatch::DaemonStatus;
-pub use settings::DaemonSettings;
+pub use settings::{DaemonSettings, DaemonSettingsPatch, DaemonSettingsView};
 pub use state::DaemonState;
-pub use tray_host::{AppLauncher, ProcessLauncher};
+pub use tray_host::{AppLauncher, AppOpen, ProcessLauncher};
 
 /// Why the daemon could not start or why a scheduler step failed.
 #[derive(Debug, Error)]
@@ -81,8 +81,11 @@ pub struct DaemonConfig {
     pub max_connections: usize,
     pub started_at: i64,
     pub daemon_version: String,
-    /// Daemon-owned preferences from `daemon.json`; P10b2 adds the editor.
+    /// Daemon-owned preferences from `daemon.json`; the settings page and CLI edit them live.
     pub settings: DaemonSettings,
+    /// The file those preferences are read from and written to. `None` means this daemon has no
+    /// settings file and refuses writes instead of accepting a value it cannot persist.
+    pub settings_path: Option<PathBuf>,
     /// A tray seam. Production injects the Windows tray; tests inject a recorder or nothing.
     pub tray: Option<Arc<dyn Tray>>,
     /// An explicit notifier seam. When absent, a started tray may provide its own.
@@ -115,6 +118,7 @@ impl DaemonConfig {
             started_at: now_ms(),
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             settings: DaemonSettings::default(),
+            settings_path: None,
             tray: None,
             notifier: None,
             app_launcher: Arc::new(ProcessLauncher),
@@ -187,7 +191,7 @@ impl Daemon {
                     if !tray_running {
                         log::info!("daemon tray is disabled or unavailable; serving headless");
                     }
-                    let tray_task = tray_running.then(|| tokio::spawn(crate::tray_host::run(Arc::clone(&thread_state))));
+                    let tray_task = thread_state.tray.is_some().then(|| tokio::spawn(crate::tray_host::run(Arc::clone(&thread_state))));
                     let bound = match server.bind().await {
                         Ok(bound) => {
                             let _ = ready_tx.send(Ok(()));
@@ -201,6 +205,7 @@ impl Daemon {
                             if let Some(tray) = &thread_state.tray {
                                 tray.stop();
                             }
+                            thread_state.set_tray_running(false);
                             let _ = ready_tx.send(Err(DaemonError::Ipc(error)));
                             return Ok(());
                         }

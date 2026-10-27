@@ -358,7 +358,7 @@ fn show_menu(hwnd: HWND, shared: &TrayShared) {
     if menu.is_null() {
         return;
     }
-    let entries = [TrayAction::Open, TrayAction::SyncNow, TrayAction::Quit];
+    let entries = [TrayAction::Open, TrayAction::SyncNow, TrayAction::OpenOutbox, TrayAction::Quit];
     for (index, action) in entries.iter().enumerate() {
         let label = wide(action.label());
         // SAFETY: menu is live, the label is NUL-terminated and outlives the call.
@@ -382,7 +382,8 @@ fn action_for_command(command: u32) -> Option<TrayAction> {
     match command {
         1 => Some(TrayAction::Open),
         2 => Some(TrayAction::SyncNow),
-        3 => Some(TrayAction::Quit),
+        3 => Some(TrayAction::OpenOutbox),
+        4 => Some(TrayAction::Quit),
         _ => None,
     }
 }

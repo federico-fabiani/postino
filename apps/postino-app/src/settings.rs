@@ -31,6 +31,8 @@ pub struct Settings {
     pub reduced_motion: bool,
     /// The account whose mailbox was last open. Opaque id only, never an address.
     pub account: Option<String>,
+    /// The first close-to-tray explanation was shown and accepted. Persisted so it is never repeated.
+    pub tray_notice_shown: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +45,7 @@ impl Default for Settings {
             folder: "inbox".to_owned(),
             reduced_motion: false,
             account: None,
+            tray_notice_shown: false,
         }
     }
 }
@@ -215,7 +218,7 @@ mod tests {
         }
         let fields = serde_json::from_str::<serde_json::Value>(&text).expect("valid JSON");
         let keys = fields.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-        assert_eq!(keys.len(), 7, "only the seven documented settings: {keys:?}");
+        assert_eq!(keys.len(), 8, "only the eight documented settings: {keys:?}");
         let _ = std::fs::remove_file(&path);
     }
 
