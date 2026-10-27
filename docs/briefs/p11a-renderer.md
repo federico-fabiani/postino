@@ -17,13 +17,22 @@ or damaged bodies. This is fidelity, not a second sanitizer.
 `crates/mime/src/{sanitize,html_text}.rs`, `apps/postino-app/src/reading.rs`,
 `apps/postino-app/src/seams.rs`, the P6c/P6d reading tests and screenshots.
 
+## Split
+
+- **P11a1 (this package, parallel with P10b2):** `crates/mime` gains a pure, bounded block model and
+  parser for the already-sanitized fragment (`blocks.rs` or equivalent). No egui, no app.rs, no new
+  dependency. This is the headless half and can merge independently.
+- **P11a2 (after P10a2/P10b2):** `apps/postino-app` maps the block model to egui, reuses the existing
+  link confirmation sheet and keeps the text fallback. This is the only half that touches app.rs.
+
 ## Required
 
-- Add `apps/postino-app/src/render.rs` with a pure `BodyRenderer` policy/trait and `BodyView`:
-  rendered blocks or `Text { reason }`. No window, no egui in the policy half.
-- `render/subset.rs` renders a bounded block list: paragraphs, h1–h3, emphasis, lists, blockquote,
-  pre, basic tables, links and `cid:` image alt text. Unknown/unsupported blocks become readable text;
-  never panic on hostile nesting or malformed input.
+- P11a1: add a pure `BodyRenderer` policy/block model in `crates/mime` (or an app-only pure module
+  if the mime API cannot express it without a workspace dependency): rendered blocks or
+  `Text { reason }`. No window, no egui in the policy half.
+- Parse the stored sanitized fragment into a bounded block list: paragraphs, h1–h3, emphasis, lists,
+  blockquote, pre, basic tables, links and `cid:` image alt text. Unknown/unsupported blocks become
+  readable text; never panic on hostile nesting or malformed input.
 - Use the stored sanitized body/block model; do **not** re-parse raw HTML or re-enable remote content.
   `remote_images` from P6d drives the existing blocked-images line; no URL is fetched or painted.
 - Links use the existing `find_links` + confirmation sheet + `LinkOpener` seam. Reuse the P6c
