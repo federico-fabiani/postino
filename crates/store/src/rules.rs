@@ -2,7 +2,8 @@
 //!
 //! The rule condition is the documented search language, translated by `postino-core` into a typed
 //! [`SearchExpr`]. This module turns that tree into fixed SQL with bound values, scoped to received
-//! mail: drafts and Sent copies are never candidates, and neither is Trash.
+//! mail: `messages.origin` must be `received`, so a Sent copy moved to Archive is not a candidate even
+//! though its folder looks ordinary; Trash, Drafts and Sent folders are excluded separately.
 //!
 //! The journal is deliberately opaque about mail content. `rule_actions.value_json` carries only
 //! ids, folder ids, label ids and booleans; a forward action records the outbox row id, never a
@@ -13,8 +14,8 @@ use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
 
 use crate::model::{
-    FolderKind, MAX_RULE_CANDIDATES, Rule, RuleActionRecord, RuleCandidateFilter, RuleCandidatePage, RuleGuard, RuleMessageState, RuleRun,
-    SEARCH_TOTAL_CAP,
+    FolderKind, MAX_RULE_CANDIDATES, MessageOrigin, Rule, RuleActionRecord, RuleCandidateFilter, RuleCandidatePage, RuleGuard, RuleMessageState,
+    RuleRun, SEARCH_TOTAL_CAP,
 };
 use crate::repo::{SUMMARY_COLUMNS, corrupt_on_decode, duplicate, row_to_summary};
 use crate::search::expr_sql;
@@ -22,6 +23,10 @@ use crate::{Store, StoreError};
 
 /// Prefix of the encrypted `meta` key that marks a received message carrying a loop guard header.
 pub const RULE_GUARD_KEY_PREFIX: &str = "rule_guard:";
+/// Prefix of the durable forward-dedupe marker, independent of outbox retention.
+pub const RULE_FORWARD_KEY_PREFIX: &str = "rule_forward:";
+/// Prefix of the per-rule `all` page cursor.
+pub const RULE_ALL_CURSOR_KEY_PREFIX: &str = "rule_all_cursor:";
 /// Prefix of the encrypted `meta` key that remembers a run's mode (`new` or `all`).
 pub const RULE_RUN_MODE_KEY_PREFIX: &str = "rule_run_mode:";
 /// Prefix of the encrypted `meta` key that marks a run reversed by `rules_undo`.
@@ -70,7 +75,7 @@ impl Store {
             return Err(StoreError::RuleLimit { limit });
         }
         tx.execute(
-            &format!("INSERT INTO rules({RULE_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+            &format!("INSERT INTO rules({RULE_COLUMNS}, name_key) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
             params![
                 rule.id,
                 rule.account_id,
@@ -81,7 +86,8 @@ impl Store {
                 rule.query,
                 rule.actions_json,
                 rule.created_at,
-                rule.updated_at
+                rule.updated_at,
+                rule.name.to_lowercase()
             ],
         )
         .map_err(|error| duplicate("rule", &rule.name, error))?;
@@ -89,20 +95,42 @@ impl Store {
         Ok(())
     }
 
-    /// Replace every editable field. The caller has already merged absent fields.
-    pub fn update_rule(&self, rule: &Rule) -> Result<Rule, StoreError> {
-        self.conn
+    /// Replace every editable field only when the row still has `expected_updated_at`. The caller
+    /// merged absent fields from the current row, so a stale editor cannot silently undo another
+    /// process's action list.
+    pub fn update_rule(&self, rule: &Rule, expected_updated_at: i64) -> Result<Rule, StoreError> {
+        let changed = self
+            .conn
             .execute(
-                "UPDATE rules SET name = ?1, enabled = ?2, priority = ?3, stop = ?4, query = ?5, actions_json = ?6, updated_at = ?7
-                 WHERE id = ?8 AND account_id = ?9",
-                params![rule.name, rule.enabled, rule.priority, rule.stop, rule.query, rule.actions_json, rule.updated_at, rule.id, rule.account_id],
+                "UPDATE rules SET name = ?1, name_key = ?2, enabled = ?3, priority = ?4, stop = ?5, query = ?6, actions_json = ?7, updated_at = ?8
+                 WHERE id = ?9 AND account_id = ?10 AND updated_at = ?11",
+                params![
+                    rule.name,
+                    rule.name.to_lowercase(),
+                    rule.enabled,
+                    rule.priority,
+                    rule.stop,
+                    rule.query,
+                    rule.actions_json,
+                    rule.updated_at,
+                    rule.id,
+                    rule.account_id,
+                    expected_updated_at
+                ],
             )
             .map_err(|error| duplicate("rule", &rule.name, error))?;
+        if changed == 0 {
+            return Err(StoreError::StaleRule { id: rule.id.clone() });
+        }
         self.get_rule(&rule.id)?.ok_or_else(|| StoreError::NotFound { entity: "rule", id: rule.id.clone() })
     }
 
     pub fn delete_rule(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.conn.execute("DELETE FROM rules WHERE id = ?1", [id])? == 1)
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let removed = tx.execute("DELETE FROM rules WHERE id = ?1", [id])? == 1;
+        tx.execute("DELETE FROM meta WHERE key = ?1", [format!("{RULE_ALL_CURSOR_KEY_PREFIX}{id}")])?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// A store-wide monotonic rule id (`rule_<n>`). A deleted id is never reused.
@@ -132,9 +160,16 @@ impl Store {
     pub fn rule_candidates(&self, filter: &RuleCandidateFilter) -> Result<RuleCandidatePage, StoreError> {
         let limit = filter.limit.clamp(1, MAX_RULE_CANDIDATES);
         let mut values = vec![Value::Text(filter.account_id.clone()), Value::Integer(filter.since)];
-        let mut where_sql = "m.account_id = ? AND m.ingested_at >= ? AND f.kind NOT IN ('drafts', 'sent', 'trash')".to_owned();
+        let mut where_sql =
+            "m.account_id = ? AND m.origin = 'received' AND m.ingested_at >= ? AND f.kind NOT IN ('drafts', 'sent', 'trash')".to_owned();
         if filter.new_only {
             where_sql.push_str(" AND m.rules_applied_at IS NULL");
+        }
+        if let Some((ingested_at, id)) = &filter.after {
+            values.push(Value::Integer(*ingested_at));
+            values.push(Value::Integer(*ingested_at));
+            values.push(Value::Text(id.clone()));
+            where_sql.push_str(" AND (m.ingested_at > ? OR (m.ingested_at = ? AND m.id > ?))");
         }
         if let Some(expr) = &filter.expr {
             let mut depth = 0u8;
@@ -183,18 +218,24 @@ impl Store {
     /// The current folder, folder kind, read state and labels of one message. `None` when the
     /// message vanished between the candidate query and the action.
     pub fn rule_message_state(&self, id: &str) -> Result<Option<RuleMessageState>, StoreError> {
-        let row: Option<(String, String, bool)> = self
+        let row: Option<(String, String, String, bool, bool)> = self
             .conn
-            .query_row("SELECT m.folder_id, f.kind, m.unread FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?1", [id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
+            .query_row(
+                "SELECT m.folder_id, f.kind, m.origin, m.unread, m.starred
+                 FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
             .optional()?;
-        let Some((folder_id, kind, unread)) = row else { return Ok(None) };
+        let Some((folder_id, kind, origin, unread, starred)) = row else { return Ok(None) };
         let Some(folder_kind) = FolderKind::parse(&kind) else {
             return Err(StoreError::Corrupt { table: "folders", detail: format!("unknown folder kind {kind:?}") });
         };
+        let Some(origin) = MessageOrigin::parse(&origin) else {
+            return Err(StoreError::Corrupt { table: "messages", detail: format!("unknown message origin {origin:?}") });
+        };
         let labels = self.labels_for(id)?;
-        Ok(Some(RuleMessageState { folder_id, folder_kind, unread, labels }))
+        Ok(Some(RuleMessageState { folder_id, folder_kind, origin, unread, starred, labels }))
     }
 
     /// Mark a bounded page of new received messages as handled by a `new` run. Messages beyond the
@@ -358,13 +399,22 @@ impl Store {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Loop guard
+    // Loop guard, forward dedupe and the `all` cursor
     // -----------------------------------------------------------------------------------------
 
+    fn guard_key(account_id: &str, message_id: &str) -> String {
+        format!("{RULE_GUARD_KEY_PREFIX}{account_id}:{message_id}")
+    }
+
+    fn forward_key(account_id: &str, rule_id: &str, message_id: &str) -> String {
+        format!("{RULE_FORWARD_KEY_PREFIX}{account_id}:{rule_id}:{message_id}")
+    }
+
     /// Remember that a received message carried `Auto-Submitted` and/or `X-Postino-Rule`. The row
-    /// lives in the encrypted `meta` table because v7 has no header column and P9c must not migrate.
-    pub fn set_rule_guard(&self, message_id: &str, guard: RuleGuard) -> Result<(), StoreError> {
-        let key = format!("{RULE_GUARD_KEY_PREFIX}{message_id}");
+    /// lives in the encrypted `meta` table because v7 has no header column. The account is part of
+    /// the key so bulk sync deletion and account removal can sweep every guard, including orphans.
+    pub fn set_rule_guard(&self, account_id: &str, message_id: &str, guard: RuleGuard) -> Result<(), StoreError> {
+        let key = Self::guard_key(account_id, message_id);
         if !guard.any() {
             self.conn.execute("DELETE FROM meta WHERE key = ?1", [&key])?;
             return Ok(());
@@ -374,11 +424,70 @@ impl Store {
     }
 
     /// The loop guard of one message, read only when a forward action actually runs.
-    pub fn rule_guard(&self, message_id: &str) -> Result<RuleGuard, StoreError> {
-        let key = format!("{RULE_GUARD_KEY_PREFIX}{message_id}");
+    pub fn rule_guard(&self, account_id: &str, message_id: &str) -> Result<RuleGuard, StoreError> {
+        let key = Self::guard_key(account_id, message_id);
         let Some(raw) = self.get_meta(&key)? else { return Ok(RuleGuard::default()) };
         let bytes = raw.as_bytes();
         Ok(RuleGuard { auto_submitted: bytes.first() == Some(&b'1'), x_postino_rule: bytes.get(1) == Some(&b'1') })
+    }
+
+    /// Delete every guard row of one message. A bulk sync deletion or folder reset calls this for
+    /// each removed id; the old un-scoped key is removed too so a pre-fix store does not leak it.
+    pub fn delete_rule_guards(&self, account_id: &str, message_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM meta WHERE key IN (?1, ?2)",
+            params![Self::guard_key(account_id, message_id), format!("{RULE_GUARD_KEY_PREFIX}{message_id}")],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every guard row of an account, including orphans left by an older bulk deletion.
+    pub fn delete_account_rule_guards(&self, account_id: &str) -> Result<u32, StoreError> {
+        let prefix = format!("{RULE_GUARD_KEY_PREFIX}{account_id}:");
+        let changed = self.conn.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("{prefix}%")])?;
+        // A v7 file written before P9c used `rule_guard:<message>`; remove any that still point at a
+        // row of this account, and any orphaned key the old build left behind for this account is
+        // best-effort (the old key had no account component).
+        self.conn.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_guard:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
+        u32::try_from(changed).map_err(|_| StoreError::OutOfRange { field: "deleted guard rows" })
+    }
+
+    /// The durable forward dedupe marker for one rule/message. It survives outbox pruning.
+    pub fn rule_forward_marker(&self, account_id: &str, rule_id: &str, message_id: &str) -> Result<Option<String>, StoreError> {
+        self.get_meta(&Self::forward_key(account_id, rule_id, message_id))
+    }
+
+    /// Remember the outbox row that carried a rule forward. The value is the row id only.
+    pub fn set_rule_forward_marker(&self, account_id: &str, rule_id: &str, message_id: &str, outbox_id: &str) -> Result<(), StoreError> {
+        self.set_meta(&Self::forward_key(account_id, rule_id, message_id), outbox_id)
+    }
+
+    /// The `all` page cursor of one rule: the last `(ingested_at, id)` already considered.
+    pub fn rule_all_cursor(&self, rule_id: &str) -> Result<Option<(i64, String)>, StoreError> {
+        let key = format!("{RULE_ALL_CURSOR_KEY_PREFIX}{rule_id}");
+        let Some(raw) = self.get_meta(&key)? else { return Ok(None) };
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let Some(ingested_at) = value.get("ingested_at").and_then(serde_json::Value::as_i64) else { return Ok(None) };
+        let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else { return Ok(None) };
+        Ok(Some((ingested_at, id.to_owned())))
+    }
+
+    /// Store or clear the `all` page cursor. A clear means the next run starts at the beginning.
+    pub fn set_rule_all_cursor(&self, rule_id: &str, cursor: Option<(i64, &str)>) -> Result<(), StoreError> {
+        let key = format!("{RULE_ALL_CURSOR_KEY_PREFIX}{rule_id}");
+        match cursor {
+            Some((ingested_at, id)) => {
+                let value = serde_json::json!({ "ingested_at": ingested_at, "id": id });
+                self.set_meta(&key, &serde_json::to_string(&value)?)
+            }
+            None => {
+                self.conn.execute("DELETE FROM meta WHERE key = ?1", [key])?;
+                Ok(())
+            }
+        }
     }
 
     /// Accounts whose rules are enabled, for the periodic and post-sync run.

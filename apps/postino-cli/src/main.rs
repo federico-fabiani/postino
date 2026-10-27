@@ -204,8 +204,8 @@ enum RuleCommand {
         #[arg(long)]
         account: Option<String>,
     },
-    /// Create a rule. Repeat --action: move:FOLDER, label:LABEL, read, unread, trash or
-    /// forward:ADDRESS[,ADDRESS].
+    /// Create a rule. Repeat --action: move:FOLDER_ID_OR_NAME, label:LABEL_ID_OR_NAME, read,
+    /// unread, trash or forward:ADDRESS[,ADDRESS].
     Create {
         name: String,
         query: String,
@@ -1594,7 +1594,7 @@ fn run_with_input(cli: Cli, engine: &mut Engine, input: &mut dyn BufRead, intera
                     for error in &result.errors {
                         text.push_str(&format!("! {error}\n"));
                     }
-                    if result.run.changed > 0 || result.run.errors == 0 {
+                    if result.run.changed > 0 {
                         text.push_str(&format!("Annulla con `postino rules undo {}`.\n", result.run.id));
                     }
                     say(text)?;

@@ -56,13 +56,13 @@ mod threads;
 pub use blob::BlobStore;
 pub use model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
-    Label, LabelCount, MAX_REMOTE_IMAGES, MAX_RULE_CANDIDATES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary,
-    OutboxEntry, OutboxState, Rule, RuleActionRecord, RuleCandidateFilter, RuleCandidatePage, RuleGuard, RuleMessageState, RuleRun, SEARCH_TOTAL_CAP,
-    SavedSearch, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer, SyncState,
-    ThreadDetail, ThreadFilter, ThreadPage, ThreadSummary, UidEntry,
+    Label, LabelCount, MAX_REMOTE_IMAGES, MAX_RULE_CANDIDATES, Message, MessageCounts, MessageFilter, MessageFlags, MessageOrigin, MessagePage,
+    MessageSummary, OutboxEntry, OutboxState, Rule, RuleActionRecord, RuleCandidateFilter, RuleCandidatePage, RuleGuard, RuleMessageState, RuleRun,
+    SEARCH_TOTAL_CAP, SavedSearch, SearchExpr, SearchFilter, SearchHit, SearchIndexStatus, SearchPage, SearchReindexOutcome, SearchSort, SmtpServer,
+    SyncState, ThreadDetail, ThreadFilter, ThreadPage, ThreadSummary, UidEntry,
 };
 pub use repo::{MAX_OUTBOX_ROWS, UNCERTAIN_AFTER_CRASH};
-pub use rules::{RULE_GUARD_KEY_PREFIX, RULE_RUN_MODE_KEY_PREFIX, RULE_RUN_UNDONE_KEY_PREFIX};
+pub use rules::{RULE_ALL_CURSOR_KEY_PREFIX, RULE_FORWARD_KEY_PREFIX, RULE_GUARD_KEY_PREFIX, RULE_RUN_MODE_KEY_PREFIX, RULE_RUN_UNDONE_KEY_PREFIX};
 pub use saved::RECENT_SEARCHES_KEY_PREFIX;
 
 use std::fmt;
@@ -294,6 +294,11 @@ ALTER TABLE messages ADD COLUMN in_reply_to TEXT NULL;
 ALTER TABLE messages ADD COLUMN references_json TEXT NULL;
 ALTER TABLE messages ADD COLUMN ingested_at INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE messages ADD COLUMN rules_applied_at INTEGER NULL;
+-- P9c provenance: a Sent copy moved to Archive must not become rule mail. `received` is the only
+-- origin rules consider. v7 is extended in place because P9c is unshipped; `Store::open` adds this
+-- column idempotently to an existing v7 file.
+ALTER TABLE messages ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'
+    CHECK(origin IN ('received', 'sent', 'draft', 'local'));
 
 CREATE INDEX messages_account_thread_date ON messages(account_id, thread_id, date DESC);
 -- The thread reference lookup and the subject fallback are on the sync insert path; without these
@@ -397,6 +402,7 @@ CREATE TABLE rules(
     stop         INTEGER NOT NULL DEFAULT 0,
     query        TEXT NOT NULL,
     actions_json TEXT NOT NULL DEFAULT '[]',
+    name_key     TEXT NOT NULL DEFAULT '',
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
 );
@@ -507,6 +513,8 @@ pub enum StoreError {
     SavedSearchLimit { limit: u32 },
     #[error("this account already has {limit} rules; delete one before adding another")]
     RuleLimit { limit: u32 },
+    #[error("rule {id:?} changed in another session; reload it before editing")]
+    StaleRule { id: String },
     #[error("attachment id {id:?} is repeated in the same draft; every attachment needs a unique id")]
     DuplicateAttachment { id: String },
     #[error("attachment id {id:?} belongs to message {owner:?}; omit the id so the engine assigns a new one")]
@@ -618,6 +626,8 @@ impl Store {
         )
         .map_err(translate)?;
         migrate(&mut conn)?;
+        ensure_message_origin(&conn)?;
+        ensure_rule_name_key(&conn)?;
         // The thread cache is derived data. Its page is ordered by `last_date` and scoped by account;
         // without this index a 100k mailbox sorts the whole cache on every list. The reference and
         // subject indexes make a synced insert a lookup instead of a mailbox scan. This is derived
@@ -631,7 +641,12 @@ impl Store {
              -- P9c uniqueness without a second migration: v7 created the rule tables but no
              -- case-insensitive name index. The table is inert until this build writes it, so the
              -- index is safe to add on the next normal open; a read-only open never creates it.
-             CREATE UNIQUE INDEX IF NOT EXISTS rules_name ON rules(account_id, name COLLATE NOCASE);",
+             CREATE UNIQUE INDEX IF NOT EXISTS rules_name ON rules(account_id, name COLLATE NOCASE);
+             CREATE UNIQUE INDEX IF NOT EXISTS rules_name_key ON rules(account_id, name_key);
+             -- P9c candidate scans. `new` reads the unapplied prefix; `all` reads a page ordered by
+             -- ingestion. Both are account- and origin-scoped so a Sent copy cannot be selected.
+             CREATE INDEX IF NOT EXISTS messages_rules_new ON messages(account_id, origin, rules_applied_at, ingested_at, id);
+             CREATE INDEX IF NOT EXISTS messages_rules_all ON messages(account_id, origin, ingested_at, id);",
         )
         .map_err(translate)?;
         let blobs = BlobStore::open(blob_root(path), key)?;
@@ -694,6 +709,69 @@ impl Store {
     pub fn get_meta(&self, name: &str) -> Result<Option<String>, StoreError> {
         Ok(self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [name], |row| row.get(0)).optional()?)
     }
+}
+
+/// Add the P9c `origin` column to a v7 file written before P9c. A fresh v7 migration already has it.
+/// Existing rows are classified from their current folder once; a later move never rewrites origin,
+/// so an archived Sent copy stays `sent`.
+fn ensure_message_origin(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_origin = false;
+    for row in rows {
+        if row? == "origin" {
+            has_origin = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if !has_origin {
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'
+                 CHECK(origin IN ('received', 'sent', 'draft', 'local'));",
+        )?;
+    } else {
+        // The v7 migration already added `origin` with its `received` default. A v6 store therefore
+        // reaches this point with every row looking received; classify once, then remember that the
+        // one-time inference has run so a later user move is never mistaken for provenance.
+        let done: Option<String> =
+            conn.query_row("SELECT value FROM meta WHERE key = 'message_origin_backfilled'", [], |row| row.get(0)).optional()?;
+        if done.is_some() {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(
+        "UPDATE messages SET origin = 'draft'
+             WHERE folder_id IN (SELECT id FROM folders WHERE kind = 'drafts');
+         UPDATE messages SET origin = 'sent'
+             WHERE folder_id IN (SELECT id FROM folders WHERE kind = 'sent');
+         INSERT OR REPLACE INTO meta(key, value) VALUES('message_origin_backfilled', '1');",
+    )?;
+    Ok(())
+}
+
+/// Add the P9c Unicode name key to a v7 rules table written before it. Core writes the lowercased
+/// key; an existing row is backfilled with SQLite's ASCII `lower()` once, which is a strict subset
+/// of Unicode lowering but never loosens the old uniqueness rule.
+fn ensure_rule_name_key(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(rules)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_name_key = false;
+    for row in rows {
+        if row? == "name_key" {
+            has_name_key = true;
+            break;
+        }
+    }
+    drop(stmt);
+    if has_name_key {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE rules ADD COLUMN name_key TEXT NOT NULL DEFAULT '';
+         UPDATE rules SET name_key = lower(name);",
+    )?;
+    Ok(())
 }
 
 /// Apply every pending migration, one transaction each.

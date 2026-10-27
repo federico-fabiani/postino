@@ -338,6 +338,12 @@ pub struct Engine {
     pub(crate) next_rule_run_seq: u32,
     /// Demo-only `rules_applied_at`: messages a `new` run has already considered.
     pub(crate) demo_rules_applied: BTreeSet<String>,
+    /// True when this engine may queue outbound mail. The desktop and the CLI default to true; the
+    /// MCP server sets it to the `--allow-send` flag, so a sync-triggered rule pass cannot forward
+    /// behind the MCP gate.
+    pub(crate) allow_send: bool,
+    /// Demo-only `all` page cursors, keyed by rule id.
+    pub(crate) demo_rule_all_cursors: HashMap<String, (i64, String)>,
 }
 
 /// The computed half of a saved-search row.
@@ -391,6 +397,8 @@ impl Engine {
             rule_run_actions: HashMap::new(),
             next_rule_run_seq: 1,
             demo_rules_applied: BTreeSet::new(),
+            allow_send: true,
+            demo_rule_all_cursors: HashMap::new(),
         }
     }
 
@@ -436,6 +444,17 @@ impl Engine {
     /// operation, so no caller can set it from JSON. Production builds leave it empty.
     pub fn set_test_extra_roots(&mut self, roots: Vec<CertificateDer<'static>>) {
         self.extra_roots = roots;
+    }
+
+    /// Set whether this engine may queue outbound mail. The desktop and CLI leave this true; the MCP
+    /// server sets it from `--allow-send` before serving, so `sync_now`'s automatic rule pass cannot
+    /// forward behind the MCP gate.
+    pub fn set_allow_send(&mut self, allow: bool) {
+        self.allow_send = allow;
+    }
+
+    pub(crate) fn allow_send(&self) -> bool {
+        self.allow_send
     }
 
     /// Stop after the SMTP server accepted the message and before the durable `append_pending`
@@ -609,6 +628,8 @@ impl Engine {
             rule_run_actions: HashMap::new(),
             next_rule_run_seq: 1,
             demo_rules_applied: BTreeSet::new(),
+            allow_send: true,
+            demo_rule_all_cursors: HashMap::new(),
         };
         engine.rebuild_message_index();
         engine.recount();

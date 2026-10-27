@@ -250,6 +250,38 @@ fn preview_writes_nothing() {
 }
 
 #[test]
+fn preview_uses_the_rule_horizon_and_reports_no_smtp_and_move_to_trash_effects() {
+    let (fixture, mut engine) = seeded(false);
+    let rule = create(&mut engine, "Fatture", "subject:Fattura", json!([{ "kind": "read" }]), 0, false);
+    let rule_id = rule["rule"]["id"].as_str().expect("rule id").to_owned();
+    let old = call(&mut engine, "rules_preview", json!({ "query": "subject:Fattura", "actions": [{ "kind": "read" }], "rule": rule_id }));
+    assert_eq!(old["total"], 0, "the rule horizon excludes mail ingested before it: {old}");
+    let all = call(&mut engine, "rules_preview", json!({ "query": "subject:Fattura", "actions": [{ "kind": "read" }] }));
+    assert!(all["total"].as_u64().is_some_and(|total| total >= 2), "{all}");
+
+    let forward = call(
+        &mut engine,
+        "rules_preview",
+        json!({ "query": "subject:Fattura", "actions": [{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }] }),
+    );
+    assert_eq!(forward["rows"][0]["effects"][0]["status"], "skip", "no SMTP endpoint means no forward: {forward}");
+
+    let trash = call(
+        &mut engine,
+        "rules_preview",
+        json!({ "query": "subject:\"Fattura 2026\"", "actions": [{ "kind": "move", "folder": "trash" }, { "kind": "trash" }] }),
+    );
+    let statuses = trash["rows"][0]["effects"]
+        .as_array()
+        .expect("effects")
+        .iter()
+        .map(|effect| effect["status"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["apply", "no_op"], "the second action sees the move: {trash}");
+    let _ = fixture;
+}
+
+#[test]
 fn undo_reverses_unchanged_messages_and_skips_a_message_changed_after_the_run() {
     let (fixture, mut engine) = seeded(true);
     create(
@@ -286,6 +318,27 @@ fn undo_reverses_unchanged_messages_and_skips_a_message_changed_after_the_run() 
 }
 
 #[test]
+fn undo_skips_a_message_starred_after_the_run() {
+    let (fixture, mut engine) = seeded(true);
+    create(&mut engine, "Letta", "subject:Fattura 2026", json!([{ "kind": "label", "label": "lbl_lavoro" }, { "kind": "read" }]), 0, false);
+    ingest_base_after_rules(&fixture);
+    let result = run(&mut engine, "new");
+    let run_id = result["run"]["id"].as_str().expect("run id").to_owned();
+    call(&mut engine, "message_flag", json!({ "id": "msg_1", "starred": true }));
+    let undo = call(&mut engine, "rules_undo", json!({ "id": run_id }));
+    assert_eq!(undo["restored"], 0, "a starred message is not unchanged: {undo}");
+    assert!(undo["skipped"].as_u64().is_some_and(|skipped| skipped >= 2), "{undo}");
+    let row = fixture
+        .raw()
+        .query_row("SELECT unread, starred FROM messages WHERE id = 'msg_1'", [], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)))
+        .expect("row");
+    assert_eq!(row, (false, true), "the rule's read and the user's star both survive");
+    let labels: i64 =
+        fixture.raw().query_row("SELECT COUNT(*) FROM message_labels WHERE message_id = 'msg_1'", [], |row| row.get(0)).expect("labels");
+    assert_eq!(labels, 1, "the rule's label was not removed");
+}
+
+#[test]
 fn forward_is_one_outbox_row_with_loop_headers_and_undo_reports_it() {
     let (fixture, mut engine) = seeded(true);
     create(&mut engine, "Inoltra", "subject:Fattura", json!([{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]), 0, false);
@@ -317,12 +370,32 @@ fn forward_is_one_outbox_row_with_loop_headers_and_undo_reports_it() {
 }
 
 #[test]
+fn forward_dedupe_survives_outbox_pruning() {
+    let (fixture, mut engine) = seeded(true);
+    create(&mut engine, "Inoltra", "subject:Fattura", json!([{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]), 0, false);
+    ingest_base_after_rules(&fixture);
+    let first = run(&mut engine, "new");
+    assert_eq!(first["run"]["changed"], 2, "{first}");
+    assert_eq!(fixture.count("outbox"), 2);
+    fixture.raw().execute("UPDATE outbox SET state = 'failed'", []).expect("terminal state");
+    let future = chrono::Utc::now().timestamp_millis() + 31 * 24 * 60 * 60 * 1_000;
+    fixture.open().prune_outbox(future, 30 * 24 * 60 * 60 * 1_000, 500).expect("prune");
+    assert_eq!(fixture.count("outbox"), 0, "the terminal rows were pruned");
+    let repeated = run(&mut engine, "all");
+    assert_eq!(repeated["run"]["changed"], 0, "the durable marker still dedupes: {repeated}");
+    assert_eq!(fixture.count("outbox"), 0, "a pruned forward must not be sent again");
+    let markers: i64 =
+        fixture.raw().query_row("SELECT COUNT(*) FROM meta WHERE key LIKE 'rule_forward:acc_1:%'", [], |row| row.get(0)).expect("markers");
+    assert_eq!(markers, 2, "one durable marker per rule/message");
+}
+
+#[test]
 fn a_loop_guarded_message_is_not_forwarded_and_a_missing_smtp_endpoint_fails_readably() {
     let (_fixture, mut engine) = seeded(true);
     create(&mut engine, "Inoltra", "subject:Fattura", json!([{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]), 0, false);
     ingest_base_after_rules(&_fixture);
     let store = _fixture.open();
-    store.set_rule_guard("msg_1", RuleGuard { auto_submitted: true, x_postino_rule: false }).expect("guard");
+    store.set_rule_guard("acc_1", "msg_1", RuleGuard { auto_submitted: true, x_postino_rule: false }).expect("guard");
     drop(store);
     let result = run(&mut engine, "new");
     assert!(result["errors"].as_array().is_some_and(Vec::is_empty), "{result}");
@@ -411,6 +484,20 @@ fn action_and_recipient_caps_and_a_stale_target_are_readable() {
 }
 
 #[test]
+fn a_stale_engine_cannot_overwrite_another_process_rule_update() {
+    let (fixture, mut first) = seeded(true);
+    create(&mut first, "Condivisa", "subject:Fattura", json!([{ "kind": "read" }]), 0, false);
+    let mut second = Engine::open(fixture.open()).expect("second engine");
+    let changed = call(&mut second, "rules_update", json!({ "id": "rule_1", "actions": [{ "kind": "label", "label": "lbl_lavoro" }] }));
+    assert_eq!(changed["rule"]["actions"][0]["kind"], "label");
+    let stale = first.call("rules_update", json!({ "id": "rule_1", "name": "Rinominata" })).expect_err("stale update");
+    assert!(matches!(stale, OpError::InvalidArgs(ref detail) if detail.contains("changed in another session")), "{stale}");
+    let stored = fixture.open().get_rule("rule_1").expect("rule").expect("row");
+    assert!(stored.actions_json.contains("\"label\""), "the second process's actions survived: {}", stored.actions_json);
+    assert!(!stored.actions_json.contains("\"read\""), "the stale engine wrote its old actions back: {}", stored.actions_json);
+}
+
+#[test]
 fn only_mail_ingested_after_the_rule_was_created_is_processed() {
     let (fixture, mut engine) = seeded(true);
     // A pre-rule message: ingested long before the rule exists.
@@ -437,6 +524,39 @@ fn only_mail_ingested_after_the_rule_was_created_is_processed() {
 }
 
 #[test]
+fn a_failed_new_action_leaves_the_message_pending_for_the_next_run() {
+    let (fixture, mut engine) = seeded(false);
+    create(&mut engine, "Inoltra", "subject:Fattura", json!([{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]), 0, false);
+    ingest_base_after_rules(&fixture);
+    let first = run(&mut engine, "new");
+    assert!(first["run"]["errors"].as_u64().is_some_and(|errors| errors >= 1), "{first}");
+    assert_eq!(fixture.count("outbox"), 0);
+    let applied: Option<i64> =
+        fixture.raw().query_row("SELECT rules_applied_at FROM messages WHERE id = 'msg_1'", [], |row| row.get(0)).expect("applied");
+    assert!(applied.is_none(), "a failed forward must not mark the message applied");
+
+    let store = fixture.open();
+    store
+        .upsert_account_server(&AccountServer {
+            account_id: "acc_1".to_owned(),
+            host: "localhost".to_owned(),
+            port: 993,
+            tls: AccountTls::Implicit,
+            username: "studio@example.com".to_owned(),
+            created_at: 1_700_000_000_000,
+            smtp: Some(SmtpServer { host: "localhost".to_owned(), port: 465, tls: AccountTls::Implicit, username: "studio@example.com".to_owned() }),
+        })
+        .expect("SMTP endpoint");
+    drop(store);
+    let second = run(&mut engine, "new");
+    assert_eq!(second["run"]["matched"], 2, "{second}");
+    assert_eq!(fixture.count("outbox"), 2, "the retried new run forwards the pending messages");
+    let applied: Option<i64> =
+        fixture.raw().query_row("SELECT rules_applied_at FROM messages WHERE id = 'msg_1'", [], |row| row.get(0)).expect("applied");
+    assert!(applied.is_some(), "a successful retry marks the message applied");
+}
+
+#[test]
 fn a_run_queues_at_most_fifty_forwards() {
     let (fixture, mut engine) = seeded(true);
     create(
@@ -454,11 +574,38 @@ fn a_run_queues_at_most_fifty_forwards() {
     drop(store);
     let result = run(&mut engine, "all");
     assert_eq!(result["run"]["matched"], 51, "{result}");
-    assert_eq!(fixture.count("outbox"), 50);
-    assert!(
-        result["errors"].as_array().is_some_and(|errors| errors.iter().any(|error| error.as_str().is_some_and(|text| text.contains("50 forwards")))),
-        "{result}"
-    );
+    assert_eq!(fixture.count("outbox"), 50, "the run is capped at 50 new forwards");
+    assert!(result["errors"].as_array().is_some_and(Vec::is_empty), "a cap is a deferral, not an action failure: {result}");
+    let second = run(&mut engine, "all");
+    assert_eq!(second["run"]["matched"], 51, "{second}");
+    assert_eq!(fixture.count("outbox"), 51, "the 51st message was deferred, not consumed: {second}");
+    assert_eq!(second["run"]["changed"], 1, "only the 51st forward is new");
+}
+
+#[test]
+fn an_archived_sent_copy_is_not_a_rule_candidate_and_a_move_to_trash_stops_later_actions() {
+    let (fixture, mut engine) = seeded(true);
+    let store = fixture.open();
+    store.upsert_synced_message(&message("msg_archived_sent", "sent", "Archiviata", true), &[]).expect("sent copy");
+    store.move_messages(&["msg_archived_sent".to_owned()], "archive").expect("archive");
+    assert_eq!(store.message_origin("msg_archived_sent").expect("origin"), Some(postino_store::MessageOrigin::Sent));
+    drop(store);
+    create(&mut engine, "Etichetta", "subject:Archiviata", json!([{ "kind": "label", "label": "lbl_lavoro" }]), 0, false);
+    let result = run(&mut engine, "all");
+    assert_eq!(result["run"]["matched"], 0, "an archived Sent copy is not received mail: {result}");
+    let labels: i64 =
+        fixture.raw().query_row("SELECT COUNT(*) FROM message_labels WHERE message_id = 'msg_archived_sent'", [], |row| row.get(0)).expect("labels");
+    assert_eq!(labels, 0);
+
+    create(&mut engine, "Cestina", "subject:Fattura 2026", json!([{ "kind": "trash" }, { "kind": "label", "label": "lbl_lavoro" }]), 1, false);
+    ingest_base_after_rules(&fixture);
+    let result = run(&mut engine, "all");
+    assert!(result["run"]["matched"].as_u64().is_some_and(|matched| matched >= 1), "{result}");
+    let folder: String = fixture.raw().query_row("SELECT folder_id FROM messages WHERE id = 'msg_1'", [], |row| row.get(0)).expect("folder");
+    assert_eq!(folder, "trash");
+    let labels: i64 =
+        fixture.raw().query_row("SELECT COUNT(*) FROM message_labels WHERE message_id = 'msg_1'", [], |row| row.get(0)).expect("labels");
+    assert_eq!(labels, 0, "after the rule trashes the message, its later label action must not run");
 }
 
 #[test]
@@ -473,7 +620,11 @@ fn a_manual_all_run_is_capped_at_two_thousand_candidates() {
     let result = run(&mut engine, "all");
     assert_eq!(result["run"]["matched"], 2_000, "{result}");
     let untouched: bool = fixture.raw().query_row("SELECT unread FROM messages WHERE id = 'msg_cap_2000'", [], |row| row.get(0)).expect("last");
-    assert!(untouched, "the 2 001st candidate is outside the manual cap");
+    assert!(untouched, "the 2 001st candidate is outside the first page");
+    let second = run(&mut engine, "all");
+    assert_eq!(second["run"]["matched"], 1, "the all cursor advances to the second page: {second}");
+    let read: bool = fixture.raw().query_row("SELECT unread FROM messages WHERE id = 'msg_cap_2000'", [], |row| row.get(0)).expect("last");
+    assert!(!read, "the second all run processed the 2 001st candidate");
 }
 
 #[test]
@@ -516,7 +667,7 @@ fn rule_crud_schemas_and_validation() {
     assert!(!find("rules_run").read_only);
     assert!(find("rules_run").destructive);
     assert!(find("rules_delete").destructive);
-    assert!(!find("rules_undo").destructive);
+    assert!(find("rules_undo").destructive);
 }
 
 #[test]

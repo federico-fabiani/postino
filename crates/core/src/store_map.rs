@@ -41,6 +41,9 @@ pub(crate) fn write_error(error: StoreError) -> OpError {
             OpError::InvalidArgs(format!("this account already has {limit} saved searches; delete one before adding another"))
         }
         StoreError::RuleLimit { limit } => OpError::InvalidArgs(format!("this account already has {limit} rules; delete one before adding another")),
+        StoreError::StaleRule { id } => {
+            OpError::InvalidArgs(format!("rule {id:?} changed in another session; reload the rules page or rules_list before editing it"))
+        }
         StoreError::DuplicateAttachment { id } => {
             OpError::InvalidArgs(format!("attachment id {id:?} is repeated in the draft; give every attachment a unique id"))
         }

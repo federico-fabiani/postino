@@ -89,11 +89,11 @@ agent can read the message and recover.
 | `saved_search_recent_clear` | no | Forget one account's recent queries from the encrypted `meta` table |
 | `rules_list` | yes | Local rules in `priority ASC, id ASC` with actions and computed `valid`/`error` |
 | `rules_create` | no | Create a validated query plus 1–5 actions (≤ 100 rules; forward gated by `--allow-send`) |
-| `rules_update` | no | Change name/query/actions/priority/stop/enabled; a forward payload is gated by `--allow-send` |
+| `rules_update` | no | Change name/query/actions/priority/stop/enabled; a forward payload or enabling a stored forward rule is gated by `--allow-send` |
 | `rules_delete` | no | Delete one local rule; past runs stay in the journal |
 | `rules_preview` | yes | First 50 matches plus one typed effect per action; writes nothing |
-| `rules_run` | no | Run enabled rules (`new`/`all`) and return the journaled run plus fixed errors; disabled unless `--allow-send` |
-| `rules_undo` | no | Reverse a run's move/label/read/trash where the message is unchanged; forward ids are reported |
+| `rules_run` | no | Run enabled rules (`new`/`all`) and return the journaled run plus bounded errors; disabled unless `--allow-send` |
+| `rules_undo` | no | Destructive and one-way: reverse a run's move/label/read/trash where the message is unchanged; forward ids are reported |
 | `rules_runs` | yes | Newest ≤ 20 runs with mode, counts, errors, finish and undone flag |
 | `labels_list` | yes | Labels with mailbox-wide total and unread counts |
 | `label_create` | no | Create a local label with a semantic colour |
@@ -117,8 +117,12 @@ stay available: a dry run writes nothing, a preview writes nothing and a cancel 
 permanently failed submission without sending. `outbox_retry` is gated because it can send stored
 bytes, `outbox_mark_sent` because it resolves an uncertainty a person should resolve, and `rules_run`
 because an enabled rule may forward. A `rules_create`/`rules_update` payload containing a forward
-action is refused before the typed parser runs; create the forward rule from the CLI or the desktop
-instead.
+action is refused before the typed parser runs, and so is an enable-only `rules_update` of a stored
+rule whose actions already include `forward`: the server reads the rule id from the raw arguments and
+checks the stored action list, so a client cannot arm a dormant forward rule without the flag. The
+automatic `new` pass inside `sync_now` obeys the same gate: with `--allow-send` absent, a forward is
+recorded as deferred and the sync still succeeds. Create or enable the forward rule from the CLI or
+the desktop instead.
 
 **MCP only queues.** The server has no timer and never runs the outbox pass. A `message_send` or
 `send_schedule` call writes the journal row and returns; the message leaves the machine when the
@@ -171,9 +175,10 @@ Annotations:
 - `readOnlyHint`: true for `accounts_list`, `account_test`, `sync_status`, `outbox_list`,
   `send_dry_run`, `rules_list`, `rules_preview`, `rules_runs` and every read.
 - `destructiveHint`: true for `account_remove` (it deletes the local cache for one account),
-  `rules_run` (it changes local mail and may queue a submission) and `rules_delete` (rule metadata
-  only). Sending and message deletion are not marked destructive: `message_send` is the product's
-  purpose and `outbox_cancel` discards a queued submission, not mail.
+  `rules_run` (it changes local mail and may queue a submission), `rules_undo` (it moves, flags and
+  labels mail and is one-way, with no redo) and `rules_delete` (rule metadata only). Sending and
+  message deletion are not marked destructive: `message_send` is the product's purpose and
+  `outbox_cancel` discards a queued submission, not mail.
 - `idempotentHint`: true for reads, `message_flag`, `label_apply`, `label_update` and `outbox_list`.
   It is false for `outbox_cancel` and `rules_run`: a second cancel finds the row already `cancelled`,
   and a run writes a new journal row even when every action is a no-op.
@@ -268,30 +273,45 @@ A rule is `{name, query, actions, priority?, stop?, enabled?}`; `query` is the s
 {"kind":"forward","to":[{"name":"","email":"dest@example.com"}]}
 ```
 
-Names are 1–48 characters, unique per account ignoring case, and an account holds at most 100 rules.
-Move targets must be regular folders of the same account (not virtual, Drafts or Sent); a label target
-must exist; forward takes 1–10 distinct addresses. A target deleted later leaves `valid:false` with a
-readable `error`; `rules_run` records the failure and carries on with the later rules.
+Names are 1–48 characters, unique per account ignoring case (including Unicode lowercase, enforced by
+`rules.name_key`), and an account holds at most 100 rules. Move targets must be regular folders of the
+same account (not virtual, Drafts or Sent) and accept an id or exact name; a label target must exist
+and belong to the same account; forward takes 1–10 distinct addresses. A target deleted later leaves
+`valid:false` with a readable `error`; `rules_run` records the failure and carries on with the later
+rules. `rules_update` re-reads the store row, refuses a stale edit with “changed in another session”
+and validates the merged action list.
 
 `rules_run` takes `{account?, scope?: "new"|"all"}`. `new` is the default and considers received mail
-ingested after the rule was created and not yet handled; `all` re-evaluates up to 2 000 candidates per
-rule. Only received mail is eligible: Drafts, Sent, Trash and outbox rows are excluded. Rules run in
-`priority ASC, id ASC`; `stop` makes later rules skip a message the rule matched. Each rule queries
-fresh candidates, so a later rule sees an earlier rule's move, label or flag. A repeated action is a
-no-op, a forward resolves to the deterministic outbox key `rule:<rule>:<message>`, and at most 50
-forwards are queued per run. A missing SMTP endpoint fails the action instead of queueing. The result
-is `{run, errors}`; `rules_runs` lists the newest 20 runs, and deletion keeps that history. A
+ingested after the rule was created and not yet applied; a message is marked applied only when every
+action completed, so a failed or deferred action is retried by the next `new`. `all` reads up to 2 000
+candidates per rule and keeps a per-rule cursor; repeated runs advance through a larger backlog, retry
+a page that ended in a deferred forward, and wrap after the tail. Only received-origin mail is
+eligible: a Sent copy moved to Archive is still `sent` and stays excluded; Drafts, Sent, Trash folders
+and outbox rows are excluded too. Rules run in `priority ASC, id ASC`; `stop` makes later rules skip a
+message the rule matched. Each rule queries fresh candidates, so a later rule sees an earlier rule's
+move, label or flag. A repeated action is a no-op, and a forward resolves to the deterministic outbox
+key `rule:<rule>:<message>` plus a durable encrypted dedupe marker that survives outbox pruning. Only
+new outbox rows count toward the 50-per-run budget; over-budget forwards are deferred to the next run
+instead of failing or being consumed. A missing SMTP endpoint fails the action instead of queueing. The
+result is `{run, errors}`; `errors` is capped at 200 sentences with an omitted-count line while
+`run.errors` stays exact. `rules_runs` lists the newest 20 runs, and deletion keeps that history. A
 forward's bytes carry `Auto-Submitted: auto-forwarded` and `X-Postino-Rule: <rule_id>`; incoming mail
 carrying either header is skipped for forwarding and the fact is stored only in the encrypted `meta`
-table.
+key `rule_guard:<account>:<message>`. Bulk sync deletion, a folder reset and account removal clean
+those keys.
 
-`rules_preview {account?, query, actions, limit?}` returns `{total, rows, truncated}` with one effect
-per action (`apply`, `no_op`, `skip`) and writes nothing. `rules_undo {id, account?}` reverses a run's
-move/label/read/trash actions only for messages still in the state the run left; it returns
-`{run, restored, skipped, forwards}` where `forwards` names outbox rows that were deliberately not
-undone. `rules_run` is destructive/open-world, `rules_delete` is destructive, `rules_preview` and
-`rules_runs` are read-only, and none is sensitive. Without `--allow-send`, `rules_run` and any forward
-payload in `rules_create`/`rules_update` are refused.
+`rules_preview {account?, query, actions, limit?, rule?}` returns `{total, rows, truncated}` with one
+effect per action (`apply`, `no_op`, `skip`) and writes nothing. With `rule`, it applies that rule's
+`created_at` horizon; without it, it previews all received mail as a hypothetical new rule. A forward
+is `skip` when the account has no SMTP endpoint or the message is loop-guarded, and a move updates the
+simulated folder so a later `trash` after a move to Trash is `no_op`. `rules_undo {id, account?}`
+reverses a run's move/label/read/trash actions only for messages still in the state the run left,
+including starred state; it returns `{run, restored, skipped, forwards}` where `forwards` names outbox
+rows that were deliberately not undone. `rules_run` is destructive/open-world, `rules_undo` and
+`rules_delete` are destructive, `rules_preview` and `rules_runs` are read-only, and none is sensitive.
+Without `--allow-send`, `rules_run`, any forward payload in `rules_create`/`rules_update`, an
+enable-only update of a stored forward rule, and any forward reached by a `sync_now` rule pass are
+refused or deferred.
 
 `draft_save` refuses CR/LF in addresses or the subject, validates every recipient, and returns the
 draft with a stable id. **It is a patch on update:** every content field (`to`, `cc`, `bcc`,
@@ -325,7 +345,8 @@ an alias of `postino send --draft <id>`, and both now submit for real.
 - The server is opt-in and stdio-only; there is no network listener.
 - The daemon pipe (M4) will be same-user and token-authenticated.
 - Sending is off unless `postino mcp --allow-send`; `message_send`, `send_schedule`, `outbox_retry`,
-  `outbox_mark_sent` and `rules_run` are refused before the arguments are read, and a rule payload
+  `outbox_mark_sent` and `rules_run` are refused before the arguments are read, an enable-only update
+  of a stored forward rule is refused the same way, and a rule payload
   containing a forward action is refused before parsing. The server never runs the outbox pass: it
   only queues. An uncertain submission is never retried automatically; a manual retry requires
   `confirm: true`.

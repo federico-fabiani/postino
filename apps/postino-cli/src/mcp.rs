@@ -31,6 +31,7 @@ const SEND_GATED: [&str; 5] = ["message_send", "send_schedule", "outbox_retry", 
 const SEND_DISABLED_REASON: &str = "sending is disabled: start `postino mcp --allow-send` to allow message_send, send_schedule, outbox_retry, outbox_mark_sent and rules_run (including rule forwards)";
 
 pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
+    engine.set_allow_send(allow_send);
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
@@ -178,6 +179,7 @@ fn tools_list(engine: &Engine, allow_send: bool) -> Value {
 }
 
 fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<Value, (i64, String)> {
+    engine.set_allow_send(allow_send);
     let name = params.get("name").and_then(Value::as_str).ok_or_else(|| (-32602, "tools/call needs a string `name`".to_owned()))?;
     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     if !arguments.is_object() {
@@ -193,6 +195,9 @@ fn tools_call(engine: &mut Engine, params: &Value, allow_send: bool) -> Result<V
     // Refuse the payload before the typed parser sees it: the CLI and the desktop can still create
     // the rule locally.
     if !allow_send && matches!(name, "rules_create" | "rules_update") && requests_rule_forward(&arguments) {
+        return Ok(send_disabled_refusal(name));
+    }
+    if !allow_send && name == "rules_update" && rule_update_enables_forward(engine, &arguments) {
         return Ok(send_disabled_refusal(name));
     }
 
@@ -218,6 +223,17 @@ fn requests_rule_forward(arguments: &Value) -> bool {
         .get("actions")
         .and_then(Value::as_array)
         .is_some_and(|actions| actions.iter().any(|action| action.get("kind").and_then(Value::as_str) == Some("forward")))
+}
+
+/// An enable-only `rules_update` can arm a stored forward rule without ever sending an `actions`
+/// payload. Read the rule before the typed parser sees the request and refuse it without
+/// `--allow-send`.
+fn rule_update_enables_forward(engine: &Engine, arguments: &Value) -> bool {
+    if arguments.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let Some(id) = arguments.get("id").and_then(Value::as_str) else { return false };
+    engine.rule_has_forward(id).ok().flatten() == Some(true)
 }
 
 fn send_disabled_refusal(name: &str) -> Value {
@@ -902,6 +918,101 @@ mod tests {
         .expect("response");
         assert!(created.get("error").is_none(), "{created}");
         assert_eq!(created["result"]["structuredContent"]["rule"]["actions"][0]["kind"], "forward");
+    }
+
+    #[test]
+    fn enabling_a_stored_forward_rule_is_refused_before_parsing_without_allow_send() {
+        let mut engine = Engine::demo();
+        let created = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 90, "method": "tools/call",
+                "params": { "name": "rules_create", "arguments": {
+                    "name": "Inoltro",
+                    "query": "subject:prova",
+                    "actions": [{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]
+                }}
+            }),
+        )
+        .expect("response");
+        let id = created["result"]["structuredContent"]["rule"]["id"].as_str().expect("rule id").to_owned();
+        handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 91, "method": "tools/call",
+                "params": { "name": "rules_update", "arguments": { "id": id, "enabled": false } }
+            }),
+        )
+        .expect("disable");
+        let refused = raw_handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 92, "method": "tools/call",
+                "params": { "name": "rules_update", "arguments": { "id": id, "enabled": true, "bogus": true } }
+            }),
+            false,
+        )
+        .expect("response");
+        assert_eq!(refused["result"]["isError"], true);
+        let text = refused["result"]["content"][0]["text"].as_str().expect("text");
+        assert!(text.contains("--allow-send"), "the refusal ran before the typed parser: {text}");
+        assert!(!text.contains("bogus"), "the refusal must not parse or echo the payload: {text}");
+    }
+
+    #[test]
+    fn sync_now_does_not_forward_without_allow_send_and_does_with_it() {
+        fn engine_with_forward_rule(allow_send: bool) -> (Engine, crate::test_support::RunningServer, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("mail.db");
+            let mut key_bytes = [0u8; 32];
+            getrandom::fill(&mut key_bytes).expect("OS random source");
+            let store = postino_store::Store::open(&path, &postino_store::StoreKey::from_bytes(key_bytes)).expect("store");
+            let vault = crate::test_support::MemoryVault::new();
+            let server = crate::test_support::RunningServer::start(crate::test_support::three_folders(), 1);
+            crate::test_support::seed_account(&store, &vault, "acc_mcp", server.port());
+            let mut account_server = store.get_account_server("acc_mcp").expect("server read").expect("server row");
+            account_server.smtp = Some(postino_store::SmtpServer {
+                host: "localhost".to_owned(),
+                port: 465,
+                tls: postino_store::AccountTls::Implicit,
+                username: "user@example.com".to_owned(),
+            });
+            store.upsert_account_server(&account_server).expect("SMTP endpoint");
+            let mut engine = Engine::open_with_vault(store, vault).expect("engine");
+            engine.set_test_extra_roots(vec![server.ca()]);
+            let created = handle(
+                &mut engine,
+                &json!({
+                    "jsonrpc": "2.0", "id": 93, "method": "tools/call",
+                    "params": { "name": "rules_create", "arguments": {
+                        "name": "Inoltro",
+                        "query": "from:synthetic",
+                        "actions": [{ "kind": "forward", "to": [{ "name": "", "email": "dest@example.com" }] }]
+                    }}
+                }),
+            )
+            .expect("create");
+            assert!(created.get("error").is_none(), "{created}");
+            engine.set_allow_send(allow_send);
+            (engine, server, dir)
+        }
+
+        for (allow_send, expected) in [(false, 0usize), (true, 2usize)] {
+            let (mut engine, server, _dir) = engine_with_forward_rule(allow_send);
+            let response = raw_handle(
+                &mut engine,
+                &json!({
+                    "jsonrpc": "2.0", "id": 94, "method": "tools/call",
+                    "params": { "name": "sync_now", "arguments": {} }
+                }),
+                allow_send,
+            )
+            .expect("response");
+            assert!(response.get("error").is_none(), "{response}");
+            server.finish();
+            let outbox = engine.outbox_list(None, 500, 0).expect("outbox");
+            assert_eq!(outbox.entries.len(), expected, "allow_send={allow_send}: {response}");
+        }
     }
 
     #[test]

@@ -698,7 +698,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "29ec05481a4b424d679a7f0323ac2cbb5004e8a50a0cf1fc48546d8092388193"
+sha256 = "e31b06751dbed1864b89451fd354cd378b7c65f705c1033635fa494d8711bca0"
 usage = "Documentation screenshot of the local rule list, editor actions, priority and recent runs at the minimum window"
 
 [[asset]]
@@ -708,7 +708,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "5b1535c15161fb26abe6382af58901df7112fcfbe283eca69e6c8686cd1c8ce2"
+sha256 = "c31fffa3a880b126135ed31be4bd23b591b6685ae077472aaee67155281e4292"
 usage = "Documentation screenshot of dark-theme local rules at the minimum window"
 
 [[asset]]
@@ -718,7 +718,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f07595bc0249072d07467057b8c58c4d9202949c5dc230cf4c2bc15d5c144305"
+sha256 = "3e52b7dfc7b26507d77c7e5edf5d998e9500d19d6f0ae2a91b5224ede23f8dff"
 usage = "Documentation screenshot of a prefilled rule editor with actions and the disabled forward reason"
 
 [[asset]]
@@ -728,7 +728,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "5af1d8b4f239466d503fe5f27fdd9f7189b31e0fa0b2c61af0078e7d487a9c68"
+sha256 = "a54decb8eb0325dc03e8bca3b0de32e7cb59fcf4bf5e566ee5a12fadf67db074"
 usage = "Documentation screenshot of the dark-theme rule editor"
 
 [[asset]]
@@ -738,7 +738,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "681eecfafad4e97515c1ea1bce96b1d8002762ca6d75d6ca43e66594dc72f02e"
+sha256 = "339f45516b3e3bcd088d22629d4677f9c4a55478e41872f69aa9a6d56790ccfe"
 usage = "Documentation screenshot of the read-only rule preview with one effect per action"
 
 [[asset]]
@@ -748,7 +748,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "d5add86c58bc837803182ddd843ba9c5879d4bd575adbe9ad14fdf26cdeddbdc"
+sha256 = "212795a59bdfa83faf8c2c3554199e810e8ec233c149844958e9cf0b6612c71b"
 usage = "Documentation screenshot of the dark-theme rule preview"
 
 [[dependency]]

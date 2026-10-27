@@ -4,9 +4,12 @@
 //! id ASC` order: the next rule queries the store again, so it sees what an earlier rule moved,
 //! labelled or marked. A `stop` rule records the messages it matched and later rules skip them.
 //!
-//! Rules never touch Drafts, Sent or Trash, never run while the app is closed (there is no daemon)
-//! and never open SMTP themselves: a forward becomes one row in the P7 outbox, with a deterministic
-//! `rule:<rule>:<message>` key. The journal stores ids, folders, labels and booleans only.
+//! Rules act only on received-origin mail: `messages.origin` is provenance, so a Sent copy moved to
+//! Archive is still `sent` and a received message moved to Sent is still eligible until the folder
+//! check sees Trash/Drafts/Sent. Every action re-checks that fact before touching the row. Rules never
+//! run while the app is closed (there is no daemon) and never open SMTP themselves: a forward becomes
+//! one row in the P7 outbox, with a deterministic `rule:<rule>:<message>` key and a durable dedupe
+//! marker. The journal stores ids, folders, labels and booleans only.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -61,7 +64,40 @@ struct Applied {
     changed: bool,
     /// The journal value. `None` means a no-op that needs no row.
     value: Option<String>,
+    /// The action was deliberately not attempted because the run's send gate or forward budget
+    /// blocked it. The message stays pending for a later run.
+    deferred: bool,
 }
+
+/// A bounded error log. The count stays exact while the returned list is capped, so a hostile
+/// mailbox cannot turn an MCP result into megabytes of repeated sentences.
+struct ErrorLog {
+    items: Vec<String>,
+    total: u32,
+}
+
+impl ErrorLog {
+    fn new() -> Self {
+        Self { items: Vec::new(), total: 0 }
+    }
+
+    fn push(&mut self, sentence: String) {
+        self.total = self.total.saturating_add(1);
+        if self.items.len() < MAX_RUN_ERRORS {
+            self.items.push(sentence);
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        if self.total > u32::try_from(self.items.len()).unwrap_or(u32::MAX) {
+            self.items
+                .push(format!("{} more errors omitted from this result", self.total.saturating_sub(u32::try_from(self.items.len()).unwrap_or(0))));
+        }
+        self.items
+    }
+}
+
+const MAX_RUN_ERRORS: usize = 200;
 
 /// The result of resolving one forward to its outbox row.
 struct ForwardOutcome {
@@ -87,6 +123,16 @@ impl Engine {
         }
         rows.sort_by(|left, right| left.priority.cmp(&right.priority).then(left.id.cmp(&right.id)));
         Ok(rows)
+    }
+
+    /// Whether one rule has a forward action. The MCP gate uses it to refuse an enable-only update
+    /// before the typed request is parsed; `None` means the rule does not exist.
+    pub fn rule_has_forward(&self, id: &str) -> Result<Option<bool>, OpError> {
+        let rule = match self.store() {
+            Some(store) => store.get_rule(id).map_err(store_map::read_error)?.map(store_map::rule),
+            None => self.rules.iter().find(|rule| rule.id == id).cloned(),
+        };
+        Ok(rule.map(|rule| rule.actions.iter().any(|action| matches!(action, RuleAction::Forward { .. }))))
     }
 
     /// Re-read one account's rules from the store. The demo has no second writer, so it is a no-op.
@@ -119,7 +165,7 @@ impl Engine {
         let name = validate_rule_name(name)?;
         let query = validate_rule_query(self, &account.id, query)?;
         let actions = validate_rule_actions(self, &account.id, &actions)?;
-        if self.rules.iter().any(|rule| rule.account_id == account.id && rule.name.eq_ignore_ascii_case(&name)) {
+        if self.rules.iter().any(|rule| rule.account_id == account.id && rule.name.to_lowercase() == name.to_lowercase()) {
             return Err(OpError::InvalidArgs(format!("a rule named {name:?} already exists; names are unique ignoring case")));
         }
         let count = self.rules.iter().filter(|rule| rule.account_id == account.id).count();
@@ -186,30 +232,50 @@ impl Engine {
             return Err(OpError::InvalidArgs("provide name, query, actions, priority, stop and/or enabled".to_owned()));
         }
         let account = self.account_for(account, "rules_update")?;
-        if !self.rules.iter().any(|rule| rule.id == id && rule.account_id == account.id) {
-            self.reload_rules(Some(&account.id))?;
-        }
-        let index =
-            self.rules.iter().position(|rule| rule.id == id).filter(|index| self.rules.get(*index).is_some_and(|rule| rule.account_id == account.id));
-        let Some(index) = index else { return Err(unknown_rule(id)) };
-        let current = self.rules.get(index).cloned().ok_or_else(|| unknown_rule(id))?;
+        let index = self.rules.iter().position(|rule| rule.id == id && rule.account_id == account.id);
+        let (current, expected_updated_at, index) = match self.store() {
+            Some(store) => {
+                let stored = store.get_rule(id).map_err(store_map::read_error)?.ok_or_else(|| unknown_rule(id))?;
+                if stored.account_id != account.id {
+                    return Err(unknown_rule(id));
+                }
+                if let Some(memory) = index.and_then(|index| self.rules.get(index))
+                    && memory.updated_at != stored.updated_at
+                {
+                    return Err(OpError::InvalidArgs(format!(
+                        "rule {id:?} changed in another session; reload the rules page or rules_list before editing it"
+                    )));
+                }
+                let expected = stored.updated_at;
+                (store_map::rule(stored), expected, index)
+            }
+            None => {
+                let index = index.ok_or_else(|| unknown_rule(id))?;
+                let current = self.rules.get(index).cloned().ok_or_else(|| unknown_rule(id))?;
+                let expected = current.updated_at;
+                (current, expected, Some(index))
+            }
+        };
         let resolved_name = match name {
             Some(name) => validate_rule_name(name)?,
             None => current.name.clone(),
         };
-        if self.rules.iter().any(|rule| rule.id != id && rule.account_id == account.id && rule.name.eq_ignore_ascii_case(&resolved_name)) {
+        if self.rules.iter().any(|rule| rule.id != id && rule.account_id == account.id && rule.name.to_lowercase() == resolved_name.to_lowercase()) {
             return Err(OpError::InvalidArgs(format!("a rule named {resolved_name:?} already exists; names are unique ignoring case")));
         }
         let resolved_query = match query {
             Some(query) => validate_rule_query(self, &account.id, query)?,
             None => current.query.clone(),
         };
+        // Validate the merged list even when the caller omitted `actions`: a corrupt stored row
+        // cannot be saved back as a zero-action rule by a name-only update.
         let resolved_actions = match actions {
             Some(actions) => validate_rule_actions(self, &account.id, &actions)?,
-            None => current.actions.clone(),
+            None => validate_rule_actions(self, &account.id, &current.actions)?,
         };
         let actions_json =
             serde_json::to_string(&resolved_actions).map_err(|error| OpError::Failed(format!("could not encode the rule actions: {error}")))?;
+        let updated_at = Utc::now().timestamp_millis().max(expected_updated_at.saturating_add(1));
         let stored = StoredRule {
             id: current.id.clone(),
             account_id: current.account_id.clone(),
@@ -220,15 +286,22 @@ impl Engine {
             query: resolved_query,
             actions_json,
             created_at: current.created_at,
-            updated_at: Utc::now().timestamp_millis(),
+            updated_at,
         };
         if let Some(store) = self.store() {
-            store.update_rule(&stored).map_err(store_map::write_error)?;
+            store.update_rule(&stored, expected_updated_at).map_err(store_map::write_error)?;
         }
         let updated = store_map::rule(stored);
-        if let Some(slot) = self.rules.get_mut(index) {
-            *slot = updated;
+        match index {
+            Some(index) => {
+                if let Some(slot) = self.rules.get_mut(index) {
+                    *slot = updated;
+                }
+            }
+            None => self.rules.push(updated),
         }
+        self.rules
+            .sort_by(|left, right| left.account_id.cmp(&right.account_id).then(left.priority.cmp(&right.priority)).then(left.id.cmp(&right.id)));
         self.bump_revision();
         self.rules_list(Some(&account.id))?.into_iter().find(|candidate| candidate.id == id).ok_or_else(|| unknown_rule(id))
     }
@@ -279,36 +352,61 @@ impl Engine {
         query: &str,
         actions: &[RuleAction],
         limit: Option<u32>,
+        rule_id: Option<&str>,
     ) -> Result<(u32, bool, Vec<RulePreviewRow>), OpError> {
         let account = self.account_for(account, "rules_preview")?;
         let query = validate_rule_query(self, &account.id, query)?;
         let actions = validate_rule_actions(self, &account.id, actions)?;
         let limit = limit.unwrap_or(MAX_PREVIEW_ROWS).clamp(1, MAX_PREVIEW_ROWS);
+        let since =
+            rule_id.and_then(|id| self.rules.iter().find(|rule| rule.id == id && rule.account_id == account.id)).map_or(0, |rule| rule.created_at);
+        let forward_allowed = self.account_can_send(&account.id);
+        let folder_kinds = self
+            .folders()
+            .iter()
+            .filter(|folder| folder.account_id == account.id)
+            .map(|folder| (folder.id.clone(), folder.kind))
+            .collect::<HashMap<_, _>>();
         let parsed = crate::search::parse(&query)
             .map_err(|error| OpError::InvalidArgs(format!("search query: {} at position {}", error.code, error.position)))?;
         if let Some(store) = self.store() {
             let expr = crate::ops::translate_search(&parsed.expr, self, Some(&account.id))?;
             let page = store
-                .rule_candidates(&RuleCandidateFilter { account_id: account.id.clone(), expr: Some(expr), since: 0, new_only: false, limit })
+                .rule_candidates(&RuleCandidateFilter {
+                    account_id: account.id.clone(),
+                    expr: Some(expr),
+                    since,
+                    new_only: false,
+                    after: None,
+                    limit,
+                })
                 .map_err(store_map::read_error)?;
             let mut rows = Vec::with_capacity(page.messages.len());
             for message in &page.messages {
                 let summary = crate::store_map::summary(message.clone());
                 let guard = if actions.iter().any(|action| matches!(action, RuleAction::Forward { .. })) {
-                    store.rule_guard(&summary.id).map_err(store_map::read_error)?
+                    store.rule_guard(&account.id, &summary.id).map_err(store_map::read_error)?
                 } else {
                     RuleGuard::default()
                 };
-                let folder_kind = self.folders().iter().find(|folder| folder.id == summary.folder_id).map(|folder| folder.kind);
-                let effects = preview_effects(&actions, &summary, folder_kind, guard);
+                let folder_kind = folder_kinds.get(&summary.folder_id).copied();
+                let effects = preview_effects(&actions, &summary, folder_kind, guard, forward_allowed, &folder_kinds);
                 rows.push(RulePreviewRow { message: summary, effects });
             }
             let truncated = page.total_capped || usize::try_from(page.total).unwrap_or(usize::MAX) > rows.len();
             return Ok((page.total, truncated, rows));
         }
-        let (total, rows) = self.demo_preview(&account.id, &parsed.expr, &actions, limit)?;
+        let (total, rows) = self.demo_preview(&account.id, &parsed.expr, &actions, limit, forward_allowed)?;
         let truncated = total > rows.len();
         Ok((u32::try_from(total).unwrap_or(u32::MAX), truncated, rows))
+    }
+
+    fn account_can_send(&self, account_id: &str) -> bool {
+        self.account_views()
+            .ok()
+            .and_then(|views| views.into_iter().find(|view| view.account.id == account_id))
+            .and_then(|view| view.server)
+            .is_some_and(|server| server.smtp.is_some())
     }
 
     fn demo_preview(
@@ -317,9 +415,16 @@ impl Engine {
         expr: &crate::search::Expr,
         actions: &[RuleAction],
         limit: u32,
+        forward_allowed: bool,
     ) -> Result<(usize, Vec<RulePreviewRow>), OpError> {
         let folder_ids =
             self.folders().iter().filter(|folder| folder.account_id == account_id).map(|folder| folder.id.as_str()).collect::<BTreeSet<_>>();
+        let folder_kinds = self
+            .folders()
+            .iter()
+            .filter(|folder| folder.account_id == account_id)
+            .map(|folder| (folder.id.clone(), folder.kind))
+            .collect::<HashMap<_, _>>();
         let mut matches = self
             .messages()
             .iter()
@@ -339,8 +444,8 @@ impl Engine {
             .into_iter()
             .take(usize::try_from(limit).unwrap_or(usize::MAX))
             .map(|message| {
-                let folder_kind = self.folders().iter().find(|folder| folder.id == message.summary.folder_id).map(|folder| folder.kind);
-                let effects = preview_effects(actions, &message.summary, folder_kind, RuleGuard::default());
+                let folder_kind = folder_kinds.get(&message.summary.folder_id).copied();
+                let effects = preview_effects(actions, &message.summary, folder_kind, RuleGuard::default(), forward_allowed, &folder_kinds);
                 RulePreviewRow { message: message.summary, effects }
             })
             .collect();
@@ -405,15 +510,21 @@ impl Engine {
                     .find(|folder| folder.id == summary.folder_id)
                     .is_some_and(|folder| !matches!(folder.kind, FolderKind::Drafts | FolderKind::Sent | FolderKind::Trash))
         };
-        let universe = self
-            .messages()
-            .iter()
-            .filter(|message| eligible(self, &folder_ids, message))
-            .filter(|message| scope == RuleRunScope::All || !self.demo_rules_applied.contains(&message.id))
-            .map(|message| message.id.clone())
-            .take(usize::try_from(MAX_RUN_MESSAGES).unwrap_or(usize::MAX))
-            .collect::<BTreeSet<_>>();
-        let mut errors = Vec::new();
+        let universe = if scope == RuleRunScope::New {
+            Some(
+                self.messages()
+                    .iter()
+                    .filter(|message| eligible(self, &folder_ids, message))
+                    .filter(|message| !self.demo_rules_applied.contains(&message.id))
+                    .map(|message| message.id.clone())
+                    .take(usize::try_from(MAX_RUN_MESSAGES).unwrap_or(usize::MAX))
+                    .collect::<BTreeSet<_>>(),
+            )
+        } else {
+            None
+        };
+        let mut completed = universe.clone().unwrap_or_default();
+        let mut errors = ErrorLog::new();
         let mut stopped = BTreeSet::new();
         let mut actions_log = Vec::new();
         let mut ordinal = 1u32;
@@ -425,23 +536,33 @@ impl Engine {
                     continue;
                 }
             };
+            let cursor = if scope == RuleRunScope::All { self.demo_rule_all_cursors.get(&rule.id).cloned() } else { None };
             let mut candidates = self
                 .messages()
                 .iter()
-                .filter(|message| universe.contains(&message.id))
+                .filter(|message| universe.as_ref().is_none_or(|universe| universe.contains(&message.id)))
                 .filter(|message| eligible(self, &folder_ids, message))
+                .filter(|message| {
+                    cursor.as_ref().is_none_or(|(date, id)| (message.date.timestamp_millis(), message.id.as_str()) > (*date, id.as_str()))
+                })
                 .filter_map(|summary| self.message(&summary.id))
                 .filter(|message| crate::ops::demo_matches(&parsed.expr, message, self))
                 .collect::<Vec<_>>();
-            candidates.sort_by_key(|message| (message.summary.date, message.summary.id.clone()));
+            candidates.sort_by_key(|message| (message.summary.date.timestamp_millis(), message.summary.id.clone()));
             candidates.truncate(usize::try_from(MAX_RUN_MESSAGES).unwrap_or(usize::MAX));
+            let page_len = candidates.len();
+            let last_position = candidates.last().map(|message| (message.summary.date.timestamp_millis(), message.summary.id.clone()));
             for message in candidates {
                 if stopped.contains(&message.summary.id) {
                     continue;
                 }
                 run.matched = run.matched.saturating_add(1);
                 let mut state = self.demo_state(&message.summary.id);
+                let mut message_ok = true;
                 for action in &rule.actions {
+                    if !rule_action_allowed(&state) {
+                        break;
+                    }
                     match self.demo_action(account, &message, &mut state, action) {
                         Ok(applied) => {
                             if applied.changed {
@@ -462,7 +583,7 @@ impl Engine {
                         }
                         Err(error) => {
                             errors.push(error);
-                            run.errors = run.errors.saturating_add(1);
+                            message_ok = false;
                             break;
                         }
                     }
@@ -470,19 +591,34 @@ impl Engine {
                 if rule.stop {
                     stopped.insert(message.summary.id.clone());
                 }
+                if !message_ok {
+                    completed.remove(&message.summary.id);
+                }
+            }
+            if scope == RuleRunScope::All {
+                if page_len >= usize::try_from(MAX_RUN_MESSAGES).unwrap_or(usize::MAX) {
+                    if let Some(position) = last_position {
+                        self.demo_rule_all_cursors.insert(rule.id.clone(), position);
+                    }
+                } else {
+                    self.demo_rule_all_cursors.remove(&rule.id);
+                }
             }
         }
+        run.errors = errors.total;
         run.finished_at = Some(Utc::now().timestamp_millis());
         if scope == RuleRunScope::New {
-            for id in &universe {
+            for id in &completed {
                 self.demo_rules_applied.insert(id.clone());
             }
         }
         self.rule_run_actions.insert(run_id, actions_log);
         self.rule_runs.insert(0, run.clone());
         self.rule_runs.truncate(usize::try_from(MAX_KEPT_RUNS).unwrap_or(MAX_KEPT_RUNS as usize));
+        let retained = self.rule_runs.iter().map(|run| run.id.clone()).collect::<BTreeSet<_>>();
+        self.rule_run_actions.retain(|run_id, _| retained.contains(run_id));
         self.bump_revision();
-        Ok(RuleRunOutcome { run, errors })
+        Ok(RuleRunOutcome { run, errors: errors.finish() })
     }
 
     fn demo_state(&self, message_id: &str) -> RuleMessageState {
@@ -492,14 +628,22 @@ impl Engine {
                 Some(RuleMessageState {
                     folder_id: summary.folder_id.clone(),
                     folder_kind: store_kind(folder.kind),
+                    origin: match folder.kind {
+                        FolderKind::Drafts => postino_store::MessageOrigin::Draft,
+                        FolderKind::Sent => postino_store::MessageOrigin::Sent,
+                        _ => postino_store::MessageOrigin::Received,
+                    },
                     unread: summary.unread,
+                    starred: summary.starred,
                     labels: summary.labels.clone(),
                 })
             })
             .unwrap_or(RuleMessageState {
                 folder_id: String::new(),
                 folder_kind: postino_store::FolderKind::Custom,
+                origin: postino_store::MessageOrigin::Local,
                 unread: false,
+                starred: false,
                 labels: Vec::new(),
             })
     }
@@ -517,36 +661,48 @@ impl Engine {
                     return Err(format!("rule action: folder {folder:?} is not a valid destination"));
                 }
                 if state.folder_id == *folder {
-                    return Ok(Applied { changed: false, value: None });
+                    return Ok(Applied { changed: false, value: None, deferred: false });
                 }
                 let target_kind = target.kind;
                 let from = state.folder_id.clone();
                 self.move_message(&id, folder).map_err(|_| format!("rule action: message {id:?} could not be moved to {folder:?}"))?;
                 state.folder_id = folder.clone();
                 state.folder_kind = store_kind(target_kind);
-                Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": folder, "after": state_json(state) }).to_string()) })
+                Ok(Applied {
+                    changed: true,
+                    value: Some(json!({ "from": from, "to": folder, "after": state_json(state) }).to_string()),
+                    deferred: false,
+                })
             }
             RuleAction::Label { label } => {
                 if self.label(label).is_none() {
                     return Err(format!("rule action: label {label:?} no longer exists"));
                 }
                 if state.labels.iter().any(|candidate| candidate == label) {
-                    return Ok(Applied { changed: false, value: None });
+                    return Ok(Applied { changed: false, value: None, deferred: false });
                 }
                 self.set_label(label, std::slice::from_ref(&id), true)
                     .map_err(|_| format!("rule action: label {label:?} could not be applied to {id:?}"))?;
                 state.labels.push(label.clone());
-                Ok(Applied { changed: true, value: Some(json!({ "label": label, "applied": true, "after": state_json(state) }).to_string()) })
+                Ok(Applied {
+                    changed: true,
+                    value: Some(json!({ "label": label, "applied": true, "after": state_json(state) }).to_string()),
+                    deferred: false,
+                })
             }
             RuleAction::Read | RuleAction::Unread => {
                 let unread = matches!(action, RuleAction::Unread);
                 if state.unread == unread {
-                    return Ok(Applied { changed: false, value: None });
+                    return Ok(Applied { changed: false, value: None, deferred: false });
                 }
                 let from = state.unread;
                 self.set_flags(&id, Some(unread), None).map_err(|_| format!("rule action: message {id:?} could not be flagged"))?;
                 state.unread = unread;
-                Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": unread, "after": state_json(state) }).to_string()) })
+                Ok(Applied {
+                    changed: true,
+                    value: Some(json!({ "from": from, "to": unread, "after": state_json(state) }).to_string()),
+                    deferred: false,
+                })
             }
             RuleAction::Trash => {
                 let trash = self
@@ -556,13 +712,17 @@ impl Engine {
                     .map(|folder| folder.id.clone())
                     .ok_or_else(|| "rule action: the account has no Trash folder".to_owned())?;
                 if state.folder_kind == postino_store::FolderKind::Trash {
-                    return Ok(Applied { changed: false, value: None });
+                    return Ok(Applied { changed: false, value: None, deferred: false });
                 }
                 let from = state.folder_id.clone();
                 self.move_message(&id, &trash).map_err(|_| format!("rule action: message {id:?} could not be moved to Trash"))?;
                 state.folder_id = trash.clone();
                 state.folder_kind = postino_store::FolderKind::Trash;
-                Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": trash, "after": state_json(state) }).to_string()) })
+                Ok(Applied {
+                    changed: true,
+                    value: Some(json!({ "from": from, "to": trash, "after": state_json(state) }).to_string()),
+                    deferred: false,
+                })
             }
             RuleAction::Forward { .. } => Err("rule action: forward needs a local store and the P7 outbox".to_owned()),
         }
@@ -702,7 +862,7 @@ fn unknown_run(id: &str) -> OpError {
 /// this snapshot before reversing anything: a message the user moved, flagged or labelled after the
 /// run is left alone. The journal never carries a subject, an address or a body.
 fn state_json(state: &RuleMessageState) -> Value {
-    json!({ "folder": state.folder_id, "unread": state.unread, "labels": state.labels })
+    json!({ "folder": state.folder_id, "unread": state.unread, "starred": state.starred, "labels": state.labels })
 }
 
 /// The last post-action state journaled for each message. The last action for a message is its
@@ -722,9 +882,11 @@ fn expected_states(actions: &[RuleActionRecord]) -> HashMap<String, Value> {
 fn state_matches(state: &RuleMessageState, expected: &Value) -> bool {
     let folder = expected.get("folder").and_then(Value::as_str);
     let unread = expected.get("unread").and_then(Value::as_bool);
+    let starred = expected.get("starred").and_then(Value::as_bool);
     let labels = expected.get("labels").and_then(Value::as_array).map(|labels| labels.iter().filter_map(Value::as_str).collect::<BTreeSet<_>>());
     folder == Some(state.folder_id.as_str())
         && unread == Some(state.unread)
+        && starred.is_none_or(|starred| starred == state.starred)
         && labels.is_some_and(|labels| labels == state.labels.iter().map(String::as_str).collect::<BTreeSet<_>>())
 }
 
@@ -787,8 +949,8 @@ fn validate_rule_actions(engine: &Engine, account_id: &str, actions: &[RuleActio
                 let folder = engine
                     .folders()
                     .iter()
-                    .find(|candidate| candidate.id == *folder && candidate.account_id == account_id)
-                    .ok_or_else(|| OpError::InvalidArgs(format!("unknown folder {folder:?} for this rule's account")))?;
+                    .find(|candidate| candidate.account_id == account_id && (candidate.id == *folder || candidate.name.eq_ignore_ascii_case(folder)))
+                    .ok_or_else(|| OpError::InvalidArgs(format!("unknown folder {folder:?} for this rule's account; use an id or exact name")))?;
                 if folder.kind.is_virtual() || matches!(folder.kind, FolderKind::Drafts | FolderKind::Sent) {
                     return Err(OpError::InvalidArgs(format!(
                         "folder {:?} cannot be a rule destination: a rule never edits a draft or a Sent copy",
@@ -798,10 +960,20 @@ fn validate_rule_actions(engine: &Engine, account_id: &str, actions: &[RuleActio
                 RuleAction::Move { folder: folder.id.clone() }
             }
             RuleAction::Label { label } => {
-                if engine.label(label).is_none() {
-                    return Err(OpError::InvalidArgs(format!("unknown label {label:?}; use an id returned by labels_list")));
+                let resolved = engine
+                    .label(label)
+                    .or_else(|| engine.labels().iter().find(|candidate| candidate.name.eq_ignore_ascii_case(label)))
+                    .ok_or_else(|| OpError::InvalidArgs(format!("unknown label {label:?}; use an id or exact name from labels_list")))?;
+                if let Some(store) = engine.store()
+                    && let Some(Some(label_account)) = store.label_account_id(&resolved.id).map_err(store_map::read_error)?
+                    && label_account != account_id
+                {
+                    return Err(OpError::InvalidArgs(format!(
+                        "label {:?} belongs to account {label_account:?}, not this rule's account",
+                        resolved.id
+                    )));
                 }
-                RuleAction::Label { label: label.clone() }
+                RuleAction::Label { label: resolved.id.clone() }
             }
             RuleAction::Read => RuleAction::Read,
             RuleAction::Unread => RuleAction::Unread,
@@ -827,8 +999,16 @@ fn validate_rule_actions(engine: &Engine, account_id: &str, actions: &[RuleActio
     Ok(normalized)
 }
 
-fn preview_effects(actions: &[RuleAction], message: &MessageSummary, folder_kind: Option<FolderKind>, guard: RuleGuard) -> Vec<RulePreviewEffect> {
+fn preview_effects(
+    actions: &[RuleAction],
+    message: &MessageSummary,
+    folder_kind: Option<FolderKind>,
+    guard: RuleGuard,
+    forward_allowed: bool,
+    folder_kinds: &HashMap<String, FolderKind>,
+) -> Vec<RulePreviewEffect> {
     let mut folder_id = message.folder_id.clone();
+    let mut kind = folder_kind;
     let mut unread = message.unread;
     let mut labels = message.labels.clone();
     let mut effects = Vec::with_capacity(actions.len());
@@ -839,6 +1019,7 @@ fn preview_effects(actions: &[RuleAction], message: &MessageSummary, folder_kind
                     RuleEffectStatus::NoOp
                 } else {
                     folder_id = folder.clone();
+                    kind = folder_kinds.get(folder).copied();
                     RuleEffectStatus::Apply
                 }
             }
@@ -860,14 +1041,15 @@ fn preview_effects(actions: &[RuleAction], message: &MessageSummary, folder_kind
                 }
             }
             RuleAction::Trash => {
-                if folder_kind == Some(FolderKind::Trash) {
+                if kind == Some(FolderKind::Trash) {
                     RuleEffectStatus::NoOp
                 } else {
+                    kind = Some(FolderKind::Trash);
                     RuleEffectStatus::Apply
                 }
             }
             RuleAction::Forward { .. } => {
-                if guard.any() {
+                if !forward_allowed || guard.any() {
                     RuleEffectStatus::Skip
                 } else {
                     RuleEffectStatus::Apply
@@ -919,14 +1101,22 @@ fn run_store(engine: &Engine, store: &Store, account: &Account, rules: &[Rule], 
         store.prune_rule_runs(&account.id, MAX_KEPT_RUNS).map_err(store_map::write_error)?;
         return Ok(RuleRunOutcome { run, errors: Vec::new() });
     }
+
     // A `new` run fixes one bounded universe of new received mail, then every rule sees it in
-    // order. An `all` run instead gives each rule its own 2 000-candidate page: a rule created today
-    // must not be starved by an older rule whose own scope starts years earlier.
+    // order. A message is marked applied only after every enabled rule finished it without an
+    // action failure or a deferred forward, so a fixed SMTP endpoint or target is retried.
     let universe = if scope == RuleRunScope::New {
         let since = rules.iter().map(|rule| rule.created_at).min().unwrap_or(started);
         Some(
             store
-                .rule_candidates(&RuleCandidateFilter { account_id: account.id.clone(), expr: None, since, new_only: true, limit: MAX_RUN_MESSAGES })
+                .rule_candidates(&RuleCandidateFilter {
+                    account_id: account.id.clone(),
+                    expr: None,
+                    since,
+                    new_only: true,
+                    after: None,
+                    limit: MAX_RUN_MESSAGES,
+                })
                 .map_err(store_map::read_error)?
                 .messages
                 .into_iter()
@@ -936,16 +1126,19 @@ fn run_store(engine: &Engine, store: &Store, account: &Account, rules: &[Rule], 
     } else {
         None
     };
-    let mut errors = Vec::new();
+    let mut completed = universe.clone().unwrap_or_default();
+    let mut errors = ErrorLog::new();
     let mut stopped = BTreeSet::new();
     let mut ordinal = 1u32;
     let mut forwards = 0u32;
+    let mut threads_dirty = false;
+    let allow_send = engine.allow_send();
+
     for rule in rules {
         let parsed = match crate::search::parse(&rule.query) {
             Ok(parsed) => parsed,
             Err(error) => {
                 errors.push(format!("rule {:?}: the stored query is not readable ({} at position {})", rule.id, error.code, error.position));
-                run.errors = run.errors.saturating_add(1);
                 continue;
             }
         };
@@ -953,19 +1146,24 @@ fn run_store(engine: &Engine, store: &Store, account: &Account, rules: &[Rule], 
             Ok(expr) => expr,
             Err(error) => {
                 errors.push(format!("rule {:?}: the stored query no longer resolves ({error})", rule.id));
-                run.errors = run.errors.saturating_add(1);
                 continue;
             }
         };
+        let cursor = if scope == RuleRunScope::All { store.rule_all_cursor(&rule.id).map_err(store_map::read_error)? } else { None };
         let page = store
             .rule_candidates(&RuleCandidateFilter {
                 account_id: account.id.clone(),
                 expr: Some(expr),
                 since: rule.created_at,
                 new_only: scope == RuleRunScope::New,
+                after: cursor,
                 limit: MAX_RUN_MESSAGES,
             })
             .map_err(store_map::read_error)?;
+        let page_len = page.messages.len();
+        let last_id = page.messages.last().map(|message| message.id.clone());
+        let mut page_deferred = false;
+
         for stored in page.messages {
             let candidate = crate::store_map::summary(stored);
             if universe.as_ref().is_some_and(|universe| !universe.contains(&candidate.id)) || stopped.contains(&candidate.id) {
@@ -974,14 +1172,28 @@ fn run_store(engine: &Engine, store: &Store, account: &Account, rules: &[Rule], 
             run.matched = run.matched.saturating_add(1);
             let Some(mut state) = store.rule_message_state(&candidate.id).map_err(store_map::read_error)? else {
                 errors.push(format!("rule {:?}: message {:?} disappeared before its actions ran", rule.id, candidate.id));
-                run.errors = run.errors.saturating_add(1);
+                completed.remove(&candidate.id);
                 continue;
             };
+            // Candidate selection is a query; another process may have moved the row. Never act on
+            // a draft, Sent copy, Trash row or any non-received origin, and re-check after every
+            // action (our own move to Trash updates `kind` immediately).
+            if !rule_action_allowed(&state) {
+                continue;
+            }
+            let mut message_ok = true;
             for action in &rule.actions {
-                match apply_store_action(engine, store, account, rule, &candidate, &mut state, action, &mut forwards) {
+                match apply_store_action(engine, store, account, rule, &candidate, &mut state, action, &mut forwards, allow_send) {
                     Ok(applied) => {
+                        if applied.deferred {
+                            message_ok = false;
+                            page_deferred = true;
+                        }
                         if applied.changed {
                             run.changed = run.changed.saturating_add(1);
+                            if matches!(action, RuleAction::Read | RuleAction::Unread) {
+                                threads_dirty = true;
+                            }
                         }
                         if let Some(value) = applied.value {
                             store
@@ -1000,26 +1212,60 @@ fn run_store(engine: &Engine, store: &Store, account: &Account, rules: &[Rule], 
                     }
                     Err(error) => {
                         errors.push(error);
-                        run.errors = run.errors.saturating_add(1);
+                        message_ok = false;
                         break;
                     }
+                }
+                if !rule_action_allowed(&state) {
+                    break;
                 }
             }
             if rule.stop {
                 stopped.insert(candidate.id.clone());
             }
+            if !message_ok {
+                completed.remove(&candidate.id);
+            }
+        }
+
+        if scope == RuleRunScope::All {
+            let next = if page_deferred {
+                // A forward budget or send-gate deferral must be retried from the same page; the
+                // next run dedupes the rows already forwarded and continues with the rest.
+                None
+            } else if page_len >= usize::try_from(MAX_RUN_MESSAGES).unwrap_or(usize::MAX) {
+                last_id.and_then(|id| store.message_ingested_at(&id).ok().flatten().map(|ingested_at| (ingested_at, id)))
+            } else {
+                None
+            };
+            store
+                .set_rule_all_cursor(&rule.id, next.as_ref().map(|(ingested_at, id)| (*ingested_at, id.as_str())))
+                .map_err(store_map::write_error)?;
         }
     }
+
+    if run.changed > 0 {
+        store.recount_account_folders(&account.id).map_err(store_map::write_error)?;
+    }
+    if threads_dirty {
+        store.refresh_all_threads().map_err(store_map::write_error)?;
+    }
+    run.errors = errors.total;
     run.finished_at = Some(Utc::now().timestamp_millis());
     store
         .finish_rule_run(&run.id, run.finished_at.unwrap_or(run.started_at), run.matched, run.changed, run.errors)
         .map_err(store_map::write_error)?;
     store.prune_rule_runs(&account.id, MAX_KEPT_RUNS).map_err(store_map::write_error)?;
-    if let Some(universe) = &universe {
-        let ids = universe.iter().cloned().collect::<Vec<_>>();
+    if universe.is_some() {
+        let ids = completed.into_iter().collect::<Vec<_>>();
         store.mark_rules_applied(&ids, started).map_err(store_map::write_error)?;
     }
-    Ok(RuleRunOutcome { run, errors })
+    Ok(RuleRunOutcome { run, errors: errors.finish() })
+}
+
+fn rule_action_allowed(state: &RuleMessageState) -> bool {
+    state.origin == postino_store::MessageOrigin::Received
+        && !matches!(state.folder_kind, postino_store::FolderKind::Drafts | postino_store::FolderKind::Sent | postino_store::FolderKind::Trash)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,8 +1278,12 @@ fn apply_store_action(
     state: &mut RuleMessageState,
     action: &RuleAction,
     forwards: &mut u32,
+    allow_send: bool,
 ) -> Result<Applied, String> {
     let id = &message.id;
+    if !rule_action_allowed(state) {
+        return Ok(Applied { changed: false, value: None, deferred: false });
+    }
     match action {
         RuleAction::Move { folder } => {
             let target = engine
@@ -1045,36 +1295,50 @@ fn apply_store_action(
                 return Err(format!("rule {:?}: folder {folder:?} is not a valid destination", rule.id));
             }
             if state.folder_id == *folder {
-                return Ok(Applied { changed: false, value: None });
+                return Ok(Applied { changed: false, value: None, deferred: false });
             }
             let from = state.folder_id.clone();
-            store.move_messages(std::slice::from_ref(id), folder).map_err(|_| format!("rule {:?}: message {id:?} could not be moved", rule.id))?;
+            if !store.rule_move_message(id, &state.folder_id, folder).map_err(|_| format!("rule {:?}: message {id:?} could not be moved", rule.id))? {
+                return Err(format!("rule {:?}: message {id:?} changed in another session; the move was skipped", rule.id));
+            }
             state.folder_id = folder.clone();
             state.folder_kind = store_kind(target.kind);
-            Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": folder, "after": state_json(state) }).to_string()) })
+            Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": folder, "after": state_json(state) }).to_string()), deferred: false })
         }
         RuleAction::Label { label } => {
             if engine.label(label).is_none() {
                 return Err(format!("rule {:?}: label {label:?} no longer exists", rule.id));
             }
             if state.labels.iter().any(|candidate| candidate == label) {
-                return Ok(Applied { changed: false, value: None });
+                return Ok(Applied { changed: false, value: None, deferred: false });
             }
-            store.apply_label(label, std::slice::from_ref(id)).map_err(|_| format!("rule {:?}: label {label:?} could not be applied", rule.id))?;
+            if !store
+                .rule_set_label(label, id, &state.folder_id, true)
+                .map_err(|_| format!("rule {:?}: label {label:?} could not be applied", rule.id))?
+            {
+                return Err(format!("rule {:?}: message {id:?} changed in another session; the label was skipped", rule.id));
+            }
             state.labels.push(label.clone());
-            Ok(Applied { changed: true, value: Some(json!({ "label": label, "applied": true, "after": state_json(state) }).to_string()) })
+            Ok(Applied {
+                changed: true,
+                value: Some(json!({ "label": label, "applied": true, "after": state_json(state) }).to_string()),
+                deferred: false,
+            })
         }
         RuleAction::Read | RuleAction::Unread => {
             let unread = matches!(action, RuleAction::Unread);
             if state.unread == unread {
-                return Ok(Applied { changed: false, value: None });
+                return Ok(Applied { changed: false, value: None, deferred: false });
             }
             let from = state.unread;
-            store
-                .set_flags(std::slice::from_ref(id), postino_store::FlagUpdate { unread: Some(unread), starred: None })
-                .map_err(|_| format!("rule {:?}: message {id:?} could not be flagged", rule.id))?;
+            if !store
+                .rule_set_flags(id, &state.folder_id, postino_store::FlagUpdate { unread: Some(unread), starred: None })
+                .map_err(|_| format!("rule {:?}: message {id:?} could not be flagged", rule.id))?
+            {
+                return Err(format!("rule {:?}: message {id:?} changed in another session; the flag was skipped", rule.id));
+            }
             state.unread = unread;
-            Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": unread, "after": state_json(state) }).to_string()) })
+            Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": unread, "after": state_json(state) }).to_string()), deferred: false })
         }
         RuleAction::Trash => {
             let trash = engine
@@ -1084,38 +1348,88 @@ fn apply_store_action(
                 .map(|folder| folder.id.clone())
                 .ok_or_else(|| format!("rule {:?}: the account has no Trash folder", rule.id))?;
             if state.folder_kind == postino_store::FolderKind::Trash {
-                return Ok(Applied { changed: false, value: None });
+                return Ok(Applied { changed: false, value: None, deferred: false });
             }
             let from = state.folder_id.clone();
-            store
-                .move_messages(std::slice::from_ref(id), &trash)
-                .map_err(|_| format!("rule {:?}: message {id:?} could not be moved to Trash", rule.id))?;
+            if !store
+                .rule_move_message(id, &state.folder_id, &trash)
+                .map_err(|_| format!("rule {:?}: message {id:?} could not be moved to Trash", rule.id))?
+            {
+                return Err(format!("rule {:?}: message {id:?} changed in another session; the trash move was skipped", rule.id));
+            }
             state.folder_id = trash.clone();
             state.folder_kind = postino_store::FolderKind::Trash;
-            Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": trash, "after": state_json(state) }).to_string()) })
+            Ok(Applied { changed: true, value: Some(json!({ "from": from, "to": trash, "after": state_json(state) }).to_string()), deferred: false })
         }
         RuleAction::Forward { to } => {
-            let guard = store.rule_guard(id).map_err(|_| format!("rule {:?}: the loop guard could not be read", rule.id))?;
+            let guard = store.rule_guard(&account.id, id).map_err(|_| format!("rule {:?}: the loop guard could not be read", rule.id))?;
             if guard.any() {
                 // A guarded message is not a forward: it must not consume the run's 50-forward
                 // budget or stop the next message.
                 return Ok(Applied {
                     changed: false,
                     value: Some(json!({ "outbox": null, "skipped": true, "after": state_json(state) }).to_string()),
+                    deferred: false,
                 });
             }
-            *forwards = forwards.saturating_add(1);
-            if *forwards > MAX_RUN_FORWARDS {
-                return Err(format!("rule {:?}: the run limit of {MAX_RUN_FORWARDS} forwards was reached", rule.id));
+            if !allow_send {
+                // The MCP server sets this false. Skipping, not failing, keeps all other actions and
+                // leaves the message pending for a later local run.
+                return Ok(Applied {
+                    changed: false,
+                    value: Some(json!({ "outbox": null, "skipped": true, "after": state_json(state) }).to_string()),
+                    deferred: true,
+                });
+            }
+            // Dedupe first: an already queued (or previously pruned) forward does not consume the
+            // 50-forward budget. Only a new outbox row counts.
+            if let Some(outbox) = rule_forward_existing(store, account, &rule.id, id)? {
+                return Ok(Applied {
+                    changed: false,
+                    value: Some(json!({ "outbox": outbox, "after": state_json(state) }).to_string()),
+                    deferred: false,
+                });
+            }
+            if *forwards >= MAX_RUN_FORWARDS {
+                return Ok(Applied {
+                    changed: false,
+                    value: Some(json!({ "outbox": null, "skipped": true, "after": state_json(state) }).to_string()),
+                    deferred: true,
+                });
             }
             match queue_rule_forward(engine, store, account, &rule.id, id, to) {
                 Ok(outcome) => {
-                    Ok(Applied { changed: outcome.created, value: Some(json!({ "outbox": outcome.outbox, "after": state_json(state) }).to_string()) })
+                    if outcome.created {
+                        *forwards = forwards.saturating_add(1);
+                    }
+                    Ok(Applied {
+                        changed: outcome.created,
+                        value: Some(json!({ "outbox": outcome.outbox, "after": state_json(state) }).to_string()),
+                        deferred: false,
+                    })
                 }
                 Err(error) => Err(error),
             }
         }
     }
+}
+
+/// The durable marker or the still-present outbox row for one rule/message. A marker survives the
+/// 30-day outbox prune, so a repeated `all` can never send the same message twice.
+fn rule_forward_existing(store: &Store, account: &Account, rule_id: &str, message_id: &str) -> Result<Option<String>, String> {
+    if let Some(outbox) =
+        store.rule_forward_marker(&account.id, rule_id, message_id).map_err(|_| format!("rule {rule_id:?}: the forward marker could not be read"))?
+    {
+        return Ok(Some(outbox));
+    }
+    let key = format!("rule:{rule_id}:{message_id}");
+    if let Some(existing) = store.outbox_by_key(&key).map_err(|_| format!("rule {rule_id:?}: the outbox could not be read"))? {
+        store
+            .set_rule_forward_marker(&account.id, rule_id, message_id, &existing.id)
+            .map_err(|_| format!("rule {rule_id:?}: the forward marker could not be stored"))?;
+        return Ok(Some(existing.id));
+    }
+    Ok(None)
 }
 
 /// Queue one rule forward through the P7 outbox. It builds a standalone submission, never a draft:
@@ -1128,10 +1442,10 @@ fn queue_rule_forward(
     message_id: &str,
     to: &[Address],
 ) -> Result<ForwardOutcome, String> {
-    let key = format!("rule:{rule_id}:{message_id}");
-    if let Some(existing) = store.outbox_by_key(&key).map_err(|_| "rule forward: the outbox could not be read".to_owned())? {
-        return Ok(ForwardOutcome { outbox: existing.id, created: false });
+    if let Some(outbox) = rule_forward_existing(store, account, rule_id, message_id)? {
+        return Ok(ForwardOutcome { outbox, created: false });
     }
+    let key = format!("rule:{rule_id}:{message_id}");
     let server = store
         .get_account_server(&account.id)
         .map_err(|_| format!("rule {rule_id:?}: the account configuration could not be read"))?
@@ -1221,9 +1535,19 @@ fn queue_rule_forward(
         lease_at: None,
     };
     match store.queue_outbox(&entry) {
-        Ok(row) => Ok(ForwardOutcome { outbox: row.id, created: true }),
+        Ok(row) => {
+            store
+                .set_rule_forward_marker(&account.id, rule_id, message_id, &row.id)
+                .map_err(|_| format!("rule {rule_id:?}: the forward was queued but its dedupe marker could not be stored"))?;
+            Ok(ForwardOutcome { outbox: row.id, created: true })
+        }
         Err(StoreError::OutboxAlreadyActive { .. }) => match store.outbox_by_key(&key) {
-            Ok(Some(row)) => Ok(ForwardOutcome { outbox: row.id, created: false }),
+            Ok(Some(row)) => {
+                store
+                    .set_rule_forward_marker(&account.id, rule_id, message_id, &row.id)
+                    .map_err(|_| format!("rule {rule_id:?}: the forward marker could not be stored"))?;
+                Ok(ForwardOutcome { outbox: row.id, created: false })
+            }
             _ => Err(format!("rule {rule_id:?}: the forward was queued concurrently and its row is not readable")),
         },
         Err(_) => Err(format!("rule {rule_id:?}: the forward could not be queued")),

@@ -198,6 +198,38 @@ pub struct Message {
     pub size: Option<u64>,
 }
 
+/// Why a message row exists. This is provenance, not its current folder: a Sent copy moved to
+/// Archive is still `Sent`, and a received message moved to Sent is still `Received`. Rules only
+/// consider `Received`, so moving a message afterwards cannot turn it into rule mail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageOrigin {
+    Received,
+    Sent,
+    Draft,
+    Local,
+}
+
+impl MessageOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Sent => "sent",
+            Self::Draft => "draft",
+            Self::Local => "local",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "received" => Some(Self::Received),
+            "sent" => Some(Self::Sent),
+            "draft" => Some(Self::Draft),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+}
+
 /// A partial flag update: `None` leaves the current value alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlagUpdate {
@@ -710,6 +742,8 @@ pub struct RuleCandidateFilter {
     pub since: i64,
     /// Only messages that no earlier `new` run has already applied.
     pub new_only: bool,
+    /// Continue strictly after this `(ingested_at, id)` position. Used by the `all` cursor.
+    pub after: Option<(i64, String)>,
     /// Clamped to 1..=[`MAX_RULE_CANDIDATES`].
     pub limit: u32,
 }
@@ -725,12 +759,15 @@ pub struct RuleCandidatePage {
 /// The largest candidate page a rule run or preview can request.
 pub const MAX_RULE_CANDIDATES: u32 = 2_000;
 
-/// The current folder, read state and labels of one candidate. Undo compares against this.
+/// The current folder, origin, read/star state and labels of one candidate. Undo compares against
+/// this; actions re-check it before touching a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleMessageState {
     pub folder_id: String,
     pub folder_kind: FolderKind,
+    pub origin: MessageOrigin,
     pub unread: bool,
+    pub starred: bool,
     pub labels: Vec<String>,
 }
 

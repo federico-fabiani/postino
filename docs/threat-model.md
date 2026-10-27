@@ -418,54 +418,77 @@ crash-dump entry above.
 - **A rule can change or forward mail, so it is treated as a stored plan, not a query macro.** The
   condition is parsed with the same bounded search grammar, and action targets are resolved against
   the current account on save. The save path refuses 0 or >5 actions, a duplicate kind, read+unread,
-  virtual/Drafts/Sent move targets, unknown labels, and forward with 0 or >10 recipients. A target
-  deleted later is visible as `valid:false` and fails that action at run time with a fixed sentence;
-  it never falls back to a broader folder or a different label. A rule is enabled or disabled, never
-  silently applied after the user turned it off.
-- **Only received mail, only after the rule existed.** Candidates exclude Drafts, Sent and Trash, and
-  require `ingested_at >= rule.created_at`. A rule created today cannot rewrite the mailbox history.
-  A `new` run also requires `rules_applied_at IS NULL` and marks only the bounded universe it
-  considered; `all` is capped at 2 000 candidates per rule. The caps are bound in the store query,
-  not only in the UI. A hostile mailbox cannot make a run scan an unbounded message set or queue
-  unbounded forwards (50 per run).
+  virtual/Drafts/Sent move targets, unknown or other-account labels, and forward with 0 or >10
+  recipients. A target deleted later is visible as `valid:false` and fails that action at run time
+  with a fixed sentence; it never falls back to a broader folder or a different label. A rule is
+  enabled or disabled, never silently applied after the user turned it off. Names are unique with
+  Unicode lowercase via `rules.name_key`, not only SQLite's ASCII `NOCASE`.
+- **Candidates use message provenance, not just the current folder.** `messages.origin` is
+  `received`, `sent`, `draft` or `local`, written when the row enters the store and by the draft→Sent
+  transition; a later move never rewrites it. Rules require `origin = 'received'` and a folder that
+  is not Drafts, Sent or Trash, so an archived Sent copy cannot be labelled or moved as received mail.
+  The rule's `created_at` is still a horizon: `ingested_at >= rule.created_at`, so a rule created
+  today cannot rewrite mailbox history. A `new` run also requires `rules_applied_at IS NULL`.
+- **A failed action is not consumed.** A `new` message is marked applied only when every action
+  completed; an action failure (stale target, missing SMTP endpoint, concurrent change) or a deferred
+  forward leaves it pending for the next run. The final message is eventually handled after the user
+  fixes the endpoint or target, instead of silently disappearing from the new-mail pass.
+- **The backlog advances and the forward budget is honest.** `all` reads at most 2 000 candidates per
+  rule per page and stores an encrypted per-rule cursor. A full page advances it, a page ending in a
+  deferred forward keeps it for a retry, and a short page clears it so the next run wraps. The caps are
+  bound in the store query, not only in the UI. Repeating `all` cannot duplicate a move/label/flag; a
+  forward is deduped by both the deterministic `rule:<rule>:<message>` outbox key and a durable
+  encrypted `rule_forward:<account>:<rule>:<message>` marker that survives outbox pruning. Only a new
+  outbox row consumes the 50-per-run budget; over-budget forwards are reported as deferred, not as
+  errors and not as applied, so the 51st message is forwarded by the next run.
 - **Immediate actions are atomic enough to retry.** A move, label, flag or trash action is a single
-  store transaction and is skipped when the message is already in that state. A failing action
-  increments the run's error count and aborts only that rule's remaining actions for that message;
-  later rules still run. `sync_now` never fails because a rule failed. Repeating `new` is a no-op;
-  repeating `all` cannot duplicate a move/label/flag and resolves a forward to the same
-  `rule:<rule>:<message>` outbox key.
+  store transaction that re-reads origin and the expected folder, so a concurrent move to
+  Sent/Drafts/Trash is skipped rather than overwritten. A failing action increments the run's error
+  count and aborts only that rule's remaining actions for that message; later rules still run. The
+  error list is capped at 200 sentences plus an omitted-count line while the run keeps the exact
+  count. `sync_now` never fails because a rule failed.
+- **A concurrent editor cannot silently overwrite a rule.** `rules_update` reloads the store row,
+  refuses a stale `updated_at` with “changed in another session”, validates the merged action list and
+  writes with `WHERE updated_at = expected`.
 - **Forward is P7, not a second SMTP client.** The action serializes through `postino-sync` and
   `postino-mime`, stores the exact bytes in the encrypted blob store and inserts one outbox row; it
   never opens a socket. The row has no local draft, so the submission path skips the draft finalize.
   The message carries `Auto-Submitted: auto-forwarded` and `X-Postino-Rule: <rule_id>`. Incoming mail
-  carrying either header is recorded in the encrypted `meta` key `rule_guard:<message_id>` by sync
-  and is skipped for forwarding; a guarded message does not consume the 50-forward budget. A missing
-  SMTP endpoint fails the action with a readable sentence instead of queueing an undeliverable row.
-  MCP gates `rules_run` behind `--allow-send` and refuses a forward payload in rule create/update
-  before parsing.
+  carrying either header is recorded in the encrypted `meta` key `rule_guard:<account>:<message>` by
+  sync and is skipped for forwarding; a guarded message does not consume the 50-forward budget. A
+  missing SMTP endpoint fails the action with a readable sentence instead of queueing an undeliverable
+  row. MCP gates `rules_run` behind `--allow-send`, refuses a forward payload in rule create/update
+  before parsing, and refuses an enable-only update that would arm a stored forward rule. The same
+  `allow_send` is carried into `sync_now`, whose automatic rule pass records a forward as deferred
+  instead of queueing it; the sync still succeeds.
 - **The journal cannot leak mail.** `rule_runs` holds account/mode/counts/times. `rule_actions` holds
   run/rule/message ids, the action name, a changed boolean and a JSON value of folder ids, label ids
-  and booleans, plus the post-action folder/unread/label state used by undo. It never stores a
+  and booleans, plus the post-action folder/unread/starred/label state used by undo. It never stores a
   subject, an address, a query, a body or an attachment name. Run errors name rule/message/target ids.
   The newest 20 non-dry runs per account are kept; deleting a run cascades its actions and the mode
-  and undone meta keys. Deleting an account deletes its rules, runs, actions and guard meta.
+  and undone meta keys. Deleting an account deletes its rules, runs, actions, forward markers and
+  guard meta, including orphan guard keys; a bulk sync deletion and a folder reset sweep the guards of
+  the rows they remove.
 - **Undo is state-checked and one-way.** The last journaled post-action state of each message is
-  compared with the live state before anything is reversed. A message moved, flagged or labelled
-  after the run is skipped entirely, not partially rewound. A forward is never undone: the undo
-  result reports the outbox id, and cancelling that row remains an explicit outbox action. A run is
-  marked undone in encrypted meta; a second undo is refused. Undo does not resurrect a deleted
-  folder: the reverse move fails and is counted as skipped.
+  compared with the live state before anything is reversed. A message moved, flagged, starred or
+  labelled after the run is skipped entirely, not partially rewound. A forward is never undone: the
+  undo result reports the outbox id, and cancelling that row remains an explicit outbox action. A run
+  is marked undone in encrypted meta; a second undo is refused. `rules_undo` is annotated destructive
+  because it moves, flags and labels mail and has no redo. Undo does not resurrect a deleted folder:
+  the reverse move fails and is counted as skipped.
 - **Bounded rules.** ≤100 rules per account, 1–5 actions, 1–10 forward recipients, 2 000 candidates
-  per rule per run, 50 forwards per run, 20 retained runs. Rule names and actions live only in
-  SQLCipher; no query, subject, address or body is logged. The only network path a rule can reach is
-  the user's own SMTP server through P7, and only after the explicit run (MCP: `--allow-send`).
+  per rule per page, 50 new forwards per run, 20 retained runs, 200 returned error sentences. Rule
+  names and actions live only in SQLCipher; no query, subject, address or body is logged. The only
+  network path a rule can reach is the user's own SMTP server through P7, and only after the explicit
+  run (MCP: `--allow-send`).
 - **Residual.** A local rule is not a server filter: it runs only when the app, CLI or MCP invokes it
   (there is no daemon), so it does not act while Postino is closed and does not apply to a phone or
   another mail client. Forwarding can still reach an external address the user configured; the loop
   guard only stops this client's own forwards and messages that declare `Auto-Submitted` or
-  `X-Postino-Rule`. `all` is capped at 2 000 candidates per rule, so a very large backlog needs
-  repeated runs; forward recall is out of scope. A rule target deleted and later re-created with the
-  same id is treated as the same target, as ids are never reused by this build.
+  `X-Postino-Rule`. `all` reads 2 000 candidates per page, so a backlog larger than that needs
+  repeated runs; the cursor advances and wraps, but a single run is still bounded. Forward recall is
+  out of scope. A rule target deleted and later re-created with the same id is treated as the same
+  target, as ids are never reused by this build.
 
 - A compromised operating system, kernel, firmware or keylogger.
 - A compromised mail provider.

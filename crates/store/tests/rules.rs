@@ -148,6 +148,14 @@ fn rules_are_ordered_unique_and_capped_at_one_hundred() {
 }
 
 #[test]
+fn rule_names_are_unique_with_unicode_lowercase() {
+    let (_fixture, store) = seeded();
+    store.create_rule_limited(&rule("rule_1", "Città", 0), 100).expect("first");
+    let duplicate = store.create_rule_limited(&rule("rule_2", "CITTÀ", 0), 100);
+    assert!(matches!(duplicate, Err(StoreError::Duplicate { .. })), "NOCASE alone does not fold Unicode: {duplicate:?}");
+}
+
+#[test]
 fn candidates_are_received_mail_in_ingestion_order() {
     let (_fixture, store) = seeded();
     let page = store
@@ -156,6 +164,7 @@ fn candidates_are_received_mail_in_ingestion_order() {
             expr: Some(SearchExpr::Match("\"fattura\"".to_owned())),
             since: 0,
             new_only: false,
+            after: None,
             limit: 50,
         })
         .expect("candidates");
@@ -164,12 +173,12 @@ fn candidates_are_received_mail_in_ingestion_order() {
 
     store.mark_rules_applied(&["msg_inbox".to_owned()], 10).expect("applied");
     let next = store
-        .rule_candidates(&RuleCandidateFilter { account_id: "acc_1".to_owned(), expr: None, since: 0, new_only: true, limit: 50 })
+        .rule_candidates(&RuleCandidateFilter { account_id: "acc_1".to_owned(), expr: None, since: 0, new_only: true, after: None, limit: 50 })
         .expect("new candidates");
     assert_eq!(next.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), ["msg_archive"]);
 
     let after = store
-        .rule_candidates(&RuleCandidateFilter { account_id: "acc_1".to_owned(), expr: None, since: 1_500, new_only: false, limit: 50 })
+        .rule_candidates(&RuleCandidateFilter { account_id: "acc_1".to_owned(), expr: None, since: 1_500, new_only: false, after: None, limit: 50 })
         .expect("since");
     assert_eq!(after.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), ["msg_archive"]);
     assert_eq!(SEARCH_TOTAL_CAP, 10_000);
@@ -224,16 +233,65 @@ fn the_journal_keeps_the_newest_twenty_runs_and_their_actions() {
 }
 
 #[test]
+fn the_rule_candidate_queries_use_their_covering_indexes() {
+    let (fixture, _store) = seeded();
+    let raw = fixture.raw();
+    let plan = |sql: &str| {
+        let mut stmt = raw.prepare(sql).expect("prepare plan");
+        stmt.query_map([], |row| row.get::<_, String>(3)).expect("plan rows").collect::<rusqlite::Result<Vec<_>>>().expect("plan")
+    };
+    let new_plan = plan(
+        "EXPLAIN QUERY PLAN
+         SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id
+         WHERE m.account_id = 'acc_1' AND m.origin = 'received' AND m.rules_applied_at IS NULL
+           AND m.ingested_at >= 0 AND f.kind NOT IN ('drafts','sent','trash')
+         ORDER BY m.ingested_at ASC, m.id ASC LIMIT 2000",
+    );
+    assert!(new_plan.iter().any(|line| line.contains("messages_rules_new")), "{new_plan:?}");
+    let all_plan = plan(
+        "EXPLAIN QUERY PLAN
+         SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id
+         WHERE m.account_id = 'acc_1' AND m.origin = 'received' AND m.ingested_at >= 0
+           AND (m.ingested_at > 1000 OR (m.ingested_at = 1000 AND m.id > 'msg_inbox'))
+           AND f.kind NOT IN ('drafts','sent','trash')
+         ORDER BY m.ingested_at ASC, m.id ASC LIMIT 2000",
+    );
+    assert!(all_plan.iter().any(|line| line.contains("messages_rules_all")), "{all_plan:?}");
+}
+
+#[test]
+fn bulk_sync_deletion_reset_and_account_removal_clean_loop_guards() {
+    let (fixture, store) = seeded();
+    store.set_rule_guard("acc_1", "msg_inbox", RuleGuard { auto_submitted: true, x_postino_rule: false }).expect("guard");
+    store.delete_synced_messages("inbox", &["msg_inbox".to_owned()]).expect("bulk delete");
+    assert!(store.get_meta("rule_guard:acc_1:msg_inbox").expect("meta").is_none());
+
+    store.set_rule_guard("acc_1", "msg_archive", RuleGuard { auto_submitted: false, x_postino_rule: true }).expect("guard");
+    store.reset_folder_messages("archive").expect("reset");
+    assert!(store.get_meta("rule_guard:acc_1:msg_archive").expect("meta").is_none());
+
+    store.set_rule_guard("acc_1", "msg_trash", RuleGuard { auto_submitted: true, x_postino_rule: true }).expect("guard");
+    store.set_rule_forward_marker("acc_1", "rule_1", "msg_trash", "ob_historical").expect("marker");
+    store.set_meta("rule_guard:acc_1:orphan", "11").expect("orphan");
+    store.delete_account("acc_1").expect("account delete");
+    let guards: i64 = fixture.raw().query_row("SELECT COUNT(*) FROM meta WHERE key LIKE 'rule_guard:acc_1:%'", [], |row| row.get(0)).expect("guards");
+    assert_eq!(guards, 0, "account removal must sweep orphan guard keys too");
+    let markers: i64 =
+        fixture.raw().query_row("SELECT COUNT(*) FROM meta WHERE key LIKE 'rule_forward:acc_1:%'", [], |row| row.get(0)).expect("markers");
+    assert_eq!(markers, 0, "account removal deletes its durable forward markers");
+}
+
+#[test]
 fn the_loop_guard_lives_in_encrypted_meta_and_dies_with_the_message() {
     let (fixture, store) = seeded();
-    store.set_rule_guard("msg_inbox", RuleGuard { auto_submitted: true, x_postino_rule: false }).expect("guard");
-    store.set_rule_guard("msg_archive", RuleGuard { auto_submitted: false, x_postino_rule: true }).expect("guard");
-    assert!(store.rule_guard("msg_inbox").expect("read").auto_submitted);
-    assert!(store.rule_guard("msg_archive").expect("read").x_postino_rule);
-    assert!(!store.rule_guard("msg_draft").expect("read").any());
-    assert!(store.get_meta(&format!("{RULE_GUARD_KEY_PREFIX}msg_inbox")).expect("meta").is_some());
+    store.set_rule_guard("acc_1", "msg_inbox", RuleGuard { auto_submitted: true, x_postino_rule: false }).expect("guard");
+    store.set_rule_guard("acc_1", "msg_archive", RuleGuard { auto_submitted: false, x_postino_rule: true }).expect("guard");
+    assert!(store.rule_guard("acc_1", "msg_inbox").expect("read").auto_submitted);
+    assert!(store.rule_guard("acc_1", "msg_archive").expect("read").x_postino_rule);
+    assert!(!store.rule_guard("acc_1", "msg_draft").expect("read").any());
+    assert!(store.get_meta(&format!("{RULE_GUARD_KEY_PREFIX}acc_1:msg_inbox")).expect("meta").is_some());
 
     store.delete_message("msg_inbox").expect("delete");
-    assert!(store.get_meta(&format!("{RULE_GUARD_KEY_PREFIX}msg_inbox")).expect("meta").is_none());
+    assert!(store.get_meta(&format!("{RULE_GUARD_KEY_PREFIX}acc_1:msg_inbox")).expect("meta").is_none());
     assert_eq!(fixture.raw().query_row("SELECT COUNT(*) FROM meta WHERE key LIKE 'rule_guard:%'", [], |row| row.get::<_, i64>(0)).expect("rows"), 1);
 }

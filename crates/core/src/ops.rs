@@ -304,7 +304,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "rules_preview",
             "Preview a rule",
-            "Evaluate a hypothetical rule against the current received mail and return the first 50 matching summaries with one effect per action (apply, no-op or skipped). It writes nothing: no journal, no flag, no move, no label, no outbox row and no rules_applied_at. A forward on a message carrying Auto-Submitted or X-Postino-Rule is reported as skipped. Read-only and offline.",
+            "Evaluate a hypothetical rule against received mail and return the first 50 matching summaries with one effect per action (apply, no-op or skipped). Pass `rule` to apply an existing rule's `created_at` horizon; without it the preview covers all received mail as an explicitly hypothetical new rule. It writes nothing: no journal, no flag, no move, no label, no outbox row and no rules_applied_at. A forward without an SMTP endpoint or on a message carrying Auto-Submitted/X-Postino-Rule is reported as skipped, and a move followed by trash shows the second action as a no-op. Read-only and offline.",
             RulesPreviewArgs,
             true,
             false
@@ -312,7 +312,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "rules_run",
             "Run rules now",
-            "Run every enabled rule in priority order and return the journaled run plus fixed errors. `new` (default) considers only received messages no earlier run applied; `all` re-evaluates at most 2 000 candidates per rule since that rule was created. Each rule queries fresh candidates, so a later rule sees the earlier rule's moves, labels and flags. A failing action is recorded and only that rule's remaining actions for that message are skipped; rules never fail a sync. A forward is one P7 outbox row with the deterministic `rule:<rule>:<message>` key, adds Auto-Submitted and X-Postino-Rule, skips loop-guarded mail and is capped at 50 per run. Rules never open SMTP. Destructive and open-world: it changes local mail and may queue a submission.",
+            "Run every enabled rule in priority order and return the journaled run plus bounded errors. `new` (default) considers only received messages no earlier run applied and marks a message applied only when its actions completed; a failed or deferred action stays pending for the next run. `all` reads at most 2 000 candidates per rule and keeps a per-rule cursor, so repeated `all` runs advance through a larger backlog and wrap at the end. Each rule queries fresh candidates, so a later rule sees the earlier rule's moves, labels and flags; drafts, Sent copies, Trash and any row whose origin is not received are excluded even after a move. A failing action is recorded, aborts only that rule's remaining actions for that message, and never fails a sync. A forward is one P7 outbox row with the deterministic `rule:<rule>:<message>` key and a durable dedupe marker (independent of outbox pruning), adds Auto-Submitted and X-Postino-Rule, skips loop-guarded mail, and only new rows count toward the 50-per-run budget; over-budget forwards are deferred to the next run. Rules never open SMTP. Destructive and open-world: it changes local mail and may queue a submission.",
             RulesRunArgs,
             false,
             true
@@ -320,10 +320,10 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "rules_undo",
             "Undo a rule run",
-            "Reverse the move, label, read and trash actions of one journaled run, newest action first, only where the message is still in the state that action left it in. A message changed afterwards is skipped, not overwritten. A forward is never undone; its outbox id is reported so the user can cancel the row in the outbox. Marking a run undone is one-way. Returns the run, restored/skipped counts and forward outbox ids.",
+            "Destructive: reverse the move, label, read and trash actions of one journaled run, newest action first, only where the message is still in the state that action left it in. A message changed afterwards is skipped, not overwritten. A forward is never undone; its outbox id is reported so the user can cancel the row in the outbox. Marking a run undone is one-way and there is no redo. Returns the run, restored/skipped counts and forward outbox ids.",
             RulesUndoArgs,
             false,
-            false
+            true
         ),
         def!(
             "rules_runs",
@@ -835,6 +835,9 @@ pub struct RulesPreviewArgs {
     pub actions: Vec<RuleAction>,
     /// Rows, 1-50. Defaults to 50; the UI shows the first 20.
     pub limit: Option<u32>,
+    /// Existing rule id. When present, the preview applies that rule's `created_at` horizon, so it
+    /// shows what a run of the rule would actually consider; a new rule previews all received mail.
+    pub rule: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1510,7 +1513,8 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "rules_preview" => {
             let args: RulesPreviewArgs = parse(args)?;
-            let (total, truncated, rows) = engine.rules_preview(args.account.as_deref(), &args.query, &args.actions, args.limit)?;
+            let (total, truncated, rows) =
+                engine.rules_preview(args.account.as_deref(), &args.query, &args.actions, args.limit, args.rule.as_deref())?;
             value(RulesPreviewResult { total, rows, truncated })
         }
         "rules_run" => {

@@ -39,8 +39,8 @@ registry shared by the desktop app, the CLI and an MCP server.
 ![Saved searches at 980×600: RICERCHE under ETICHETTE and an applied query](docs/images/postino-p9b-saved-searches-980.png)
 
 ![Local rules at 980×600: the rule list, condition, priority, actions and recent runs](docs/images/postino-p9c-rules-980.png)
-![The same rule editor in the dark theme](docs/images/postino-p9c-rules-980-dark.png)
-![The rule editor with a 20-match preview and the enabled/stop controls](docs/images/postino-p9c-rule-editor-980.png)
+![The rules page in the dark theme](docs/images/postino-p9c-rules-980-dark.png)
+![The rule editor with one action, the disabled forward reason and the enabled/stop controls](docs/images/postino-p9c-rule-editor-980.png)
 ![A rule preview at 980×600: the first matches and one effect per action, with nothing written](docs/images/postino-p9c-rule-preview-980.png)
 
 ![Encrypted search at 980×600: query chips, syntax help and bm25-ranked results](docs/images/postino-p9a-search.png)
@@ -130,18 +130,23 @@ MCP      ─┘
   **Regole locali**/**Nuova regola**) stores up to 100 rules per account on the encrypted v7 tables.
   A rule is a validated search query plus 1–5 actions: move to a folder, add a label, read/unread,
   trash, or forward to 1–10 addresses. Rules run by `priority ASC, id ASC`; **stop** makes later rules
-  skip the messages this one matched. `new` (the default) processes received mail ingested after the
-  rule was created and not yet handled, while `all` re-evaluates up to 2 000 candidates per rule;
-  Drafts, Sent, Trash and outbox rows are never candidates. Actions apply immediately in rule order,
-  a repeated run is a no-op, and a failing target is reported without stopping the later rules.
+  skip the messages this one matched. `new` (the default) processes received-origin mail ingested
+  after the rule was created and not yet applied; a message whose action failed or was deferred stays
+  pending for the next run. `all` reads up to 2 000 candidates per rule and keeps a per-rule cursor,
+  so repeated runs advance through a larger backlog and wrap at the end. Drafts, Sent copies (even an
+  archived one), Trash and outbox rows are never candidates. Actions apply immediately in rule order,
+  a repeated action is a no-op, and a failing target is reported without stopping the later rules.
   **Anteprima** shows the first 20 matches with one `applica`/`già così`/`salta` effect per action and
-  writes nothing. Every real run is journaled with ids and booleans only (no subject, address or
-  body), the newest 20 runs are kept, and **Annulla esecuzione** reverses move/label/read/trash only
-  on messages still in the state the run left them. A forward is one P7 outbox row with the
-  deterministic `rule:<rule>:<message>` key, `Auto-Submitted` and `X-Postino-Rule`; incoming mail with
-  either header is skipped, and a run queues at most 50. The app disables forward with a visible
-  reason when the account has no SMTP endpoint; MCP refuses `rules_run` and any forward payload
-  without `--allow-send`.
+  writes nothing; editing an existing rule uses its creation horizon, and a forward without SMTP is
+  `salta`. Every real run is journaled with ids and booleans only (no subject, address or body), the
+  newest 20 runs are kept, and **Annulla esecuzione** reverses move/label/read/trash only on messages
+  still in the state the run left them (a star change also protects the message). A forward is one P7
+  outbox row with the deterministic `rule:<rule>:<message>` key, a durable dedupe marker,
+  `Auto-Submitted` and `X-Postino-Rule`; incoming mail with either header is skipped, and a run queues
+  at most 50 new forwards, leaving the rest for the next run. The app disables forward with a visible
+  reason when the account has no SMTP endpoint; MCP refuses `rules_run`, a forward payload, an
+  enable-only update of a stored forward rule, and any forward reached by `sync_now` without
+  `--allow-send`.
 - **Encrypted search (P9a).** `search` runs on the FTS5 index inside SQLCipher, not over an in-memory
   body vector: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:`, `has:`,
   `before:`/`after:`, `larger:`/`smaller:`, quoted phrases, `*` prefixes and uppercase `AND`/`OR`/`NOT`

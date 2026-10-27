@@ -927,8 +927,8 @@ impl PostinoApp {
                     let empty = self.engine.rules_list(Some(&account)).is_ok_and(|rules| rules.is_empty());
                     if empty {
                         for (name, query, actions, priority) in [
-                            ("Da Giulia", "from:giulia", json!([{ "kind": "label", "label": "lbl_1" }, { "kind": "read" }]), 10),
-                            ("Fatture", "subject:fattura", json!([{ "kind": "label", "label": "lbl_3" }, { "kind": "read" }]), 20),
+                            ("Da Giulia", "from:giulia", json!([{ "kind": "label", "label": "lbl_1" }]), 10),
+                            ("Fatture", "subject:fattura", json!([{ "kind": "label", "label": "lbl_3" }]), 20),
                             ("Newsletter", "subject:newsletter", json!([{ "kind": "move", "folder": "archive" }]), 30),
                         ] {
                             let _ = self.engine.call(
@@ -942,10 +942,13 @@ impl PostinoApp {
                 }
                 self.open_rules(false);
                 if state == ScreenshotState::RuleEditor || state == ScreenshotState::RulePreview {
-                    let actions = vec![
-                        postino_core::RuleAction::Move { folder: "archive".to_owned() },
-                        postino_core::RuleAction::Read,
-                    ];
+                    let actions = if state == ScreenshotState::RuleEditor {
+                        // The 980x600 editor scrolls after one action row; keep the seeded screenshot
+                        // and its seed in step instead of showing a second row behind the fold.
+                        vec![postino_core::RuleAction::Move { folder: "archive".to_owned() }]
+                    } else {
+                        vec![postino_core::RuleAction::Move { folder: "archive".to_owned() }, postino_core::RuleAction::Read]
+                    };
                     if let Some(page) = self.rules_page.as_mut() {
                         page.seed_editor(&self.engine, "Fatture e ricevute", "subject:fattura", &actions);
                     }
@@ -3663,6 +3666,7 @@ impl PostinoApp {
             || self.pending_link.is_some()
             || self.attachment_warning.is_some()
             || self.attachment_overwrite.is_some()
+            || self.rules_page.is_some()
         {
             return;
         }
@@ -14973,6 +14977,8 @@ mod tests {
             assert!(text.iter().any(|line| line == "REGOLE"), "the rules page header is missing: {text:?}");
             assert!(text.iter().any(|line| line.contains("Fatture")), "the seeded rule list is missing: {text:?}");
             assert!(text.iter().any(|line| line.contains("Salva")), "the editor actions are missing: {text:?}");
+            assert!(text.iter().any(|line| line == "Rimuovi"), "the editor action row is missing: {text:?}");
+            assert!(text.iter().any(|line| line == "Etichetta"), "the seeded action kind is missing: {text:?}");
             let page = app.rules_page.as_ref().expect("the rules page is open");
             assert!(!page.is_forward_allowed(), "the demo has no P7 outbox and must disable forward with a reason");
 
@@ -14986,9 +14992,15 @@ mod tests {
     }
 
     #[test]
-    fn the_rules_page_opens_from_the_keyboard_palette_and_escapes_back() {
+    fn the_rules_page_owns_the_keyboard_and_escapes_back() {
         let (ctx, mut app) = ready_app();
         frame(&ctx, &mut app, vec![]);
+        let rows = app.visible_messages().0;
+        let id = rows[0].id.clone();
+        app.open_message(id.clone());
+        let before = app.engine.message(&id).expect("message");
+        let selected_before = app.selected.clone();
+        assert!(app.reading_open);
         frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::COMMAND), key(Key::K, Modifiers::COMMAND)]);
         assert!(app.show_palette);
         app.palette_query = "regole".to_owned();
@@ -14996,9 +15008,21 @@ mod tests {
         frame(&ctx, &mut app, vec![]);
         frame(&ctx, &mut app, vec![key(Key::Enter, Modifiers::NONE)]);
         assert!(app.rules_page.is_some(), "the palette command must open the rules page");
+
+        for pressed in [Key::E, Key::Delete, Key::Z, Key::J] {
+            frame(&ctx, &mut app, vec![key(pressed, Modifiers::NONE)]);
+        }
+        let after = app.engine.message(&id).expect("message");
+        assert_eq!(after.summary.folder_id, before.summary.folder_id, "a shell shortcut archived/deleted mail behind the page");
+        assert_eq!(after.summary.unread, before.summary.unread, "a shell shortcut changed the hidden message");
+        assert_eq!(app.selected, selected_before, "J moved the hidden selection");
+        assert!(app.reading_open, "the hidden reading pane closed");
+
         frame(&ctx, &mut app, vec![key(Key::Escape, Modifiers::NONE)]);
         assert!(app.rules_page.is_none(), "Esc closes the rules page");
         assert!(!app.show_palette);
+        assert!(app.reading_open, "Esc must close only the rules page, not the reading pane");
+        assert_eq!(app.selected, selected_before);
     }
 
     #[test]

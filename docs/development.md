@@ -118,8 +118,9 @@ What is still demo or missing:
 - IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox, compose depth,
   encrypted search, conversations, saved searches and local rules (attachment bytes, per-account
   signatures, reply/forward headers, P5-P9c) exist. Still missing: the daemon and a scheduled send
-  that runs with the app closed (M4), server-side Sieve/HTML rendering (M5/M6), server-side signatures
-  and Gmail OAuth (P12).
+  that runs with the app closed (M4), server-side HTML rendering (M5/M6), server-side signatures and
+  Gmail OAuth (P12). Server-side Sieve/ManageSieve is not implemented and is out of scope for M3
+  (it remains a possible later M6 item); Postino's rules are local and never generate a Sieve script.
   `message_send` queues real mail; the desktop send worker (which polls the store every two seconds)
   and `postino send` process the outbox, so a future `--at` row waits until one of them runs.
   A plain `postino send` (no `--at`) waits the 5-second undo window and submits in the same command.
@@ -367,6 +368,12 @@ cargo run -p postino-app -- --screenshot conversation --size 980x600 --out docs/
 cargo run -p postino-app -- --screenshot conversation --size 980x600 --dark --out docs/images/postino-p9b-conversation-980-dark.png
 cargo run -p postino-app -- --screenshot saved_searches --size 980x600 --out docs/images/postino-p9b-saved-searches-980.png
 cargo run -p postino-app -- --screenshot saved_searches --size 980x600 --dark --out docs/images/postino-p9b-saved-searches-980-dark.png
+cargo run -p postino-app -- --screenshot rules --size 980x600 --out docs/images/postino-p9c-rules-980.png
+cargo run -p postino-app -- --screenshot rules --size 980x600 --dark --out docs/images/postino-p9c-rules-980-dark.png
+cargo run -p postino-app -- --screenshot rule_editor --size 980x600 --out docs/images/postino-p9c-rule-editor-980.png
+cargo run -p postino-app -- --screenshot rule_editor --size 980x600 --dark --out docs/images/postino-p9c-rule-editor-980-dark.png
+cargo run -p postino-app -- --screenshot rule_preview --size 980x600 --out docs/images/postino-p9c-rule-preview-980.png
+cargo run -p postino-app -- --screenshot rule_preview --size 980x600 --dark --out docs/images/postino-p9c-rule-preview-980-dark.png
 ```
 
 The states are `shell` (demo inbox, no selection), `reading` (first inbox message open),

@@ -164,6 +164,9 @@ pub struct RulesPage {
     runs_open: bool,
     error: Option<String>,
     notice: Option<String>,
+    /// The run a notice's Undo button belongs to. Without it, saving or deleting a rule could show
+    /// an Undo for an unrelated older run.
+    notice_run: Option<String>,
     confirm: Option<Confirm>,
     forward_allowed: bool,
     forward_reason: String,
@@ -183,6 +186,7 @@ impl RulesPage {
             runs_open: true,
             error: None,
             notice: None,
+            notice_run: None,
             confirm: None,
             forward_allowed: false,
             forward_reason: String::new(),
@@ -201,6 +205,7 @@ impl RulesPage {
         self.editor = Some(Editor::blank(&folders, &labels));
         self.preview = None;
         self.notice = None;
+        self.notice_run = None;
         self.error = None;
         self.focus_close = false;
     }
@@ -369,6 +374,7 @@ impl RulesPage {
         match result {
             Ok(result) => {
                 self.notice = Some("Regola salvata.".to_owned());
+                self.notice_run = None;
                 self.preview = None;
                 self.selected = Some(result.rule.id.clone());
                 self.reload(engine);
@@ -386,6 +392,7 @@ impl RulesPage {
         match call::<postino_core::RuleDeleteResult>(engine, "rules_delete", json!({ "id": id, "account": self.account })) {
             Ok(result) => {
                 self.notice = Some(format!("Regola eliminata: {}.", result.rule.name));
+                self.notice_run = None;
                 self.selected = None;
                 self.editor = None;
                 self.preview = None;
@@ -417,8 +424,11 @@ impl RulesPage {
             }
             return;
         }
-        match call::<RulesPreviewResult>(engine, "rules_preview", json!({ "account": self.account, "query": query, "actions": actions, "limit": 20 }))
-        {
+        match call::<RulesPreviewResult>(
+            engine,
+            "rules_preview",
+            json!({ "account": self.account, "query": query, "actions": actions, "limit": 20, "rule": editor.id }),
+        ) {
             Ok(result) => {
                 self.preview = Some(Preview { total: result.total, truncated: result.truncated, rows: result.rows });
                 if let Some(current) = self.editor.as_mut() {
@@ -446,6 +456,7 @@ impl RulesPage {
                 } else {
                     format!("Esecuzione {}: {} corrispondenze, {} azioni, {} errori.", result.run.id, result.run.matched, result.run.changed, errors)
                 });
+                self.notice_run = Some(result.run.id.clone());
                 self.error = if result.errors.is_empty() { None } else { Some(result.errors.join(" · ")) };
                 self.reload(engine);
                 self.reload_runs(engine);
@@ -463,6 +474,7 @@ impl RulesPage {
                     "Esecuzione {} annullata: {} azioni ripristinate, {} saltate (messaggi cambiati).{forwards}",
                     result.run.id, result.restored, result.skipped
                 ));
+                self.notice_run = None;
                 self.reload(engine);
                 self.reload_runs(engine);
             }
@@ -561,7 +573,7 @@ impl RulesPage {
                         }
                         if self.runs_open {
                             ScrollArea::vertical().id_salt("rules-runs").max_height(126.0).auto_shrink([false, false]).show(ui, |ui| {
-                                for run in self.runs.iter().take(5) {
+                                for run in &self.runs {
                                     ui.vertical(|ui| {
                                         ui.add(
                                             egui::Label::new(typography::text(
@@ -633,11 +645,13 @@ impl RulesPage {
                         if let Some(notice) = self.notice.clone() {
                             ui.horizontal(|ui| {
                                 ui.add(egui::Label::new(typography::text(Role::Caption, notice.as_str(), t.text_muted)).truncate());
-                                if let Some(run) = self.runs.first().cloned()
+                                if let Some(run_id) = self.notice_run.clone()
+                                    && let Some(run) = self.runs.iter().find(|run| run.id == run_id)
                                     && !run.undone
+                                    && (run.changed > 0 || run.matched > 0)
                                     && Button::ghost("Annulla esecuzione").size(ButtonSize::Sm).show(ui).clicked()
                                 {
-                                    action = Some(PageAction::Undo(run.id));
+                                    action = Some(PageAction::Undo(run_id));
                                 }
                             });
                         }

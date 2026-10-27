@@ -68,10 +68,10 @@ fn loop_guard_headers_are_recorded_for_received_mail() {
 
     let guarded = message_by_header(&store, "synthetic-1@example.test");
     let plain = message_by_header(&store, "synthetic-2@example.test");
-    let guard = store.rule_guard(&guarded.summary.id).expect("guard");
+    let guard = store.rule_guard(ACCOUNT_ID, &guarded.summary.id).expect("guard");
     assert!(guard.auto_submitted && guard.x_postino_rule, "{guard:?}");
-    assert!(!store.rule_guard(&plain.summary.id).expect("plain").any(), "a normal message writes no guard");
-    assert!(store.get_meta(&format!("rule_guard:{}", plain.summary.id)).expect("meta").is_none());
+    assert!(!store.rule_guard(ACCOUNT_ID, &plain.summary.id).expect("plain").any(), "a normal message writes no guard");
+    assert!(store.get_meta(&format!("rule_guard:{ACCOUNT_ID}:{}", plain.summary.id)).expect("meta").is_none());
 }
 
 #[test]

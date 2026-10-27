@@ -193,7 +193,7 @@ pub(crate) fn ingest(
         x_postino_rule: parsed.headers.get("X-Postino-Rule").is_some(),
     };
     if guard.any() {
-        store.set_rule_guard(&id, guard).map_err(SyncError::Store)?;
+        store.set_rule_guard(&account.id, &id, guard).map_err(SyncError::Store)?;
     }
     index.inserted.insert(id.clone(), uid);
     Ok(Some(Ingested { message_id: id, new, drift, attachments_stored: stored }))

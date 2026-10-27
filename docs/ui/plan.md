@@ -289,8 +289,10 @@ per action, no hidden mutation.
 ### 6.7 Local rules (P9c)
 
 - **Entry.** The Rules page is a full-page modal opened by **Regole locali** in Settings → DATI and by
-  the palette commands **Regole locali** / **Nuova regola**. `Esc` closes it and returns to the shell;
-  the mailbox selection and scroll position are untouched.
+  the palette commands **Regole locali** / **Nuova regola**. It is part of the modal guard: `E`,
+  `Delete`, `Z`, `J`/`K`, `Enter`, the palette and every other shell shortcut do not reach the mailbox
+  behind it. `Esc` closes only the page and returns to the shell; the selection, reading pane and
+  scroll position are untouched.
 - **List + editor.** The left column lists rules in execution order with priority, enabled state and a
   visible “non valida” marker for a deleted target. The right column edits name, condition (the same
   search language as `/`), priority, `Ferma le regole successive`, `Attiva` and 1–5 actions. Each
@@ -298,15 +300,21 @@ per action, no hidden mutation.
   exists or a destination that does not exist is disabled with a reason. Forward is disabled with a
   visible reason when the account has no P7 SMTP endpoint; the demo has none.
 - **Preview.** **Anteprima** evaluates the editor state without writing anything and shows the first 20
-  matches, each with its subject and one `applica` / `già così` / `salta` line per action. A loop-guarded
-  forward is `salta`. The preview does not create a run, move mail, apply a label or queue an outbox row.
+  matches, each with its subject and one `applica` / `già così` / `salta` line per action. Editing an
+  existing rule previews with that rule's creation horizon; a brand-new rule previews all received
+  mail as an explicitly hypothetical rule. A forward is `salta` when the account has no SMTP endpoint
+  or the message is loop-guarded, and a move updates the simulated folder so a `trash` after a move to
+  Trash shows `già così`. The preview does not create a run, move mail, apply a label or queue an
+  outbox row.
 - **Save / run / undo.** Save/Cancel/Delete sit above the run row, so they stay visible when the editor
   scrolls at 980×600. Delete asks for confirmation. **Esegui nuove** / **Esegui tutte** ask for
   confirmation, then report the run id, matches, changed actions and errors; **Annulla esecuzione**
-  reverses the newest run and reports skipped messages and any forward outbox ids. Recent runs show
-  mode, changed actions and “annullata”.
-- **Keyboard.** Tab reaches every field and button; the palette opens the page; `Esc` closes the page.
-  There is no mouse-only action, and a disabled control always carries a reason.
+  reverses the run that produced the notice (not whatever run happens to be newest) and reports
+  skipped messages and any forward outbox ids. All 20 retained runs are reachable in a scroll area,
+  each with mode, changed actions and “annullata”; no run is hidden behind a fixed `.take(5)`.
+- **Keyboard.** Tab reaches every field and button; the palette opens the page; `Esc` closes the page
+  without touching the mailbox. There is no mouse-only action, and a disabled control always carries
+  a reason.
 - 980×600 light/dark screenshots: `docs/images/postino-p9c-rules-980.png`,
   `postino-p9c-rules-980-dark.png`, `postino-p9c-rule-editor-980.png`,
   `postino-p9c-rule-editor-980-dark.png`, `postino-p9c-rule-preview-980.png`,

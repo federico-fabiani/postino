@@ -167,21 +167,28 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] Flags, move, archive, delete and undo; spam classification is out of scope for M3.
 - [x] Local rules (P9c): a validated query plus 1-5 actions (move, label, read/unread, trash,
       forward), `priority ASC, id ASC` with `stop`, ≤100 rules and ≤5 actions per account. `new`
-      runs after `sync_now` or on demand on received mail ingested after the rule was created;
-      `all` re-evaluates up to 2 000 candidates per rule. Actions apply immediately in rule order so
-      later rules see earlier effects, repeats are no-ops, a failed target is journaled without
-      stopping the later rules, and `sync_now` never fails because of a rule. The journal holds
-      ids/folders/labels/booleans only, keeps 20 runs, and undo reverses move/label/read/trash only
-      on messages still in the state the run left. A forward is one P7 outbox row keyed
-      `rule:<rule>:<message>`, carries `Auto-Submitted`/`X-Postino-Rule`, skips loop-guarded mail and
-      is capped at 50/run; MCP gates it behind `--allow-send`. Rules page, preview, CLI/MCP parity and
-      980×600 light/dark captures.
+      runs after `sync_now` or on demand on received-origin mail ingested after the rule was created;
+      a message is marked applied only when every action completed, so a failed/deferred action is
+      retried. `all` reads up to 2 000 candidates per rule and keeps a per-rule cursor that advances
+      through a larger backlog, retries a deferred page and wraps at the end. Actions apply
+      immediately in rule order so later rules see earlier effects, repeats are no-ops, a failed
+      target is journaled without stopping the later rules, and `sync_now` never fails because of a
+      rule. The journal holds ids/folders/labels/booleans only, keeps 20 runs, and undo reverses
+      move/label/read/trash only on messages still in the state the run left (including starred).
+      A forward is one P7 outbox row keyed `rule:<rule>:<message>` with a durable dedupe marker
+      independent of outbox pruning, carries `Auto-Submitted`/`X-Postino-Rule`, skips loop-guarded
+      mail, and queues at most 50 new rows per run while deferring the rest. MCP gates `rules_run`,
+      forward payloads, enabling a stored forward rule and the `sync_now` rule pass behind
+      `--allow-send`. Rules page, preview, CLI/MCP parity, 20k/100k evidence and 980×600 light/dark
+      captures.
 - [ ] Attachment preview/save with path confinement.
 - [ ] Verify: thread fixtures, rule idempotency, no path escape. The search, real-ingest and
       account-wide thread halves of the 100k gate are proven; the folder thread view and open/RSS
       halves remain open. P9c proves rule priority/stop, later-rule effects, idempotency, preview
-      writes nothing, state-checked undo, forward dedupe/loop/caps/no-SMTP, failure isolation and the
-      new-vs-old horizon.
+      writes nothing, state-checked undo (including starred), forward dedupe across an outbox prune,
+      loop guard, the 50-new-forward budget and the 51st retry, no-SMTP retry, failure isolation,
+      archived-Sent exclusion, the new-vs-old horizon, two-page `all` progress, stale-rule updates,
+      guard cleanup and 20k/100k rule-run numbers.
 
 ## M4 — live in the background
 

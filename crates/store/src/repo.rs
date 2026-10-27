@@ -11,8 +11,8 @@ use rusqlite::{ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavi
 
 use crate::model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
-    Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessagePage, MessageSummary, OutboxEntry, OutboxState,
-    SyncState, UidEntry,
+    Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessageOrigin, MessagePage, MessageSummary,
+    OutboxEntry, OutboxState, SyncState, UidEntry,
 };
 use crate::threads;
 use crate::{REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError};
@@ -148,6 +148,9 @@ impl Store {
         )?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'reply_to:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_guard:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
+        tx.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("rule_guard:{account_id}:%")])?;
+        tx.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("rule_forward:{account_id}:%")])?;
+        tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_all_cursor:' || id FROM rules WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_run_mode:' || id FROM rule_runs WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_run_undone:' || id FROM rule_runs WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM rule_runs WHERE account_id = ?1", [account_id])?;
@@ -597,6 +600,21 @@ impl Store {
     }
 
     /// Recompute and store a folder's `unread`/`total` from `messages`, then return them.
+    /// Rebuild the cached unread/total counts of every folder of one account. Rules update many
+    /// messages in one pass; recounting after the pass avoids a folder scan per action.
+    pub fn recount_account_folders(&self, account_id: &str) -> Result<u32, StoreError> {
+        let ids = {
+            let mut stmt = self.conn.prepare("SELECT id FROM folders WHERE account_id = ?1")?;
+            stmt.query_map([account_id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for id in &ids {
+            refresh_folder_counts(&tx, id)?;
+        }
+        tx.commit()?;
+        u32::try_from(ids.len()).map_err(|_| StoreError::OutOfRange { field: "folder count" })
+    }
+
     pub fn recount_folder(&self, id: &str) -> Result<MessageCounts, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         require_folder(&tx, id)?;
@@ -805,6 +823,90 @@ impl Store {
         changed_count(moved)
     }
 
+    /// Move one rule candidate only while it is still received mail in `expected_folder`. The
+    /// check and the update share one transaction, so a concurrent move to Sent/Drafts/Trash cannot
+    /// be overwritten by a rule that read the row a moment earlier.
+    pub fn rule_move_message(&self, id: &str, expected_folder: &str, folder_id: &str) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let target_account: Option<String> =
+            tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [folder_id], |row| row.get(0)).optional()?;
+        let Some(target_account) = target_account else {
+            return Err(StoreError::NotFound { entity: "folder", id: folder_id.to_owned() });
+        };
+        let row: Option<(String, String, String)> = tx
+            .query_row("SELECT m.folder_id, m.account_id, m.origin FROM messages m WHERE m.id = ?1", [id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let Some((previous, account, origin)) = row else {
+            return Err(StoreError::NotFound { entity: "message", id: id.to_owned() });
+        };
+        if account != target_account {
+            return Err(StoreError::AccountMismatch { folder_id: folder_id.to_owned(), message_account: account, folder_account: target_account });
+        }
+        if previous != expected_folder || origin != MessageOrigin::Received.as_str() {
+            return Ok(false);
+        }
+        tx.execute("UPDATE messages SET folder_id = ?1 WHERE id = ?2", params![folder_id, id])?;
+        // The rule pass recounts every folder once at the end; a folder scan per moved message would
+        // make a 2 000-message run quadratic. A move does not change a thread's unread/starred
+        // counts, and the run refreshes the thread cache once if a flag changed.
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Set flags on one rule candidate only while it is still received mail in `expected_folder`.
+    pub fn rule_set_flags(&self, id: &str, expected_folder: &str, update: FlagUpdate) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let row: Option<(String, String)> =
+            tx.query_row("SELECT folder_id, origin FROM messages WHERE id = ?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        let Some((folder, origin)) = row else {
+            return Err(StoreError::NotFound { entity: "message", id: id.to_owned() });
+        };
+        if folder != expected_folder || origin != MessageOrigin::Received.as_str() {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE messages SET unread = COALESCE(?1, unread), starred = COALESCE(?2, starred) WHERE id = ?3",
+            params![update.unread, update.starred, id],
+        )?;
+        // Folder counts and the thread cache are repaired once after the rule pass.
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Add or remove one label on a rule candidate only while it is still received mail in
+    /// `expected_folder`. Returns whether a row changed.
+    pub fn rule_set_label(&self, label_id: &str, id: &str, expected_folder: &str, apply: bool) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        require_label(&tx, label_id)?;
+        let label_account: Option<Option<String>> =
+            tx.query_row("SELECT account_id FROM labels WHERE id = ?1", [label_id], |row| row.get(0)).optional()?;
+        let row: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT m.folder_id, m.origin, f.account_id FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((folder, origin, account)) = row else {
+            return Err(StoreError::NotFound { entity: "message", id: id.to_owned() });
+        };
+        if label_account.flatten().is_some_and(|label_account| label_account != account) {
+            return Ok(false);
+        }
+        if folder != expected_folder || origin != MessageOrigin::Received.as_str() {
+            return Ok(false);
+        }
+        let changed = if apply {
+            tx.execute("INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?1, ?2)", params![id, label_id])?
+        } else {
+            tx.execute("DELETE FROM message_labels WHERE message_id = ?1 AND label_id = ?2", params![id, label_id])?
+        };
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     /// Delete one message permanently. Attachments and label assignments go with it via
     /// `ON DELETE CASCADE`; the draft row and its revision counter are removed explicitly in the
     /// same transaction, so a later open cannot resurrect the draft. Returns `false` when the
@@ -821,8 +923,10 @@ impl Store {
         tx.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
         tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
-        let guard_key = format!("{}{id}", crate::rules::RULE_GUARD_KEY_PREFIX);
-        tx.execute("DELETE FROM meta WHERE key = ?1", [guard_key])?;
+        if let Some((_, _, account)) = &row {
+            tx.execute("DELETE FROM meta WHERE key = ?1", [format!("rule_guard:{account}:{id}")])?;
+        }
+        tx.execute("DELETE FROM meta WHERE key = ?1", [format!("{}{id}", crate::rules::RULE_GUARD_KEY_PREFIX)])?;
         tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
         if let Some((folder, thread, account)) = &row {
             refresh_folder_counts(&tx, folder)?;
@@ -910,6 +1014,22 @@ impl Store {
             })
             .optional()
             .map_err(|error| corrupt_on_decode("messages", error))
+    }
+
+    /// The ingestion instant of one row, for the `all` page cursor.
+    pub fn message_ingested_at(&self, id: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row("SELECT ingested_at FROM messages WHERE id = ?1", [id], |row| row.get(0)).optional()?)
+    }
+
+    /// Why one row exists. Used by rules and by the archived-Sent regression tests.
+    pub fn message_origin(&self, id: &str) -> Result<Option<MessageOrigin>, StoreError> {
+        let raw: Option<String> = self.conn.query_row("SELECT origin FROM messages WHERE id = ?1", [id], |row| row.get(0)).optional()?;
+        Ok(raw.as_deref().and_then(MessageOrigin::parse))
+    }
+
+    /// The account a label belongs to, or `None` for a mailbox-wide label.
+    pub fn label_account_id(&self, id: &str) -> Result<Option<Option<String>>, StoreError> {
+        self.conn.query_row("SELECT account_id FROM labels WHERE id = ?1", [id], |row| row.get(0)).optional().map_err(StoreError::Sqlite)
     }
 
     /// The RFC 5322 `Message-ID` of one row, without reading its body or attachments.
@@ -1011,6 +1131,7 @@ impl Store {
             let deleted = tx.execute("DELETE FROM messages WHERE id = ?1 AND folder_id = ?2", params![id, folder_id])?;
             if deleted > 0 {
                 tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
+                tx.execute("DELETE FROM meta WHERE key IN (?1, ?2)", params![format!("rule_guard:{account}:{id}"), format!("rule_guard:{id}")])?;
                 if let Some(thread) = thread {
                     touched_threads.push(thread);
                 }
@@ -1053,6 +1174,16 @@ impl Store {
                  WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
              )",
             [folder_id],
+        )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (
+                 SELECT 'rule_guard:' || ?2 || ':' || id FROM messages
+                 WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
+             ) OR key IN (
+                 SELECT 'rule_guard:' || id FROM messages
+                 WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
+             )",
+            params![folder_id, account],
         )?;
         let removed =
             tx.execute("DELETE FROM messages WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)", [folder_id])?;
@@ -1444,6 +1575,9 @@ impl Store {
             touched_threads.push(thread);
         }
         upsert_message_row(&tx, message, true)?;
+        // The local draft became a Sent copy. `upsert_message_row` deliberately preserves origin on
+        // an update, so this transition is the one place that makes it `sent`.
+        tx.execute("UPDATE messages SET origin = 'sent' WHERE id = ?1", [&message.summary.id])?;
         if let Some(uid) = adopted_uid {
             tx.execute("UPDATE messages SET uid = ?2 WHERE id = ?1", params![message.summary.id, uid])?;
         }
@@ -1664,10 +1798,16 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
     let bcc_json = serde_json::to_string(&message.bcc)?;
     let size = message.size.map(|value| to_i64(value, "message size")).transpose()?;
     let remote_images = i64::from(message.remote_images.min(MAX_REMOTE_IMAGES));
-    let folder_account: Option<String> =
-        tx.query_row("SELECT account_id FROM folders WHERE id = ?1", [&message.summary.folder_id], |row| row.get(0)).optional()?;
-    let Some(folder_account) = folder_account else {
+    let folder_row: Option<(String, String)> = tx
+        .query_row("SELECT account_id, kind FROM folders WHERE id = ?1", [&message.summary.folder_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    let Some((folder_account, folder_kind)) = folder_row else {
         return Err(StoreError::NotFound { entity: "folder", id: message.summary.folder_id.clone() });
+    };
+    let origin = match folder_kind.as_str() {
+        "drafts" => MessageOrigin::Draft,
+        "sent" => MessageOrigin::Sent,
+        _ => MessageOrigin::Received,
     };
     if folder_account != message.summary.account_id {
         return Err(StoreError::AccountMismatch {
@@ -1691,9 +1831,9 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
              to_json, cc_json, bcc_json, subject, snippet, date, unread, starred,
              has_attachments, body_text, body_html, remote_images, size,
              search_sender, search_to, search_cc, search_bcc, attachment_names, subject_norm,
-             ingested_at
+             ingested_at, origin
          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                  ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+                  ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
          ON CONFLICT(id) DO UPDATE SET
              account_id = excluded.account_id,
              folder_id = excluded.folder_id,
@@ -1750,6 +1890,7 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
             attachment_names,
             subject_norm,
             crate::now_ms(),
+            origin.as_str(),
         ],
     )?;
     // Counts only move when the folder or the read flag changes; a body/subject refresh during a

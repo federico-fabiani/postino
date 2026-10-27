@@ -31,6 +31,8 @@ DROP INDEX IF EXISTS messages_account_thread_date;
 DROP INDEX IF EXISTS messages_account_message_id;
 DROP INDEX IF EXISTS messages_account_subject_norm_date;
 DROP INDEX IF EXISTS messages_list_cover;
+DROP INDEX IF EXISTS messages_rules_new;
+DROP INDEX IF EXISTS messages_rules_all;
 DROP TABLE IF EXISTS thread_aliases;
 DROP TABLE IF EXISTS threads;
 DROP TABLE IF EXISTS saved_searches;
@@ -47,8 +49,10 @@ ALTER TABLE messages DROP COLUMN in_reply_to;
 ALTER TABLE messages DROP COLUMN references_json;
 ALTER TABLE messages DROP COLUMN ingested_at;
 ALTER TABLE messages DROP COLUMN rules_applied_at;
+ALTER TABLE messages DROP COLUMN origin;
 DELETE FROM meta WHERE key = 'search_index';
 DELETE FROM meta WHERE key = 'search_updated_at';
+DELETE FROM meta WHERE key = 'message_origin_backfilled';
 ";
 
 fn account(id: &str) -> Account {
@@ -376,7 +380,7 @@ fn the_v5_outbox_columns_arrive_with_the_migration() {
 
 #[test]
 fn upgrades_a_v6_database_to_v7_with_the_search_columns_and_index() {
-    use postino_store::{Address, Folder, FolderKind, Message, MessageSummary, SearchExpr, SearchFilter};
+    use postino_store::{Address, Folder, FolderKind, Message, MessageOrigin, MessageSummary, SearchExpr, SearchFilter};
 
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("store.db");
@@ -417,11 +421,32 @@ fn upgrades_a_v6_database_to_v7_with_the_search_columns_and_index() {
         remote_images: 0,
         size: Some(32),
     };
+    let sent_folder = Folder {
+        id: "fld_sent".to_owned(),
+        account_id: "acc_1".to_owned(),
+        name: "Sent".to_owned(),
+        kind: FolderKind::Sent,
+        unread: 0,
+        total: 1,
+        uid_validity: Some(1),
+        uid_next: Some(2),
+        last_sync_at: None,
+    };
+    let mut sent = message.clone();
+    sent.summary.id = "msg_sent".to_owned();
+    sent.summary.folder_id = "fld_sent".to_owned();
+    sent.summary.subject = "Lettera inviata".to_owned();
+    sent.summary.snippet = "Una lettera".to_owned();
+    sent.body_text = "Una lettera inviata".to_owned();
+    sent.uid = Some(1);
+    sent.message_id = Some("<sent@example.com>".to_owned());
     {
         let store = Store::open(&path, &key).expect("open v7");
         store.upsert_account(&account("acc_1")).expect("account");
         store.upsert_folder(&folder).expect("folder");
+        store.upsert_folder(&sent_folder).expect("sent folder");
         store.upsert_synced_message(&message, &[]).expect("message");
+        store.upsert_synced_message(&sent, &[]).expect("sent message");
         let connection = raw_open(&path, &key);
         connection.execute_batch(DROP_V7).expect("forge v6 objects");
         connection.execute_batch("PRAGMA user_version = 6;").expect("forge v6 version");
@@ -431,16 +456,18 @@ fn upgrades_a_v6_database_to_v7_with_the_search_columns_and_index() {
     assert_eq!(store.schema_version().expect("version"), 7);
     let pending = store.search_status().expect("pending status");
     assert!(!pending.ready, "the migrated v7 index must start pending");
-    assert_eq!(pending.total, 1);
+    assert_eq!(pending.total, 2);
     store.ensure_search_index().expect("build the pending v7 index");
     let status = store.search_status().expect("search status");
     assert!(status.ready, "the v7 index was not built on open: {status:?}");
-    assert_eq!((status.indexed, status.total), (1, 1));
+    assert_eq!((status.indexed, status.total), (2, 2));
     assert!(store.get_meta("search_index").expect("meta").is_some(), "v7 did not write meta.search_index");
     let page = store.search(&SearchFilter { expr: Some(SearchExpr::Match("\"verbale\"".to_owned())), ..SearchFilter::default() }).expect("search");
     assert_eq!(page.total, 1);
     assert_eq!(page.hits[0].message.id, "msg_1");
     assert!(page.hits[0].body_text.contains("verbale"));
+    assert_eq!(store.message_origin("msg_1").expect("inbox origin"), Some(MessageOrigin::Received));
+    assert_eq!(store.message_origin("msg_sent").expect("sent origin"), Some(MessageOrigin::Sent), "a v6 Sent copy must be classified");
     drop(store);
 
     let connection = raw_open(&path, &key);
