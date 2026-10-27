@@ -158,6 +158,13 @@ pub(crate) fn ingest(
     // a hostile message cannot make this overflow or grow without bound.
     let remote_images = u32::try_from(parsed.remote_images_blocked).unwrap_or(u32::MAX).min(store::MAX_REMOTE_IMAGES);
 
+    // PGP/MIME is the only received mail whose exact bytes cannot be rebuilt from the parsed row:
+    // verification needs the signed entity as it arrived (CRLF, folding, the detached signature).
+    // The blob is written before the row, like an attachment, and the row only names it afterwards.
+    // `max_message_bytes` bounds it already: the MIME parse above refused a larger entity, so this
+    // branch can never keep bytes the run was allowed to fetch but not store.
+    let raw_blob_hash = if is_pgp_mime(&parsed) { Some(store.blobs().put(raw).map_err(SyncError::Store)?) } else { None };
+
     let row = store::Message {
         summary: store::MessageSummary {
             id: id.clone(),
@@ -185,6 +192,9 @@ pub(crate) fn ingest(
     };
     let (in_reply_to, references) = ids::thread_headers(&parsed.references, parsed.in_reply_to.as_deref());
     store.upsert_synced_message_with_refs(&row, &attachments, in_reply_to.as_deref(), &references).map_err(SyncError::Store)?;
+    // NULL is the honest `Not stored` state for ordinary mail and for a row cached before v9; an
+    // explicit refresh may fetch the entity again, but nothing here re-derives it from the body.
+    store.set_message_raw_blob_hash(&id, raw_blob_hash.as_deref()).map_err(SyncError::Store)?;
     store.set_message_reply_to(&id, &reply_to).map_err(SyncError::Store)?;
     // P9c's forward loop guard. The headers are recorded in the encrypted `meta` table because v7
     // has no header column and P9c must not migrate; a normal message writes nothing.
@@ -271,6 +281,19 @@ fn choose_identity(
         return Ok(Some((variant.clone(), None)));
     }
     Ok(None)
+}
+
+/// Whether the root entity is PGP/MIME: `multipart/signed` or `multipart/encrypted`.
+///
+/// Structure only: the root media type is read from the parsed headers, and no packet, key or
+/// signature is inspected. Prepared mail that is signed but not OpenPGP (S/MIME) still keeps its
+/// bytes, because retention is keyed on the container and the cost is one bounded blob; P12c2b
+/// splits the signed entity and its signature out of the same bytes.
+fn is_pgp_mime(parsed: &ParsedMessage) -> bool {
+    parsed.headers.get("Content-Type").is_some_and(|value| {
+        let media = value.split(';').next().unwrap_or_default().trim();
+        media.eq_ignore_ascii_case("multipart/signed") || media.eq_ignore_ascii_case("multipart/encrypted")
+    })
 }
 
 /// The MIME bounds for a sync run: the per-message cap and the per-attachment cap, both clamped.
@@ -362,6 +385,20 @@ mod tests {
         assert_eq!(mime.max_bytes, postino_mime::Limits::HARD_MAX_BYTES);
         assert_eq!(mime.max_part_bytes, postino_mime::Limits::HARD_MAX_PART_BYTES);
         assert_eq!(mime.max_total_attachment_bytes, postino_mime::Limits::HARD_MAX_TOTAL_ATTACHMENT_BYTES);
+    }
+
+    fn is_pgp_mime_for(content_type: &str) -> bool {
+        let raw = format!("From: a@example.com\r\nContent-Type: {content_type}\r\n\r\nbody\r\n");
+        let parsed = postino_mime::parse(raw.as_bytes(), &postino_mime::Limits::default()).expect("parse");
+        is_pgp_mime(&parsed)
+    }
+
+    #[test]
+    fn raw_retention_is_decided_by_the_root_media_type() {
+        assert!(is_pgp_mime_for("multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=b"));
+        assert!(is_pgp_mime_for("Multipart/Encrypted; protocol=\"application/pgp-encrypted\"; boundary=b"));
+        assert!(!is_pgp_mime_for("multipart/mixed; boundary=b"));
+        assert!(!is_pgp_mime_for("text/plain"));
     }
 
     #[test]

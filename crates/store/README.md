@@ -3,7 +3,7 @@
 **Layer:** foundation. Depends on `postino-crypto` (the blob subkey) and on no other workspace crate;
 no UI toolkit.
 
-The encrypted local store. One SQLCipher database with schema **v8**, a migration runner on
+The encrypted local store. One SQLCipher database with schema **v9**, a migration runner on
 `PRAGMA user_version`, a typed repository for the mailbox and outbox, and a content-addressed encrypted
 blob store for attachment bytes. The engine drives it through `Engine::open` (P3c), the attachment
 seam (P4b) and the outbox (P7); `postino-sync` (P5b) is the writer for received mail and P7's Sent
@@ -96,6 +96,16 @@ mail.db.blobs/<first two hex chars>/<64 lowercase hex>.blob
 - The blob directory has no garbage collector yet: deleting a message leaves its blob, because
   another message may reference the same content.
 
+## Schema v9
+
+v9 is additive from v8: nullable `messages.raw_blob_hash`, a reference into the encrypted blob store
+for the exact received bytes of a `multipart/signed` or `multipart/encrypted` message. `postino-sync`
+writes a blob first and names it afterwards, exactly like an attachment; ordinary mail leaves the
+column NULL. NULL is the honest `Not stored` state for every row cached before v9 and for ordinary
+mail, and nothing re-derives the bytes from the parsed body. `Store::set_message_raw_blob_hash` writes
+or clears the reference and `Store::message_raw_blob_hash` reads it. A failed v9 keeps `user_version =
+8`; an older binary refuses a v9 file as too new.
+
 ## Schema v8
 
 v8 is additive from v7: the `pgp_keys` table (`id`, `account_id` foreign key with cascade delete,
@@ -146,7 +156,7 @@ IMAP and optional SMTP secrets live in the OS keyring.
 | `accounts` | id, name, email, provider, signature, created_at |
 | `account_servers` | IMAP endpoint, plus the nullable SMTP endpoint (P7) |
 | `folders` | account, name, kind, cached unread/total, `uid_validity`, `uid_next`, `last_sync_at` |
-| `messages` | envelope, JSON recipient lists, flags, body text/HTML, stored blocked-image count, size, optional IMAP uid, derived search text, threading headers and provenance `origin` (P9a/P9b/P9c) |
+| `messages` | envelope, JSON recipient lists, flags, body text/HTML, stored blocked-image count, size, optional IMAP uid, derived search text, threading headers, provenance `origin` (P9a/P9b/P9c) and the optional raw PGP/MIME blob hash (P12c2a) |
 | `message_fts` | contentless-delete FTS5 index over the search columns, keyed by `messages.rowid` (P9a) |
 | `message_fts_rank` | rowid → date/id tie-break for a global bm25 page (P9a) |
 | `threads` | conversation cache: subject, last date, mailbox-wide counts, attachments, latest message (P9b) |
@@ -298,14 +308,15 @@ for tests and read paths; the daemon and the app use `open_locked`/`WriterLock`,
 read-only command uses `Store::open_read_only` (or `open_read_only_locked` for `--in-process`).
 
 `Store::gc_unreferenced_blobs(limit)` lists `<root>/<shard>/<hash>.blob`, builds the referenced set from
-`attachments.blob_hash` and `outbox.raw_blob_hash`, rechecks each candidate immediately before
-unlinking, and deletes at most `limit` (≤4096) per call. It is bounded and resumable: the next call sees
-the remaining files. A read-only store refuses it. It never deletes a file whose name is not exactly
-64 lowercase hex characters plus `.blob`.
+`attachments.blob_hash`, `outbox.raw_blob_hash` and `messages.raw_blob_hash`, rechecks each candidate
+immediately before unlinking, and deletes at most `limit` (≤4096) per call. It is bounded and
+resumable: the next call sees the remaining files. A read-only store refuses it. It never deletes a
+file whose name is not exactly 64 lowercase hex characters plus `.blob`.
 
 ## Not here yet
 
-Desktop-app daemon wiring (P10a2), raw-message blobs, key rotation. P9c's rules live here as data and
+Desktop-app daemon wiring (P10a2), raw-message blobs for ordinary mail (P12c2a keeps them only for
+PGP/MIME), key rotation. P9c's rules live here as data and
 candidate queries; their action engine and forward-through-P7 policy live in `postino-core`.
 `sync_state` and the sync-status `meta` key have writers now: `postino-sync` (P5b) is the client of this
 crate for received mail. Parsing MIME is not here: sync parses and hands over rows and blob hashes. The

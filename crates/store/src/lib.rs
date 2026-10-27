@@ -78,7 +78,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
 /// label id is never handed out again.
@@ -467,6 +467,13 @@ CREATE TABLE pgp_keys(
 CREATE UNIQUE INDEX pgp_keys_fingerprint ON pgp_keys(fingerprint);
 CREATE INDEX pgp_keys_account ON pgp_keys(account_id, created_at);
 "#,
+    // v9 (P12c2a): the exact received bytes of a PGP/MIME message, as a blob hash. Verification
+    // needs the bytes as they arrived (CRLF, header folding, the detached signature part) and the
+    // parsed body cannot reconstruct them, so sync keeps one blob for `multipart/signed` or
+    // `multipart/encrypted` mail only. NULL means ordinary mail or a row cached before v9; both are
+    // reported as `Not stored` rather than re-derived into a fake verification. Additive, so an
+    // existing row keeps its mail and reads NULL.
+    "ALTER TABLE messages ADD COLUMN raw_blob_hash TEXT;",
 ];
 
 /// A 256-bit store key.

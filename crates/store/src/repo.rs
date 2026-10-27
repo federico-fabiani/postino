@@ -1006,6 +1006,28 @@ impl Store {
         Ok(())
     }
 
+    /// Record, or clear, the raw blob of a received message.
+    ///
+    /// `Some(hash)` names a blob that already exists in the store's blob directory and holds the
+    /// exact RFC 5322 bytes of a `multipart/signed` or `multipart/encrypted` message. `None` clears
+    /// the column, so ordinary mail and a re-sync that is no longer PGP/MIME keep no stale bytes
+    /// that could verify the wrong message. A pre-v9 row stays NULL until a refresh stores one.
+    pub fn set_message_raw_blob_hash(&self, id: &str, hash: Option<&str>) -> Result<(), StoreError> {
+        let changed = self.conn.execute("UPDATE messages SET raw_blob_hash = ?1 WHERE id = ?2", params![hash, id])?;
+        if changed == 0 {
+            return Err(StoreError::NotFound { entity: "message", id: id.to_owned() });
+        }
+        Ok(())
+    }
+
+    /// The raw blob hash of a received message, or `None` when no exact bytes were kept.
+    ///
+    /// `None` is the honest `Not stored` state: an ordinary message, a row cached before v9, or a
+    /// PGP/MIME message whose bytes were rejected. It is never re-derived from the parsed body.
+    pub fn message_raw_blob_hash(&self, id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.conn.query_row("SELECT raw_blob_hash FROM messages WHERE id = ?1", [id], |row| row.get::<_, Option<String>>(0)).optional()?.flatten())
+    }
+
     /// The folder and local read/star flags of a cached message, or `None` when it is new.
     pub fn message_flags(&self, id: &str) -> Result<Option<MessageFlags>, StoreError> {
         self.conn

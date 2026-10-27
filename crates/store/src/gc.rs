@@ -1,9 +1,11 @@
 //! Bounded, resumable blob garbage collection.
 //!
-//! A blob is referenced when an attachment row or an outbox row names its hash. Drafts are message
-//! rows with attachment rows, so a draft attachment is covered; a P7/P9c outbox snapshot is covered
-//! by `outbox.raw_blob_hash`. A sweep never trusts a cached list: it rechecks each candidate before
-//! deletion, because a forward or a new attachment can be written between the scan and the unlink.
+//! A blob is referenced when an attachment row, an outbox row or a received PGP/MIME message names
+//! its hash. Drafts are message rows with attachment rows, so a draft attachment is covered; a
+//! P7/P9c outbox snapshot is covered by `outbox.raw_blob_hash`; the exact bytes sync kept for
+//! `multipart/signed` and `multipart/encrypted` mail are covered by `messages.raw_blob_hash`. A
+//! sweep never trusts a cached list: it rechecks each candidate before deletion, because a forward, a
+//! new attachment or a re-synced raw entity can be written between the scan and the unlink.
 //!
 //! The *deletion* is bounded by `limit`; the *scan* visits every shard directory. That is the
 //! resumable shape: a call that deletes nothing this time will see the remaining files next time.
@@ -58,7 +60,9 @@ impl Store {
         let mut statement = self.conn.prepare(
             "SELECT blob_hash FROM attachments WHERE blob_hash IS NOT NULL AND blob_hash <> ''
              UNION
-             SELECT raw_blob_hash FROM outbox WHERE raw_blob_hash IS NOT NULL AND raw_blob_hash <> ''",
+             SELECT raw_blob_hash FROM outbox WHERE raw_blob_hash IS NOT NULL AND raw_blob_hash <> ''
+             UNION
+             SELECT raw_blob_hash FROM messages WHERE raw_blob_hash IS NOT NULL AND raw_blob_hash <> ''",
         )?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         let mut hashes = HashSet::new();
@@ -74,6 +78,8 @@ impl Store {
                  SELECT 1 FROM attachments WHERE blob_hash = ?1
                  UNION ALL
                  SELECT 1 FROM outbox WHERE raw_blob_hash = ?1
+                 UNION ALL
+                 SELECT 1 FROM messages WHERE raw_blob_hash = ?1
              )",
             params![hash],
             |row| row.get::<_, bool>(0),
@@ -183,6 +189,26 @@ mod tests {
         assert!(store.blobs().has(&outbox_hash).expect("outbox"));
         assert!(!store.blobs().has(&orphan_hash).expect("orphan"));
         assert!(!blob_root(&_directory.path().join("mail.db")).join(&orphan_hash[..2]).join(format!("{orphan_hash}.blob")).exists());
+    }
+
+    #[test]
+    fn gc_keeps_the_raw_blob_of_a_pgp_mime_message() {
+        let (_directory, store) = store();
+        store.upsert_synced_message(&message(), &[]).expect("message");
+        let raw_hash = store.blobs().put(b"multipart/signed exact bytes").expect("raw blob");
+        store.set_message_raw_blob_hash("msg", Some(&raw_hash)).expect("raw hash");
+        let report = store.gc_unreferenced_blobs(16).expect("gc");
+        assert_eq!(report.removed, 0, "the sweep deleted the raw entity of a cached message");
+        assert_eq!(report.referenced, 1);
+        assert_eq!(store.message_raw_blob_hash("msg").expect("read raw"), Some(raw_hash.clone()));
+        assert!(store.blobs().has(&raw_hash).expect("raw"));
+
+        // Clearing the column (ordinary mail, or a row that is no longer PGP/MIME) releases it.
+        store.set_message_raw_blob_hash("msg", None).expect("clear");
+        assert_eq!(store.message_raw_blob_hash("msg").expect("read cleared"), None);
+        let report = store.gc_unreferenced_blobs(16).expect("gc after clear");
+        assert_eq!(report.removed, 1);
+        assert!(!store.blobs().has(&raw_hash).expect("raw removed"));
     }
 
     #[test]

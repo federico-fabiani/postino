@@ -243,7 +243,7 @@ fn a_read_only_store_refuses_writes_and_rejects_an_old_schema() {
     drop(store);
 
     let read_only = Store::open_read_only(&fixture.path(), &fixture.key).expect("read-only open");
-    assert_eq!(read_only.schema_version().expect("version"), 8);
+    assert_eq!(read_only.schema_version().expect("version"), 9);
     assert_eq!(read_only.list_accounts().expect("read").len(), 1);
     let error = read_only.upsert_account(&account(ACCOUNT_B, "b@example.com")).expect_err("a write must fail on a read-only store");
     assert!(error.to_string().contains("readonly") || error.to_string().contains("read-only"), "{error}");
@@ -258,7 +258,7 @@ fn a_read_only_store_refuses_writes_and_rejects_an_old_schema() {
         connection.execute_batch(&format!("PRAGMA key = \"x'{hex}'\"; PRAGMA user_version = 3;")).expect("forge v3");
     }
     let error = Store::open_read_only(&fixture.path(), &fixture.key).err().expect("an old schema must be refused read-only");
-    assert!(matches!(error, postino_store::StoreError::SchemaTooOld { found: 3, supported: 8 }), "{error}");
+    assert!(matches!(error, postino_store::StoreError::SchemaTooOld { found: 3, supported: 9 }), "{error}");
 }
 
 #[test]

@@ -67,8 +67,9 @@ block the caller and own a private current-thread runtime; none logs a body, add
    with `postino-mime` under the sync limits. Upsert the message, recipients, bodies, blocked remote
    image count, flags, `uid`, `Message-ID`, thread placeholder and attachment metadata in one
    transaction; write attachment bytes through the encrypted blob seam only when the part is complete
-   and within the limit. A body that vanished between the envelope and the fetch is a per-message skip
-   with a warning.
+   and within the limit. A `multipart/signed` or `multipart/encrypted` entity also keeps the exact
+   received bytes in one blob named by `messages.raw_blob_hash` (schema v9); ordinary mail keeps
+   none. A body that vanished between the envelope and the fetch is a per-message skip with a warning.
 5. Advance `sync_state.uid_next` only after the transaction commits.
 6. Fetch `UID FLAGS` for the whole folder in 1 000-UID windows (the only liveness source), compare it
    with one `folder_message_flags` snapshot in memory, and propose the ids whose UID is gone.

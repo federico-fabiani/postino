@@ -7,7 +7,7 @@
 > reply/forward headers (P8) + encrypted FTS5 search, the body-free read path and schema v7 (P9a) +
 > conversation derivation/merge/alias, the conversation view and saved searches (P9b) + local rules
 > with preview, idempotent runs, undo and forwarding through P7 (P9c) + PGP key storage and schema v8
-> (P12c1).
+> (P12c1) + exact PGP/MIME raw retention and schema v9 (P12c2a).
 > **Last updated:** 2026-10-27 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
@@ -22,7 +22,7 @@ One Cargo workspace, edition 2024, Rust 1.98+:
 | `crates/mime` | MIME parsing, HTML sanitization, HTML-to-text and RFC 5322 serialization (P4a) |
 | `crates/net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounds, typed errors |
 | `crates/platform` | OS seams: store key and account credentials in the OS keyring |
-| `crates/store` | SQLCipher schema v8, migrations, the repository, FTS5 search, the conversation cache, saved searches, local rules and their journal, the outbox journal, the encrypted blob store and PGP keys (P3b, P4b, P6a, P6d, P7, P9a, P9b, P9c, P12c1) |
+| `crates/store` | SQLCipher schema v9, migrations, the repository, FTS5 search, the conversation cache, saved searches, local rules and their journal, the outbox journal, the encrypted blob store, PGP keys and PGP/MIME raw blobs (P3b, P4b, P6a, P6d, P7, P9a, P9b, P9c, P12c1, P12c2a) |
 | `crates/sync` | One account from IMAP into the store, plus submission serialization and the Sent append (P5b, P7) |
 | `crates/testkit` | Test-only fake IMAP/SMTP servers, TLS fixture, response builders and synthetic mail (dev-dependency only) |
 | `apps/postino-app` | egui/eframe desktop shell, design tokens, banded three-pane layout |
@@ -181,7 +181,7 @@ it also replaces an oversized response (for example a dry-run of a large draft) 
 | Crate | Responsibility |
 |---|---|
 | `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
-| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b); local rules, candidate query and journal (P9c); PGP key rows and schema v8 (P12c1) |
+| `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b); local rules, candidate query and journal (P9c); PGP key rows and schema v8 (P12c1); raw PGP/MIME retention and schema v9 (P12c2a) |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
 | `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. Autodiscovery and QRESYNC later |
 | `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler later |
@@ -1543,6 +1543,26 @@ conflict. Imports are capped at 64 keys per account in one immediate transaction
 and `pgp_key_export_public` (read-only); MCP excludes the import. The library decision and its
 licence review are in `docs/decisions/0007-pgp-key-storage.md`. P12c1 does not verify, decrypt, sign,
 encrypt, fetch keys or downgrade to plaintext; P12c2 owns MIME and UI.
+
+### 4.15 Implemented in P12c2a: exact bytes for received PGP/MIME
+
+Schema v9 is additive from v8: nullable `messages.raw_blob_hash`, a reference into the existing
+encrypted content-addressed blob store, with no new table, index or dependency. `postino-sync`
+decides retention from the root media type of the parsed entity: `multipart/signed` and
+`multipart/encrypted` keep the exact received RFC 5322 bytes (CRLF, header folding and the detached
+signature part are what a verifier needs), and ordinary mail keeps nothing. The blob is written
+through the P4b seam before the message row names it, like an attachment; `max_message_bytes` is the
+bound, because the MIME parse already refuses a larger entity and the run skips an over-limit message
+whole. The raw column is not a second body: `body_text`/`body_html` and FTS still come from the MIME
+parse, an encrypted entity shows no plaintext until P12c2b decrypts it, and nothing re-derives the
+bytes from the parsed body. `Store::message_raw_blob_hash` returning `None` is the honest
+`Not stored` state for ordinary mail and for every row cached before v9; a refresh may fetch the
+entity again. A move, an edit and a de-flag never touch the column, and the GC adds
+`messages.raw_blob_hash` to both the referenced set and the per-candidate recheck, so a sweep cannot
+delete bytes a cached PGP/MIME message still needs. Migration v8→v9 runs in one transaction
+and a failed v9 keeps `user_version = 8`; an older binary refuses a v9 file as too new. P12c2a adds
+no crypto, no operation, no CLI/UI surface and no way to verify a message from a body that was
+re-parsed locally.
 
 ## 5. Synchronization
 

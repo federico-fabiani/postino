@@ -589,6 +589,117 @@ fn a_message_over_the_message_limit_is_skipped_with_a_warning() {
     assert_eq!(store.get_sync_state(&inbox_row.id).expect("state").expect("row").uid_next, 3);
 }
 
+/// A PGP/MIME `multipart/signed` entity. The bytes are the point: CRLF and a folded `Content-Type`
+/// must survive into the blob unchanged.
+fn signed_message(uid: u32) -> TestMessage {
+    let raw = format!(
+        concat!(
+            "From: Synthetic Sender <synthetic{uid}@example.test>\r\n",
+            "To: Me <me@example.test>\r\n",
+            "Subject: Firmato {uid}\r\n",
+            "Date: Mon, 04 Mar 2024 10:0{uid}:00 +0000\r\n",
+            "Message-ID: <synthetic-{uid}@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/signed;\r\n",
+            " protocol=\"application/pgp-signature\"; micalg=pgp-sha256;\r\n",
+            " boundary=\"sig{uid}\"\r\n",
+            "\r\n",
+            "--sig{uid}\r\n",
+            "Content-Type: text/plain; charset=us-ascii\r\n",
+            "\r\n",
+            "corpo firmato\r\n",
+            "--sig{uid}\r\n",
+            "Content-Type: application/pgp-signature; name=\"signature.asc\"\r\n",
+            "\r\n",
+            "-----BEGIN PGP SIGNATURE-----\r\n",
+            "iQEzBAABCAAdFiEE\r\n",
+            "-----END PGP SIGNATURE-----\r\n",
+            "--sig{uid}--\r\n"
+        ),
+        uid = uid
+    );
+    let mut message = TestMessage::synthetic(synthetic_message(uid));
+    message.raw = raw.into_bytes();
+    message
+}
+
+/// A PGP/MIME `multipart/encrypted` entity: version part plus an opaque payload.
+fn encrypted_message(uid: u32) -> TestMessage {
+    let raw = format!(
+        concat!(
+            "From: Synthetic Sender <synthetic{uid}@example.test>\r\n",
+            "To: Me <me@example.test>\r\n",
+            "Subject: Cifrato {uid}\r\n",
+            "Date: Mon, 04 Mar 2024 10:0{uid}:00 +0000\r\n",
+            "Message-ID: <synthetic-{uid}@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"enc{uid}\"\r\n",
+            "\r\n",
+            "--enc{uid}\r\n",
+            "Content-Type: application/pgp-encrypted\r\n",
+            "\r\n",
+            "Version: 1\r\n",
+            "--enc{uid}\r\n",
+            "Content-Type: application/octet-stream; name=\"encrypted.asc\"\r\n",
+            "\r\n",
+            "-----BEGIN PGP MESSAGE-----\r\n",
+            "hQEMAw\r\n",
+            "-----END PGP MESSAGE-----\r\n",
+            "--enc{uid}--\r\n"
+        ),
+        uid = uid
+    );
+    let mut message = TestMessage::synthetic(synthetic_message(uid));
+    message.raw = raw.into_bytes();
+    message
+}
+
+#[test]
+fn pgp_mime_messages_keep_their_exact_bytes_and_plain_mail_keeps_none() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let signed = signed_message(1);
+    let signed_raw = signed.raw.clone();
+    let encrypted = encrypted_message(2);
+    let encrypted_raw = encrypted.raw.clone();
+    let server = RunningServer::start(one_inbox(10, vec![signed, encrypted, TestMessage::synthetic(synthetic_message(3))]));
+    sync(&store, &server).expect("sync with PGP/MIME");
+    server.finish();
+
+    let signed_row = message_by_header(&store, "synthetic-1@example.test");
+    let hash = store.message_raw_blob_hash(&signed_row.summary.id).expect("raw hash").expect("a signed message keeps its raw bytes");
+    assert_eq!(
+        store.blobs().get(&hash, 1024 * 1024).expect("raw blob").as_slice(),
+        signed_raw.as_slice(),
+        "the stored entity is not the received entity"
+    );
+    assert_eq!(signed_row.body_text.trim(), "corpo firmato", "the parsed body still comes from the MIME parse");
+
+    let encrypted_row = message_by_header(&store, "synthetic-2@example.test");
+    let hash = store.message_raw_blob_hash(&encrypted_row.summary.id).expect("raw hash").expect("an encrypted message keeps its raw bytes");
+    assert_eq!(store.blobs().get(&hash, 1024 * 1024).expect("raw blob").as_slice(), encrypted_raw.as_slice());
+
+    let plain = message_by_header(&store, "synthetic-3@example.test");
+    assert_eq!(store.message_raw_blob_hash(&plain.summary.id).expect("raw hash"), None, "ordinary mail kept a raw blob");
+    // The encrypted entity has no readable body until it is decrypted, so `assert_consistent` (which
+    // requires a body) is deliberately not used here; the row and the raw blob are the contract.
+    assert!(encrypted_row.body_text.is_empty() && encrypted_row.body_html.is_none(), "a locked message must not fake a body");
+}
+
+#[test]
+fn a_pgp_mime_message_over_the_message_limit_keeps_no_row_and_no_raw_blob() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let server = RunningServer::start(one_inbox(10, vec![signed_message(1)]));
+    let limits = SyncLimits { max_message_bytes: 64, ..SyncLimits::default() };
+    let outcome = run(&store, &server, &limits, &AtomicBool::new(false)).expect("sync");
+    server.finish();
+    assert_eq!(outcome.fetched, 0);
+    assert!(outcome.warnings.iter().any(|warning| warning.contains("over the 64-byte message limit")), "{:?}", outcome.warnings);
+    assert!(store.list_all_messages().expect("messages").is_empty(), "an over-limit message left a row behind");
+    assert!(store.blobs().list_hashes().expect("blobs").is_empty(), "an over-limit message left a raw blob behind");
+}
+
 #[test]
 fn a_parse_failure_is_a_warning_not_a_failed_run() {
     let harness = Harness::new();

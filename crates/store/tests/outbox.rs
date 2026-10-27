@@ -102,7 +102,7 @@ fn entry(id: &str, key: &str, send_at: i64) -> OutboxEntry {
 fn the_v5_schema_has_the_smtp_columns_and_the_outbox() {
     let fixture = Fixture::new();
     let store = fixture.open();
-    assert_eq!(store.schema_version().expect("version"), 8);
+    assert_eq!(store.schema_version().expect("version"), 9);
     let server = store.get_account_server(ACCOUNT).expect("server").expect("row");
     let smtp = server.smtp.expect("smtp endpoint");
     assert_eq!((smtp.host.as_str(), smtp.port, smtp.tls), ("smtp.example.com", 465, AccountTls::Implicit));
