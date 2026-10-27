@@ -63,7 +63,7 @@ pub mod size {
     /// header and the footer keep their position at every window size.
     pub const COMPOSER_HEADER_BLOCK: f32 = 78.0;
     pub const COMPOSER_ACCOUNT_ROW: f32 = 20.0;
-    pub const COMPOSER_FOOTER_BLOCK: f32 = 50.0;
+    pub const COMPOSER_FOOTER_BLOCK: f32 = 68.0;
     pub const COMPOSER_BODY_MIN: f32 = 96.0;
     pub const ATTACHMENT_LIST_MAX: f32 = 72.0;
     /// The inline label editor is a drawer above the sidebar footer, tall enough for the field, its

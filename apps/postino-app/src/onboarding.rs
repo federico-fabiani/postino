@@ -871,7 +871,7 @@ impl Onboarding {
         for (icon, title, body) in [
             (icons::LOCK, "Solo sul tuo computer", "La password resta nel portachiavi di sistema; l'archivio è cifrato a riposo."),
             (icons::SYNC, "Sincronizzazione onesta", "Postino dice quando è offline, quando aggiorna e quando l'ultima volta è andata bene."),
-            (icons::KEYBOARD, "Si usa da tastiera", "Invio continua, Esc torna indietro, Tab attraversa i campi."),
+            (icons::KEYBOARD, "Si usa da tastiera", "J/K naviga, Invio apre, E archivia, U segna come non letto; ? mostra tutte le scorciatoie."),
         ] {
             ui.horizontal(|ui| {
                 ui.label(icons::icon(icon, 18.0, t.gold_ink));
@@ -1204,11 +1204,11 @@ impl Onboarding {
                 let fraction = progress.fraction();
                 let label = if let Some(fraction) = fraction {
                     format!(
-                        "{:.0}% · {}/{} cartelle · {} messaggi",
+                        "{:.0}% · {}/{} cartelle · {}",
                         fraction * 100.0,
                         progress.folders_done,
                         progress.folders_total,
-                        progress.messages
+                        plural(progress.messages as usize, "messaggio", "messaggi")
                     )
                 } else {
                     "Connessione al server…".to_owned()
@@ -1246,14 +1246,12 @@ impl Onboarding {
         let account_id = self.account_id.clone();
         let mut left_action = None;
         let mut primary = false;
-        let mut sync_secondary = None;
         Sides::new().shrink_left().show(
             ui,
             |ui| {
                 ui.horizontal(|ui| {
-                    if stage != Stage::Welcome && !adding {
-                        let back_label = if stage == Stage::Sync { "Torna alla posta" } else { "Indietro" };
-                        let back = Button::ghost(back_label).icon(icons::ARROW_LEFT).size(ButtonSize::Sm).show(ui);
+                    if stage != Stage::Welcome && stage != Stage::Sync && !adding {
+                        let back = Button::ghost("Indietro").icon(icons::ARROW_LEFT).size(ButtonSize::Sm).show(ui);
                         if focus == Some(FocusField::Back) {
                             back.request_focus();
                         }
@@ -1262,6 +1260,21 @@ impl Onboarding {
                             if !matches!(next, Action::None) {
                                 left_action = Some(next);
                             }
+                        }
+                    }
+                    if stage == Stage::Sync && !adding {
+                        match &sync_stage {
+                            SyncStage::Running(_) => {
+                                if Button::ghost("Annulla sincronizzazione").size(ButtonSize::Sm).show(ui).clicked() {
+                                    left_action = Some(Action::CancelSync);
+                                }
+                            }
+                            SyncStage::Cancelled | SyncStage::Failed(_) => {
+                                if Button::ghost("Continua nella posta").size(ButtonSize::Sm).show(ui).clicked() {
+                                    left_action = account_id.clone().map(Action::Finish);
+                                }
+                            }
+                            SyncStage::Idle | SyncStage::Finished => {}
                         }
                     }
                     if mode == Mode::AddAccount && stage != Stage::Sync && !adding {
@@ -1287,25 +1300,10 @@ impl Onboarding {
                     if response.clicked() {
                         primary = true;
                     }
-                    if stage == Stage::Sync {
-                        match &sync_stage {
-                            SyncStage::Running(_) => {
-                                if Button::new("Annulla").show(ui).clicked() {
-                                    sync_secondary = Some(Action::CancelSync);
-                                }
-                            }
-                            SyncStage::Cancelled | SyncStage::Failed(_) => {
-                                if Button::ghost("Continua nella posta").show(ui).clicked() {
-                                    sync_secondary = account_id.clone().map(Action::Finish);
-                                }
-                            }
-                            SyncStage::Idle | SyncStage::Finished => {}
-                        }
-                    }
                 });
             },
         );
-        let mut action = left_action.or(sync_secondary);
+        let mut action = left_action;
         if self.confirm_back {
             ui.add_space(space::XS);
             ui.label(typography::text(Role::Meta, "I dati inseriti non saranno salvati. Premi di nuovo Esc o Indietro per uscire.", t.gold_ink));
@@ -1591,6 +1589,10 @@ pub fn classify_probe_error(error: SyncError, provider: ProviderChoice, host: &s
             focus: FocusField::Primary,
         },
     }
+}
+
+fn plural(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 { format!("1 {singular}") } else { format!("{count} {plural}") }
 }
 
 #[cfg(test)]
@@ -2013,6 +2015,49 @@ mod tests {
         onboarding.sync_finished();
         assert!(onboarding.password_is_empty());
         assert!(onboarding.sync_is_finished());
+    }
+
+    #[test]
+    fn the_sync_footer_has_one_primary_and_one_exit() {
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        let cases = [
+            (
+                SyncStage::Running(SyncProgress { folders_done: 1, folders_total: 3, messages: 4 }),
+                vec!["Annulla sincronizzazione", "Continua in background"],
+            ),
+            (SyncStage::Finished, vec!["Apri la posta"]),
+            (SyncStage::Failed("La sincronizzazione non è riuscita.".to_owned()), vec!["Riprova", "Continua nella posta"]),
+        ];
+        for (sync, expected) in cases {
+            let mut onboarding = Onboarding::screenshot(
+                Stage::Sync,
+                ProviderChoice::Aruba,
+                Some(preview_fixture()),
+                None,
+                Some(SyncProgress { folders_done: 1, folders_total: 3, messages: 4 }),
+            );
+            onboarding.sync = sync;
+            onboarding.focus = None;
+            let mut output = ctx.run_ui(RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() }, |ui| {
+                let _ = onboarding.show(ui, false, Vec::new());
+            });
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            output.textures_delta.clear();
+            for label in expected {
+                assert!(text.iter().any(|line| line == label), "missing {label:?} at Sync: {text:?}");
+            }
+            assert!(!text.iter().any(|line| line == "Torna alla posta"), "two Finish controls are still visible: {text:?}");
+        }
     }
 
     #[test]

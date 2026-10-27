@@ -223,7 +223,13 @@ impl<'a> Button<'a> {
             paint_right(ui, rect, right, &galley);
         }
 
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label));
+        response.widget_info(|| {
+            if self.selected {
+                WidgetInfo::selected(WidgetType::Button, self.enabled, true, self.label)
+            } else {
+                WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label)
+            }
+        });
 
         let mut tooltip = self.label.to_owned();
         if let Some(shortcut) = self.shortcut {
@@ -267,12 +273,23 @@ pub struct IconButton<'a> {
     accent: bool,
     enabled: bool,
     danger: bool,
+    disabled_reason: Option<&'a str>,
 }
 
 impl<'a> IconButton<'a> {
     #[must_use]
     pub fn new(icon: &'a str, label: &'a str) -> Self {
-        Self { icon, label, size: IconButtonSize::Md, selected: false, filled: false, accent: false, enabled: true, danger: false }
+        Self {
+            icon,
+            label,
+            size: IconButtonSize::Md,
+            selected: false,
+            filled: false,
+            accent: false,
+            enabled: true,
+            danger: false,
+            disabled_reason: None,
+        }
     }
 
     #[must_use]
@@ -310,6 +327,12 @@ impl<'a> IconButton<'a> {
     #[must_use]
     pub fn danger(mut self, danger: bool) -> Self {
         self.danger = danger;
+        self
+    }
+
+    #[must_use]
+    pub fn disabled_reason(mut self, reason: &'a str) -> Self {
+        self.disabled_reason = Some(reason);
         self
     }
 
@@ -363,15 +386,34 @@ impl<'a> IconButton<'a> {
         let pos = eframe::egui::pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5);
         ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
 
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label));
-        let response = response.on_hover_text(self.label);
-        if self.enabled { response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand) } else { response }
+        response.widget_info(|| {
+            if self.selected {
+                WidgetInfo::selected(WidgetType::Button, self.enabled, true, self.label)
+            } else {
+                WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label)
+            }
+        });
+        let mut tooltip = self.label.to_owned();
+        if !self.enabled
+            && let Some(reason) = self.disabled_reason
+        {
+            tooltip.push('\n');
+            tooltip.push_str(reason);
+        }
+        let response = response.on_hover_text(tooltip);
+        if self.enabled {
+            response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
+        } else {
+            response.on_hover_cursor(eframe::egui::CursorIcon::NotAllowed)
+        }
     }
 }
 
 fn paint_colors(kind: ButtonKind, t: &Tokens, enabled: bool, hovered: bool, pressed: bool) -> (Color32, Color32, Color32) {
     if !enabled {
-        return (t.panel_alt, t.border, t.text_faint);
+        // An unavailable control loses its surface entirely: a filled disabled button used to look
+        // like an ordinary secondary. The faint outline still says where the target is.
+        return (Color32::TRANSPARENT, t.border, t.text_faint);
     }
     match kind {
         ButtonKind::Primary => {

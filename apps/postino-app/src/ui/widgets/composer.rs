@@ -22,6 +22,11 @@ pub const AUTOSAVE_DELAY: f64 = 1.2;
 /// Shown next to the Send button: sending is real and the undo window is short. The text never
 /// claims a local-only move.
 pub const SEND_NOTICE: &str = "Invio reale via SMTP. Puoi annullare entro 5 secondi.";
+/// Why Send is unavailable for the demo. Shared by the button and Ctrl+Enter so both say the
+/// same sentence.
+pub const DEMO_SEND_REASON: &str = "La modalità demo non invia: usa un account reale con SMTP";
+/// Why Send is unavailable when a store account has no submission endpoint.
+pub const NO_SMTP_SEND_REASON: &str = "Questo account non ha un server SMTP: aggiungilo nelle impostazioni per inviare";
 
 /// Each composer gets a fresh text-edit id so undo history and cursor state cannot leak from a
 /// previous message.
@@ -453,7 +458,9 @@ impl<'a> Composer<'a> {
         ui.horizontal(|ui| {
             ui.add_sized([24.0, ui_size::CONTROL], egui::Label::new(typography::text(Role::Meta, label, t.text_faint)));
             let hide = matches!(field, ComposerFocus::Cc | ComposerFocus::Bcc);
-            let reserved = 76.0;
+            // The A row also carries the Cc and Bcc reveal buttons to its right. Reserving only
+            // their label width let the row grow past the 640 pt card and shifted the whole modal.
+            let reserved = 112.0;
             let field_response = TextField::new(text, hint)
                 .id_salt(salt)
                 .icon(icon)
@@ -647,111 +654,109 @@ impl<'a> Composer<'a> {
 
     fn footer(&mut self, ui: &mut Ui, t: &Tokens, rect: Rect, addresses_ok: bool, send_ready: bool, response: &mut ComposerResponse) {
         ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, t.border));
-        let row_rect = Rect::from_min_size(pos2(rect.min.x, rect.top() + space::MD), Vec2::new(rect.width(), ui_size::CONTROL_LG));
-        ui.scope_builder(UiBuilder::new().max_rect(row_rect), |ui| {
-            Sides::new().height(ui_size::CONTROL_LG).show(
-                ui,
-                |ui| {
-                    let (text, color) = if let Some(error) = &self.state.save_error {
-                        (format!("Bozza non salvata · {error}"), t.danger)
-                    } else if self.state.dirty {
-                        ("Salvataggio automatico in corso…".to_owned(), t.text_faint)
-                    } else if let Some(at) = &self.state.saved_at {
-                        (format!("Bozza salvata alle {at}"), t.success)
-                    } else {
-                        ("La bozza si salva da sola".to_owned(), t.text_faint)
-                    };
-                    ui.horizontal(|ui| {
-                        let attach_reason = if self.attachments_available {
-                            "Scegli uno o più file da allegare"
-                        } else if self.demo {
-                            "La modalità demo non ha un archivio locale: gli allegati reali richiedono un account"
-                        } else {
-                            "Questo account non ha un archivio locale: riapri Postino su un archivio per allegare file"
-                        };
-                        let attach = Button::new("Allega file")
-                            .icon(icons::PAPERCLIP)
-                            .size(ButtonSize::Sm)
-                            .enabled(self.attachments_available)
-                            .disabled_reason(attach_reason)
-                            .show(ui);
-                        #[cfg(test)]
-                        crate::app::probe::composer_attach(ui, attach.rect, self.attachments_available);
-                        #[cfg(test)]
-                        crate::app::probe::composer_attach_id(ui, attach.id);
-                        #[cfg(test)]
-                        crate::app::probe::composer_attach_clicked(ui, attach.clicked());
-                        if attach.clicked() {
-                            response.pick_files = true;
-                        }
-                        ui.add(egui::Label::new(typography::text(Role::Caption, text, color)).truncate());
-                        if !self.state.attachments.is_empty() {
-                            let total = self.state.attachments.iter().map(|attachment| attachment.size).sum::<u64>();
-                            ui.label(typography::mono(
-                                format!("· {} · {}", plural_attachments(self.state.attachments.len()), format_size_it(total)),
-                                9.5,
-                                t.text_faint,
-                            ));
-                        }
-                    });
-                },
-                |ui| {
-                    let send_reason = if !self.send_available && self.demo {
-                        "La modalità demo non invia: usa un account reale con SMTP"
-                    } else if !self.send_available {
-                        "Questo account non ha un server SMTP: aggiungilo nelle impostazioni per inviare"
-                    } else if !addresses_ok {
-                        "Controlla gli indirizzi: c'è un destinatario non valido"
-                    } else if !send_ready {
-                        "Aggiungi almeno un destinatario"
-                    } else {
-                        ""
-                    };
-                    let send_label = "Invia";
-                    let send = Button::primary(send_label)
-                        .icon(icons::SEND)
-                        .shortcut("Ctrl+Invio")
-                        .enabled(send_ready && self.send_available)
-                        .disabled_reason(send_reason)
-                        .show(ui);
-                    #[cfg(test)]
-                    crate::app::probe::composer_send(ui, send.rect);
-                    if send.clicked() {
-                        response.send = true;
-                    }
-                    ui.add_space(space::XS);
-                    let notice_text = if self.send_available {
-                        SEND_NOTICE
-                    } else if self.demo {
-                        "Demo: nessun messaggio lascia il computer."
-                    } else {
-                        "Nessun server SMTP configurato: questo account può solo ricevere."
-                    };
-                    let notice = IconButton::new(icons::INFO, notice_text).size(IconButtonSize::Sm).show(ui);
-                    #[cfg(test)]
-                    probe::send_notice(notice_text, notice.rect);
-                    #[cfg(not(test))]
-                    let _ = notice;
-                    ui.add_space(space::XS);
-                    if Button::new("Salva bozza")
-                        .icon(icons::SAVE)
-                        .size(ButtonSize::Sm)
-                        .enabled(addresses_ok)
-                        .disabled_reason("Controlla gli indirizzi: c'è un destinatario non valido")
-                        .show(ui)
-                        .clicked()
-                    {
-                        response.save = true;
-                    }
-                    ui.add_space(space::XS);
-                    let discard = Button::ghost("Scarta").size(ButtonSize::Sm).show(ui);
-                    #[cfg(test)]
-                    crate::app::probe::composer_cancel(ui, discard.rect);
-                    if discard.clicked() {
-                        response.discard = true;
-                    }
-                },
-            );
+        let notice_text = self.state.notice.as_deref().unwrap_or(if self.send_available {
+            SEND_NOTICE
+        } else if self.demo {
+            "Demo: nessun messaggio lascia il computer."
+        } else {
+            "Nessun server SMTP configurato: questo account può solo ricevere."
+        });
+        let notice_rect = Rect::from_min_size(pos2(rect.min.x, rect.top() + space::XS), Vec2::new(rect.width(), 14.0));
+        ui.scope_builder(UiBuilder::new().max_rect(notice_rect), |ui| {
+            let notice = ui.add(egui::Label::new(typography::text(Role::Caption, notice_text, t.text_muted)).truncate());
+            #[cfg(test)]
+            probe::send_notice(notice_text, notice.rect);
+            #[cfg(not(test))]
+            let _ = notice;
+        });
+        let row_rect = Rect::from_min_size(pos2(rect.min.x, notice_rect.bottom() + space::XS), Vec2::new(rect.width(), ui_size::CONTROL_LG));
+        // Two explicit columns. A `Sides` row lets the left group grow under the actions when the
+        // draft state is long; the footer then widens the whole card. The left column always ends
+        // before the right one, so the saved state truncates and Send stays visible.
+        let right_width = 350.0_f32.min(row_rect.width() * 0.62);
+        let right_rect = Rect::from_min_max(pos2(row_rect.right() - right_width, row_rect.top()), row_rect.max);
+        let left_rect = Rect::from_min_max(row_rect.min, pos2(row_rect.right() - right_width - space::SM, row_rect.bottom()));
+        ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
+            let (text, color) = if let Some(error) = &self.state.save_error {
+                (format!("Bozza non salvata · {error}"), t.danger)
+            } else if self.state.dirty {
+                ("Salvataggio automatico in corso…".to_owned(), t.text_faint)
+            } else if let Some(at) = &self.state.saved_at {
+                (format!("Bozza salvata alle {at}"), t.success)
+            } else {
+                ("La bozza si salva da sola".to_owned(), t.text_faint)
+            };
+            let attach_reason = if self.attachments_available {
+                "Scegli uno o più file da allegare"
+            } else if self.demo {
+                "La modalità demo non ha un archivio locale: gli allegati reali richiedono un account"
+            } else {
+                "Questo account non ha un archivio locale: riapri Postino su un archivio per allegare file"
+            };
+            let attach = Button::new("Allega file")
+                .icon(icons::PAPERCLIP)
+                .size(ButtonSize::Sm)
+                .enabled(self.attachments_available)
+                .disabled_reason(attach_reason)
+                .show(ui);
+            #[cfg(test)]
+            crate::app::probe::composer_attach(ui, attach.rect, self.attachments_available);
+            #[cfg(test)]
+            crate::app::probe::composer_attach_id(ui, attach.id);
+            #[cfg(test)]
+            crate::app::probe::composer_attach_clicked(ui, attach.clicked());
+            if attach.clicked() {
+                response.pick_files = true;
+            }
+            let remaining = ui.available_width().max(0.0);
+            let state = ui.add_sized([remaining, ui_size::CONTROL_LG], egui::Label::new(typography::text(Role::Caption, text, color)).truncate());
+            #[cfg(test)]
+            crate::app::probe::composer_footer_state(ui, state.rect);
+            #[cfg(not(test))]
+            let _ = state;
+        });
+        ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
+            let send_reason = if !self.send_available && self.demo {
+                DEMO_SEND_REASON
+            } else if !self.send_available {
+                NO_SMTP_SEND_REASON
+            } else if !addresses_ok {
+                "Controlla gli indirizzi: c'è un destinatario non valido"
+            } else if !send_ready {
+                "Aggiungi almeno un destinatario"
+            } else {
+                ""
+            };
+            let send_label = "Invia";
+            let send = Button::primary(send_label)
+                .icon(icons::SEND)
+                .shortcut("Ctrl+Invio")
+                .enabled(send_ready && self.send_available)
+                .disabled_reason(send_reason)
+                .show(ui);
+            #[cfg(test)]
+            crate::app::probe::composer_send(ui, send.rect);
+            if send.clicked() {
+                response.send = true;
+            }
+            ui.add_space(space::XS);
+            if Button::new("Salva bozza")
+                .icon(icons::SAVE)
+                .size(ButtonSize::Sm)
+                .enabled(addresses_ok)
+                .disabled_reason("Controlla gli indirizzi: c'è un destinatario non valido")
+                .show(ui)
+                .clicked()
+            {
+                response.save = true;
+            }
+            ui.add_space(space::XS);
+            let discard = Button::ghost("Scarta").size(ButtonSize::Sm).show(ui);
+            #[cfg(test)]
+            crate::app::probe::composer_cancel(ui, discard.rect);
+            if discard.clicked() {
+                response.discard = true;
+            }
         });
     }
 }
@@ -825,17 +830,17 @@ mod probe {
     use eframe::egui::Rect;
 
     thread_local! {
-        static SEND_NOTICE: RefCell<Option<(&'static str, Rect)>> = const { RefCell::new(None) };
+        static SEND_NOTICE: RefCell<Option<(String, Rect)>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn send_notice(text: &'static str, rect: Rect) {
+    pub(super) fn send_notice(text: &str, rect: Rect) {
         SEND_NOTICE.with(|slot| {
-            *slot.borrow_mut() = Some((text, rect));
+            *slot.borrow_mut() = Some((text.to_owned(), rect));
         });
     }
 
-    pub(super) fn take_send_notice() -> Option<(&'static str, Rect)> {
-        SEND_NOTICE.with(|slot| *slot.borrow())
+    pub(super) fn take_send_notice() -> Option<(String, Rect)> {
+        SEND_NOTICE.with(|slot| slot.borrow().clone())
     }
 
     pub(super) fn clear() {

@@ -61,7 +61,7 @@ impl<'a> Chip<'a> {
         let mark_width = if self.icon.is_some() || self.dot.is_some() { 12.0 + space::SM } else { 0.0 };
         let count_width = self.count.map_or(0.0, |count| space::SM + layout(ui, &count.to_string(), &count_font, t.text).size().x);
         let width = space::LG + mark_width + label_width + count_width + space::LG;
-        let height = 24.0;
+        let height = tokens::size::CONTROL_SM;
 
         let sense = if self.enabled { Sense::click() } else { Sense::hover() };
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), sense);
@@ -102,7 +102,13 @@ impl<'a> Chip<'a> {
             paint_right(ui, rect, rect.right() - space::LG, &galley);
         }
 
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label));
+        response.widget_info(|| {
+            if self.selected {
+                WidgetInfo::selected(WidgetType::Button, self.enabled, true, self.label)
+            } else {
+                WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label)
+            }
+        });
         let response = response.on_hover_text(self.label);
         if self.enabled { response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand) } else { response }
     }

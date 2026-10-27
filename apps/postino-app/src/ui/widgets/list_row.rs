@@ -11,6 +11,8 @@ use crate::ui::widgets::{layout, paint_left, paint_right};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListRowKind {
     Message,
+    /// A conversation row: two text lines, unread dot, star state, no avatar.
+    Thread,
     Folder,
     /// A two-line account block with no unread dot, star or avatar.
     Account,
@@ -89,6 +91,26 @@ impl<'a> ListRow<'a> {
             show_avatar: false,
             height: 40.0,
             kind: ListRowKind::Account,
+        }
+    }
+
+    /// A conversation row: subject, participants/counts, date, unread dot and a star state.
+    #[must_use]
+    pub fn thread(title: &'a str, subtitle: &'a str, meta: &'a str) -> Self {
+        Self {
+            title,
+            subtitle,
+            meta,
+            initials: "",
+            leading_icon: None,
+            dot: None,
+            unread: false,
+            starred: false,
+            selected: false,
+            focused: false,
+            show_avatar: false,
+            height: 48.0,
+            kind: ListRowKind::Thread,
         }
     }
 
@@ -187,28 +209,28 @@ impl<'a> ListRow<'a> {
                 cursor += 15.0 + space::SM;
             }
         }
-        if self.kind == ListRowKind::Message {
+        if self.kind == ListRowKind::Message || self.kind == ListRowKind::Thread {
             if self.unread {
                 // The 3 pt dot is the only unread cue on a light row: gold ink, not the decorative
                 // gold, because 1.55:1 is invisible. On the forest selection the light gold returns.
                 ui.painter().circle_filled(pos2(cursor + 3.0, rect.center().y), 3.0, if selected { t.gold } else { t.gold_ink });
             }
             cursor += 12.0;
-            if self.show_avatar {
-                let avatar = eframe::egui::Rect::from_center_size(pos2(cursor + 12.0, rect.center().y), Vec2::splat(24.0));
-                ui.painter().circle_filled(avatar.center(), 12.0, if selected { t.gold } else { t.panel_alt });
-                let initials_font = FontId::new(type_size::CAPTION, theme::medium());
-                let galley = layout(ui, self.initials, &initials_font, if selected { tokens::FOREST } else { t.text });
-                ui.painter().galley(
-                    pos2(avatar.center().x - galley.size().x * 0.5, avatar.center().y - galley.size().y * 0.5),
-                    galley,
-                    Color32::PLACEHOLDER,
-                );
-                cursor += 24.0 + space::MD;
-            }
+        }
+        if self.kind == ListRowKind::Message && self.show_avatar {
+            let avatar = eframe::egui::Rect::from_center_size(pos2(cursor + 12.0, rect.center().y), Vec2::splat(24.0));
+            ui.painter().circle_filled(avatar.center(), 12.0, if selected { t.gold } else { t.panel_alt });
+            let initials_font = FontId::new(type_size::CAPTION, theme::medium());
+            let galley = layout(ui, self.initials, &initials_font, if selected { tokens::FOREST } else { t.text });
+            ui.painter().galley(
+                pos2(avatar.center().x - galley.size().x * 0.5, avatar.center().y - galley.size().y * 0.5),
+                galley,
+                Color32::PLACEHOLDER,
+            );
+            cursor += 24.0 + space::MD;
         }
 
-        let star_width = if self.kind == ListRowKind::Message { 20.0 + space::MD } else { 0.0 };
+        let star_width = if matches!(self.kind, ListRowKind::Message | ListRowKind::Thread) { 20.0 + space::MD } else { 0.0 };
         let meta_width =
             if self.meta.is_empty() { 0.0 } else { layout(ui, self.meta, &FontId::new(type_size::CAPTION, FontFamily::Monospace), faint).size().x };
         let text_right = rect.right() - space::LG - star_width - meta_width - if self.meta.is_empty() { 0.0 } else { space::MD };
@@ -229,7 +251,8 @@ impl<'a> ListRow<'a> {
         let subtitle = eframe::egui::WidgetText::from(eframe::egui::RichText::new(self.subtitle).font(subtitle_font.clone()).color(muted))
             .into_galley(ui, Some(TextWrapMode::Truncate), subtitle_width, subtitle_font.clone());
 
-        let (title_top, subtitle_top) = if self.kind == ListRowKind::Message || self.kind == ListRowKind::Account {
+        let two_lines = matches!(self.kind, ListRowKind::Message | ListRowKind::Thread | ListRowKind::Account);
+        let (title_top, subtitle_top) = if two_lines {
             let total = title.size().y + 2.0 + subtitle.size().y;
             let top = rect.center().y - total * 0.5;
             (top, top + title.size().y + 2.0)
@@ -237,7 +260,7 @@ impl<'a> ListRow<'a> {
             (rect.center().y - title.size().y * 0.5, rect.center().y)
         };
         let title_height = title.size().y;
-        if self.kind == ListRowKind::Message || self.kind == ListRowKind::Account {
+        if two_lines {
             ui.painter().galley(pos2(cursor, title_top), title.clone(), Color32::PLACEHOLDER);
             ui.painter().galley(pos2(cursor, subtitle_top), subtitle, Color32::PLACEHOLDER);
         } else {
@@ -256,7 +279,7 @@ impl<'a> ListRow<'a> {
                 paint_right(ui, rect, rect.right() - space::LG - star_width, &galley);
             }
         }
-        if self.kind == ListRowKind::Message {
+        if matches!(self.kind, ListRowKind::Message | ListRowKind::Thread) {
             let star_color = if self.starred {
                 if selected { t.gold } else { t.gold_ink }
             } else if selected {

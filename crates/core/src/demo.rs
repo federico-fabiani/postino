@@ -145,7 +145,7 @@ pub fn seed_at(now: DateTime<Utc>) -> Engine {
         now - Duration::days(1) - Duration::hours(2),
         true,
         false,
-        "Le novità di settembre\n\nQuesta è una newsletter sintetica con HTML. Nella modalità M0 il corpo viene mostrato come testo; il renderer HTML arriverà più avanti.\n\n• Nuovi strumenti per il colore\n• Miglioramenti al motore di rendering\n• Una community che cresce\n\nLeggi tutto sul sito.",
+        "Le novità di settembre\n\nQuesta è una newsletter sintetica con HTML. In questa versione il corpo viene mostrato come testo; il rendering HTML arriverà con il visualizzatore isolato.\n\n• Nuovi strumenti per il colore\n• Miglioramenti al motore di rendering\n• Una community che cresce\n\nLeggi tutto sul sito.",
     );
     newsletter.body_html = Some(
         "<h1>Le novità di settembre</h1><p>Questa è una newsletter sintetica con HTML.</p><ul><li>Nuovi strumenti per il colore</li><li>Miglioramenti al motore di rendering</li></ul>"

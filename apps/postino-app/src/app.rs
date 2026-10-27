@@ -39,8 +39,8 @@ use crate::ui::typography::{self, Role};
 #[cfg(test)]
 use crate::ui::widgets::ComposerFocus;
 use crate::ui::widgets::{
-    AUTOSAVE_DELAY, Badge, BadgeKind, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerState, Dialog, EmptyState, IconButton, IconButtonSize,
-    ListRow, Menu, MenuItem, SearchField, SectionHeader, TextField, Toast, ToastKind, ToastResult,
+    AUTOSAVE_DELAY, Badge, BadgeKind, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerState, DEMO_SEND_REASON, Dialog, EmptyState,
+    IconButton, IconButtonSize, ListRow, Menu, MenuItem, NO_SMTP_SEND_REASON, SearchField, SectionHeader, TextField, Toast, ToastKind, ToastResult,
 };
 
 /// The shell scenes `--screenshot` can render. Add a label here and a branch in
@@ -169,6 +169,8 @@ const AVATAR_MIN_LIST_WIDTH: f32 = 720.0;
 /// declared minimum window and a card that does not touch the status bar.
 const COMPOSER_CARD_MIN_WIDTH: f32 = 1000.0;
 const COMPOSER_CARD_MIN_HEIGHT: f32 = 700.0;
+/// The reading body keeps at least this much room when an attachment strip shares the pane.
+const READING_BODY_MIN: f32 = 48.0;
 /// `label_apply` accepts at most 500 ids per call; undoing a delete restores in these batches.
 const LABEL_APPLY_CHUNK: usize = 500;
 
@@ -181,6 +183,9 @@ pub struct PostinoApp {
     /// post-sync reload use this handle; a demo session has none.
     store: Option<StoreHandle>,
     store_path: Option<PathBuf>,
+    /// The store handle a demo opened from onboarding or recovery can return to. `None` for a
+    /// real `--demo` launch and after the user has left the demo.
+    demo_return: Option<StoreHandle>,
     /// True for the synthetic mailbox, including a screenshot that seeds the store UI.
     demo: bool,
     /// The command line choice, so the recovery screen can retry the same store.
@@ -463,6 +468,7 @@ impl PostinoApp {
             active_account,
             store,
             store_path,
+            demo_return: None,
             demo,
             launch,
             boot_failure,
@@ -876,17 +882,15 @@ impl PostinoApp {
             }
             ScreenshotState::Search => {
                 self.query = "from:giulia is:unread".to_owned();
-                self.search_committed = self.query.clone();
-                self.search_debounce_until = None;
-                self.list_cache = None;
+                self.recording_recent = false;
+                self.commit_search();
                 self.status.clear();
             }
             ScreenshotState::SearchError => {
                 self.query = "subject:\"unclosed".to_owned();
-                self.search_committed = self.query.clone();
-                self.search_debounce_until = None;
+                self.recording_recent = false;
+                self.commit_search();
                 self.search_error = Some(("unclosed_quote".to_owned(), 8));
-                self.list_cache = None;
                 self.status.clear();
             }
             ScreenshotState::Threads => {
@@ -1145,6 +1149,13 @@ impl PostinoApp {
         !self.demo && (self.store.is_some() || self.screenshot.is_some())
     }
 
+    /// A demo opened from first-run onboarding or from the boot-recovery card is a detour, not a
+    /// final choice: the original store is still reachable. A real `--demo` launch has no archive
+    /// to return to, so it does not advertise one.
+    fn demo_can_return(&self) -> bool {
+        self.demo && self.launch != Launch::Demo
+    }
+
     fn sync_ready(&self) -> bool {
         !self.demo && (self.store.is_some() || self.screenshot.is_some()) && self.active_account.is_some()
     }
@@ -1227,7 +1238,10 @@ impl PostinoApp {
                     let last = self.last_sync.or_else(|| Some(self.now_utc.timestamp_millis()));
                     self.last_sync = last;
                     self.sync_view = SyncView::Idle { last_sync: last };
-                    self.status = format!("Sincronizzazione completata · {} messaggi aggiornati", report.fetched);
+                    self.status = format!(
+                        "Sincronizzazione completata · {}",
+                        plural(usize::try_from(report.fetched).unwrap_or(usize::MAX), "messaggio aggiornato", "messaggi aggiornati")
+                    );
                     if let Some(onboarding) = self.onboarding.as_mut() {
                         onboarding.sync_finished();
                     }
@@ -1522,6 +1536,12 @@ impl PostinoApp {
 
     fn open_demo(&mut self) {
         self.stop_sync_worker();
+        if !self.demo {
+            // Keep the handle the store launch already opened. Leaving the demo then reopens the
+            // archive without asking the keyring again; the recovery path, which never had a
+            // handle, falls back to a full boot retry.
+            self.demo_return = self.store.take();
+        }
         self.engine = Engine::demo_at(self.now_utc);
         self.demo = true;
         self.store = None;
@@ -1561,18 +1581,46 @@ impl PostinoApp {
         self.persist_settings();
     }
 
+    fn adopt_booted(&mut self, booted: boot::Booted, launch: Launch) {
+        let replacement = Self::from_booted(booted, self.custom_chrome, self.now_utc, launch, self.extra_roots.clone());
+        let settings_path = self.settings_path.clone();
+        let settings = self.settings_snapshot();
+        *self = replacement;
+        self.settings_path = settings_path;
+        self.apply_settings(settings);
+    }
+
     fn retry_boot(&mut self) {
         let launch = self.launch.clone();
         match boot::boot(launch.clone(), boot::KeySource::Keyring, self.now_utc) {
-            Ok(booted) => {
-                let replacement = Self::from_booted(booted, self.custom_chrome, self.now_utc, launch, self.extra_roots.clone());
-                let settings_path = self.settings_path.clone();
-                let settings = self.settings_snapshot();
-                *self = replacement;
+            Ok(booted) => self.adopt_booted(booted, launch),
+            Err(failure) => self.boot_failure = Some(failure),
+        }
+    }
+
+    /// Leave the synthetic mailbox and go back to the archive the session was launched with.
+    /// The first-run welcome and the boot-recovery card both offer the demo; neither may become a
+    /// one-way door. A real `--demo` launch has no archive and therefore no visible exit.
+    fn leave_demo(&mut self) {
+        if !self.demo_can_return() {
+            return;
+        }
+        let launch = self.launch.clone();
+        let settings_path = self.settings_path.clone();
+        let settings = self.settings_snapshot();
+        let reopened = self.demo_return.take().and_then(|store| match store.open_engine() {
+            Ok(engine) => Some(boot::Booted { engine, store: Some(store), demo: false }),
+            Err(_) => None,
+        });
+        match reopened {
+            Some(booted) => {
+                *self = Self::from_booted(booted, self.custom_chrome, self.now_utc, launch, self.extra_roots.clone());
                 self.settings_path = settings_path;
                 self.apply_settings(settings);
             }
-            Err(failure) => self.boot_failure = Some(failure),
+            // Recovery never had a handle to keep: re-run the original boot, which also re-reads
+            // the keyring and may now succeed.
+            None => self.retry_boot(),
         }
     }
 
@@ -1659,7 +1707,12 @@ impl PostinoApp {
         }
         match &self.sync_view {
             SyncView::Running(progress) => Some(if progress.folders_total > 0 {
-                format!("Sincronizzazione… {}/{} cartelle · {} messaggi", progress.folders_done, progress.folders_total, progress.messages)
+                format!(
+                    "Sincronizzazione… {}/{} cartelle · {}",
+                    progress.folders_done,
+                    progress.folders_total,
+                    plural(usize::try_from(progress.messages).unwrap_or(usize::MAX), "messaggio", "messaggi")
+                )
             } else {
                 "Sincronizzazione…".to_owned()
             }),
@@ -1761,8 +1814,17 @@ impl PostinoApp {
     /// filter produced the result. Each branch offers at most two ways out, and every action changes
     /// something visible.
     fn empty_view(&self, label_name: Option<&str>, label_scope: Option<&str>) -> EmptyView {
+        self.empty_view_in(label_name, label_scope, false)
+    }
+
+    /// The same resolver for the threaded default: only the nouns and the folder sentence change,
+    /// so unread/attachments/label/search keep their "Mostra tutti"/"Togli filtro" way out.
+    fn empty_view_in(&self, label_name: Option<&str>, label_scope: Option<&str>, threads: bool) -> EmptyView {
         let query = self.query.trim();
         let scope = label_scope.unwrap_or("in questa cartella");
+        let any = if threads { "Nessuna conversazione" } else { "Nessun messaggio" };
+        let unread_title = if threads { "Nessuna conversazione non letta" } else { "Nessun messaggio non letto" };
+        let attachments_title = if threads { "Nessuna conversazione con allegati" } else { "Nessun messaggio con allegati" };
         if !query.is_empty() {
             let search_scope = match (label_name, label_scope) {
                 (Some(name), Some(folder)) if folder != "in tutte le cartelle" => format!("nell'etichetta “{name}” {folder}"),
@@ -1771,10 +1833,15 @@ impl PostinoApp {
             };
             let primary = ("Cancella ricerca", EmptyAction::ClearSearch);
             let secondary = label_name.map(|_| ("Togli filtro etichetta", EmptyAction::ClearLabel));
+            let body = if threads {
+                format!("Nessuna conversazione corrisponde a “{query}” {search_scope}.")
+            } else {
+                format!("Nessun messaggio corrisponde a “{query}” {search_scope}.")
+            };
             return EmptyView {
                 icon: icons::SEARCH,
-                title: "Nessun risultato".to_owned(),
-                body: format!("Nessun messaggio corrisponde a “{query}” {search_scope}."),
+                title: if threads { "Nessuna conversazione" } else { "Nessun risultato" }.to_owned(),
+                body,
                 primary: Some(primary),
                 secondary,
             };
@@ -1783,8 +1850,11 @@ impl PostinoApp {
             if self.unread_only {
                 return EmptyView {
                     icon: icons::MARK_UNREAD,
-                    title: format!("Nessun messaggio non letto con l'etichetta “{name}”"),
-                    body: format!("Nessun messaggio non letto con l'etichetta “{name}” {scope}."),
+                    title: format!("{unread_title} con l'etichetta “{name}”"),
+                    body: format!(
+                        "{} con l'etichetta “{name}” {scope}.",
+                        if threads { "Nessuna conversazione non letta" } else { "Nessun messaggio non letto" }
+                    ),
                     primary: Some(("Togli filtro “non letti”", EmptyAction::ClearUnread)),
                     secondary: None,
                 };
@@ -1792,16 +1862,19 @@ impl PostinoApp {
             if self.attachments_only {
                 return EmptyView {
                     icon: icons::PAPERCLIP,
-                    title: "Nessun messaggio con allegati".to_owned(),
-                    body: format!("Nessun messaggio con allegati ha l'etichetta “{name}” {scope}."),
+                    title: attachments_title.to_owned(),
+                    body: format!(
+                        "{} con l'etichetta “{name}” {scope}.",
+                        if threads { "Nessuna conversazione con allegati" } else { "Nessun messaggio con allegati" }
+                    ),
                     primary: Some(("Togli filtro “allegati”", EmptyAction::ClearAttachments)),
                     secondary: Some(("Togli filtro etichetta", EmptyAction::ClearLabel)),
                 };
             }
             return EmptyView {
                 icon: icons::TAG,
-                title: "Nessun messaggio".to_owned(),
-                body: format!("Nessun messaggio con l'etichetta “{name}” {scope}."),
+                title: any.to_owned(),
+                body: format!("{any} con l'etichetta “{name}” {scope}."),
                 primary: Some(("Togli filtro etichetta", EmptyAction::ClearLabel)),
                 secondary: Some(("Mostra tutti", EmptyAction::ShowAll)),
             };
@@ -1809,8 +1882,12 @@ impl PostinoApp {
         if self.unread_only {
             return EmptyView {
                 icon: icons::MARK_UNREAD,
-                title: "Nessun messaggio non letto".to_owned(),
-                body: "In questa cartella non ci sono messaggi non letti.".to_owned(),
+                title: unread_title.to_owned(),
+                body: if threads {
+                    "In questa cartella non ci sono conversazioni non lette.".to_owned()
+                } else {
+                    "In questa cartella non ci sono messaggi non letti.".to_owned()
+                },
                 primary: Some(("Mostra tutti", EmptyAction::ShowAll)),
                 secondary: None,
             };
@@ -1818,8 +1895,12 @@ impl PostinoApp {
         if self.attachments_only {
             return EmptyView {
                 icon: icons::PAPERCLIP,
-                title: "Nessun messaggio con allegati".to_owned(),
-                body: "In questa cartella non ci sono messaggi con allegati.".to_owned(),
+                title: attachments_title.to_owned(),
+                body: if threads {
+                    "In questa cartella non ci sono conversazioni con allegati.".to_owned()
+                } else {
+                    "In questa cartella non ci sono messaggi con allegati.".to_owned()
+                },
                 primary: Some(("Mostra tutti", EmptyAction::ShowAll)),
                 secondary: None,
             };
@@ -1836,16 +1917,16 @@ impl PostinoApp {
         if self.folder_kind(&self.folder) == Some(FolderKind::Inbox) {
             return EmptyView {
                 icon: icons::INBOX,
-                title: "Nessun messaggio".to_owned(),
-                body: "La posta in arrivo è vuota.".to_owned(),
+                title: any.to_owned(),
+                body: if threads { "La posta in arrivo non ha conversazioni." } else { "La posta in arrivo è vuota." }.to_owned(),
                 primary: None,
                 secondary: None,
             };
         }
         EmptyView {
             icon: icons::INBOX,
-            title: "Nessun messaggio".to_owned(),
-            body: "Questa cartella è vuota.".to_owned(),
+            title: any.to_owned(),
+            body: if threads { "Questa cartella non ha conversazioni." } else { "Questa cartella è vuota." }.to_owned(),
             primary: self.folder_for_kind(FolderKind::Inbox).is_some().then_some(("Vai a Posta in arrivo", EmptyAction::Inbox)),
             secondary: None,
         }
@@ -2338,6 +2419,22 @@ impl PostinoApp {
 
     fn thread_all_ids(&mut self) -> Result<Vec<String>, String> {
         Ok(self.thread_all_messages()?.into_iter().map(|message| message.id).collect())
+    }
+
+    /// A single-message flag can change the open conversation's unread/star totals. Refresh the
+    /// banner and the loaded cards from the engine instead of leaving the cached summary stale.
+    fn refresh_open_thread(&mut self) {
+        let Some(id) = self.selected_thread.clone() else { return };
+        let account = self.active_account.clone();
+        let offset = self.thread_offset;
+        if let Ok(value) = self.engine.call("thread_get", json!({ "id": id, "account": account, "limit": 200, "offset": offset }))
+            && let Ok(detail) = serde_json::from_value::<ThreadGetResult>(value)
+        {
+            self.thread_summary = Some(detail.thread);
+            self.thread_messages = detail.messages;
+            self.thread_total = detail.total;
+            self.threads_cache = None;
+        }
     }
 
     fn set_thread_flag(&mut self, unread: Option<bool>, starred: Option<bool>) {
@@ -3123,12 +3220,13 @@ impl PostinoApp {
         let message = if changes.len() == 1 {
             if starred { "Stella aggiunta" } else { "Stella rimossa" }.to_owned()
         } else if starred {
-            format!("Stella aggiunta a {} messaggi", changes.len())
+            format!("Stella aggiunta a {}", plural(changes.len(), "messaggio", "messaggi"))
         } else {
-            format!("Stella rimossa da {} messaggi", changes.len())
+            format!("Stella rimossa da {}", plural(changes.len(), "messaggio", "messaggi"))
         };
         self.status = message.clone();
         self.push_toast(message, UndoAction::Starred(changes));
+        self.refresh_open_thread();
     }
 
     fn toggle_read(&mut self) {
@@ -3176,13 +3274,14 @@ impl PostinoApp {
         let message = if changes.len() == 1 {
             if unread { "Messaggio non letto" } else { "Messaggio letto" }.to_owned()
         } else if unread {
-            format!("{} messaggi segnati come non letti", changes.len())
+            format!("{} segnati come non letti", plural(changes.len(), "messaggio", "messaggi"))
         } else {
-            format!("{} messaggi segnati come letti", changes.len())
+            format!("{} segnati come letti", plural(changes.len(), "messaggio", "messaggi"))
         };
         self.status = message.clone();
         self.push_toast(message, UndoAction::Unread(changes));
         self.refresh_labels();
+        self.refresh_open_thread();
     }
 
     fn mark_read_after_delay(&mut self, id: &str) {
@@ -3305,6 +3404,7 @@ impl PostinoApp {
             self.report_failure("Non è stato possibile annullare l'azione.", false);
         } else {
             self.refresh_labels();
+            self.refresh_open_thread();
             self.status = "Annullato".to_owned();
         }
     }
@@ -3652,6 +3752,44 @@ impl PostinoApp {
         if let Some(previous) = self.threads_view_before_search.take() {
             self.threads_view = previous;
         }
+        // A flat search hit is still the open message when the folder returns to conversations:
+        // select its thread and load the page so the row highlight and the pane agree. Without
+        // this the next J/K jumps to the first conversation and the open hit has no row.
+        if self.threads_view && self.reading_open {
+            self.select_open_message_thread();
+        }
+    }
+
+    fn select_open_message_thread(&mut self) {
+        let Some(open_id) = self.selected.clone() else { return };
+        let Some(thread_id) = self.engine.message(&open_id).map(|message| message.summary.thread_id.clone()) else { return };
+        if self.selected_thread.as_deref() == Some(thread_id.as_str()) {
+            return;
+        }
+        let account = self.active_account.clone();
+        let summary = match self.engine.call("thread_get", json!({ "id": thread_id, "account": account, "limit": 1, "offset": 0 })) {
+            Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
+                Ok(detail) => detail,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let start = summary.total.saturating_sub(200);
+        let page = match self.engine.call("thread_get", json!({ "id": summary.resolved_id, "account": account, "limit": 200, "offset": start })) {
+            Ok(value) => match serde_json::from_value::<ThreadGetResult>(value) {
+                Ok(detail) => detail,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        self.selected_thread = Some(page.resolved_id.clone());
+        self.thread_summary = Some(page.thread);
+        self.thread_messages = page.messages;
+        self.thread_total = page.total;
+        self.thread_offset = start.min(page.total);
+        self.thread_open = Some(open_id.clone());
+        self.select_only(open_id);
+        self.threads_cache = None;
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -4204,6 +4342,9 @@ impl PostinoApp {
         // account without an SMTP endpoint has no path to a submission, so the shortcut must not
         // attempt one and fail later.
         if !self.send_allowed_for_active_account() {
+            let reason = if self.demo { DEMO_SEND_REASON } else { NO_SMTP_SEND_REASON };
+            self.composer.notice = Some(reason.to_owned());
+            self.status = reason.to_owned();
             return;
         }
         if !self.save_composer(true) {
@@ -4643,7 +4784,10 @@ impl PostinoApp {
         let Some(failure) = self.boot_failure.clone() else {
             return;
         };
-        let enter = ui.ctx().input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+        // Enter retries only when no control owns the keyboard; otherwise it must activate the
+        // focused button (for example "Apri la modalità demo") like every other surface.
+        let enter =
+            ui.ctx().memory(|memory| memory.focused()).is_none() && ui.ctx().input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
         if enter {
             self.retry_boot();
             return;
@@ -4673,7 +4817,11 @@ impl PostinoApp {
                         ui.add_space(space::XS);
                         ui.label(typography::text(Role::Meta, format!("Passaggio · {}", failure.stage.label()), t.text_faint));
                         ui.add_space(space::XS);
-                        ui.add(egui::Label::new(typography::mono(failure.reason.as_str(), type_size::CAPTION, t.text_faint)).truncate());
+                        ui.label(typography::text(
+                            Role::Meta,
+                            "Il dettaglio tecnico resta nel registro dell'app: questa schermata non mostra messaggi grezzi del sistema.",
+                            t.text_faint,
+                        ));
                         ui.add_space(space::MD);
                         ui.label(typography::text(
                             Role::Meta,
@@ -4729,13 +4877,7 @@ impl PostinoApp {
                 }
                 let _ = drag.on_hover_cursor(CursorIcon::Grab);
 
-                let wordmark_rect = Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 240.0, rect.max.y));
                 let controls_rect = Rect::from_min_max(egui::pos2(rect.max.x - controls_width, rect.min.y), rect.max);
-                ui.scope_builder(UiBuilder::new().max_rect(wordmark_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-                    ui.label(icons::icon(icons::MAIL, 16.0, theme::GOLD));
-                    ui.add_space(space::SM);
-                    ui.label(RichText::new("postino").font(FontId::new(15.0, theme::display())).color(theme::IVORY));
-                });
                 ui.scope_builder(UiBuilder::new().max_rect(controls_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
                     if window_control(ui, icons::CLOSE, "Chiudi", true).clicked() {
                         ui.ctx().send_viewport_cmd(ViewportCommand::Close);
@@ -4971,7 +5113,7 @@ impl PostinoApp {
                 let mut sidebar_scroll = egui::ScrollArea::vertical()
                     .id_salt("sidebar-scroll")
                     .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
                 if let Some(offset) = sidebar_offset {
                     sidebar_scroll = sidebar_scroll.vertical_scroll_offset(offset);
                 }
@@ -5094,9 +5236,20 @@ impl PostinoApp {
                     }
 
                     ui.add_space(space::LG);
+                    let can_save = !self.search_committed.trim().is_empty() && saved_searches.len() < 12;
+                    let save_reason = if self.search_committed.trim().is_empty() {
+                        "Scrivi una ricerca prima di salvarla"
+                    } else {
+                        "Hai già 12 ricerche salvate: eliminane una prima di aggiungerne un'altra"
+                    };
                     let search_header = ui.scope(|ui| {
                         ui.spacing_mut().interact_size.y = 20.0;
-                        SectionHeader::new("RICERCHE").count(saved_searches.len()).action(icons::PLUS, "Salva ricerca").show(ui)
+                        SectionHeader::new("RICERCHE")
+                            .count(saved_searches.len())
+                            .action(icons::PLUS, "Salva ricerca")
+                            .action_enabled(can_save)
+                            .action_reason(save_reason)
+                            .show(ui)
                     });
                     saved_header_rect = Some(search_header.response.rect);
                     if self.scroll_saved_into_view {
@@ -5142,7 +5295,7 @@ impl PostinoApp {
                             response.clone().on_hover_text(if saved.index_pending {
                                 format!("{}\nIndice di ricerca in preparazione", saved.name)
                             } else if saved.valid {
-                                format!("{}\n{}", saved.name, saved.query)
+                                format!("{}\n{}\n{}", saved.name, saved.query, detail)
                             } else {
                                 format!("{}\nRicerca non valida: correggila o eliminala", saved.name)
                             });
@@ -5817,9 +5970,17 @@ impl PostinoApp {
             label_filter.as_ref().map_or(current_folder_name.clone(), |(_, name, _)| name.clone())
         };
         let meta = if searching {
-            format!("{total} conversazioni nei risultati · {unread_messages} messaggi non letti nei risultati")
+            format!(
+                "{} nei risultati · {} nei risultati",
+                plural(usize::try_from(total).unwrap_or(usize::MAX), "conversazione", "conversazioni"),
+                plural(usize::try_from(unread_messages).unwrap_or(usize::MAX), "messaggio non letto", "messaggi non letti")
+            )
         } else {
-            format!("{unread_threads} conversazioni con messaggi non letti · {total} conversazioni")
+            format!(
+                "{} con messaggi non letti · {}",
+                plural(usize::try_from(unread_threads).unwrap_or(usize::MAX), "conversazione", "conversazioni"),
+                plural(usize::try_from(total).unwrap_or(usize::MAX), "conversazione", "conversazioni")
+            )
         };
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
             if matches!(self.sync_view, SyncView::Offline { .. }) {
@@ -5934,24 +6095,31 @@ impl PostinoApp {
                 self.list_cache = None;
             }
             ui.add_space(space::MD);
-            if threads.is_empty() {
-                let body = if searching {
-                    "Nessuna conversazione corrisponde alla ricerca."
-                } else if self.unread_only || self.attachments_only {
-                    "Nessuna conversazione con questi filtri."
-                } else {
-                    "Questa cartella non ha conversazioni."
-                };
-                let mut state = EmptyState::new(icons::MAIL, "Nessuna conversazione", body);
-                if searching {
-                    state = state.action("Cancella ricerca");
+            if threads.is_empty() && search_error.is_none() {
+                let label_name = label_filter.as_ref().map(|(_, name, _)| name.as_str());
+                let scope = label_filter
+                    .as_ref()
+                    .map(|_| if saved_account_wide { "in tutte le mail".to_owned() } else { format!("in {current_folder_name}") });
+                let view = self.empty_view_in(label_name, scope.as_deref(), true);
+                let mut state = EmptyState::new(view.icon, &view.title, &view.body);
+                if let Some((label, _)) = view.primary {
+                    state = state.action(label);
                 }
+                if let Some((label, _)) = view.secondary {
+                    state = state.secondary(label);
+                }
+                #[cfg(test)]
+                probe::empty_state(ui, &view.title, &view.body, view.primary.map(|(label, _)| label), view.secondary.map(|(label, _)| label));
                 let response = state.show(ui);
-                if response.primary_clicked() && searching {
-                    self.cancel_search();
-                }
-                if clear_filter {
-                    self.clear_label_filter();
+                let action = if response.primary_clicked() {
+                    view.primary.map(|(_, action)| action)
+                } else if response.secondary_clicked() {
+                    view.secondary.map(|(_, action)| action)
+                } else {
+                    None
+                };
+                if let Some(action) = action {
+                    self.apply_empty_action(action);
                 }
                 return;
             }
@@ -5974,23 +6142,41 @@ impl PostinoApp {
                         names
                     };
                     let meta = format_when(thread.last_date, self.now_utc);
-                    let counts = if thread.message_count == 1 { "1 messaggio".to_owned() } else { format!("{} messaggi", thread.message_count) };
-                    let unread_detail = if thread.unread_count > 0 { format!(" · {} non letti", thread.unread_count) } else { String::new() };
+                    let counts = messages_text(usize::try_from(thread.message_count).unwrap_or(usize::MAX));
+                    let unread_detail = if thread.unread_count > 0 {
+                        format!(" · {}", unread_text(usize::try_from(thread.unread_count).unwrap_or(usize::MAX)))
+                    } else {
+                        String::new()
+                    };
                     let subtitle = format!("{participants} · {counts}{unread_detail}");
                     let subject = thread_subject(&thread.subject);
                     let subject = if subject.trim().is_empty() { "(Nessun oggetto)" } else { subject.as_str() };
-                    let row = ListRow::account(subject, &subtitle, &meta)
-                        .dot(if thread.unread_count > 0 { t.gold_ink } else { t.border })
-                        .selected(selected)
-                        .height(48.0);
+                    let starred = thread.starred_count > 0;
+                    let row =
+                        ListRow::thread(subject, &subtitle, &meta).unread(thread.unread_count > 0).starred(starred).selected(selected).height(48.0);
                     let response = row.show(ui);
                     #[cfg(test)]
                     probe::row(ui, &format!("thread:{}", thread.id), response.rect);
-                    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{subject} — {subtitle}")));
+                    #[cfg(test)]
+                    probe::thread_star(ui, &thread.id, starred, response.rect);
+                    let mut accessible = format!("{subject}. {subtitle}. {meta}.");
+                    if thread.unread_count > 0 {
+                        accessible.push_str(" Non letta.");
+                    }
+                    if starred {
+                        accessible.push_str(" Con stella.");
+                    }
+                    if selected {
+                        accessible.push_str(" Selezionata.");
+                    }
+                    accessible.push_str(" Premi Invio per aprire.");
+                    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
+                    response.clone().on_hover_text(accessible);
                     if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
                         action = Some(ThreadRowAction::Open(thread.id.clone()));
                     }
                     response.context_menu(|ui| {
+                        let (star_id, _) = thread_star_menu(starred);
                         let items = [
                             menu_item("open"),
                             MenuItem::separator(),
@@ -5999,7 +6185,7 @@ impl PostinoApp {
                             MenuItem::separator(),
                             menu_item("read"),
                             menu_item("unread"),
-                            menu_item("star"),
+                            menu_item(star_id),
                         ];
                         match Menu::new(&items).show(ui) {
                             Some(0) => {
@@ -6023,7 +6209,8 @@ impl PostinoApp {
                                 ui.close();
                             }
                             Some(7) => {
-                                action = Some(ThreadRowAction::Flag(thread.id.clone(), None, Some(thread.starred_count == 0)));
+                                let (_, next) = thread_star_menu(starred);
+                                action = Some(ThreadRowAction::Flag(thread.id.clone(), None, Some(next)));
                                 ui.close();
                             }
                             _ => {}
@@ -6182,16 +6369,23 @@ impl PostinoApp {
             self.load_older_thread_messages();
             return;
         }
-        Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(ui, |ui| {
+        Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::XS)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(typography::strong(Role::Caption, "CONVERSAZIONE", t.text_faint));
                 ui.add_space(space::XS);
                 ui.add(egui::Label::new(typography::strong(Role::BodySmall, &subject, t.text)).truncate().selectable(false));
                 ui.add_space(space::SM);
-                ui.label(typography::text(Role::Caption, format!("{} · {} non letti", summary.message_count, summary.unread_count), t.text_muted));
+                ui.label(typography::text(
+                    Role::Caption,
+                    format!(
+                        "{} · {}",
+                        messages_text(usize::try_from(summary.message_count).unwrap_or(usize::MAX)),
+                        unread_text(usize::try_from(summary.unread_count).unwrap_or(usize::MAX))
+                    ),
+                    t.text_muted,
+                ));
             });
-            ui.add_space(space::XS);
-            ScrollArea::horizontal().id_salt("conversation-cards").max_height(34.0).auto_shrink([false, true]).show(ui, |ui| {
+            ScrollArea::horizontal().id_salt("conversation-cards").max_height(30.0).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for message in &messages {
                         let open = open_id.as_deref() == Some(message.id.as_str());
@@ -6214,6 +6408,7 @@ impl PostinoApp {
     }
 
     fn reading_content(&mut self, ui: &mut Ui, t: &Tokens, full: bool) {
+        let content_bottom = ui.max_rect().bottom();
         let selected = self.selected.clone();
         let message = self
             .screenshot_message
@@ -6233,7 +6428,7 @@ impl PostinoApp {
         probe::clear_links(ui);
         if self.selected_thread.is_some() && self.threads_view {
             self.conversation_strip(ui, t);
-            ui.add_space(space::SM);
+            ui.add_space(space::XS);
         }
         let is_draft = self
             .engine
@@ -6374,11 +6569,11 @@ impl PostinoApp {
             return;
         }
 
-        ui.add_space(space::LG);
+        ui.add_space(space::MD);
         let subject_text = if message.summary.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.summary.subject.as_str() };
         let subject = ui.label(typography::strong(Role::Page, subject_text, t.text));
         reading_context_menu(subject, message.summary.subject.clone(), message.summary.from.display());
-        ui.add_space(space::MD);
+        ui.add_space(space::SM);
         let to = message.summary.to.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
         let cc = message.cc.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
         Sides::new().height(if cc.is_empty() { 38.0 } else { 52.0 }).show(
@@ -6412,7 +6607,7 @@ impl PostinoApp {
         let mut chip_filter = None;
         if !message.summary.labels.is_empty() {
             let labels = self.labels_cache.clone();
-            ui.add_space(space::SM);
+            ui.add_space(space::XS);
             ui.horizontal_wrapped(|ui| {
                 for id in &message.summary.labels {
                     if let Some(label) = labels.iter().find(|label| &label.id == id)
@@ -6437,25 +6632,30 @@ impl PostinoApp {
                 ui.label(typography::text(Role::Caption, remote, t.text_faint));
             });
         }
-        ui.add_space(space::MD);
-        ui.separator();
         ui.add_space(space::SM);
+        ui.separator();
+        ui.add_space(space::XS);
         ui.label(typography::text(Role::Caption, "Vista testo · il rendering HTML arriverà con il visualizzatore isolato.", t.text_faint));
-        ui.add_space(space::MD);
+        ui.add_space(space::SM);
         // A pinned strip keeps the attachment and its Save button visible at 980×600, where the body
-        // scroll would otherwise push it below the fold. The strip never takes the body's minimum:
-        // with many attachments it shrinks and its internal scroll list takes over.
-        let available_height = ui.available_height();
+        // scroll would otherwise push it below the fold. One budget covers banner, header, chips and
+        // strip: the region is reserved once, the body gets the space above the strip and the strip
+        // sits exactly on the content bottom. Nothing can grow past the status bar.
+        let available_height = (content_bottom - ui.cursor().top()).max(0.0);
         let strip_height = if message.attachments.is_empty() {
             0.0
         } else {
-            reading_attachment_strip_height(message.attachments.len()).min((available_height - 80.0).max(72.0))
+            reading_attachment_strip_height(message.attachments.len()).min((available_height - READING_BODY_MIN).max(0.0))
         };
-        let body_height = (available_height - strip_height).max(0.0);
+        let gap = if strip_height > 0.0 { space::SM } else { 0.0 };
+        let body_height = (available_height - strip_height - gap).max(0.0);
+        let (region, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), available_height), Sense::hover());
+        let strip_top = region.bottom() - strip_height;
+        let body_rect = Rect::from_min_max(region.min, pos2(region.right(), (strip_top - gap).max(region.top())));
         // A whole message shares one link budget; the scanner also rejects a link over the byte
         // bound, so a hostile body cannot create unlimited widgets or a huge dialog.
         let mut link_budget = reading::MAX_LINKS_PER_MESSAGE;
-        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), body_height), Layout::top_down(Align::Min), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(body_rect), |ui| {
             egui::ScrollArea::vertical()
                 .id_salt(("reading-scroll", message.summary.id.as_str()))
                 .max_height(body_height)
@@ -6487,13 +6687,24 @@ impl PostinoApp {
                         }
                         ui.add_space(space::LG);
                     }
+                    // The last line breathes above the fade instead of ending exactly on the clip.
+                    ui.add_space(space::SM);
                     if let Some(link) = clicked_link {
                         self.request_link_open(&link);
                     }
                 });
         });
+        // A hard scroll clip slices the next line through its glyphs. The fade turns that boundary
+        // into a deliberate visual end without hiding a whole line.
+        bottom_fade(ui, body_rect, t.panel);
+        #[cfg(test)]
+        probe::reading_body(ui, body_rect);
         if !message.attachments.is_empty()
-            && let Some(attachment) = self.reading_attachment_strip(ui, &message, t, strip_height)
+            && let Some(attachment) = ui
+                .scope_builder(UiBuilder::new().max_rect(Rect::from_min_max(pos2(region.left(), strip_top), region.max)), |ui| {
+                    self.reading_attachment_strip(ui, &message, t, strip_height)
+                })
+                .inner
         {
             self.request_attachment_save(&attachment);
         }
@@ -6814,6 +7025,8 @@ impl PostinoApp {
         let mut switch = None;
         let mut add = false;
         let mut manage = false;
+        let mut leave_demo = false;
+        let can_return = self.demo_can_return();
         let response = egui::Modal::new(Id::new("postino-accounts"))
             .area(egui::Modal::default_area(Id::new("postino-accounts")).anchor(Align2::LEFT_TOP, Vec2::new(ui_size::SIDEBAR + 24.0, 96.0)))
             .backdrop_color(theme::scrim(self.dark))
@@ -6837,14 +7050,24 @@ impl PostinoApp {
                     }
                 }
                 ui.add_space(space::SM);
-                let add_button = Button::new("Aggiungi account")
-                    .icon(icons::PLUS)
-                    .full_width()
-                    .enabled(self.can_add_account())
-                    .disabled_reason("La modalità demo non ha un archivio locale: avvia Postino senza --demo")
-                    .show(ui);
-                if add_button.clicked() {
-                    add = true;
+                if can_return {
+                    if Button::new("Configura un account").icon(icons::USER).full_width().show(ui).clicked() {
+                        leave_demo = true;
+                    }
+                    ui.add_space(space::XS);
+                    ui.label(typography::text(Role::Caption, "Torna all'archivio locale e aggiungi il tuo account.", t.text_faint));
+                } else {
+                    let add_button = Button::new("Aggiungi account")
+                        .icon(icons::PLUS)
+                        .full_width()
+                        .enabled(self.can_add_account())
+                        .disabled_reason(
+                            "La modalità demo non ha un archivio locale: chiudi e riapri Postino senza la demo per aggiungere un account",
+                        )
+                        .show(ui);
+                    if add_button.clicked() {
+                        add = true;
+                    }
                 }
                 if Button::ghost("Gestisci account…").icon(icons::SETTINGS).full_width().show(ui).clicked() {
                     manage = true;
@@ -6862,6 +7085,10 @@ impl PostinoApp {
         if add {
             self.show_accounts_menu = false;
             self.onboarding = Some(Onboarding::add_account());
+        }
+        if leave_demo {
+            self.show_accounts_menu = false;
+            self.leave_demo();
         }
         if manage {
             self.show_accounts_menu = false;
@@ -6973,14 +7200,18 @@ impl PostinoApp {
         let t = theme::tokens(self.dark);
         let window = ui.ctx().content_rect();
         let width = (window.width() - 2.0 * space::HUGE).clamp(560.0, 780.0);
-        let height = (window.height() - 120.0).clamp(320.0, 560.0);
+        // The card must end above the status bar even at 980×600. The frame is capped first, then
+        // the list takes only the room left after the fixed header and footer.
+        let card_height = (window.height() - ui_size::STATUS - 2.0 * space::XXL).clamp(280.0, 500.0);
         let mut close = false;
+        let mut open_settings = false;
         let mut action = None;
         let response = egui::Modal::new(Id::new("postino-outbox"))
             .backdrop_color(theme::scrim(self.dark))
             .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
             .show(ui.ctx(), |ui| {
                 ui.set_width(width);
+                ui.set_max_height(card_height);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
@@ -6992,7 +7223,7 @@ impl PostinoApp {
                         });
                         ui.label(typography::text(
                             Role::Meta,
-                            "Il messaggio è salvato prima di partire. Puoi annullare finché è in coda; dopo l'invio la copia in Inviati viene ritentata da sola.",
+                            "Il messaggio è salvato prima di partire. Puoi annullare finché è in coda; dopo l'invio la copia in Inviati viene ritentata da sola. Postino invia solo mentre l'app o il comando postino send è in esecuzione.",
                             t.text_faint,
                         ));
                     });
@@ -7017,6 +7248,11 @@ impl PostinoApp {
                                         ui.label(typography::strong(Role::BodySmall, format!("Invio fermo per {}", halt.account), t.danger));
                                         ui.label(typography::text(Role::Caption, halt.error.as_str(), t.text_muted));
                                     });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if Button::ghost("Apri impostazioni").size(ButtonSize::Sm).show(ui).clicked() {
+                                            open_settings = true;
+                                        }
+                                    });
                                 });
                             });
                         ui.add_space(space::XS);
@@ -7032,7 +7268,8 @@ impl PostinoApp {
                     });
                     ui.add_space(space::LG);
                 } else {
-                    ScrollArea::vertical().id_salt("outbox-scroll").max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+                    let list_height = (ui.available_height() - 44.0).max(80.0);
+                    ScrollArea::vertical().id_salt("outbox-scroll").max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
                         ui.spacing_mut().scroll = crate::ui::tokens::scroll_style();
                         for entry in self.outbox.entries.clone() {
                             Self::outbox_row(ui, &t, &entry, self.now_utc.timestamp_millis(), self.now_utc, &mut action);
@@ -7050,7 +7287,7 @@ impl PostinoApp {
                     });
                 }
                 ui.add_space(space::SM);
-                ui.horizontal(|ui| {
+                let _footer = ui.horizontal(|ui| {
                     ui.label(typography::text(Role::Caption, "Ctrl+Shift+O apre questa coda · Esc chiude", t.text_faint));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if Button::ghost("Aggiorna").icon(icons::SYNC).show(ui).clicked() {
@@ -7058,11 +7295,20 @@ impl PostinoApp {
                         }
                     });
                 });
+                #[cfg(test)]
+                probe::outbox_footer(ui, _footer.response.rect);
             });
+        #[cfg(test)]
+        probe::outbox_card(ui, response.response.rect);
         if close || response.should_close() {
             self.outbox_open = false;
             self.outbox_confirm = None;
             ui.ctx().memory_mut(|memory| memory.stop_text_input());
+        }
+        if open_settings {
+            self.outbox_open = false;
+            self.outbox_confirm = None;
+            self.open_settings(ui.ctx(), None);
         }
         match action {
             Some(OutboxUiAction::Cancel(id)) => match self.engine.call("outbox_cancel", json!({ "id": id })) {
@@ -7113,7 +7359,7 @@ impl PostinoApp {
                         });
                         let recipients = plural(entry.recipient_count, "destinatario", "destinatari");
                         let when = if entry.state == postino_store::OutboxState::Queued && entry.send_at > now_ms {
-                            format!("parte {}", format_millis(entry.send_at, now_utc))
+                            format!("parte {} · richiede Postino aperto", format_millis(entry.send_at, now_utc))
                         } else {
                             format_millis(entry.send_at, now_utc)
                         };
@@ -7338,6 +7584,7 @@ impl PostinoApp {
         let last = accounts.len() == 1;
         let mut remove = None;
         let mut add = false;
+        let mut leave_demo = false;
         let mut close = false;
         let mut theme_choice: Option<(bool, bool)> = None;
         let mut reduced = self.reduced_motion;
@@ -7376,8 +7623,12 @@ impl PostinoApp {
                     });
                 });
                 ui.add_space(space::SM);
-                let _settings_scroll =
-                    egui::ScrollArea::vertical().id_salt("settings-scroll").max_height(scroll_height).auto_shrink([false, false]).show(ui, |ui| {
+                let _settings_scroll = egui::ScrollArea::vertical()
+                    .id_salt("settings-scroll")
+                    .max_height(scroll_height)
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
                         ui.spacing_mut().scroll = crate::ui::tokens::scroll_style();
                         let _account_header = ui.label(typography::strong(Role::BodySmall, "ACCOUNT", t.text_faint));
                         #[cfg(test)]
@@ -7472,10 +7723,19 @@ impl PostinoApp {
                             }
                             ui.add_space(space::XS);
                         }
-                        if Button::new("Aggiungi account")
+                        if self.demo_can_return() {
+                            let leave = Button::new("Torna all'archivio e configura un account").icon(icons::USER).size(ButtonSize::Sm).show(ui);
+                            #[cfg(test)]
+                            probe::settings_action(ui, "leave_demo", leave.rect);
+                            if leave.clicked() {
+                                leave_demo = true;
+                            }
+                        } else if Button::new("Aggiungi account")
                             .icon(icons::PLUS)
                             .enabled(self.can_add_account())
-                            .disabled_reason("La modalità demo non ha un archivio locale")
+                            .disabled_reason(
+                                "La modalità demo non ha un archivio locale: chiudi e riapri Postino senza la demo per aggiungere un account",
+                            )
                             .show(ui)
                             .clicked()
                         {
@@ -7503,12 +7763,7 @@ impl PostinoApp {
                         });
                         ui.add_space(space::XS);
                         ui.horizontal(|ui| {
-                            if Button::new(if reduced { "Riduci le animazioni" } else { "Animazioni attive" })
-                                .icon(icons::CLOCK)
-                                .selected(reduced)
-                                .show(ui)
-                                .clicked()
-                            {
+                            if Button::new("Riduci le animazioni").icon(icons::CLOCK).selected(reduced).show(ui).clicked() {
                                 reduced = !reduced;
                             }
                             if Button::new("Reimposta larghezza lettura").icon(icons::SIDEBAR).show(ui).clicked() {
@@ -7671,6 +7926,11 @@ impl PostinoApp {
         if close || response.should_close() {
             self.close_settings(ui.ctx());
         }
+        if leave_demo {
+            self.close_settings(ui.ctx());
+            self.leave_demo();
+            return;
+        }
         if add {
             self.show_accounts_dialog = false;
             self.settings_return_focus = None;
@@ -7775,6 +8035,10 @@ impl PostinoApp {
     fn status_bar(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
         let kind = self.status_kind();
+        let composer_can_send = self.send_allowed_for_active_account();
+        let configuring = self.onboarding.is_some();
+        let recovering = self.boot_failure.is_some();
+        let mut leave_demo = false;
         egui::Panel::bottom("status")
             .exact_size(ui_size::STATUS)
             .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(inset::LG, inset::XS)))
@@ -7795,9 +8059,18 @@ impl PostinoApp {
                             // explanation, not four scattered milestone lines.
                             let badge = Badge::new("Modalità demo").kind(BadgeKind::Accent).show(ui);
                             badge.on_hover_text(DEMO_TOOLTIP);
+                            if self.demo_can_return() {
+                                ui.add_space(space::SM);
+                                let back = Button::ghost("Torna all'archivio").size(ButtonSize::Sm).show(ui);
+                                #[cfg(test)]
+                                probe::demo_return_button(ui, back.rect);
+                                if back.clicked() {
+                                    leave_demo = true;
+                                }
+                            }
                         }
                         StatusKind::Ready => {
-                            ui.label(typography::text(Role::Meta, "Pronto", t.text_muted));
+                            ui.label(typography::text(Role::Meta, if configuring { "Configurazione" } else { "Pronto" }, t.text_muted));
                         }
                         StatusKind::Offline => {
                             // The sync line starts with "Offline ·": one phrase, not two.
@@ -7872,8 +8145,16 @@ impl PostinoApp {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let hint = if self.composer.open {
-                            "Ctrl+Invio invia · Esc chiude e conserva"
+                        let hint = if recovering {
+                            "Invio riprova · la modalità demo non tocca il file"
+                        } else if configuring {
+                            "Invio continua · Esc torna indietro"
+                        } else if self.composer.open {
+                            if composer_can_send {
+                                "Ctrl+Invio invia · Esc chiude e conserva"
+                            } else {
+                                "Invio non disponibile · Esc chiude e conserva"
+                            }
                         } else {
                             "Ctrl+K comandi · J/K naviga · ? scorciatoie"
                         };
@@ -7881,6 +8162,9 @@ impl PostinoApp {
                     });
                 });
             });
+        if leave_demo {
+            self.leave_demo();
+        }
     }
 
     fn composer_window(&mut self, ui: &mut Ui) {
@@ -7912,6 +8196,7 @@ impl PostinoApp {
         let attachments_available = !self.demo && self.store.is_some();
         let response = egui::Modal::new(id).area(area).backdrop_color(theme::scrim(self.dark)).frame(frame).show(ui.ctx(), |ui| {
             ui.set_min_size(inner.size());
+            ui.set_max_width(inner.width());
             ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
                 Composer::new(&mut self.composer, &account)
                     .send_available(smtp_available)
@@ -7921,6 +8206,8 @@ impl PostinoApp {
             })
             .inner
         });
+        #[cfg(test)]
+        probe::composer_surface(ui, response.response.rect);
         let action = response.inner;
         if action.discard {
             self.discard_composer();
@@ -8573,6 +8860,7 @@ impl PostinoApp {
             probe::clear_identity(ui);
             probe::clear_retries(ui);
             probe::clear_dialog_buttons(ui);
+            probe::clear_thread_stars(ui);
         }
         self.poll_add_account();
         self.handle_sync_events();
@@ -8640,10 +8928,16 @@ impl PostinoApp {
         self.label_delete_dialog(ui);
         self.account_menu(ui);
         self.accounts_dialog(ui);
-        if let Some(mut page) = self.rules_page.take()
-            && !page.show(ui, &mut self.engine)
-        {
-            self.rules_page = Some(page);
+        if let Some(mut page) = self.rules_page.take() {
+            if page.show(ui, &mut self.engine) {
+                // Rules can move mail and apply labels. The sidebar reads `labels_cache`, so the
+                // counts must be refreshed when the page closes, not only after a mail action.
+                self.refresh_labels();
+                self.threads_cache = None;
+                self.list_cache = None;
+            } else {
+                self.rules_page = Some(page);
+            }
         }
         self.outbox_dialog(ui);
         self.outbox_confirm_dialog(ui);
@@ -9108,7 +9402,7 @@ fn demo_outbox(now: i64) -> OutboxList {
                 created_at: now - 3_600_000,
                 send_at: now - 3_500_000,
                 attempts: 2,
-                last_error: Some("Il server ha rifiutato rcpt con 550: casella inesistente.".to_owned()),
+                last_error: Some("Il server ha rifiutato il destinatario con il codice 550: casella inesistente.".to_owned()),
                 recipient_count: 1,
                 subject: "Fattura 2026-041".to_owned(),
                 message_id: "<demo-failed@example.it>".to_owned(),
@@ -9632,7 +9926,7 @@ fn folder_icon(kind: FolderKind) -> &'static str {
 }
 
 /// Italian singular/plural for a count: `plural(1, "messaggio", "messaggi")` → "1 messaggio".
-fn plural(count: usize, singular: &str, plural: &str) -> String {
+pub(crate) fn plural(count: usize, singular: &str, plural: &str) -> String {
     if count == 1 { format!("1 {singular}") } else { format!("{count} {plural}") }
 }
 
@@ -9692,6 +9986,12 @@ fn query_has_folder(query: &str) -> bool {
 
 /// Strip repeated reply/forward prefixes for a conversation title. The stored subject stays
 /// untouched; this is a display decision, and an empty result falls back to the original.
+/// The star command a conversation row exposes. A starred thread removes the star; an unstarred
+/// one adds it, so the label and the action can never disagree.
+fn thread_star_menu(starred: bool) -> (&'static str, bool) {
+    if starred { ("unstar", false) } else { ("star", true) }
+}
+
 fn thread_subject(subject: &str) -> String {
     let mut rest = subject.trim();
     loop {
@@ -10196,6 +10496,24 @@ fn reading_attachment_strip_height(rows: usize) -> f32 {
     (24.0 + rows as f32 * 52.0 + 2.0 * f32::from(inset::SM)).min(200.0)
 }
 
+/// Fade the last pixels of a scrollable reading body into the panel. A scroll area clips at an
+/// arbitrary pixel; without this a line can be sliced horizontally at the attachment strip.
+fn bottom_fade(ui: &Ui, rect: Rect, panel: Color32) {
+    let height = 14.0_f32.min(rect.height() * 0.4);
+    if height <= 0.0 {
+        return;
+    }
+    let top = rect.bottom() - height;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(pos2(rect.left(), top), Color32::TRANSPARENT);
+    mesh.colored_vertex(pos2(rect.right(), top), Color32::TRANSPARENT);
+    mesh.colored_vertex(pos2(rect.left(), rect.bottom()), panel);
+    mesh.colored_vertex(pos2(rect.right(), rect.bottom()), panel);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
 fn avatar(ui: &mut Ui, size: f32, initials: &str, bg: Color32, fg: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     ui.painter().circle_filled(rect.center(), size * 0.5, bg);
@@ -10270,9 +10588,9 @@ fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+        format!("{} KB", format!("{:.1}", bytes as f64 / 1024.0).replace('.', ","))
     } else {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        format!("{} MB", format!("{:.1}", bytes as f64 / (1024.0 * 1024.0)).replace('.', ","))
     }
 }
 
@@ -10499,12 +10817,58 @@ pub(crate) mod probe {
         ctx.data(|data| data.get_temp(id("composer-card")))
     }
 
+    pub fn composer_surface(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-surface"), rect));
+    }
+
+    pub fn composer_surface_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-surface")))
+    }
+
     pub fn outbox_button(ui: &Ui, rect: Rect) {
         ui.ctx().data_mut(|data| data.insert_temp(id("outbox-button"), rect));
     }
 
     pub fn outbox_button_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("outbox-button")))
+    }
+
+    pub fn outbox_card(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("outbox-card"), rect));
+    }
+
+    pub fn outbox_card_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("outbox-card")))
+    }
+
+    pub fn outbox_footer(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("outbox-footer"), rect));
+    }
+
+    pub fn outbox_footer_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("outbox-footer")))
+    }
+
+    pub fn demo_return_button(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("demo-return-button"), rect));
+    }
+
+    pub fn demo_return_button_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("demo-return-button")))
+    }
+
+    pub fn thread_star(ui: &Ui, thread_id: &str, starred: bool, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, (bool, Rect)>>(id("thread-stars")).insert(thread_id.to_owned(), (starred, rect));
+        });
+    }
+
+    pub fn thread_star_state(ctx: &Context, thread_id: &str) -> Option<(bool, Rect)> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, (bool, Rect)>>(id("thread-stars"))).and_then(|stars| stars.get(thread_id).copied())
+    }
+
+    pub fn clear_thread_stars(ui: &Ui) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("thread-stars"), BTreeMap::<String, (bool, Rect)>::new()));
     }
 
     pub fn composer_send(ui: &Ui, rect: Rect) {
@@ -10520,6 +10884,14 @@ pub(crate) mod probe {
 
     pub fn composer_cancel_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("composer-cancel")))
+    }
+
+    pub fn composer_footer_state(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-footer-state"), rect));
+    }
+
+    pub fn composer_footer_state_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-footer-state")))
     }
 
     pub fn composer_attach(ui: &Ui, rect: Rect, enabled: bool) {
@@ -10856,6 +11228,14 @@ pub(crate) mod probe {
 
     pub fn reading_attachments_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("reading-attachments")))
+    }
+
+    pub fn reading_body(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("reading-body"), rect));
+    }
+
+    pub fn reading_body_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("reading-body")))
     }
 
     pub fn attachment_save_enabled(ui: &Ui, attachment_id: &str, enabled: bool) {
@@ -12077,13 +12457,34 @@ mod tests {
         app.composer.touch(0.0);
         frame(&ctx, &mut app, vec![egui::Event::ModifiersChanged(Modifiers::COMMAND), key(Key::Enter, Modifiers::COMMAND)]);
         assert!(app.composer.open, "the demo must keep the composer open instead of pretending the message left");
-        // The shortcut reads the same enabled rule as the button: it does not attempt a send the
-        // button would refuse, so there is no error to show.
+        // The shortcut reads the same enabled rule as the button and shows the reason instead of
+        // doing nothing. There is no save error, because no submission was attempted.
         assert!(app.composer.save_error.is_none(), "the shortcut attempted a disabled send: {:?}", app.composer.save_error);
+        assert_eq!(app.composer.notice.as_deref(), Some(DEMO_SEND_REASON));
+        let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
+        assert!(text.iter().any(|line| line.contains("La modalità demo non invia")), "the refusal is not visible: {text:?}");
+        assert!(text.iter().any(|line| line.contains("Invio non disponibile")), "the status bar still promises Ctrl+Invio: {text:?}");
         assert!(
             !app.engine.messages().iter().any(|message| message.subject == "Invio da tastiera" && message.folder_id == "sent"),
             "the demo moved the message to Sent without a submission"
         );
+    }
+
+    #[test]
+    fn ctrl_enter_without_smtp_names_the_missing_server() {
+        let mut app = booted_app("send-no-smtp-notice", Vec::new(), |store| {
+            seed_account_rows(store, "acc_no_smtp", "no-smtp@example.com", None);
+        });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.compose_new();
+        app.composer.to = "Giulia <giulia.ferri@example.com>".to_owned();
+        app.composer.subject = "Senza SMTP".to_owned();
+        app.send_composer();
+        assert_eq!(app.composer.notice.as_deref(), Some(NO_SMTP_SEND_REASON));
+        let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
+        assert!(text.iter().any(|line| line.contains("Questo account non ha un server SMTP")), "{text:?}");
     }
 
     #[test]
@@ -12876,14 +13277,18 @@ mod tests {
     #[test]
     fn there_is_exactly_one_demo_notice_and_no_milestone_code_in_the_copy() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        for source in ["app.rs", "ui/widgets/composer.rs", "ui/gallery.rs"] {
+        for source in ["app.rs", "ui/widgets/composer.rs", "ui/gallery.rs", "rules_ui.rs"] {
             let path = format!("{root}/{source}");
             let text = std::fs::read_to_string(&path).expect("the source file");
             let production = text.split_once("\nmod tests {").map_or(text.as_str(), |(before, _)| before);
-            for forbidden in ["M0 + U0.5", "Locale · offline", "HTML in M5", "metadati in M0", "memoria fino a M1", "dopo U0.5", "store M1"] {
+            for forbidden in
+                ["M0 + U0.5", "Locale · offline", "HTML in M5", "metadati in M0", "memoria fino a M1", "dopo U0.5", "store M1", "SMTP (P7)"]
+            {
                 assert!(!production.contains(forbidden), "{source} still contains {forbidden:?}");
             }
         }
+        let demo = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/core/src/demo.rs")).expect("the demo data");
+        assert!(!demo.contains("modalità M0"), "the demo body still names the milestone");
     }
 
     #[test]
@@ -13269,10 +13674,13 @@ mod tests {
             let mut app = PostinoApp::demo_at(true, clock);
             app.dark = dark;
             app.seed_screenshot(ScreenshotState::Search);
+            assert!(!app.threads_view, "the first search is flat, not threaded");
             frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
             let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
             assert!(text.iter().any(|line| line.contains("Risultati per")), "search results are missing at 980: {text:?}");
             assert!(text.iter().any(|line| line.contains("from:")), "the syntax help is missing at 980: {text:?}");
+            assert!(text.iter().any(|line| line == "MITTENTE"), "the flat result table is missing: {text:?}");
+            assert!(!text.iter().any(|line| line.contains("CONVERSAZIONE")), "the search stayed threaded: {text:?}");
 
             app.seed_screenshot(ScreenshotState::SearchError);
             frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
@@ -13854,6 +14262,249 @@ mod tests {
     }
 
     #[test]
+    fn a_first_run_demo_can_return_to_onboarding_and_settings() {
+        let mut app = booted_app("demo-return-onboarding", Vec::new(), |_| {});
+        assert!(app.onboarding.is_some());
+        app.open_demo();
+        assert!(app.demo && app.demo_can_return());
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let size = Vec2::new(980.0, 600.0);
+        settle_at(&ctx, &mut app, size);
+        let back = probe::demo_return_button_rect(&ctx).expect("the demo status bar offers a way back");
+        click_at(&ctx, &mut app, back.center(), size);
+        frame_at(&ctx, &mut app, size, Vec::new());
+        assert!(!app.demo, "the demo exit did not reopen the store");
+        assert!(app.store.is_some());
+        assert!(app.onboarding.is_some(), "an empty store returns to first-run onboarding");
+        assert_eq!(app.onboarding.as_ref().map(Onboarding::stage), Some(Stage::Welcome));
+
+        // Settings is the second visible path; it must not dead-end in the demo either.
+        let mut app = booted_app("demo-return-settings", Vec::new(), |_| {});
+        app.open_demo();
+        app.open_settings(&ctx, None);
+        settle_at(&ctx, &mut app, size);
+        let leave = probe::settings_action_rect(&ctx, "leave_demo").expect("Settings offers the archive return");
+        click_at(&ctx, &mut app, leave.center(), size);
+        frame_at(&ctx, &mut app, size, Vec::new());
+        assert!(!app.demo && app.store.is_some() && app.onboarding.is_some());
+    }
+
+    #[test]
+    fn a_recovery_demo_can_return_to_the_original_store() {
+        let mut app = booted_app("demo-return-recovery", Vec::new(), |_| {});
+        app.boot_failure = Some(BootFailure {
+            path: Some(PathBuf::from("C:/Users/demo/AppData/Local/Postino/mail.db")),
+            stage: BootStage::Keyring,
+            reason: "locked".to_owned(),
+        });
+        app.onboarding = None;
+        app.open_demo();
+        assert!(app.demo && app.boot_failure.is_none());
+        app.leave_demo();
+        assert!(!app.demo);
+        assert!(app.boot_failure.is_none(), "the retained handle reopens without asking the keyring again");
+        assert!(app.store.is_some());
+        assert!(app.onboarding.is_some(), "the store still has no account");
+    }
+
+    #[test]
+    fn a_conversation_attachment_save_stays_inside_the_980_window_in_both_themes() {
+        for dark in [false, true] {
+            let clock = screenshot_clock().expect("the frozen screenshot clock");
+            let mut app = PostinoApp::demo_at(true, clock);
+            app.seed_screenshot(ScreenshotState::Conversation);
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let size = Vec2::new(980.0, 600.0);
+            settle_at(&ctx, &mut app, size);
+            let content = ctx.content_rect();
+            let strip = probe::reading_attachments_rect(&ctx).expect("the conversation attachment strip");
+            let save = probe::attachment_save_rect(&ctx, "att_001").expect("the attachment Save");
+            let body = probe::reading_body_rect(&ctx).expect("the reading body");
+            assert!(content.contains_rect(strip), "dark={dark}: strip {strip:?} leaves the window");
+            assert!(content.contains_rect(save), "dark={dark}: Save {save:?} leaves the window");
+            assert!(strip.contains_rect(save), "dark={dark}: Save {save:?} is outside the strip {strip:?}");
+            assert!(strip.height() >= 80.0, "dark={dark}: the strip cannot show its row: {strip:?}");
+            assert!(body.bottom() <= strip.top(), "dark={dark}: the body viewport overlaps the strip: {body:?} {strip:?}");
+            assert!(save.bottom() <= size.y - ui_size::STATUS, "dark={dark}: Save is under the status bar: {save:?}");
+        }
+    }
+
+    #[test]
+    fn the_composer_keeps_its_640_card_and_the_footer_stays_separate_at_1280() {
+        for dark in [false, true] {
+            let clock = screenshot_clock().expect("the frozen screenshot clock");
+            let mut app = PostinoApp::demo_at(true, clock);
+            app.seed_screenshot(ScreenshotState::Compose);
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let size = Vec2::new(1280.0, 720.0);
+            settle_at(&ctx, &mut app, size);
+            let card = probe::composer_card_rect(&ctx).expect("the composer card");
+            let surface = probe::composer_surface_rect(&ctx).expect("the composer surface");
+            let send = probe::composer_send_rect(&ctx).expect("the Send button");
+            let cancel = probe::composer_cancel_rect(&ctx).expect("Scarta");
+            let state = probe::composer_footer_state_rect(&ctx).expect("the saved state");
+            assert!((card.width() - ui_size::COMPOSER_CARD_WIDTH).abs() < 1.0, "dark={dark}: card {card:?}");
+            assert!(surface.width() <= card.width() + 4.5, "dark={dark}: the modal grew past its card: {surface:?} {card:?}");
+            assert!(surface.contains_rect(card), "dark={dark}: the card escaped the modal area: {surface:?} {card:?}");
+            assert!((card.center().x - ctx.content_rect().center().x).abs() < 1.0, "dark={dark}: {card:?}");
+            assert!(card.contains_rect(send), "dark={dark}: Send {send:?} is outside {card:?}");
+            assert!(card.contains_rect(cancel), "dark={dark}: Scarta {cancel:?} is outside {card:?}");
+            assert!(state.right() <= cancel.left(), "dark={dark}: saved state {state:?} runs under Scarta {cancel:?}");
+        }
+    }
+
+    #[test]
+    fn the_outbox_card_keeps_its_footer_inside_at_980_in_both_themes() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, dark);
+            let mut app = PostinoApp::demo_at(true, Utc::now());
+            app.outbox = demo_outbox(app.now_utc.timestamp_millis());
+            app.outbox_open = true;
+            app.outbox_loaded = true;
+            let size = Vec2::new(980.0, 600.0);
+            settle_at(&ctx, &mut app, size);
+            let card = probe::outbox_card_rect(&ctx).expect("the outbox card");
+            let footer = probe::outbox_footer_rect(&ctx).expect("the outbox footer");
+            assert!(ctx.content_rect().contains_rect(card), "dark={dark}: card {card:?}");
+            assert!(card.contains_rect(footer), "dark={dark}: footer {footer:?} is outside card {card:?}");
+            assert!(card.bottom() <= size.y - ui_size::STATUS, "dark={dark}: the card reaches the status bar: {card:?}");
+            let text = painted_text(&ctx, &mut app, size);
+            assert!(text.iter().any(|line| line.contains("richiede Postino aperto")), "dark={dark}: {text:?}");
+            assert!(text.iter().any(|line| line.contains("Postino invia solo mentre")), "dark={dark}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn the_threaded_filter_empty_states_offer_the_resolver_action() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        let cases = [
+            (ScreenshotState::EmptyUnread, "Nessuna conversazione non letta", "Mostra tutti", EmptyAction::ShowAll),
+            (ScreenshotState::EmptyAttachments, "Nessuna conversazione con allegati", "Mostra tutti", EmptyAction::ShowAll),
+            (
+                ScreenshotState::EmptyLabelUnread,
+                "Nessuna conversazione non letta con l'etichetta “Lavoro”",
+                "Togli filtro “non letti”",
+                EmptyAction::ClearUnread,
+            ),
+        ];
+        for (state, title, primary, action) in cases {
+            let mut app = PostinoApp::demo(true);
+            app.seed_screenshot(state);
+            app.threads_view = true;
+            app.threads_cache = None;
+            app.list_cache = None;
+            let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            let view = probe::empty_state_view(&ctx).expect("the threaded empty state");
+            assert_eq!(view.title, title, "{state:?}");
+            assert_eq!(view.primary.as_deref(), Some(primary), "{state:?}");
+            assert!(!text.iter().any(|line| line.contains("Nessun messaggio")), "{state:?}: flat copy leaked: {text:?}");
+            assert!(!view.body.contains("è vuota"), "{state:?} must not blame the folder");
+            app.apply_empty_action(action);
+            assert!(!app.visible_threads().0.is_empty(), "{state:?}: the way out revealed no conversation");
+        }
+    }
+
+    #[test]
+    fn a_threaded_parse_error_does_not_also_render_the_empty_state() {
+        let (ctx, mut app) = ready_app();
+        app.query = "subject:\"unclosed".to_owned();
+        app.commit_search();
+        app.threads_view = true;
+        app.threads_cache = None;
+        let _ = app.visible_threads();
+        let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        assert!(text.iter().any(|line| line.contains("Ricerca non valida")), "{text:?}");
+        assert!(!text.iter().any(|line| line.contains("Nessuna conversazione")), "the invalid query showed a threaded empty state: {text:?}");
+    }
+
+    #[test]
+    fn opening_a_message_refreshes_the_conversation_unread_count() {
+        let mut app = PostinoApp::demo(true);
+        app.threads_view = true;
+        app.select_thread("thr_preventivo".to_owned());
+        let before = app.thread_summary.as_ref().expect("the thread summary").unread_count;
+        let open = app.thread_messages.iter().find(|message| message.unread).expect("an unread card").id.clone();
+        app.mark_read_after_delay(&open);
+        let after = app.thread_summary.as_ref().expect("the refreshed summary").unread_count;
+        assert_eq!(after + 1, before, "the banner kept the stale unread count");
+        assert!(
+            app.thread_messages.iter().find(|message| message.id == open).is_some_and(|message| !message.unread),
+            "the loaded card still claims to be unread"
+        );
+    }
+
+    #[test]
+    fn thread_rows_show_their_star_and_the_menu_matches_it() {
+        let (ctx, mut app) = conversations_app();
+        let wide = Vec2::new(1280.0, 720.0);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        frame_at(&ctx, &mut app, wide, vec![]);
+        let (starred, row) = probe::thread_star_state(&ctx, "thr_preventivo").expect("the starred thread row");
+        assert!(starred, "the Preventivo thread has a starred message and must show it");
+        assert!(ctx.content_rect().contains_rect(row));
+        let other = app
+            .visible_threads()
+            .0
+            .into_iter()
+            .find(|thread| thread.id != "thr_preventivo" && thread.starred_count == 0)
+            .expect("an unstarred thread")
+            .id;
+        let (unstarred, _) = probe::thread_star_state(&ctx, &other).expect("an unstarred thread row");
+        assert!(!unstarred);
+        assert_eq!(thread_star_menu(true), ("unstar", false));
+        assert_eq!(thread_star_menu(false), ("star", true));
+        assert_eq!(command_label("unstar", "x"), "Togli stella");
+        assert_eq!(command_label("star", "x"), "Aggiungi stella");
+    }
+
+    #[test]
+    fn clearing_a_search_reconnects_the_open_hit_to_its_thread() {
+        let mut app = PostinoApp::demo(true);
+        app.threads_view = true;
+        app.query = "from:giulia".to_owned();
+        app.commit_search();
+        let hit = app.visible_messages().0.first().expect("a search hit").id.clone();
+        app.open_message(hit.clone());
+        assert!(!app.threads_view && app.selected_thread.is_none());
+        app.clear_search();
+        assert!(app.threads_view, "the folder returns to conversations");
+        assert!(app.reading_open, "the open hit stays readable");
+        assert_eq!(app.selected.as_deref(), Some(hit.as_str()));
+        assert_eq!(app.thread_open.as_deref(), Some(hit.as_str()));
+        let thread = app.selected_thread.as_deref().expect("the hit's thread is selected");
+        assert!(app.thread_messages.iter().any(|message| message.id == hit && message.thread_id == thread));
+    }
+
+    #[test]
+    fn the_shell_paints_one_product_wordmark() {
+        let clock = screenshot_clock().expect("the frozen screenshot clock");
+        let mut app = PostinoApp::demo_at(true, clock);
+        app.seed_screenshot(ScreenshotState::Shell);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        for size in [Vec2::new(980.0, 600.0), Vec2::new(1280.0, 720.0)] {
+            let text = painted_text(&ctx, &mut app, size);
+            assert_eq!(text.iter().filter(|line| line.as_str() == "postino").count(), 1, "two product marks at {size:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn attachment_sizes_use_the_italian_decimal_comma() {
+        assert_eq!(format_size(248_320), "242,5 KB");
+    }
+
+    #[test]
     fn the_conversation_opens_the_latest_unread_card_and_jk_moves_it() {
         let (ctx, mut app) = conversations_app();
         app.select_thread("thr_preventivo".to_owned());
@@ -14400,12 +15051,17 @@ mod tests {
         theme::apply(&ctx, false);
         let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(980.0, 600.0))), ..Default::default() };
         let mut output = ctx.run_ui(raw, |ui| app.show(ui));
-        let text = output.shapes.iter().any(|shape| match &shape.shape {
-            egui::epaint::Shape::Text(text) => text.galley.text().contains("portachiavi"),
-            _ => false,
-        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         output.textures_delta.clear();
-        assert!(text, "the recovery screen must name the keyring");
+        assert!(text.iter().any(|line| line.contains("portachiavi")), "the recovery screen must name the keyring: {text:?}");
+        assert!(!text.iter().any(|line| line.contains("the keyring is locked")), "a raw engine sentence reached the recovery card: {text:?}");
         app.open_demo();
         assert!(app.demo);
         assert!(app.boot_failure.is_none());
@@ -14979,8 +15635,10 @@ mod tests {
             assert!(text.iter().any(|line| line.contains("Salva")), "the editor actions are missing: {text:?}");
             assert!(text.iter().any(|line| line == "Rimuovi"), "the editor action row is missing: {text:?}");
             assert!(text.iter().any(|line| line == "Etichetta"), "the seeded action kind is missing: {text:?}");
+            assert!(!text.iter().any(|line| line.contains("rule_run_")), "a raw run id reached the page: {text:?}");
+            assert!(!text.iter().any(|line| line.contains(" · off")), "an English state reached the page: {text:?}");
             let page = app.rules_page.as_ref().expect("the rules page is open");
-            assert!(!page.is_forward_allowed(), "the demo has no P7 outbox and must disable forward with a reason");
+            assert!(!page.is_forward_allowed(), "the demo has no SMTP outbox and must disable forward with a reason");
 
             let mut app = PostinoApp::demo(true);
             app.seed_screenshot(ScreenshotState::RulePreview);

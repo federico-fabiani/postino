@@ -400,7 +400,7 @@ fn a_permanent_failure_records_a_fixed_sentence_and_stops() {
     assert_eq!(report.failed, 1);
     let row = outbox_state(&engine).entries[0].clone();
     assert_eq!(row.state, OutboxState::Failed);
-    assert!(row.last_error.as_deref().is_some_and(|error| error.contains("550") && error.contains("mail")), "{row:?}");
+    assert!(row.last_error.as_deref().is_some_and(|error| error.contains("550") && error.contains("mittente")), "{row:?}");
     assert!(row.last_error.as_deref().is_some_and(|error| !error.contains("sender rejected")), "the server's own text must not be stored: {row:?}");
     smtp.finish();
     imap.finish();
@@ -785,7 +785,7 @@ fn a_hostile_rcpt_echo_never_reaches_the_journal() {
     let row = outbox_state(&engine).entries[0].clone();
     assert_eq!(row.state, OutboxState::Failed);
     let sentence = row.last_error.clone().expect("a reason");
-    assert!(sentence.contains("rcpt") && sentence.contains("550"), "the stage and code must survive: {sentence}");
+    assert!(sentence.contains("destinatario") && sentence.contains("550"), "the recipient and code must survive: {sentence}");
     for forbidden in [secret.as_str(), body, recipient] {
         assert!(!sentence.contains(forbidden), "the journal kept server text: {sentence}");
         assert!(!outbox_json(&engine).contains(forbidden), "outbox_list exposed server text");

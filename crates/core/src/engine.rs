@@ -3892,6 +3892,16 @@ fn mailbox(address: &Address) -> postino_sync::SubmissionMailbox {
 /// `550`, a `451` or a `535` may echo either one; the sentence names the stage, the code and what a
 /// person can do, and nothing the peer chose. The same rule applies to [`SmtpError::Auth`], whose
 /// reason is built by the network client without server text.
+fn smtp_stage_sentence(stage: &str) -> &'static str {
+    match stage {
+        "mail" | "mail_from" => "il mittente",
+        "rcpt" => "il destinatario",
+        "data" => "il contenuto del messaggio",
+        "auth" | "login" => "l'accesso al server",
+        _ => "la connessione al server",
+    }
+}
+
 fn smtp_error_sentence(error: &SmtpError) -> String {
     match error {
         SmtpError::Uncertain { .. } => "l'esito è sconosciuto: controlla Inviati prima di riprovare".to_owned(),
@@ -3903,9 +3913,9 @@ fn smtp_error_sentence(error: &SmtpError) -> String {
         SmtpError::Tls { .. } => "la connessione TLS con il server SMTP è fallita".to_owned(),
         SmtpError::Dns { .. } => "il nome del server SMTP non è stato risolto".to_owned(),
         SmtpError::Connect { .. } => "il server SMTP non è raggiungibile".to_owned(),
-        SmtpError::Rejected { code, stage, .. } => format!("il server ha rifiutato la fase {stage} con il codice {code}"),
-        SmtpError::Transient { stage, .. } => format!("la fase {stage} è fallita in modo temporaneo"),
-        SmtpError::Permanent { stage, .. } => format!("la fase {stage} è fallita in modo definitivo"),
+        SmtpError::Rejected { code, stage, .. } => format!("il server ha rifiutato {} con il codice {code}", smtp_stage_sentence(stage)),
+        SmtpError::Transient { stage, .. } => format!("{} non ha risposto: riprova più tardi", smtp_stage_sentence(stage)),
+        SmtpError::Permanent { stage, .. } => format!("{} è stato rifiutato in modo definitivo", smtp_stage_sentence(stage)),
         SmtpError::Protocol { .. } => "lo scambio SMTP non può proseguire".to_owned(),
     }
 }

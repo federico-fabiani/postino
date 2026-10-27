@@ -109,16 +109,7 @@ impl Editor {
         }
     }
 
-    fn blank(folders: &[(String, String)], labels: &[(String, String)]) -> Self {
-        let mut actions = vec![EditorAction {
-            kind: ActionKind::Move,
-            folder: folders.first().map(|(id, _)| id.clone()).unwrap_or_default(),
-            label: String::new(),
-            forward: String::new(),
-        }];
-        if let Some((label, _)) = labels.first() {
-            actions.push(EditorAction { kind: ActionKind::Label, folder: String::new(), label: label.clone(), forward: String::new() });
-        }
+    fn blank() -> Self {
         Self {
             id: None,
             name: String::new(),
@@ -126,7 +117,9 @@ impl Editor {
             priority: "0".to_owned(),
             stop: false,
             enabled: true,
-            actions,
+            // A new rule starts with no action. The first folder and label used to be added
+            // silently, so saving a rule could apply a label the person never chose.
+            actions: Vec::new(),
             error: None,
             focus_name: true,
         }
@@ -198,11 +191,9 @@ impl RulesPage {
         page
     }
 
-    pub(crate) fn start_new(&mut self, engine: &Engine) {
-        let folders = self.folders(engine);
-        let labels = self.labels(engine);
+    pub(crate) fn start_new(&mut self, _engine: &Engine) {
         self.selected = None;
-        self.editor = Some(Editor::blank(&folders, &labels));
+        self.editor = Some(Editor::blank());
         self.preview = None;
         self.notice = None;
         self.notice_run = None;
@@ -211,10 +202,8 @@ impl RulesPage {
     }
 
     #[doc(hidden)]
-    pub(crate) fn seed_editor(&mut self, engine: &Engine, name: &str, query: &str, actions: &[RuleAction]) {
-        let folders = self.folders(engine);
-        let labels = self.labels(engine);
-        let mut editor = Editor::blank(&folders, &labels);
+    pub(crate) fn seed_editor(&mut self, _engine: &Engine, name: &str, query: &str, actions: &[RuleAction]) {
+        let mut editor = Editor::blank();
         editor.name = name.to_owned();
         editor.query = query.to_owned();
         editor.actions = actions.iter().map(EditorAction::from_rule).collect();
@@ -249,7 +238,7 @@ impl RulesPage {
         self.forward_reason = if allowed {
             String::new()
         } else if !engine.is_persistent() {
-            "serve un account reale con SMTP (P7)".to_owned()
+            "serve un account reale con SMTP".to_owned()
         } else {
             "questo account non ha un endpoint SMTP; aggiungilo in Impostazioni".to_owned()
         };
@@ -450,11 +439,17 @@ impl RulesPage {
                 let errors = result.errors.len();
                 self.notice = Some(if errors == 0 {
                     format!(
-                        "Esecuzione {}: {} corrispondenze, {} azioni applicate. Puoi annullarla.",
-                        result.run.id, result.run.matched, result.run.changed
+                        "Esecuzione completata: {} corrispondenze, {} azioni applicate. Puoi annullarla.",
+                        crate::app::plural(result.run.matched as usize, "corrispondenza", "corrispondenze"),
+                        crate::app::plural(result.run.changed as usize, "azione", "azioni")
                     )
                 } else {
-                    format!("Esecuzione {}: {} corrispondenze, {} azioni, {} errori.", result.run.id, result.run.matched, result.run.changed, errors)
+                    format!(
+                        "Esecuzione completata: {} corrispondenze, {} azioni, {} errori.",
+                        crate::app::plural(result.run.matched as usize, "corrispondenza", "corrispondenze"),
+                        crate::app::plural(result.run.changed as usize, "azione", "azioni"),
+                        crate::app::plural(errors, "errore", "errori")
+                    )
                 });
                 self.notice_run = Some(result.run.id.clone());
                 self.error = if result.errors.is_empty() { None } else { Some(result.errors.join(" · ")) };
@@ -471,8 +466,9 @@ impl RulesPage {
                 let forwards =
                     if result.forwards.is_empty() { String::new() } else { format!(" Inoltri non annullati: {}.", result.forwards.join(", ")) };
                 self.notice = Some(format!(
-                    "Esecuzione {} annullata: {} azioni ripristinate, {} saltate (messaggi cambiati).{forwards}",
-                    result.run.id, result.restored, result.skipped
+                    "Esecuzione annullata: {} ripristinate, {} saltate (messaggi cambiati).{forwards}",
+                    crate::app::plural(result.restored as usize, "azione ripristinata", "azioni ripristinate"),
+                    crate::app::plural(result.skipped as usize, "azione saltata", "azioni saltate")
                 ));
                 self.notice_run = None;
                 self.reload(engine);
@@ -557,7 +553,7 @@ impl RulesPage {
                                 let selected = self.selected.as_deref() == Some(rule.id.as_str());
                                 let mut label = format!("{}  ·  priorità {}", rule.name, rule.priority);
                                 if !rule.enabled {
-                                    label.push_str("  ·  off");
+                                    label.push_str("  ·  disattivata");
                                 }
                                 if !rule.valid {
                                     label.push_str("  ·  non valida");
@@ -579,10 +575,11 @@ impl RulesPage {
                                             egui::Label::new(typography::text(
                                                 Role::Caption,
                                                 format!(
-                                                    "{} · {} · {} mod.{}",
-                                                    run.id,
-                                                    if run.mode == RuleRunScope::All { "tutte" } else { "nuove" },
-                                                    run.changed,
+                                                    "{} · {} · {} {}{}",
+                                                    if run.mode == RuleRunScope::All { "Tutte" } else { "Nuove" },
+                                                    crate::app::plural(run.changed as usize, "azione modificata", "azioni modificate"),
+                                                    run.matched,
+                                                    if run.matched == 1 { "corrispondenza" } else { "corrispondenze" },
                                                     if run.undone { " · annullata" } else { "" }
                                                 )
                                                 .as_str(),
@@ -591,7 +588,7 @@ impl RulesPage {
                                             .truncate(),
                                         );
                                         let can_undo = !run.undone && (run.changed > 0 || run.matched > 0);
-                                        if Button::ghost("Annulla")
+                                        if Button::ghost("Annulla esecuzione")
                                             .size(ButtonSize::Sm)
                                             .enabled(can_undo)
                                             .disabled_reason(if run.undone { "Esecuzione già annullata." } else { "Nessuna azione da annullare." })
@@ -619,9 +616,9 @@ impl RulesPage {
                                 ui.label(typography::text(
                                     Role::Caption,
                                     format!(
-                                        "Priorità {} · {} azioni · {}",
+                                        "Priorità {} · {} · {}",
                                         editor.priority,
-                                        editor.actions.len(),
+                                        crate::app::plural(editor.actions.len(), "azione", "azioni"),
                                         if editor.enabled { "attiva" } else { "disattivata" }
                                     )
                                     .as_str(),
@@ -694,6 +691,9 @@ impl RulesPage {
                                 action = Some(PageAction::AskDelete { id, name: editor_name.clone() });
                             }
                         });
+                        if has_editor && editor_id.is_none() {
+                            ui.label(typography::text(Role::Caption, "Elimina si attiva dopo il primo salvataggio.", t.text_faint));
+                        }
                         ui.add_space(space::XS);
                         ui.horizontal(|ui| {
                             if Button::new("Esegui nuove").icon(icons::ARROW_RIGHT).show(ui).clicked() {
@@ -709,8 +709,12 @@ impl RulesPage {
                             ui.add_space(space::XXS);
                             ui.label(typography::strong(
                                 Role::BodySmall,
-                                format!("ANTEPRIMA · {} corrispondenze{}", preview.total, if preview.truncated { " (prime 20)" } else { "" })
-                                    .as_str(),
+                                format!(
+                                    "ANTEPRIMA · {}{}",
+                                    crate::app::plural(preview.total as usize, "corrispondenza", "corrispondenze"),
+                                    if preview.truncated { " · prime 20" } else { "" }
+                                )
+                                .as_str(),
                                 t.text_faint,
                             ));
                             ScrollArea::vertical()
@@ -987,4 +991,16 @@ fn status_label(status: RuleEffectStatus) -> &'static str {
 fn call<T: DeserializeOwned>(engine: &mut Engine, name: &str, args: Value) -> Result<T, String> {
     let value = engine.call(name, args).map_err(|error| error.to_string())?;
     serde_json::from_value(value).map_err(|error| format!("Risposta non leggibile: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_rule_has_no_implicit_action() {
+        let editor = Editor::blank();
+        assert!(editor.actions.is_empty(), "a new rule must not apply a folder or label the user did not choose");
+        assert!(editor.name.is_empty() && editor.query.is_empty());
+    }
 }

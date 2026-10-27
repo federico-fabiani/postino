@@ -12,12 +12,14 @@ pub struct SectionHeader<'a> {
     count: Option<usize>,
     action_icon: Option<&'a str>,
     action_label: Option<&'a str>,
+    action_enabled: bool,
+    action_reason: Option<&'a str>,
 }
 
 impl<'a> SectionHeader<'a> {
     #[must_use]
     pub fn new(title: &'a str) -> Self {
-        Self { title, count: None, action_icon: None, action_label: None }
+        Self { title, count: None, action_icon: None, action_label: None, action_enabled: true, action_reason: None }
     }
 
     #[must_use]
@@ -33,6 +35,18 @@ impl<'a> SectionHeader<'a> {
         self
     }
 
+    #[must_use]
+    pub fn action_enabled(mut self, enabled: bool) -> Self {
+        self.action_enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn action_reason(mut self, reason: &'a str) -> Self {
+        self.action_reason = Some(reason);
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> Option<Response> {
         let t = tokens::tokens(ui.visuals().dark_mode);
         let mut action = None;
@@ -44,7 +58,11 @@ impl<'a> SectionHeader<'a> {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let (Some(icon), Some(label)) = (self.action_icon, self.action_label) {
-                    action = Some(IconButton::new(icon, label).size(IconButtonSize::Sm).show(ui));
+                    let mut button = IconButton::new(icon, label).size(IconButtonSize::Sm).enabled(self.action_enabled);
+                    if let Some(reason) = self.action_reason {
+                        button = button.disabled_reason(reason);
+                    }
+                    action = Some(button.show(ui));
                 }
             });
         });

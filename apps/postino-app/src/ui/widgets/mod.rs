@@ -15,7 +15,7 @@ pub use button::{Button, ButtonKind, ButtonSize, IconButton, IconButtonSize};
 pub use chip::{Badge, BadgeKind, Chip};
 #[cfg(test)]
 pub use composer::ComposerFocus;
-pub use composer::{AUTOSAVE_DELAY, ComposeMode, Composer, ComposerState};
+pub use composer::{AUTOSAVE_DELAY, ComposeMode, Composer, ComposerState, DEMO_SEND_REASON, NO_SMTP_SEND_REASON};
 pub use dialog::Dialog;
 #[cfg(test)]
 pub(crate) use feedback::probe as toast_probe;
