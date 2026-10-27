@@ -93,10 +93,10 @@ Status: `todo` · `active` · `review` · `done`.
 | P11a1 | M5 render | bounded sanitized block model/parser in `crates/mime` | done |
 | P11a2 | M5 render | egui mapping, link sheet, text fallback | done |
 | P11b | M5 render | optional sandboxed WebView2 backend | todo |
-| P12a | M6 ship | Gmail OAuth/XOAUTH2, keyring tokens, app onboarding | active |
-| P12b | M6 ship | ManageSieve client and script activation | todo |
+| P12a | M6 ship | Gmail OAuth/XOAUTH2, keyring tokens, app onboarding | done |
+| P12b | M6 ship | ManageSieve client and script activation | deferred (no confirmed provider) |
 | P12c | M6 ship | PGP keyring, MIME verify/decrypt/sign/encrypt | todo |
-| P12d | M6 ship | iCalendar invites, RSVP drafts | todo |
+| P12d | M6 ship | iCalendar invites, RSVP drafts | active |
 | P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | done |
 | P12f | M6 ship | standalone fuzz targets and security CI | todo |
 
@@ -147,9 +147,10 @@ activation/quit. M4 is complete at `2dcd612`.
 **P11a1** merged the bounded sanitized block model in `crates/mime`; **P11a2** maps the blocks to
 egui in the reading pane, keeps the link sheet/text fallback and the 980×600 budget. The full CI is
 green on the merged tree. P11b (optional sandboxed WebView2) remains after P11a2.
-M6 is split: **P12a** Gmail OAuth and **P12e** Windows packaging start in parallel; **P12b**
-ManageSieve, **P12c** PGP, **P12d** invites and **P12f** fuzz follow. The audit keeps them vertical
-because they touch core/store/app; packaging and fuzz are the only infrastructure packages.
+M6 is split. **P12a** Gmail OAuth and **P12e** Windows packaging are merged and CI-green; **P12d**
+iCalendar invites is active; **P12c** PGP follows. **P12b** ManageSieve is deferred until a provider
+with a real ManageSieve endpoint is confirmed (Gmail has none); **P12f** fuzz remains infrastructure.
+The audit keeps the vertical packages serial because they touch core/store/app.
 
 ## 5. Delighters backlog
 
