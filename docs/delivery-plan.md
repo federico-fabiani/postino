@@ -97,7 +97,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P12b | M6 ship | ManageSieve client and script activation | todo |
 | P12c | M6 ship | PGP keyring, MIME verify/decrypt/sign/encrypt | todo |
 | P12d | M6 ship | iCalendar invites, RSVP drafts | todo |
-| P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | active |
+| P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | done |
 | P12f | M6 ship | standalone fuzz targets and security CI | todo |
 
 P0-P2 close U0. P3-P6d make M1 real; P7-P8 close M2. Each package may split when the brief is too
