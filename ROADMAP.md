@@ -194,16 +194,16 @@ interaction model before real mail makes them expensive to change. Full spec:
 ## M4 — live in the background
 
 - [x] `postino-daemon` owns the store, sync and scheduler (P10a1).
-- [x] JSON-RPC over a named pipe/UDS with a per-launch token; autostart and tray are P10b.
-- [x] CLI/MCP become clients; "daemon not running" is a normal state. App client connection is P10a2.
-- [ ] Scheduled send, undo send, automatically running local rules while the app is closed, notifications.
-- [ ] Single-instance and crash recovery.
+- [x] JSON-RPC over a named pipe/UDS with a per-launch token; tray, autostart and notifications (P10b1).
+- [x] CLI/MCP become clients; "daemon not running" is a normal state. App client connection (P10a2).
+- [x] Scheduled send, undo send, automatic local rules while the app is closed, notifications (P10a1/P10b1).
+- [x] Single-instance activation and crash recovery (P10b2/P10a1).
 - [x] Verify: two clients (CLI + MCP) mutate one store; scheduled mail sends with the app closed;
-      daemon restart loses no outbox entry. P10b still needs tray/autostart/notifications.
+      daemon restart loses no outbox entry; tray/autostart/notifications have recorder evidence.
 
 ## M5 — make it professional
 
-- [ ] `BodyRenderer` with the sanitized subset; optional sandboxed webview backend.
+- [x] `BodyRenderer` with the sanitized subset (P11a1/P11a2); optional sandboxed webview backend is P11b.
 - [ ] Block composer and advanced HTML/Tailwind mode; live preview.
 - [ ] Email-safe HTML compiler (tables + inline CSS), plain-text alternative.
 - [ ] Templates, signatures, identities, remote-content policy, tracking-pixel stripping.

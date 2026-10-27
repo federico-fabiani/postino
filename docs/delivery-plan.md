@@ -91,7 +91,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P10b1 | M4 tray | platform seams, daemon tray/notifier, autostart | done |
 | P10b2 | M4 tray | app settings, close-to-tray, activation | done |
 | P11a1 | M5 render | bounded sanitized block model/parser in `crates/mime` | done |
-| P11a2 | M5 render | egui mapping, link sheet, text fallback | active |
+| P11a2 | M5 render | egui mapping, link sheet, text fallback | done |
 | P11b | M5 render | optional sandboxed WebView2 backend | todo |
 | P12 | M6 ship | Gmail OAuth, Sieve, PGP, invites, packaging, security/fuzz | todo |
 
@@ -139,9 +139,9 @@ mcp` clients and the app's readable daemon-owned state.
 state); **P10b1** added the daemon-owned tray, privacy-preserving notices, HKCU autostart and the
 platform seams; **P10b2** added live settings, `--open outbox`, close-to-tray and daemon-brokered
 activation/quit. M4 is complete at `2dcd612`.
-**P11a1** merged the bounded sanitized block model in `crates/mime`; **P11a2** is active: map the
-blocks to egui in the reading pane, keep the link sheet/text fallback and the 980×600 budget.
-P11b (optional sandboxed WebView2) remains after P11a2.
+**P11a1** merged the bounded sanitized block model in `crates/mime`; **P11a2** maps the blocks to
+egui in the reading pane, keeps the link sheet/text fallback and the 980×600 budget. The full CI is
+green on the merged tree. P11b (optional sandboxed WebView2) remains after P11a2.
 
 ## 5. Delighters backlog
 
