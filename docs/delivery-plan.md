@@ -95,8 +95,10 @@ Status: `todo` · `active` · `review` · `done`.
 | P11b | M5 render | optional sandboxed WebView2 backend | todo |
 | P12a | M6 ship | Gmail OAuth/XOAUTH2, keyring tokens, app onboarding | done |
 | P12b | M6 ship | ManageSieve client and script activation | deferred (no confirmed provider) |
-| P12c1 | M6 ship | PGP key store v8, key ops, CLI | active |
-| P12c2 | M6 ship | PGP MIME verify/decrypt/sign/encrypt, UI | todo |
+| P12c1 | M6 ship | PGP key store v8, key ops, CLI | done |
+| P12c2a | M6 ship | v9 raw retention for signed/encrypted mail, GC | active |
+| P12c2b | M6 ship | PGP/MIME verify/decrypt/sign/encrypt, ops/CLI | todo |
+| P12c2c | M6 ship | PGP reading badges, composer toggles, key manager | todo |
 | P12d | M6 ship | iCalendar invites, RSVP drafts | done |
 | P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | done |
 | P12f | M6 ship | standalone fuzz targets and security CI | todo |
@@ -148,11 +150,11 @@ activation/quit. M4 is complete at `2dcd612`.
 **P11a1** merged the bounded sanitized block model in `crates/mime`; **P11a2** maps the blocks to
 egui in the reading pane, keeps the link sheet/text fallback and the 980×600 budget. The full CI is
 green on the merged tree. P11b (optional sandboxed WebView2) remains after P11a2.
-M6 is split. **P12a** Gmail OAuth, **P12e** Windows packaging and **P12d** iCalendar invites are
-merged and CI-green. **P12c1** PGP key store (v8) is active; **P12c2** MIME/UI follows. **P12b**
-ManageSieve is deferred until a provider with a real ManageSieve endpoint is confirmed (Gmail has
-none); **P12f** fuzz remains infrastructure. The audit keeps the vertical packages serial because
-they touch core/store/app.
+M6 is split. **P12a** Gmail OAuth, **P12e** Windows packaging, **P12d** iCalendar invites and
+**P12c1** PGP key storage are merged and CI-green. **P12c2a** adds v9 raw retention for signed and
+encrypted mail; **P12c2b** MIME/ops/CLI and **P12c2c** app UI follow. **P12b** ManageSieve is deferred
+until a provider with a real ManageSieve endpoint is confirmed (Gmail has none); **P12f** fuzz
+remains infrastructure. The audit keeps the vertical packages serial because they touch core/store/app.
 
 ## 5. Delighters backlog
 

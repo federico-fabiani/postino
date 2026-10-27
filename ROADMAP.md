@@ -217,7 +217,8 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [ ] Gmail label mapping.
 - [ ] Sieve/ManageSieve for server-side filters and vacation responder where supported (deferred:
       no confirmed provider; Gmail has none).
-- [ ] PGP via an external agent/library; S/MIME later.
+- [x] PGP key storage/import/export with a passphrase-protected v8 store (P12c1).
+- [ ] PGP/MIME verify/decrypt/sign/encrypt (P12c2); S/MIME later.
 - [x] `.ics` invite parsing and organizer-only reply drafts (P12d).
 - [ ] Unsubscribe, export/import `.eml`/`.mbox`, Thunderbird import.
 - [ ] MCP compact mode, resources, send guardrails, audit log.
