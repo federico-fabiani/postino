@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1–U0.5 foundations, P2a/P2b, P6b onboarding/sync and P6c reading/settings done · **Last updated:** 2026-10-25
+> **Status:** U0.1–U0.5 foundations, P2a/P2b, P6b onboarding/sync and P6c reading/settings done · **Last updated:** 2026-10-27
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
@@ -534,7 +534,10 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   keyring/archive and two actions, **Riprova** and **Apri la modalità demo**. It never panics and
   never opens an empty mailbox in place of the user's own. A store with no accounts opens the
   first-run wizard; a store with accounts shows the cache at once and starts one background refresh
-  for the active account.
+  for the active account. A demo opened from that welcome card or from the recovery card keeps the
+  original store handle: the status bar, the account menu and Settings expose **Torna all'archivio**
+  / **Configura un account**, which re-runs the original boot. A real `--demo` launch has no archive
+  and therefore no exit; its reason names what to do instead of a command-line flag.
 - **Onboarding** is a real state machine: Benvenuto → Provider (Aruba/Gmail/Altro, with host, port,
   TLS implicit/STARTTLS for Altro) → Credenziali (name, address, masked password, Caps Lock hint,
   zeroising buffer) → Cartelle (the server's selectable folders and mapped roles, plus Italian

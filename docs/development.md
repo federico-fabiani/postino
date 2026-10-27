@@ -3,7 +3,7 @@
 > **Status:** M0 + U0.5 labels + P3c engine on the encrypted store + P4a MIME crate + P4b encrypted
 > attachment blobs + P5a IMAP client + P5b sync into the store + P2b states/accessibility + P6/P7
 > app, SMTP and outbox + P8 compose attachments, signatures and reply headers ·
-> **Last updated:** 2026-10-26
+> **Last updated:** 2026-10-27
 
 ## 1. Toolchain
 
@@ -368,6 +368,12 @@ cargo run -p postino-app -- --screenshot conversation --size 980x600 --out docs/
 cargo run -p postino-app -- --screenshot conversation --size 980x600 --dark --out docs/images/postino-p9b-conversation-980-dark.png
 cargo run -p postino-app -- --screenshot saved_searches --size 980x600 --out docs/images/postino-p9b-saved-searches-980.png
 cargo run -p postino-app -- --screenshot saved_searches --size 980x600 --dark --out docs/images/postino-p9b-saved-searches-980-dark.png
+cargo run -p postino-app -- --screenshot search --size 980x600 --out docs/images/postino-p9a-search.png
+cargo run -p postino-app -- --screenshot search --size 980x600 --dark --out docs/images/postino-p9a-search-dark.png
+cargo run -p postino-app -- --screenshot search_error --size 980x600 --out docs/images/postino-p9a-search-error.png
+cargo run -p postino-app -- --screenshot search_error --size 980x600 --dark --out docs/images/postino-p9a-search-error-dark.png
+cargo run -p postino-app -- --screenshot outbox --size 980x600 --out docs/images/postino-p7-outbox-980.png
+cargo run -p postino-app -- --screenshot outbox --size 980x600 --dark --out docs/images/postino-p7-outbox-980-dark.png
 cargo run -p postino-app -- --screenshot rules --size 980x600 --out docs/images/postino-p9c-rules-980.png
 cargo run -p postino-app -- --screenshot rules --size 980x600 --dark --out docs/images/postino-p9c-rules-980-dark.png
 cargo run -p postino-app -- --screenshot rule_editor --size 980x600 --out docs/images/postino-p9c-rule-editor-980.png
@@ -379,7 +385,9 @@ cargo run -p postino-app -- --screenshot rule_preview --size 980x600 --dark --ou
 The states are `shell` (demo inbox, no selection), `reading` (first inbox message open),
 `reading_full` (the same message with the pane expanded), `compose` (the composer prefilled with
 the docs fixture and two attachments with the P8 total), `palette` (command palette open), `labels`
-(Lavoro filter active, list visible),
+(Lavoro filter active, list visible), `outbox` (the demo send journal in every state, including a
+scheduled row that names the app-open requirement), `search` (a committed flat FTS result with its
+syntax help), `search_error` (an invalid query with the positional error and no empty result card),
 `label_menu` (a labelled message open with the modal label menu above its captured target),
 `label_editor` (the inline create editor open under the ETICHETTE header with a name typed),
 `empty_unread` (the inbox with every message read and the unread filter on), `empty_attachments`

@@ -147,7 +147,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "c7813b386385e576b796f445c56e8c6a4cfb86ce7e1b6dfeef6cc48f907e19a8"
+sha256 = "684e118fbbeeaa0615aa3e230cec0034ce6d8f1b0270b793566687bfcc6683e9"
 usage = "Documentation screenshot of the reading pane with reply and forward actions"
 
 [[asset]]
@@ -157,7 +157,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "831c0ca9e1acdce6f7fbe727db4d06bb2ab4ef988b196dd3b67aed44bdb7c86e"
+sha256 = "3ea9dc359fd957188f07d12ad466e45d8b3d6c41f92793e5cf4c4e00472237c8"
 usage = "Documentation screenshot of the composer with recipients, attachment and draft state"
 
 [[asset]]
@@ -167,7 +167,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "5b46f333f57bae462204a46285456ace3774f9a8ddf335557bcb188db032ee37"
+sha256 = "3565fb7eb2079b28235e777f351077e8a7623441793749593503131389eaab81"
 usage = "Documentation screenshot of the composer in the dark theme"
 
 [[asset]]
@@ -177,7 +177,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "c7a870d2385baba3cf05115070fc9350aa031cf55f79e10d8e7bfc366284b69a"
+sha256 = "b107da9d8f92b71519bbe56ee3f4c5c882204ef75d698c1574d4cac13816205c"
 usage = "Documentation screenshot of the label view, its mailbox-wide scope header and the coloured label rows"
 
 [[asset]]
@@ -187,7 +187,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "4518433a6a0829b7d794e8f0ba67bcaa541f0099268c3e49910b77dc93a3e642"
+sha256 = "976ae49d99463c546228a4c412a2eae7749640c629679ab60a77be9c4e7d4fd5"
 usage = "Documentation screenshot of the modal label menu over the message list, with the applied label chip visible in the reading pane"
 
 [[asset]]
@@ -207,7 +207,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "e638d66fb7789d50a5d4a74a90eb8c4af7c19d16c65378541fc324e35659ee29"
+sha256 = "91e9e58de1d18901d5b53ed0f463b2dd6bd4a2202dcb766e0320fdf7e41423d6"
 usage = "Documentation screenshot of the composer sheet at the 980×600 minimum window, with pinned header/footer and a scrolling body"
 
 [[asset]]
@@ -277,7 +277,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "9071e40f13a01b75effadb200d534354947678d325962faae7b98ef02742beba"
+sha256 = "2e2314885179cb0259735440e78b4720e95ae07162dfc41b74a2bbd75554e758"
 usage = "Documentation screenshot of the unread filter empty state with its 'Mostra tutti' way out"
 
 [[asset]]
@@ -287,7 +287,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "5141a21a4e2e5a7e4ce1b786fd3e7d3827fd29ba9890ebf8b0dacda228a7fc1c"
+sha256 = "bd23ab91733e90c51c2355ed184a6b26b28c5c2d6c2f32f966761fde8f33eaf6"
 usage = "Documentation screenshot of the attachments filter empty state with its 'Mostra tutti' way out"
 
 [[asset]]
@@ -297,7 +297,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "38d442c456019c88bcdff748f5aa86b5b3bc41099654c91eb859df97f20790f7"
+sha256 = "f4fe9b33c294fb2117475bc4964712161124832fee819ef864a7ab138411019b"
 usage = "Documentation screenshot of the Lavoro and unread empty state, naming both filters and offering 'Togli filtro non letti'"
 
 [[asset]]
@@ -327,7 +327,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "4cab33e1d8a18e062c70f13167d580813968595ae43e374fee9dde158b51e643"
+sha256 = "c85b92e0998bda77f6dbf4b2c9c34d937697ba83517b41e3c28bade79e771687"
 usage = "Documentation screenshot of the first-run welcome"
 
 [[asset]]
@@ -337,7 +337,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "c50a68395b7241d04d896bbb4233b085f9bbb96d044eba85026c73638f0bdda8"
+sha256 = "b8480fe0ee9a59960563f35c35077958cf53c39b456655b73fb7848abc584959"
 usage = "Documentation screenshot of the provider step with the Gmail app-password note"
 
 [[asset]]
@@ -347,7 +347,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "682a426ac7611cc133c903c6dc0092dbc7c1a4c497ee85305472197b6ccf6ab7"
+sha256 = "4fec0f3e0a7f6fc1dce830bdae4fdf7246bd4c7c20fde3120f2c07eb0a8254fc"
 usage = "Documentation screenshot of the masked credentials form"
 
 [[asset]]
@@ -357,7 +357,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f9e874651e709ebb3303808f3536746252e7485b7e3372b6d600c600d4e8963b"
+sha256 = "029718518adac00b04ea95bcd3df9e48841f71e2e2e82bb9458471ff0ec70062"
 usage = "Documentation screenshot of a specific rejected-password error"
 
 [[asset]]
@@ -367,7 +367,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "4b0de182b736f08afac6c6c38414e57f3288874516ae7d33b526737ccc313f8f"
+sha256 = "84bf75d6d3fa437ed894689eb587bae6fbb88d74399a37e78b3caf0740f18a96"
 usage = "Documentation screenshot of discovered folders and role warnings"
 
 [[asset]]
@@ -377,7 +377,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a7e99391c4d894a47ec76a56365a922392b842b3c9e0a03d291d7d7a5841475d"
+sha256 = "ce27c9a2b4ead4fc0234d85893f6223472633a4584f70c5e6ed648ce5ff6c819"
 usage = "Documentation screenshot of determinate first-sync progress"
 
 [[asset]]
@@ -387,7 +387,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "aa4d9edf344b5772c9b3219612bbd2f8f2ebf5c1fc7b02267f34a7224be04c2b"
+sha256 = "edc89fcaab474f6af3d57bf7156913acf2374b74c75fdfb1b487caa9fca065cf"
 usage = "Documentation screenshot of the account switcher, store folders and sync status"
 
 [[asset]]
@@ -397,7 +397,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "47415be0a0e8c3def2a5c141032834433a2e5b1989d414211684e732bae4a14d"
+sha256 = "60ced770d3e7dc85b0a093be0bdefa7a42e48d24caa3312432c4b1d69740ce65"
 usage = "Documentation screenshot of the offline banner with cached mail still readable"
 
 [[asset]]
@@ -407,7 +407,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f36aab831f65b25c5ef6ccce4e62379643175b77b6c08efa4dc25345ff8fbbe0"
+sha256 = "cad748447b6e0997233cb5b8436aa0802214f443bd2180cfebb12a408b2f512b"
 usage = "Documentation screenshot of the dark credentials form"
 
 [[asset]]
@@ -417,7 +417,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f77383ba9beba2f7014986b5c67d63bbf3ac4ca11e3c7f0d1ee363cd87779eba"
+sha256 = "4a00423259919aa56ac7fa6cbb80c4c3010a1db36e39559b7d902d94058b6770"
 usage = "Documentation screenshot of dark discovered folders"
 
 [[asset]]
@@ -427,7 +427,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "385b5a12765ddef5ec4b4995101a8cd64d91c01dfe30512b4a83a103acefd51e"
+sha256 = "e5aba3273ec02df6181e2dc0cf5f8649955be65d6c1133a6d12da00a544c8d1b"
 usage = "Documentation screenshot of the dark mailbox"
 
 [[asset]]
@@ -437,7 +437,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a2352a9a8c451d194a8ee9857b1cbd2a7be91cb355b68719fc07eb61659fd9f2"
+sha256 = "4aec67a22542c1b3d04d76a3e112f430bb7e10094383a6460d18d5769b56fbd4"
 usage = "Documentation screenshot of the dark offline state"
 
 [[asset]]
@@ -447,7 +447,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "394924c58033a08e89bc00e806a9ff7279ac05c0a4fd2d5d57a3b73f0f6fd972"
+sha256 = "0637ed6e75ddaa5f2c1f2ae64e0f6db56144755e9fe5a2b75bd1fe0001cb63bd"
 usage = "Documentation screenshot of the minimum supported window"
 
 [[asset]]
@@ -457,7 +457,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a9eba0fdd69a04dfa6d21109bcaa1d5b2dfe0f4737942e5c7980bf16a812b329"
+sha256 = "5ae104462cd6bac7857e05fe2a19f87144ee96fe1bbc86c1bf21fa3496e4961d"
 usage = "Documentation screenshot of the folder step at the minimum window"
 
 [[asset]]
@@ -467,7 +467,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "6f44ac7fb99492529cd1a6825cb09927db4954a44ec15bff52ede0fc9c0092ea"
+sha256 = "22ced0eb49ca93dbc04ee0fee7e9036202317cdc071e2530a03e028d2fc9593f"
 usage = "Documentation screenshot of the text reading pane, the stored blocked-image line, a safe link and attachment Save chip"
 
 [[asset]]
@@ -477,7 +477,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f6ae3f86591c03582e825e95dd933886f2d168c77f10a31172b1b84bb1275b2d"
+sha256 = "cb928e7ac47625e57aaa4eb7598f9f54604e87b1491a19e5b7491d13ec75eda1"
 usage = "Documentation screenshot of the full-destination link confirmation sheet"
 
 [[asset]]
@@ -487,7 +487,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "95c0dfb394d664f6f8fa73608973b9f48e48a8d794cb67d88383cd18a686351f"
+sha256 = "520145d541256e188c50c8d8a212f59f14773436950593f057065b2362f7b02f"
 usage = "Documentation screenshot of accounts, appearance, data and information settings"
 
 [[asset]]
@@ -497,7 +497,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "8b2d2d8af181356f767e9c505b5c36aa71a7bbb5313365e727e49989541be9e8"
+sha256 = "57d8e081cb9581b0a0821ab1c669ee50c0a47f647d6f848465a298f368d14b68"
 usage = "Documentation screenshot of the settings dialog in the dark theme"
 
 [[asset]]
@@ -507,7 +507,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "973771123d266f4350a74fa2998b3829347f84ede3ea3db7a42189bbdaa1408f"
+sha256 = "925f5c8d14a078d862d900bf9b5d4e55e187c8cb363c890597372b8de5ed1fae"
 usage = "Documentation screenshot of the settings dialog at the minimum window"
 
 [[asset]]
@@ -517,7 +517,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "70f3468f1bd44172225822492650bd0c2ddb1cf1661245a074c264acb99c51c5"
+sha256 = "5645e67a3e27d7ec1eb100e43d32087aa8448a6361f80dc1132f94d1ae5ef04f"
 usage = "Documentation screenshot of the stored blocked-image line, pinned attachment strip and Save button at the minimum window"
 
 [[asset]]
@@ -527,7 +527,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "5239e87493a093783717f9ac185f7d579cfb15c97c1c8b168667a535e8f7f40d"
+sha256 = "cc60f57962fc8ff7ccfc54aac83eeca8fadda46deb15a4a8d6c063bcd39fe4d5"
 usage = "Documentation screenshot of the host/recipient link confirmation sheet at the minimum window"
 
 [[asset]]
@@ -537,7 +537,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "266bede8d29695592be4fa48b69a8b33c105b3bffca87849b32f6eaad279ad4b"
+sha256 = "9a5b6383e7b32e540b920302df64cfc932885b7544833acf0dfb0eb2cdd21735"
 usage = "Documentation screenshot of the settings dialog at the minimum window in the dark theme"
 
 [[asset]]
@@ -547,7 +547,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a52dfc400b31c67d73588baba3b539138d6d642bb136d904d530b72bfdf327a9"
+sha256 = "91e9e58de1d18901d5b53ed0f463b2dd6bd4a2202dcb766e0320fdf7e41423d6"
 usage = "Documentation screenshot of the composer at the minimum window with two attachments, their total, the picker button and Invia"
 
 [[asset]]
@@ -557,7 +557,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "4ab1a7a33a2cf6efdcdf5d52638a6ef0a71e54e8e95ee673668454b248de48f7"
+sha256 = "855cd97de79b57583b05fe9103c4b834da97020e865c11f9ff6ca5d2a00f69d2"
 usage = "Documentation screenshot of the composer with attachments at the minimum window in the dark theme"
 
 [[asset]]
@@ -567,7 +567,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "59ea8d9ba83c3f79b5e7193d58f7d6bb0722a3c0ad4e052c0bbfb67a71f684e4"
+sha256 = "6abf7f09a7201f29cd87df92d1f50f1dcfb08bf6aaaf03bfcf5faeef186b4244"
 usage = "Documentation screenshot of the per-account plain-text signature editor in Settings at the minimum window"
 
 [[asset]]
@@ -577,7 +577,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "834971e26be6d4e8840d84c6d97fbcabe58cef56ee142f58a4933d87ef4c4778"
+sha256 = "f9ed49503108dd46466d7da1679779519595ac93555c3d18fba47bbe589b332b"
 usage = "Documentation screenshot of the signature editor in Settings at the minimum window in the dark theme"
 
 # Cargo dependencies that carry licensed assets (an icon font, not a vendored file).
@@ -598,7 +598,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "00007136078ccc08575302e3772ae21868550b494ab1f9d354e18848811e2556"
+sha256 = "6162edad459e8c75746957bea069d80276fb0cdbc08f179539bfbf50aaa01485"
 usage = "Documentation screenshot of query chips, syntax help and bm25-ranked results at the minimum window"
 
 [[asset]]
@@ -608,7 +608,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a13cdda6b46451114512016cc5b2339c1817176192eebec755a993961dc0b7b5"
+sha256 = "f5a3a6d649e49ea7b24dc5c35b14c6cf64cafbd9ae6c4d39ee83927ce572b912"
 usage = "Documentation screenshot of dark-theme search at the minimum window"
 
 [[asset]]
@@ -618,7 +618,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "81666376d6239168ca943e571e0d5d7585b4ce56feb3b7e731192997ed327c79"
+sha256 = "43b6e986a8717a544709e913d9eb3f560ff08414cd7be7d7bfc8bb969bddaf10"
 usage = "Documentation screenshot of the positional Italian parse error and its way out"
 
 [[asset]]
@@ -628,7 +628,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f02edaebabea771a1fbeb00c8640d0744f7b1c684ef63d1f09a7f76a7189ee75"
+sha256 = "7d03cbce174dfb325c776d46a199a76f49534eeea74a60e5154ccd623b6dcff8"
 usage = "Documentation screenshot of the dark-theme search parse error"
 
 [[asset]]
@@ -638,7 +638,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "3f0bd908e9daf92b39e3eb2413754eef18f4af8fec33262e01c76769493d7478"
+sha256 = "08ddcf8f54be53681d573b4da4c4da7f47aafe8e8a05d9ea898725f8afb2227c"
 usage = "Documentation screenshot of conversation rows, participants and mailbox-wide counts at the minimum window"
 
 [[asset]]
@@ -648,7 +648,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a8981550583a9204a2325685a42551b0e452affea95fffb1cfca1eb14e806944"
+sha256 = "802a0bcbd577bf49e7833b8b61fb9e1647574be6f41fbe8eea11233a8f4f8c9d"
 usage = "Documentation screenshot of dark-theme conversation rows at the minimum window"
 
 [[asset]]
@@ -658,7 +658,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "77e83b03b7359f172496c59f0289b39b8e96f97aa62215f6a59a169432122c31"
+sha256 = "4b610db8602f20d7ea22e0f53521bed0472f10480c131db8c827ff5857d2ee36"
 usage = "Documentation screenshot of the one-open-card conversation overlay and its actions at the minimum window"
 
 [[asset]]
@@ -668,7 +668,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "e3526d07939b9c0fec01cb4fae791479501c4f284d4bb8696f7554fd0a8be5bc"
+sha256 = "452f8bfad93dac66071adfdc81472570914d816b24c7f0d91ad6d124861a9285"
 usage = "Documentation screenshot of dark-theme conversation cards at the minimum window"
 
 [[asset]]
@@ -678,7 +678,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "e417c7db224a229b9408709caf00c809dc7c66a64aeb25dda2164ccae2c29e7f"
+sha256 = "d078110a7432847682f81dd0c891c0ab9eb07058b2ed4dd38f90d870f0c54979"
 usage = "Documentation screenshot of the RICERCHE sidebar and an applied saved search at the minimum window"
 
 [[asset]]
@@ -688,7 +688,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "59a665cf61643ba4f25ee49f8fefb54e966d42335fbd3ac45694ac2c610cc7f6"
+sha256 = "9d642ee6adb36851d1c434dd2db16c5dd96fa1b5356b06dcbda8b6b7f3124d31"
 usage = "Documentation screenshot of dark-theme saved searches and recent queries at the minimum window"
 
 [[asset]]
@@ -698,7 +698,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "e31b06751dbed1864b89451fd354cd378b7c65f705c1033635fa494d8711bca0"
+sha256 = "ad2e271dba6c7090321e46ab21936ee785d0bbdd9bd7e44f720ece73d25ca038"
 usage = "Documentation screenshot of the local rule list, editor actions, priority and recent runs at the minimum window"
 
 [[asset]]
@@ -708,7 +708,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "c31fffa3a880b126135ed31be4bd23b591b6685ae077472aaee67155281e4292"
+sha256 = "641b117b7d2d037c6fcb938120bdcd1706f99d99dca5a062887378169d2fa74b"
 usage = "Documentation screenshot of dark-theme local rules at the minimum window"
 
 [[asset]]
@@ -718,7 +718,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "3e52b7dfc7b26507d77c7e5edf5d998e9500d19d6f0ae2a91b5224ede23f8dff"
+sha256 = "bd3504442f253b9a91d442be0e82799262c465abfe57b11d6d6fe459ad154fc9"
 usage = "Documentation screenshot of a prefilled rule editor with actions and the disabled forward reason"
 
 [[asset]]
@@ -728,7 +728,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "a54decb8eb0325dc03e8bca3b0de32e7cb59fcf4bf5e566ee5a12fadf67db074"
+sha256 = "44d43ce4c3d77d3dbdfd97bc804284e39549de08254811aaa971f91fea799b91"
 usage = "Documentation screenshot of the dark-theme rule editor"
 
 [[asset]]
@@ -738,7 +738,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "339f45516b3e3bcd088d22629d4677f9c4a55478e41872f69aa9a6d56790ccfe"
+sha256 = "5ab442e577d5c84ded88cf3bfb05023b20058fc724b40dc009ea6defb2dd3e40"
 usage = "Documentation screenshot of the read-only rule preview with one effect per action"
 
 [[asset]]
@@ -748,7 +748,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "212795a59bdfa83faf8c2c3554199e810e8ec233c149844958e9cf0b6612c71b"
+sha256 = "89f55b23a8469691b885d109325bdafdb83af49dc653d0fc1cfa9eb538af2968"
 usage = "Documentation screenshot of the dark-theme rule preview"
 
 [[dependency]]

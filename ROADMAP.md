@@ -1,8 +1,9 @@
 # Postino roadmap
 
 > **Current milestone:** M2 complete for SMTP/outbox and compose depth (P7/P8); M3 organize is
-> complete with encrypted search (P9a), conversations/saved searches (P9b) and local rules (P9c).
-> Full draft APPEND, attachment preview/save and HTML compose remain · **Last updated:** 2026-10-27
+> complete for encrypted search (P9a), conversations/saved searches (P9b) and local rules (P9c).
+> Attachment preview and HTML compose remain; the folder-thread view and the open/RSS halves of the
+> 100k gate are still open · **Last updated:** 2026-10-27
 >
 > M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
 > desktop app reads and syncs a real mailbox from the encrypted cache. M2 has started with SMTP,
@@ -181,7 +182,7 @@ interaction model before real mail makes them expensive to change. Full spec:
       forward payloads, enabling a stored forward rule and the `sync_now` rule pass behind
       `--allow-send`. Rules page, preview, CLI/MCP parity, 20k/100k evidence and 980×600 light/dark
       captures.
-- [ ] Attachment preview/save with path confinement.
+- [ ] Attachment preview (Save with path confinement shipped in P6c).
 - [ ] Verify: thread fixtures, rule idempotency, no path escape. The search, real-ingest and
       account-wide thread halves of the 100k gate are proven; the folder thread view and open/RSS
       halves remain open. P9c proves rule priority/stop, later-rule effects, idempotency, preview
