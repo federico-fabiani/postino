@@ -68,9 +68,20 @@ pub enum PgpDecryptState {
     NotStored,
 }
 
+/// What the retained raw bytes are, independent of signature validity. `none` means the message is
+/// readable but is not PGP/MIME; the UI shows no PGP affordance in that case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PgpMimeKind {
+    None,
+    Signed,
+    Encrypted,
+}
+
 /// Result of `message_pgp_verify`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PgpVerifyResult {
+    pub kind: PgpMimeKind,
     pub state: PgpVerifyState,
     /// Stored key row id, when the signature was attributed to one.
     pub key_id: Option<String>,
@@ -182,18 +193,20 @@ pub fn verify(store: &Store, account_id: &str, raw: &[u8]) -> Result<PgpVerifyRe
     let limits = postino_mime::Limits::default();
     let entity = match pgp_mime::detect(raw, &limits) {
         Ok(Some(entity)) => entity,
-        Ok(None) => return Ok(verify_state(PgpVerifyState::Unknown, "the retained message is not PGP/MIME")),
-        Err(error) => return Ok(verify_state(PgpVerifyState::Unknown, &format!("the retained message is not readable PGP/MIME: {error}"))),
+        Ok(None) => return Ok(verify_state(PgpMimeKind::None, PgpVerifyState::Unknown, "the retained message is not PGP/MIME")),
+        Err(error) => {
+            return Ok(verify_state(PgpMimeKind::None, PgpVerifyState::Unknown, &format!("the retained message is not readable PGP/MIME: {error}")));
+        }
     };
     let PgpMimeEntity::Signed { entity, signature, .. } = entity else {
-        return Ok(verify_state(PgpVerifyState::Unknown, "the retained message is encrypted, not signed; decrypt it first"));
+        return Ok(verify_state(PgpMimeKind::Encrypted, PgpVerifyState::Unknown, "the retained message is encrypted, not signed; decrypt it first"));
     };
     let Some(signature) = parse_detached_signature(&signature) else {
-        return Ok(verify_state(PgpVerifyState::Unknown, "the detached signature is not readable OpenPGP data"));
+        return Ok(verify_state(PgpMimeKind::Signed, PgpVerifyState::Unknown, "the detached signature is not readable OpenPGP data"));
     };
     let summaries = store.list_pgp_keys(account_id).map_err(crate::store_map::read_error)?;
     if summaries.is_empty() {
-        return Ok(verify_state(PgpVerifyState::NoKey, "no PGP key is stored for this account"));
+        return Ok(verify_state(PgpMimeKind::Signed, PgpVerifyState::NoKey, "no PGP key is stored for this account"));
     }
     let mut readable = 0usize;
     for summary in &summaries {
@@ -202,6 +215,7 @@ pub fn verify(store: &Store, account_id: &str, raw: &[u8]) -> Result<PgpVerifyRe
         readable = readable.saturating_add(1);
         if signature_matches(&signature, &key, &entity) {
             return Ok(PgpVerifyResult {
+                kind: PgpMimeKind::Signed,
                 state: PgpVerifyState::Verified,
                 key_id: Some(summary.id.clone()),
                 fingerprint: Some(summary.fingerprint.clone()),
@@ -211,9 +225,9 @@ pub fn verify(store: &Store, account_id: &str, raw: &[u8]) -> Result<PgpVerifyRe
         }
     }
     if readable == 0 {
-        return Ok(verify_state(PgpVerifyState::Unknown, "the stored public keys could not be parsed"));
+        return Ok(verify_state(PgpMimeKind::Signed, PgpVerifyState::Unknown, "the stored public keys could not be parsed"));
     }
-    Ok(verify_state(PgpVerifyState::Bad, "the signature does not match any stored key"))
+    Ok(verify_state(PgpMimeKind::Signed, PgpVerifyState::Bad, "the signature does not match any stored key"))
 }
 
 /// Decrypt a retained raw PGP/MIME message with a per-use passphrase.
@@ -498,8 +512,8 @@ fn send_error(error: PgpSendError) -> OpError {
     OpError::InvalidArgs(error.message().to_owned())
 }
 
-fn verify_state(state: PgpVerifyState, reason: &str) -> PgpVerifyResult {
-    PgpVerifyResult { state, key_id: None, fingerprint: None, signer: None, reason: Some(reason.to_owned()) }
+fn verify_state(kind: PgpMimeKind, state: PgpVerifyState, reason: &str) -> PgpVerifyResult {
+    PgpVerifyResult { kind, state, key_id: None, fingerprint: None, signer: None, reason: Some(reason.to_owned()) }
 }
 
 fn decrypt_state(state: PgpDecryptState, reason: &str) -> PgpDecryptResult {

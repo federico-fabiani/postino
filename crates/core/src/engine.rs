@@ -49,6 +49,7 @@ pub(crate) fn unknown_message(id: &str) -> OpError {
 fn not_stored_verify() -> crate::pgp_mime::PgpVerifyResult {
     crate::pgp_mime::PgpVerifyResult {
         state: crate::pgp_mime::PgpVerifyState::NotStored,
+        kind: crate::pgp_mime::PgpMimeKind::None,
         key_id: None,
         fingerprint: None,
         signer: None,

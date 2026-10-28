@@ -14,12 +14,14 @@ use eframe::egui::{
 };
 use postino_core::{
     Account, Address, Attachment, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor, LabelCreate,
-    LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView, SavedSearch,
-    SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
+    LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult,
+    PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase,
+    ThreadGetResult, ThreadSummary, ThreadsListResult,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
 use serde_json::json;
+use zeroize::Zeroizing;
 
 use crate::background;
 use crate::body;
@@ -483,6 +485,23 @@ pub struct PostinoApp {
     /// True while the reading pane shows a received, valid invite that can be answered. The three
     /// invite commands read this rule; the card never carries its own enabled state.
     invite_ready: bool,
+    /// The PGP verdict and any display-only decrypted body for the open message. Keyed by message
+    /// id so a list refresh cannot show the previous message's badge.
+    pgp_reading: Option<PgpReadingState>,
+    /// The last message id a verify was attempted for, including a non-PGP or failed result, so the
+    /// pane never re-runs the operation on every frame.
+    pgp_checked: Option<String>,
+    /// The one passphrase sheet: decrypting the open message or sending a signed draft.
+    pgp_prompt: Option<PgpPromptState>,
+    /// The account's public key rows, loaded when Settings or the composer needs them.
+    pgp_keys: Vec<PgpKey>,
+    pgp_keys_loaded: bool,
+    /// The key import sheet. Key material and the passphrase stay in this state only.
+    pgp_import: Option<PgpImportState>,
+    /// The key waiting for the delete confirmation.
+    pgp_delete: Option<PgpDeleteState>,
+    /// A one-line result under the PGP settings section.
+    pgp_notice: Option<String>,
     /// The sidebar account row, used to return focus when settings closes.
     account_switcher_id: Option<Id>,
     /// The widget to restore when the settings dialog closes.
@@ -1157,6 +1176,14 @@ impl PostinoApp {
             screenshot_invite: None,
             invite_cache: None,
             invite_ready: false,
+            pgp_reading: None,
+            pgp_checked: None,
+            pgp_prompt: None,
+            pgp_keys: Vec::new(),
+            pgp_keys_loaded: false,
+            pgp_import: None,
+            pgp_delete: None,
+            pgp_notice: None,
             account_switcher_id: None,
             settings_return_focus: None,
             settings_focus_pending: false,
@@ -2197,6 +2224,7 @@ impl PostinoApp {
         }
         self.active_account = Some(id);
         self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
+        self.reset_pgp_account_state();
         self.clear_search();
         self.unread_only = false;
         self.attachments_only = false;
@@ -2225,6 +2253,7 @@ impl PostinoApp {
     fn enter_account(&mut self, id: String) {
         self.active_account = Some(id.clone());
         self.folder = default_folder_for(&self.engine, self.active_account.as_deref());
+        self.reset_pgp_account_state();
         self.clear_search();
         self.unread_only = false;
         self.attachments_only = false;
@@ -5262,6 +5291,12 @@ impl PostinoApp {
     }
 
     fn send_composer(&mut self) {
+        self.send_composer_with(None);
+    }
+
+    /// The real send path. `passphrase` is present only after the signing sheet confirmed it; it is
+    /// inserted into the operation arguments once and never stored on the draft or in Settings.
+    fn send_composer_with(&mut self, passphrase: Option<&str>) {
         if !self.composer.open {
             return;
         }
@@ -5274,6 +5309,9 @@ impl PostinoApp {
             self.status = reason.to_owned();
             return;
         }
+        if !self.pgp_keys_loaded && !self.demo {
+            self.refresh_pgp_keys();
+        }
         if !self.save_composer(true) {
             return;
         }
@@ -5285,7 +5323,23 @@ impl PostinoApp {
             self.composer.mark_failed("Aggiungi almeno un destinatario prima di inviare", self.now);
             return;
         };
-        match self.op("message_send", json!({ "draft": id })) {
+        let sign = self.composer.pgp_sign.clone();
+        let encrypt = self.composer.pgp_encrypt.clone();
+        if let Some(key_id) = sign.as_deref() {
+            let Some(key) = self.pgp_keys.iter().find(|key| key.id == key_id) else {
+                self.composer.mark_failed("La chiave PGP scelta non è più disponibile: scegline un'altra.", self.now);
+                return;
+            };
+            if key.protected && passphrase.is_none() {
+                self.pgp_prompt = Some(PgpPromptState::new(PgpPromptPurpose::Send));
+                return;
+            }
+        }
+        let mut args = json!({ "draft": id });
+        if let Some(pgp) = pgp_send_request(sign.as_deref(), &encrypt, passphrase) {
+            args["pgp"] = pgp;
+        }
+        match self.op("message_send", args) {
             Ok(value) => match serde_json::from_value::<SendQueued>(value) {
                 Ok(queued) => {
                     let row = queued.queued.outbox;
@@ -7374,6 +7428,144 @@ impl PostinoApp {
         }
     }
 
+    /// Verify the open message once and keep only what the pane shows. A message that is not
+    /// PGP/MIME, a demo row or a pre-v9 row gets no badge: the app never invents a signature.
+    fn sync_pgp_reading(&mut self, message: &Message) {
+        if self.demo
+            || self.screenshot_message.as_ref().is_some_and(|shot| shot.summary.id == message.summary.id)
+            || self.pgp_checked.as_deref() == Some(message.summary.id.as_str())
+        {
+            return;
+        }
+        self.pgp_reading = None;
+        self.pgp_prompt = None;
+        self.pgp_checked = Some(message.summary.id.clone());
+        let mut args = json!({ "id": message.summary.id });
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        let Ok(value) = self.op("message_pgp_verify", args) else { return };
+        let Ok(result) = serde_json::from_value::<PgpVerifyResult>(value) else { return };
+        if result.kind == PgpMimeKind::None {
+            return;
+        }
+        self.pgp_reading =
+            Some(PgpReadingState { message_id: message.summary.id.clone(), kind: result.kind, verify: Some(result), decrypt: None, view: None });
+    }
+
+    /// Ask the engine to decrypt with no passphrase first. An unprotected key opens immediately; a
+    /// protected key answers `Locked` and only then the sheet asks for the secret.
+    fn begin_pgp_decrypt(&mut self) {
+        let Some(state) = self.pgp_reading.as_ref() else { return };
+        if !matches!(state.kind, PgpMimeKind::Encrypted) {
+            return;
+        }
+        let id = state.message_id.clone();
+        let Some(result) = self.pgp_decrypt(&id, "") else { return };
+        match result.state {
+            PgpDecryptState::Decrypted => self.apply_pgp_decrypt(result),
+            PgpDecryptState::Locked | PgpDecryptState::WrongPassphrase => {
+                self.apply_pgp_decrypt(result);
+                self.pgp_prompt = Some(PgpPromptState::new(PgpPromptPurpose::Decrypt));
+            }
+            _ => self.apply_pgp_decrypt(result),
+        }
+    }
+
+    fn pgp_decrypt(&mut self, id: &str, passphrase: &str) -> Option<PgpDecryptResult> {
+        let mut args = json!({ "id": id, "passphrase": passphrase });
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        match self.op("message_pgp_decrypt", args) {
+            Ok(value) => match serde_json::from_value::<PgpDecryptResult>(value) {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    self.push_info_toast("Risposta di decifratura non leggibile.", ToastKind::Error);
+                    None
+                }
+            },
+            Err(error) => {
+                self.push_info_toast(format!("Decifratura non riuscita: {error}"), ToastKind::Error);
+                None
+            }
+        }
+    }
+
+    fn apply_pgp_decrypt(&mut self, result: PgpDecryptResult) {
+        let Some(state) = self.pgp_reading.as_mut() else { return };
+        if result.state == PgpDecryptState::Decrypted {
+            let text = result.text.as_deref().unwrap_or_default();
+            let view = body::SubsetBodyRenderer.render(&body::StoredBody { html: result.html.as_deref(), text });
+            state.view = Some(Arc::new(view));
+        }
+        state.decrypt = Some(result);
+    }
+
+    fn pgp_body_view(&self, message_id: &str) -> Option<Arc<body::View>> {
+        let state = self.pgp_reading.as_ref().filter(|state| state.message_id == message_id)?;
+        state.decrypt.as_ref().filter(|result| result.state == PgpDecryptState::Decrypted)?;
+        state.view.clone()
+    }
+
+    /// The badge and the decrypt action. It reads the cached verdict, never the parsed body: the
+    /// UI cannot tell a signed message from an unsigned one without the retained raw bytes.
+    fn pgp_reading_row(&mut self, ui: &mut Ui, t: &Tokens, message_id: &str) {
+        let Some(state) = self.pgp_reading.as_ref().filter(|state| state.message_id == message_id) else { return };
+        ui.add_space(space::XS);
+        let mut decrypt = false;
+        let mut tooltip = String::new();
+        let (label, kind) = if let Some(result) = state.decrypt.as_ref() {
+            tooltip = result.reason.clone().unwrap_or_default();
+            match result.state {
+                PgpDecryptState::Decrypted => ("Decifrato · solo in questa vista", BadgeKind::Accent),
+                PgpDecryptState::Locked => ("Chiave bloccata", BadgeKind::Neutral),
+                PgpDecryptState::WrongPassphrase => ("Passphrase errata", BadgeKind::Danger),
+                PgpDecryptState::NoKey => ("Nessuna chiave privata", BadgeKind::Neutral),
+                PgpDecryptState::Unknown => ("Decifratura non riuscita", BadgeKind::Danger),
+                PgpDecryptState::NotStored => ("PGP non disponibile", BadgeKind::Neutral),
+            }
+        } else if state.kind == PgpMimeKind::Encrypted {
+            tooltip = state.verify.as_ref().and_then(|result| result.reason.clone()).unwrap_or_default();
+            ("Crittografato", BadgeKind::Neutral)
+        } else if let Some(result) = state.verify.as_ref() {
+            tooltip = result.reason.clone().unwrap_or_else(|| {
+                let signer = result.signer.as_deref().unwrap_or("firma");
+                let fingerprint = result.fingerprint.as_deref().unwrap_or("");
+                if fingerprint.is_empty() { format!("Firmato da {signer}") } else { format!("Firmato da {signer} · {fingerprint}") }
+            });
+            match result.state {
+                PgpVerifyState::Verified => ("Firma verificata", BadgeKind::Accent),
+                PgpVerifyState::Bad => ("Firma non valida", BadgeKind::Danger),
+                PgpVerifyState::NoKey => ("Firma: chiave assente", BadgeKind::Neutral),
+                PgpVerifyState::Unknown => ("PGP: stato sconosciuto", BadgeKind::Neutral),
+                PgpVerifyState::NotStored => ("PGP non disponibile", BadgeKind::Neutral),
+            }
+        } else {
+            ("PGP: stato sconosciuto", BadgeKind::Neutral)
+        };
+        let _row = ui.horizontal_wrapped(|ui| {
+            let badge = Badge::new(label).kind(kind).show(ui);
+            if !tooltip.is_empty() {
+                badge.on_hover_text(tooltip.as_str());
+            }
+            if state.kind == PgpMimeKind::Encrypted
+                && state.decrypt.as_ref().is_none_or(|result| result.state != PgpDecryptState::Decrypted)
+                && Button::ghost("Decifra").size(ButtonSize::Sm).show(ui).clicked()
+            {
+                decrypt = true;
+            }
+            if state.decrypt.as_ref().is_some_and(|result| result.state == PgpDecryptState::Decrypted) {
+                ui.label(typography::text(Role::Caption, "Il testo decifrato non viene salvato né indicizzato.", t.text_faint));
+            }
+        });
+        #[cfg(test)]
+        probe::reading_pgp(ui, _row.response.rect);
+        if decrypt {
+            self.begin_pgp_decrypt();
+        }
+    }
+
     /// Parse the open message's calendar part once. A screenshot scene owns its card directly.
     fn reading_invite(&mut self, message: &Message) -> Option<CalendarInviteView> {
         if self.screenshot_message.as_ref().is_some_and(|screenshot| screenshot.summary.id == message.summary.id) {
@@ -7437,6 +7629,7 @@ impl PostinoApp {
             self.close_reading();
             return;
         };
+        self.sync_pgp_reading(&message);
         let invite = self.reading_invite(&message);
         #[cfg(test)]
         probe::clear_actions(ui);
@@ -7642,6 +7835,7 @@ impl PostinoApp {
             self.select_label(id);
             return;
         }
+        self.pgp_reading_row(ui, t, message.summary.id.as_str());
         // The three reply commands are enabled only while a received, valid invite is on screen.
         self.invite_ready = invite.as_ref().is_some_and(|invite| invite.valid && !invite.cancelled && invite.can_reply);
         // The count is stored truth from sync, not a scan of `body_html`: the sanitizer removed the
@@ -7657,7 +7851,7 @@ impl PostinoApp {
         ui.add_space(space::SM);
         ui.separator();
         ui.add_space(space::XS);
-        let view = self.rendered_body(&message);
+        let view = self.pgp_body_view(message.summary.id.as_str()).unwrap_or_else(|| self.rendered_body(&message));
         ui.label(typography::text(Role::Caption, body::caption(view.as_ref()), t.text_faint));
         ui.add_space(space::SM);
         // A pinned strip keeps the attachment and its Save button visible at 980×600, where the body
@@ -8627,6 +8821,9 @@ impl PostinoApp {
         if self.background_rows.is_none() {
             self.refresh_background();
         }
+        if !self.pgp_keys_loaded && !self.demo {
+            self.refresh_pgp_keys();
+        }
         // Escape closes the signature editor first; only a second Escape leaves Settings. Consuming
         // the key here keeps the modal's own close rule from seeing it.
         if self.signature_editor.is_some()
@@ -8652,6 +8849,9 @@ impl PostinoApp {
         let mut signature_open: Option<String> = None;
         let mut signature_save: Option<String> = None;
         let mut signature_cancel = false;
+        let mut pgp_import = false;
+        let mut pgp_delete: Option<PgpKey> = None;
+        let mut pgp_export: Option<String> = None;
         let focus_close = self.settings_focus_pending;
         self.settings_focus_pending = false;
         let window = ui.ctx().content_rect();
@@ -8953,6 +9153,76 @@ impl PostinoApp {
                                 shortcuts = true;
                             }
                         });
+
+                        ui.add_space(space::MD);
+                        let _pgp = ui.label(typography::strong(Role::BodySmall, "PGP", t.text_faint));
+                        #[cfg(test)]
+                        probe::settings_section(ui, "PGP", _pgp.rect);
+                        ui.add_space(space::XS);
+                        ui.label(typography::text(
+                            Role::Meta,
+                            "Le chiavi restano in questo archivio cifrato. La passphrase non viene salvata e serve a ogni uso.",
+                            t.text_faint,
+                        ));
+                        if let Some(notice) = self.pgp_notice.as_deref() {
+                            ui.label(typography::text(Role::Caption, notice, t.text_muted));
+                        }
+                        if self.pgp_keys.is_empty() {
+                            ui.label(typography::text(Role::BodySmall, "Nessuna chiave PGP salvata.", t.text_muted));
+                        }
+                        for key in &self.pgp_keys {
+                            Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::XS)).show(
+                                ui,
+                                |ui| {
+                                    Sides::new().show(
+                                        ui,
+                                        |ui| {
+                                            ui.vertical(|ui| {
+                                                ui.spacing_mut().item_spacing.y = 1.0;
+                                                ui.label(typography::text(
+                                                    Role::BodySmall,
+                                                    key.user_id.as_deref().unwrap_or("Chiave senza identità"),
+                                                    t.text,
+                                                ));
+                                                let short = key.fingerprint.chars().take(16).collect::<String>();
+                                                let short = if short.len() < key.fingerprint.len() { format!("{short}…") } else { short };
+                                                ui.add(egui::Label::new(typography::mono(short, 11.0, t.text_faint)).truncate())
+                                                    .on_hover_text(key.fingerprint.as_str());
+                                            });
+                                        },
+                                        |ui| {
+                                            if key.has_secret {
+                                                ui.label(typography::text(
+                                                    Role::Caption,
+                                                    if key.protected { "Privata · protetta" } else { "Privata" },
+                                                    t.text_faint,
+                                                ));
+                                            }
+                                            let export = Button::ghost("Copia pubblica").size(ButtonSize::Sm).show(ui);
+                                            #[cfg(test)]
+                                            probe::settings_pgp_export(ui, key.id.as_str(), export.rect);
+                                            if export.clicked() {
+                                                pgp_export = Some(key.id.clone());
+                                            }
+                                            if Button::danger("Elimina").size(ButtonSize::Sm).show(ui).clicked() {
+                                                pgp_delete = Some(key.clone());
+                                            }
+                                        },
+                                    );
+                                },
+                            );
+                            ui.add_space(space::XS);
+                        }
+                        if Button::new("Importa chiave PGP")
+                            .icon(icons::PLUS)
+                            .size(ButtonSize::Sm)
+                            .enabled(!self.demo)
+                            .disabled_reason("La modalità demo non ha un archivio locale su cui salvare le chiavi")
+                            .show(ui)
+                            .clicked()
+                        {
+                            pgp_import = true;
+                        }
                     });
                 #[cfg(test)]
                 probe::settings_scroll(ui, _settings_scroll.inner_rect, _settings_scroll.content_size, _settings_scroll.state.offset);
@@ -8985,6 +9255,15 @@ impl PostinoApp {
             self.mark_settings_dirty();
             self.persist_settings();
             self.status = "Larghezza lettura reimpostata".to_owned();
+        }
+        if let Some(id) = pgp_export {
+            self.export_pgp_key(&id, ui.ctx());
+        }
+        if let Some(key) = pgp_delete {
+            self.pgp_delete = Some(PgpDeleteState { key, focus_cancel: true });
+        }
+        if pgp_import {
+            self.open_pgp_import();
         }
         if let Some(account_id) = signature_open {
             let text =
@@ -9092,6 +9371,250 @@ impl PostinoApp {
             });
         if close || response.should_close() {
             self.close_licences(ui.ctx());
+        }
+    }
+
+    /// Read the account's key rows once. A failure becomes a sentence in Settings; it never hides
+    /// the existing rows or claims the account has no keys.
+    /// Keys, verdicts and the passphrase sheet belong to one account. Switching accounts must not
+    /// show the previous account's keys or keep a prompt that would sign with the wrong identity.
+    fn reset_pgp_account_state(&mut self) {
+        self.pgp_keys.clear();
+        self.pgp_keys_loaded = false;
+        self.pgp_reading = None;
+        self.pgp_checked = None;
+        self.pgp_prompt = None;
+        self.pgp_import = None;
+        self.pgp_delete = None;
+    }
+
+    fn refresh_pgp_keys(&mut self) {
+        let mut args = json!({});
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        match self.op("pgp_keys_list", args) {
+            Ok(value) => match serde_json::from_value::<Vec<PgpKey>>(value) {
+                Ok(keys) => {
+                    self.pgp_keys = keys;
+                    self.pgp_notice = None;
+                }
+                Err(_) => self.pgp_notice = Some("L'elenco delle chiavi non è leggibile.".to_owned()),
+            },
+            Err(error) => self.pgp_notice = Some(format!("Chiavi PGP non disponibili: {error}")),
+        }
+        self.pgp_keys_loaded = true;
+    }
+
+    fn open_pgp_import(&mut self) {
+        self.pgp_import = Some(PgpImportState {
+            armor: Zeroizing::new(String::new()),
+            passphrase: Zeroizing::new(String::new()),
+            focus_armor: true,
+            error: None,
+            busy: false,
+        });
+    }
+
+    fn submit_pgp_import(&mut self, mut state: PgpImportState) {
+        let mut args = json!({ "armored_key": state.armor.as_str() });
+        if !state.passphrase.is_empty() {
+            args["passphrase"] = json!(state.passphrase.as_str());
+        }
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        match self.op("pgp_key_import", args) {
+            Ok(_) => {
+                self.pgp_import = None;
+                self.pgp_keys_loaded = false;
+                self.refresh_pgp_keys();
+                self.pgp_notice = Some("Chiave PGP importata in questo archivio cifrato.".to_owned());
+            }
+            Err(error) => {
+                state.busy = false;
+                state.error = Some(format!("Import non riuscito: {error}"));
+                self.pgp_import = Some(state);
+            }
+        }
+    }
+
+    /// Export is public-only: the button copies the armor, never the secret, and the operation has
+    /// no secret path at all.
+    fn export_pgp_key(&mut self, id: &str, ctx: &egui::Context) {
+        let mut args = json!({ "id": id });
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        match self.op("pgp_key_export_public", args) {
+            Ok(value) => match serde_json::from_value::<PgpPublicKey>(value) {
+                Ok(key) => {
+                    ctx.copy_text(key.public_armor);
+                    self.pgp_notice = Some("Chiave pubblica copiata negli appunti.".to_owned());
+                }
+                Err(_) => self.pgp_notice = Some("La chiave pubblica esportata non è leggibile.".to_owned()),
+            },
+            Err(error) => self.pgp_notice = Some(format!("Esportazione non riuscita: {error}")),
+        }
+    }
+
+    fn delete_pgp_key(&mut self, id: &str) {
+        let mut args = json!({ "id": id });
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        match self.op("pgp_key_delete", args) {
+            Ok(_) => {
+                self.pgp_keys_loaded = false;
+                self.refresh_pgp_keys();
+                self.pgp_notice = Some("Chiave PGP eliminata.".to_owned());
+            }
+            Err(error) => self.pgp_notice = Some(format!("Eliminazione non riuscita: {error}")),
+        }
+    }
+
+    fn pgp_prompt_dialog(&mut self, ui: &mut Ui) {
+        let Some(mut prompt) = self.pgp_prompt.take() else { return };
+        let t = theme::tokens(self.dark);
+        let (title, body, action) = match prompt.purpose {
+            PgpPromptPurpose::Decrypt => (
+                "Passphrase della chiave PGP",
+                "La passphrase apre la chiave privata solo per questa decifratura. Non viene salvata, non entra nel testo della mail e non viene indicizzata.",
+                "Decifra",
+            ),
+            PgpPromptPurpose::Send => (
+                "Firma con la chiave PGP",
+                "La passphrase sblocca la chiave privata solo per questo invio. Il messaggio parte firmato: se la chiave non si apre, l'invio viene annullato.",
+                "Firma e invia",
+            ),
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let focus = prompt.focus;
+        prompt.focus = false;
+        let response = egui::Modal::new(Id::new("postino-pgp-passphrase"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(440.0);
+                ui.label(typography::strong(Role::Emphasis, title, t.text));
+                ui.add_space(space::SM);
+                ui.label(typography::text(Role::Secondary, body, t.text_muted));
+                ui.add_space(space::MD);
+                TextField::new(&mut prompt.value, "Passphrase").label("PASSPHRASE").password(true).width(ui.available_width()).focus(focus).show(ui);
+                if let Some(error) = prompt.error.as_deref() {
+                    ui.label(typography::text(Role::Meta, error, t.danger));
+                }
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    confirm = Button::primary(action).show(ui).clicked();
+                    cancel = Button::ghost("Annulla").show(ui).clicked();
+                });
+                if ui.input(|input| input.key_pressed(Key::Enter)) && !prompt.value.is_empty() {
+                    confirm = true;
+                }
+            });
+        let escaped = response.should_close();
+        if confirm && !prompt.value.is_empty() {
+            let value = std::mem::take(&mut prompt.value);
+            match prompt.purpose {
+                PgpPromptPurpose::Decrypt => {
+                    let Some(id) = self.pgp_reading.as_ref().map(|state| state.message_id.clone()) else { return };
+                    match self.pgp_decrypt(&id, value.as_str()) {
+                        Some(result) if result.state == PgpDecryptState::WrongPassphrase => {
+                            prompt.error = Some("La passphrase non apre la chiave. Riprova.".to_owned());
+                            prompt.focus = true;
+                            self.pgp_prompt = Some(prompt);
+                        }
+                        Some(result) => self.apply_pgp_decrypt(result),
+                        None => self.pgp_prompt = Some(prompt),
+                    }
+                }
+                PgpPromptPurpose::Send => self.send_composer_with(Some(value.as_str())),
+            }
+        } else if cancel || escaped {
+            self.pgp_prompt = None;
+        } else {
+            self.pgp_prompt = Some(prompt);
+        }
+    }
+
+    fn pgp_import_dialog(&mut self, ui: &mut Ui) {
+        let Some(state) = self.pgp_import.as_mut() else { return };
+        let t = theme::tokens(self.dark);
+        let mut submit = false;
+        let mut cancel = false;
+        let focus = state.focus_armor;
+        state.focus_armor = false;
+        let response = egui::Modal::new(Id::new("postino-pgp-import"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(520.0);
+                ui.label(typography::strong(Role::Emphasis, "Importa una chiave PGP", t.text));
+                ui.add_space(space::SM);
+                ui.label(typography::text(
+                    Role::Secondary,
+                    "Incolla un blocco armored pubblico o privato. Una chiave privata deve essere già protetta: la passphrase serve solo a verificarla e non viene salvata.",
+                    t.text_muted,
+                ));
+                ui.add_space(space::MD);
+                TextField::new(&mut state.armor, "-----BEGIN PGP PRIVATE KEY BLOCK-----")
+                    .label("CHIAVE ARMORED")
+                    .multiline(6)
+                    .width(ui.available_width())
+                    .focus(focus)
+                    .show(ui);
+                ui.add_space(space::SM);
+                TextField::new(&mut state.passphrase, "Passphrase della chiave privata")
+                    .label("PASSPHRASE · SOLO PER UNA CHIAVE PRIVATA")
+                    .password(true)
+                    .width(ui.available_width())
+                    .show(ui);
+                if let Some(error) = state.error.as_deref() {
+                    ui.label(typography::text(Role::Meta, error, t.danger));
+                }
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let import = Button::primary("Importa").enabled(!state.busy && !state.armor.trim().is_empty());
+                    submit = import.show(ui).clicked();
+                    cancel = Button::ghost("Annulla").show(ui).clicked();
+                });
+            });
+        if submit {
+            let Some(mut state) = self.pgp_import.take() else { return };
+            state.busy = true;
+            self.submit_pgp_import(state);
+        } else if cancel || response.should_close() {
+            self.pgp_import = None;
+        }
+    }
+
+    fn pgp_delete_dialog(&mut self, ui: &mut Ui) {
+        let Some(state) = self.pgp_delete.clone() else { return };
+        let name = state.key.user_id.as_deref().unwrap_or("questa chiave");
+        let body = format!(
+            "Eliminare la chiave PGP “{name}” ({})? La chiave pubblica e, se presente, quella privata vengono rimosse da questo archivio cifrato. Le mail già firmate o cifrate restano nel loro stato, ma non potranno più essere verificate o decifrate con questa chiave.",
+            state.key.fingerprint
+        );
+        let mut confirm = false;
+        let mut cancel = false;
+        let response =
+            egui::Modal::new(Id::new("postino-pgp-delete")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
+                let response = Dialog::new("Eliminare la chiave PGP?", body.as_str(), "Elimina")
+                    .secondary("Annulla")
+                    .danger(true)
+                    .width(480.0)
+                    .focus_secondary(state.focus_cancel)
+                    .show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            });
+        if confirm {
+            self.pgp_delete = None;
+            self.delete_pgp_key(&state.key.id);
+        } else if cancel || response.should_close() {
+            self.pgp_delete = None;
         }
     }
 
@@ -9297,6 +9820,9 @@ impl PostinoApp {
         if !self.composer.open {
             return;
         }
+        if !self.pgp_keys_loaded && !self.demo {
+            self.refresh_pgp_keys();
+        }
         let Some(account) = self.account().cloned() else {
             self.composer = ComposerState::closed();
             return;
@@ -9328,6 +9854,7 @@ impl PostinoApp {
                     .send_available(smtp_available)
                     .demo(self.demo)
                     .attachments_available(attachments_available)
+                    .pgp_keys(&self.pgp_keys)
                     .show(ui)
             })
             .inner
@@ -10082,6 +10609,8 @@ impl PostinoApp {
         self.outbox_dialog(ui);
         self.outbox_confirm_dialog(ui);
         self.account_remove_dialog(ui);
+        self.pgp_import_dialog(ui);
+        self.pgp_delete_dialog(ui);
         self.link_confirmation(ui);
         self.attachment_warning_dialog(ui);
         self.attachment_overwrite_dialog(ui);
@@ -10093,6 +10622,9 @@ impl PostinoApp {
             self.composer_focus_pending = false;
         }
         self.composer_window(ui);
+        // The passphrase sheet belongs to the composer when it signs: draw it after the composer so
+        // it sits on top instead of behind the composer modal.
+        self.pgp_prompt_dialog(ui);
         if composer_was_open
             && !self.composer.open
             && let Some(id) = self.composer_return_focus.take()
@@ -10415,6 +10947,53 @@ struct BodyCache {
     /// `body_text`; the key must hold the input instead.
     text: String,
     view: Arc<body::View>,
+}
+
+/// The PGP state of the open message. `view` is the decrypted body, built once from the sanitized
+/// text/html the engine returned; it is display-only and never written back to the store.
+struct PgpReadingState {
+    message_id: String,
+    kind: PgpMimeKind,
+    verify: Option<PgpVerifyResult>,
+    decrypt: Option<PgpDecryptResult>,
+    view: Option<Arc<body::View>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PgpPromptPurpose {
+    Decrypt,
+    Send,
+}
+
+/// A passphrase held only while its sheet is open. It is never put in `Settings`, a draft, a log or
+/// a toast; the operation call serializes it once and the engine owns the zeroised copy.
+struct PgpPromptState {
+    purpose: PgpPromptPurpose,
+    value: Zeroizing<String>,
+    focus: bool,
+    error: Option<String>,
+}
+
+impl PgpPromptState {
+    fn new(purpose: PgpPromptPurpose) -> Self {
+        Self { purpose, value: Zeroizing::new(String::new()), focus: true, error: None }
+    }
+}
+
+/// The key import sheet. A private key is imported only with its passphrase; the armor is held here
+/// until the operation returns and is never shown in the list.
+struct PgpImportState {
+    armor: Zeroizing<String>,
+    passphrase: Zeroizing<String>,
+    focus_armor: bool,
+    error: Option<String>,
+    busy: bool,
+}
+
+#[derive(Clone)]
+struct PgpDeleteState {
+    key: PgpKey,
+    focus_cancel: bool,
 }
 
 /// An attachment whose bytes are already read from the blob store and whose destination is being
@@ -11484,6 +12063,22 @@ fn missing_attachment_name(raw: &str) -> Option<String> {
 }
 
 /// Translate an engine send failure into Italian copy. The raw sentence never reaches the shell.
+/// The optional `pgp` object on a send. Encryption alone takes no passphrase; a signature adds it
+/// only after the sheet collected it. No key ids means a plain send and no `pgp` field at all.
+fn pgp_send_request(sign: Option<&str>, encrypt: &[String], passphrase: Option<&str>) -> Option<Value> {
+    if sign.is_none() && encrypt.is_empty() {
+        return None;
+    }
+    let mut request = json!({ "encrypt": encrypt });
+    if let Some(sign) = sign {
+        request["sign"] = json!(sign);
+        if let Some(passphrase) = passphrase {
+            request["passphrase"] = json!(passphrase);
+        }
+    }
+    Some(request)
+}
+
 fn send_error_message(raw: &str, demo: bool) -> String {
     if demo || raw.contains("demo mailbox") {
         return "La modalità demo non invia messaggi: aggiungi un account reale con un server SMTP.".to_owned();
@@ -12596,6 +13191,30 @@ pub(crate) mod probe {
 
     pub fn reading_header_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("reading-header")))
+    }
+
+    pub fn reading_pgp(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("reading-pgp"), rect));
+    }
+
+    pub fn reading_pgp_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("reading-pgp")))
+    }
+
+    pub fn composer_pgp(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-pgp"), rect));
+    }
+
+    pub fn composer_pgp_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-pgp")))
+    }
+
+    pub fn settings_pgp_export(ui: &Ui, key_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(Id::new(("settings-pgp-export", key_id)), rect));
+    }
+
+    pub fn settings_pgp_export_rect(ctx: &Context, key_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(Id::new(("settings-pgp-export", key_id))))
     }
 
     pub fn reading_cc(ui: &Ui, rect: Rect) {
@@ -18852,5 +19471,155 @@ mod tests {
         let accounts = app.op("accounts_list", json!({})).expect("a read after the refused add");
         assert_eq!(accounts["accounts"].as_array().map(Vec::len), Some(1), "the refused add must not create an account");
         daemon.shutdown().expect("the daemon stops");
+    }
+
+    #[test]
+    fn pgp_badges_and_the_decrypt_sheet_are_rendered_from_the_engine_verdict() {
+        let (ctx, mut app) = ready_app();
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let id = app
+            .selected
+            .clone()
+            .or_else(|| app.visible_messages().0.first().map(|message| message.id.clone()))
+            .expect("the demo has one open message");
+        app.open_message(id.clone());
+        app.pgp_checked = Some(id.clone());
+        app.pgp_reading = Some(PgpReadingState {
+            message_id: id.clone(),
+            kind: PgpMimeKind::Signed,
+            verify: Some(PgpVerifyResult {
+                state: PgpVerifyState::Verified,
+                kind: PgpMimeKind::Signed,
+                key_id: Some("A6079AAB69465D6D".to_owned()),
+                fingerprint: Some("D529DDA09F683768022096EBA6079AAB69465D6D".to_owned()),
+                signer: Some("Ada <ada@example.com>".to_owned()),
+                reason: None,
+            }),
+            decrypt: None,
+            view: None,
+        });
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Firma verificata");
+        assert!(probe::reading_pgp_rect(&ctx).is_some(), "the badge row must be probe-able");
+
+        app.pgp_reading = Some(PgpReadingState {
+            message_id: id.clone(),
+            kind: PgpMimeKind::Encrypted,
+            verify: Some(PgpVerifyResult {
+                state: PgpVerifyState::Unknown,
+                kind: PgpMimeKind::Encrypted,
+                key_id: None,
+                fingerprint: None,
+                signer: None,
+                reason: Some("the retained message is encrypted, not signed; decrypt it first".to_owned()),
+            }),
+            decrypt: None,
+            view: None,
+        });
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Crittografato");
+        painted_visible(&runs, "Decifra");
+        app.dark = true;
+        theme::apply(&ctx, true);
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Crittografato");
+        app.dark = false;
+        theme::apply(&ctx, false);
+
+        app.pgp_prompt = Some(PgpPromptState::new(PgpPromptPurpose::Decrypt));
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Passphrase della chiave PGP");
+        painted_visible(&runs, "Decifra");
+        assert!(app.pgp_prompt.is_some(), "Escape was not pressed: the sheet stays open");
+    }
+
+    #[test]
+    fn composer_pgp_row_uses_the_stored_keys_and_offers_encryption_without_a_dead_toggle() {
+        let (ctx, mut app) = ready_app();
+        app.pgp_keys_loaded = true;
+        app.pgp_keys = vec![pgp_key("key_ada")];
+        app.compose_new();
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Nessuna firma");
+        painted_visible(&runs, "Cifra");
+        assert!(probe::composer_pgp_rect(&ctx).is_some(), "the composer PGP row must be probe-able");
+
+        app.composer.pgp_sign = Some("key_ada".to_owned());
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Ada Lovelace");
+    }
+
+    #[test]
+    fn settings_lists_pgp_keys_with_export_and_delete() {
+        let (ctx, mut app) = ready_app();
+        app.pgp_keys_loaded = true;
+        app.pgp_keys = vec![pgp_key("key_ada")];
+        app.open_settings(&ctx, None);
+        frame_at(&ctx, &mut app, Vec2::new(1200.0, 900.0), vec![]);
+        if let Some(scroll) = probe::settings_scroll_view(&ctx) {
+            frame_at(&ctx, &mut app, Vec2::new(1200.0, 900.0), wheel(scroll.center(), 80));
+        }
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(1200.0, 900.0));
+        painted_visible(&runs, "Importa chiave PGP");
+        painted_visible(&runs, "Ada Lovelace");
+        painted_visible(&runs, "Copia pubblica");
+        painted_visible(&runs, "Elimina");
+    }
+
+    #[test]
+    fn pgp_send_request_carries_keys_and_only_the_signed_passphrase() {
+        assert_eq!(pgp_send_request(None, &[], None), None);
+        let encrypt = vec!["key_b".to_owned()];
+        let request = pgp_send_request(None, &encrypt, None).expect("an encrypt-only send");
+        assert_eq!(request["encrypt"], json!(["key_b"]));
+        assert!(request.get("sign").is_none());
+        assert!(request.get("passphrase").is_none());
+
+        let request = pgp_send_request(Some("key_a"), &encrypt, Some("segreta")).expect("a signed send");
+        assert_eq!(request["sign"], json!("key_a"));
+        assert_eq!(request["passphrase"], json!("segreta"));
+    }
+
+    #[test]
+    fn pgp_key_import_and_public_export_reach_the_daemon() {
+        let (mut app, daemon, _path, _key, _vault) =
+            daemon_app("p12c2c-pgp-export", |store| seed_account_rows(store, "acc_a", "save@example.com", None));
+        let armor = include_str!("../../../testdata/pgp/public.asc");
+        let imported =
+            app.op("pgp_key_import", json!({ "account": "acc_a", "armored_key": armor, "passphrase": "" })).expect("import the test public key");
+        let key_id = imported["id"].as_str().expect("the imported key id").to_owned();
+        assert_eq!(imported["has_secret"], json!(false), "a public key must not claim secret material");
+
+        app.pgp_keys_loaded = false;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        app.open_settings(&ctx, None);
+        let size = Vec2::new(1200.0, 900.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        if let Some(scroll) = probe::settings_scroll_view(&ctx) {
+            frame_at(&ctx, &mut app, size, wheel(scroll.center(), 80));
+        }
+        frame_at(&ctx, &mut app, size, vec![]);
+        let rect = probe::settings_pgp_export_rect(&ctx, key_id.as_str()).expect("the public export action");
+        let output = click_at_output(&ctx, &mut app, rect.center(), size);
+        let copied = copied_text(&output).unwrap_or_default();
+        assert!(copied.contains("BEGIN PGP PUBLIC KEY BLOCK"), "the export must put the public armor on the clipboard");
+        assert!(app.pgp_notice.as_deref().is_some_and(|notice| notice.contains("copiata")), "the export must report its result");
+        daemon.shutdown().expect("the daemon stops");
+    }
+
+    fn pgp_key(id: &str) -> PgpKey {
+        PgpKey {
+            id: id.to_owned(),
+            account_id: "acc_a".to_owned(),
+            fingerprint: "D529DDA09F683768022096EBA6079AAB69465D6D".to_owned(),
+            key_id: "A6079AAB69465D6D".to_owned(),
+            user_id: Some("Ada Lovelace <ada@example.com>".to_owned()),
+            protected: true,
+            has_secret: true,
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 }

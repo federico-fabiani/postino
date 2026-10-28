@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eframe::egui::containers::Sides;
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{self, Align, FontFamily, FontId, Frame, Layout, Margin, Rect, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2, pos2};
-use postino_core::{Account, Address, Attachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS};
+use postino_core::{Account, Address, Attachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS, PgpKey};
 
 use crate::theme::Tokens;
 use crate::ui::icons;
@@ -105,6 +105,9 @@ pub struct ComposerState {
     pub saved_at: Option<String>,
     pub save_error: Option<String>,
     pub notice: Option<String>,
+    /// Public key ids selected for this send. Signing uses `pgp_sign`; encryption uses every id.
+    pub pgp_sign: Option<String>,
+    pub pgp_encrypt: Vec<String>,
     session: u64,
     body_selection: Option<(usize, usize)>,
     pending_selection: Option<(usize, usize)>,
@@ -135,6 +138,8 @@ impl ComposerState {
             saved_at: None,
             save_error: None,
             notice: None,
+            pgp_sign: None,
+            pgp_encrypt: Vec::new(),
             session: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
             body_selection: None,
             pending_selection: None,
@@ -271,12 +276,21 @@ pub struct Composer<'a> {
     send_available: bool,
     demo: bool,
     attachments_available: bool,
+    pgp_keys: &'a [PgpKey],
 }
 
 impl<'a> Composer<'a> {
     #[must_use]
     pub fn new(state: &'a mut ComposerState, account: &'a Account) -> Self {
-        Self { state, account, send_available: true, demo: true, attachments_available: false }
+        Self { state, account, send_available: true, demo: true, attachments_available: false, pgp_keys: &[] }
+    }
+
+    /// The account's stored PGP keys. The screen loads them through the registry; the component
+    /// never calls the engine and an empty list hides the row instead of showing a dead toggle.
+    #[must_use]
+    pub fn pgp_keys(mut self, keys: &'a [PgpKey]) -> Self {
+        self.pgp_keys = keys;
+        self
     }
 
     /// Whether this account can submit. The demo has no SMTP endpoint and must not pretend.
@@ -357,6 +371,7 @@ impl<'a> Composer<'a> {
                     if let Some(error) = &recipient_error {
                         ui.label(typography::text(Role::Caption, error.as_str(), t.danger));
                     }
+                    self.pgp_bar(ui, &t);
                     ui.add_space(space::XS);
 
                     let subject = TextField::new(&mut self.state.subject, "Oggetto")
@@ -495,6 +510,53 @@ impl<'a> Composer<'a> {
             field_response.changed()
         })
         .inner
+    }
+
+    /// Signing and encryption are per-send choices, not draft fields: cancelling a draft leaves no
+    /// key selected. The row disappears when the account has no keys, so it never offers a dead
+    /// toggle.
+    fn pgp_bar(&mut self, ui: &mut Ui, t: &Tokens) {
+        if self.pgp_keys.is_empty() {
+            return;
+        }
+        let keys = self.pgp_keys.to_vec();
+        let has_secret = keys.iter().any(|key| key.has_secret);
+        let _row = ui.horizontal_wrapped(|ui| {
+            ui.label(icons::icon(icons::LOCK, 14.0, t.text_faint));
+            ui.add_space(space::XS);
+            if has_secret {
+                let selected = self
+                    .state
+                    .pgp_sign
+                    .as_deref()
+                    .and_then(|id| keys.iter().find(|key| key.id == id))
+                    .map_or_else(|| "Nessuna firma".to_owned(), pgp_key_label);
+                egui::ComboBox::from_id_salt(("composer-pgp-sign", self.state.session)).width(190.0).selected_text(selected).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.state.pgp_sign, None, "Nessuna firma");
+                    for key in keys.iter().filter(|key| key.has_secret) {
+                        ui.selectable_value(&mut self.state.pgp_sign, Some(key.id.clone()), pgp_key_label(key));
+                    }
+                });
+            } else {
+                ui.label(typography::text(Role::Meta, "Nessuna chiave privata per firmare", t.text_faint));
+            }
+            let count = self.state.pgp_encrypt.len();
+            let label = if count == 0 { "Cifra".to_owned() } else { format!("Cifra · {count}") };
+            ui.menu_button(label, |ui| {
+                for key in &keys {
+                    let mut selected = self.state.pgp_encrypt.contains(&key.id);
+                    if ui.checkbox(&mut selected, pgp_key_label(key)).changed() {
+                        if selected {
+                            self.state.pgp_encrypt.push(key.id.clone());
+                        } else {
+                            self.state.pgp_encrypt.retain(|id| id != &key.id);
+                        }
+                    }
+                }
+            });
+        });
+        #[cfg(test)]
+        crate::app::probe::composer_pgp(ui, _row.response.rect);
     }
 
     fn formatting_bar(&mut self, ui: &mut Ui, t: &Tokens, now: f64) {
@@ -821,6 +883,12 @@ fn attachment_limit_warning(attachments: &[Attachment]) -> Option<String> {
         return Some(format!("Gli allegati totali superano {}. Rimuovine alcuni prima di inviare.", format_size_it(MAX_ATTACHMENT_TOTAL_BYTES)));
     }
     None
+}
+
+fn pgp_key_label(key: &PgpKey) -> String {
+    let name = key.user_id.as_deref().unwrap_or("chiave PGP");
+    let short = key.fingerprint.chars().take(16).collect::<String>();
+    if short.is_empty() { name.to_owned() } else { format!("{name} · {short}") }
 }
 
 #[cfg(test)]

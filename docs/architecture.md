@@ -1577,7 +1577,9 @@ usual MIME limits apply before parsing: body size, header size, part size, exact
 `message_pgp_verify` (read-only, offline) reports `verified` with key id, fingerprint and signer,
 `bad` on a mismatch, `no_key` when the account has no stored public key, `unknown` when the entity or
 the stored key cannot be read, and `not_stored` for rows that predate v9; it never fakes a result
-from the parsed body. A detached signature is checked against the primary key and every signing
+from the parsed body. The result also carries a `kind` (`none`, `signed`, `encrypted`) independent of
+signature validity, so a client can offer "decrypt" without treating an encrypted message as a
+failed signature. A detached signature is checked against the primary key and every signing
 subkey, so a certificate that signs with a subkey is not reported as `bad`. `message_pgp_decrypt` is
 `sensitive`: the per-use passphrase comes from stdin or a no-echo prompt, is zeroised, and never
 appears in argv, the environment, a log or a result. The decrypted payload is decompressed through a
@@ -1602,10 +1604,23 @@ never lists or dispatches `message_pgp_decrypt` or `pgp_key_import`. The CLI add
 `postino pgp message verify|decrypt`, `postino pgp keys ...` and
 `postino send --sign <id> --encrypt <id>... [--passphrase-stdin]`.
 
+The desktop app (P12c2c) calls `message_pgp_verify` once when a message opens and renders the cached
+verdict, not a guess from the body: a verified signature, a bad signature, a missing key, an unknown
+state, and an encrypted message each have a distinct badge, with the signer and fingerprint in the
+tooltip. "Decifra" first tries an unprotected key, then opens the one passphrase sheet; a `locked` or
+`wrong_passphrase` result stays visible and the sheet can be retried. The decrypted text/html is
+parsed by the same sanitizer and the same `SubsetBodyRenderer` as stored mail, cached only in memory
+for the open message, and never written to the row or FTS. The composer has a per-send sign choice
+over secret keys and a multi-select encryption menu over stored keys; the protected signing key opens
+the same sheet and the passphrase is inserted only into that `message_send` call. Settings lists the
+account's keys with import, public-armor copy and delete; import accepts public or passphrase-protected
+private armor and keeps the secret material out of the list.
+
 Limits: keys are local only, with no discovery or revocation fetch; verification does not consult
 revocation or expiry (the send path does, because it chooses a key), and there is no S/MIME, no HTML
 signing and no key UX beyond the settings table. Received mail cached before v9 has no raw bytes and
-reports `not_stored` until it is refreshed.
+reports `not_stored` until it is refreshed; because the bytes are gone the app cannot tell whether
+such a row was PGP at all, so it shows no PGP badge rather than a false one.
 
 ## 5. Synchronization
 

@@ -46,7 +46,8 @@ pub use ops::{
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
 pub use pgp_mime::{
-    MAX_PGP_RECIPIENTS, MAX_RAW_MESSAGE_BYTES, PgpDecryptResult, PgpDecryptState, PgpSendError, PgpSendOptions, PgpVerifyResult, PgpVerifyState,
+    MAX_PGP_RECIPIENTS, MAX_RAW_MESSAGE_BYTES, PgpDecryptResult, PgpDecryptState, PgpMimeKind, PgpSendError, PgpSendOptions, PgpVerifyResult,
+    PgpVerifyState,
 };
 pub use postino_sync::{SyncPhase, SyncStatus};
 pub use reply::{ReplyMode, ReplyPrefill, compose_reply, forward_subject, new_message_body, quote_body, reply_subject, signature_block};

@@ -12,7 +12,7 @@ use pgp::composed::{
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::types::{KeyDetails, Password};
-use postino_core::{Engine, PgpDecryptState, PgpSendOptions, PgpVerifyState};
+use postino_core::{Engine, PgpDecryptState, PgpMimeKind, PgpSendOptions, PgpVerifyState};
 use postino_store::{FolderKind, Store};
 use rand::rngs::OsRng;
 use serde_json::json;
@@ -212,6 +212,7 @@ fn exact_bytes_verify_and_one_byte_tamper() {
     let (harness, mut engine) = received_fixture(&raw, Some(&key));
     let verified = engine.call("message_pgp_verify", json!({ "id": "msg_pgp" })).expect("verify");
     assert_eq!(verified["state"], json!(PgpVerifyState::Verified));
+    assert_eq!(verified["kind"], json!(PgpMimeKind::Signed), "the UI must know this is a signed message");
     assert_eq!(verified["fingerprint"], key.fingerprint);
     assert_eq!(verified["reason"], serde_json::Value::Null);
 
@@ -253,6 +254,11 @@ fn decrypt_round_trip_and_failure_states_never_touch_the_stored_body_or_fts() {
     let secret_body = format!("{BODY}{PLAINTEXT_MARKER}\r\n");
     let raw = encrypted_raw(&headers("encrypted"), &entity(&secret_body), &key.public_armor);
     let (harness, mut engine) = received_fixture(&raw, Some(&key));
+
+    let verify = engine.call("message_pgp_verify", json!({ "id": "msg_pgp" })).expect("verify kind");
+    assert_eq!(verify["kind"], json!(PgpMimeKind::Encrypted), "the UI must offer decrypt on an encrypted message");
+    assert_eq!(verify["state"], json!(PgpVerifyState::Unknown));
+    assert!(verify["reason"].as_str().is_some_and(|reason| reason.contains("decrypt")), "the reason must tell the UI what to do: {verify}");
 
     let locked = engine.call("message_pgp_decrypt", json!({ "id": "msg_pgp" })).expect("empty passphrase");
     assert_eq!(locked["state"], json!(PgpDecryptState::Locked));
