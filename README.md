@@ -97,7 +97,7 @@ MCP      ─┘
   `Esc`.
 - Typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
-  `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_flag`, `message_move`,
+  `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_unsubscribe`, `message_flag`, `message_move`,
   `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
   `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`,
   `search_status`, `search_reindex`, `threads_list`, `thread_get`, `thread_flag`,
@@ -128,6 +128,13 @@ MCP      ─┘
   search field is focused and empty; “Cancella ricerche recenti” clears them. Rename, edit and delete
   are undoable, and `saved_searches_list` plus the four CRUD/recent operations expose the same surface
   to agents.
+- **Unsubscribe (P13d).** The IMAP ingest records the sender's bounded RFC 2369/8058
+  `List-Unsubscribe` targets, and `message_unsubscribe` classifies up to four `mailto`, `https` or
+  `http` choices. The reading pane shows **Disiscriviti** only when a valid target exists: a
+  `mailto:` choice opens an ordinary draft the person still reviews and sends, a web choice goes
+  through the existing link confirmation, and an `http` target is labelled insecure. Nothing is
+  posted in the background, even when the header declares One-Click; the CLI prints the same choices
+  and the target list is deleted with its message.
 - **Local templates (P13c).** Up to 20 named compose templates live in the encrypted `meta` table, so
   no schema migration is needed. Settings → **MODELLI** creates, edits and deletes them, and the
   composer's **Modelli** menu inserts a subject only when it is empty and appends the body after any

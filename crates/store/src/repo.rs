@@ -15,7 +15,7 @@ use crate::model::{
     OutboxEntry, OutboxState, SyncState, UidEntry,
 };
 use crate::threads;
-use crate::{REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError};
+use crate::{REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError, UNSUBSCRIBE_KEY_PREFIX};
 
 /// Largest page a caller can request. A mailbox list never needs more, and the cap bounds memory.
 const MAX_PAGE: u32 = 500;
@@ -147,6 +147,7 @@ impl Store {
             [account_id],
         )?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'reply_to:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
+        tx.execute("DELETE FROM meta WHERE key IN (SELECT 'unsubscribe:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_guard:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("rule_guard:{account_id}:%")])?;
         tx.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("rule_forward:{account_id}:%")])?;
@@ -1153,6 +1154,7 @@ impl Store {
             let deleted = tx.execute("DELETE FROM messages WHERE id = ?1 AND folder_id = ?2", params![id, folder_id])?;
             if deleted > 0 {
                 tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
+                tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{UNSUBSCRIBE_KEY_PREFIX}{id}")])?;
                 tx.execute("DELETE FROM meta WHERE key IN (?1, ?2)", params![format!("rule_guard:{account}:{id}"), format!("rule_guard:{id}")])?;
                 if let Some(thread) = thread {
                     touched_threads.push(thread);
@@ -1193,6 +1195,13 @@ impl Store {
         tx.execute(
             "DELETE FROM meta WHERE key IN (
                  SELECT 'reply_to:' || id FROM messages
+                 WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
+             )",
+            [folder_id],
+        )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (
+                 SELECT 'unsubscribe:' || id FROM messages
                  WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
              )",
             [folder_id],
@@ -1609,6 +1618,7 @@ impl Store {
         {
             tx.execute("DELETE FROM messages WHERE id = ?1", [duplicate])?;
             tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{duplicate}")])?;
+            tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{UNSUBSCRIBE_KEY_PREFIX}{duplicate}")])?;
         }
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
         threads::refresh_threads_in_tx(&tx, &message.summary.account_id, touched_threads)?;

@@ -196,6 +196,18 @@ pub(crate) fn ingest(
     // explicit refresh may fetch the entity again, but nothing here re-derives it from the body.
     store.set_message_raw_blob_hash(&id, raw_blob_hash.as_deref()).map_err(SyncError::Store)?;
     store.set_message_reply_to(&id, &reply_to).map_err(SyncError::Store)?;
+    // RFC 2369/8058 unsubscribe targets are header-only. They live beside the reply-to override in
+    // encrypted `meta`, within the same small bound as a header value, so no schema migration is
+    // needed and a later message can be deleted without leaving them behind.
+    let unsubscribe: Vec<&str> = parsed.headers.get_all("List-Unsubscribe").take(4).map(str::trim).filter(|value| !value.is_empty()).collect();
+    if !unsubscribe.is_empty() {
+        // RFC 8058 spells the field `List-Unsubscribe=One-Click`; the token is the part after `=`.
+        let one_click = parsed.headers.get("List-Unsubscribe-Post").is_some_and(|value| value.to_ascii_lowercase().contains("one-click"));
+        let value = serde_json::json!({ "targets": unsubscribe, "one_click": one_click }).to_string();
+        if value.len() <= 4096 {
+            store.set_meta(&format!("{}{id}", store::UNSUBSCRIBE_KEY_PREFIX), &value).map_err(SyncError::Store)?;
+        }
+    }
     // P9c's forward loop guard. The headers are recorded in the encrypted `meta` table because v7
     // has no header column and P9c must not migrate; a normal message writes nothing.
     let guard = store::RuleGuard {

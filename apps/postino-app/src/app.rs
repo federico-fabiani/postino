@@ -17,7 +17,7 @@ use postino_core::{
     Account, Address, Attachment, AttachmentGet, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor,
     LabelCreate, LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessageTemplate, MessagesList, OutboxList, OutboxRunReport,
     OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult,
-    SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
+    SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod, UnsubscribeTarget,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
@@ -514,6 +514,12 @@ pub struct PostinoApp {
     template_editor: Option<TemplateEditorState>,
     /// The template waiting for the delete confirmation.
     template_delete: Option<MessageTemplate>,
+    /// The unsubscribe choices for the open message. Empty means the header was absent or invalid.
+    unsubscribe_info: Option<UnsubscribeInfo>,
+    /// The message whose headers were already checked; a negative result is cached too.
+    unsubscribe_checked: Option<String>,
+    /// The choice sheet is open. It never sends or opens anything until the person picks a target.
+    show_unsubscribe: bool,
     /// The sidebar account row, used to return focus when settings closes.
     account_switcher_id: Option<Id>,
     /// The widget to restore when the settings dialog closes.
@@ -1202,6 +1208,9 @@ impl PostinoApp {
             templates_loaded: false,
             template_editor: None,
             template_delete: None,
+            unsubscribe_info: None,
+            unsubscribe_checked: None,
+            show_unsubscribe: false,
             account_switcher_id: None,
             settings_return_focus: None,
             settings_focus_pending: false,
@@ -3910,6 +3919,9 @@ impl PostinoApp {
         self.pending_read = None;
         self.invite_ready = false;
         self.attachment_preview = None;
+        self.unsubscribe_info = None;
+        self.unsubscribe_checked = None;
+        self.show_unsubscribe = false;
     }
 
     fn move_selected(&mut self, kind: FolderKind, confirmation: &str, plural: &str) {
@@ -4770,6 +4782,7 @@ impl PostinoApp {
             || self.pgp_delete.is_some()
             || self.template_editor.is_some()
             || self.template_delete.is_some()
+            || self.show_unsubscribe
             || self.rules_page.is_some()
         {
             return;
@@ -7509,6 +7522,136 @@ impl PostinoApp {
             Some(PgpReadingState { message_id: message.summary.id.clone(), kind: result.kind, verify: Some(result), decrypt: None, view: None });
     }
 
+    /// Read the unsubscribe headers once per open message. A missing or invalid header is cached as
+    /// a negative result so the frame loop does not repeat the operation.
+    fn sync_unsubscribe(&mut self, message: &Message) {
+        if self.demo
+            || self.screenshot_message.as_ref().is_some_and(|shot| shot.summary.id == message.summary.id)
+            || self.unsubscribe_checked.as_deref() == Some(message.summary.id.as_str())
+        {
+            return;
+        }
+        self.unsubscribe_info = None;
+        self.show_unsubscribe = false;
+        self.unsubscribe_checked = Some(message.summary.id.clone());
+        let mut args = json!({ "id": message.summary.id });
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        let Ok(value) = self.op("message_unsubscribe", args) else { return };
+        let Ok(info) = serde_json::from_value::<UnsubscribeInfo>(value) else { return };
+        if !info.targets.is_empty() {
+            self.unsubscribe_info = Some(info);
+        }
+    }
+
+    /// A `mailto:` choice becomes a normal draft, never a background request. The person still
+    /// reviews the address, body and Send.
+    fn unsubscribe_mailto(&mut self, target: &UnsubscribeTarget) {
+        let address = target.target.split_once(':').map(|(_, rest)| rest).unwrap_or(target.target.as_str());
+        let address = address.split('?').next().unwrap_or(address);
+        self.close_reading();
+        self.compose_new();
+        self.composer.to = address.to_owned();
+        self.composer.subject = "unsubscribe".to_owned();
+        self.composer.body = "Please unsubscribe this address from your mailing list.".to_owned();
+        self.composer.focus = Some(ComposerFocus::Body);
+        self.composer.dirty = true;
+        self.composer.last_edit = 0.0;
+    }
+
+    fn unsubscribe_web(&mut self, target: &UnsubscribeTarget, ui: &Ui) {
+        let Some(link) = reading::find_links(&target.target).into_iter().next() else {
+            self.push_info_toast("Il link di disiscrizione non è apribile.", ToastKind::Error);
+            return;
+        };
+        self.show_unsubscribe = false;
+        self.request_link_open(&link);
+        ui.ctx().request_repaint();
+    }
+
+    /// The explicit choice sheet. It lists every target from the header and never performs one.
+    fn unsubscribe_sheet(&mut self, ui: &mut Ui) {
+        if !self.show_unsubscribe {
+            return;
+        }
+        let Some(info) = self.unsubscribe_info.clone() else {
+            self.show_unsubscribe = false;
+            return;
+        };
+        let t = theme::tokens(self.dark);
+        let mut close = false;
+        let mut mailto: Option<UnsubscribeTarget> = None;
+        let mut web: Option<UnsubscribeTarget> = None;
+        let response = egui::Modal::new(Id::new("postino-unsubscribe"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(500.0);
+                ui.label(typography::strong(Role::Emphasis, "Disiscrizione", t.text));
+                ui.add_space(space::SM);
+                ui.label(typography::text(
+                    Role::Secondary,
+                    "Il mittente ha indicato queste opzioni. Postino non invia richieste in background: scegli tu se scrivere o aprire la pagina.",
+                    t.text_muted,
+                ));
+                ui.add_space(space::MD);
+                ScrollArea::vertical().max_height(330.0).show(ui, |ui| {
+                    for target in &info.targets {
+                        Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::SM)).show(
+                            ui,
+                            |ui| {
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    let (label, action) = match target.method {
+                                        UnsubscribeMethod::Mailto => ("Email", "Scrivi la disiscrizione"),
+                                        UnsubscribeMethod::Https => ("Pagina web", "Apri la pagina"),
+                                        UnsubscribeMethod::Http => ("Pagina web non cifrata", "Apri con avviso"),
+                                    };
+                                    ui.label(typography::text(Role::BodySmall, label, t.text));
+                                    ui.add(egui::Label::new(typography::mono(target.target.as_str(), 11.0, t.text_faint)).truncate());
+                                    if target.method == UnsubscribeMethod::Mailto {
+                                        if Button::primary(action).size(ButtonSize::Sm).show(ui).clicked() {
+                                            mailto = Some(target.clone());
+                                        }
+                                    } else if Button::new(action).size(ButtonSize::Sm).show(ui).clicked() {
+                                        web = Some(target.clone());
+                                    }
+                                    if target.method == UnsubscribeMethod::Http {
+                                        ui.label(typography::text(
+                                            Role::Caption,
+                                            "Il collegamento non usa TLS: aprilo solo se ti fidi del mittente.",
+                                            t.danger,
+                                        ));
+                                    }
+                                });
+                            },
+                        );
+                        ui.add_space(space::XS);
+                    }
+                });
+                if info.one_click {
+                    ui.label(typography::text(
+                        Role::Caption,
+                        "Il mittente dichiara One-Click. Postino apre comunque la pagina: nessuna richiesta parte da sola.",
+                        t.text_faint,
+                    ));
+                }
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = Button::ghost("Chiudi").show(ui).clicked();
+                });
+            });
+        if let Some(target) = mailto {
+            self.show_unsubscribe = false;
+            self.unsubscribe_mailto(&target);
+        } else if let Some(target) = web {
+            self.unsubscribe_web(&target, ui);
+        } else if close || response.should_close() {
+            self.show_unsubscribe = false;
+        }
+    }
+
     /// Ask the engine to decrypt with no passphrase first. An unprotected key opens immediately; a
     /// protected key answers `Locked` and only then the sheet asks for the secret.
     fn begin_pgp_decrypt(&mut self) {
@@ -7695,6 +7838,7 @@ impl PostinoApp {
             return;
         };
         self.sync_pgp_reading(&message);
+        self.sync_unsubscribe(&message);
         let invite = self.reading_invite(&message);
         #[cfg(test)]
         probe::clear_actions(ui);
@@ -7723,6 +7867,7 @@ impl PostinoApp {
         #[cfg(test)]
         probe::reading_header(ui, header_rect);
 
+        let has_unsubscribe = self.unsubscribe_info.is_some();
         let (left_action, right_action) = Sides::new().height(36.0).shrink_left().show(
             ui,
             |ui| {
@@ -7804,6 +7949,10 @@ impl PostinoApp {
                     }
                     if IconButton::new(command_icon("forward", icons::FORWARD), command_label("forward", "Inoltra")).show(ui).clicked() {
                         action = Some(ReadingAction::Forward);
+                    }
+                    if has_unsubscribe && IconButton::new(icons::EYE_OFF, "Disiscriviti").show(ui).on_hover_text("Opzioni di disiscrizione").clicked()
+                    {
+                        action = Some(ReadingAction::Unsubscribe);
                     }
                 }
                 ui.add_space(space::XS);
@@ -8038,6 +8187,7 @@ impl PostinoApp {
             Some(ReadingAction::Read) => self.toggle_read(),
             Some(ReadingAction::Close) => self.close_reading(),
             Some(ReadingAction::Expand) => self.reading_full = true,
+            Some(ReadingAction::Unsubscribe) => self.show_unsubscribe = self.unsubscribe_info.is_some(),
             Some(ReadingAction::Back) => {
                 // In the narrow overlay the back button leaves the reading pane entirely; only the
                 // wide window has a list to return to under the full-screen pane.
@@ -9729,6 +9879,9 @@ impl PostinoApp {
         self.pgp_prompt = None;
         self.pgp_import = None;
         self.pgp_delete = None;
+        self.unsubscribe_info = None;
+        self.unsubscribe_checked = None;
+        self.show_unsubscribe = false;
     }
 
     fn refresh_pgp_keys(&mut self) {
@@ -11042,6 +11195,7 @@ impl PostinoApp {
         self.pgp_delete_dialog(ui);
         self.template_editor_dialog(ui);
         self.template_delete_dialog(ui);
+        self.unsubscribe_sheet(ui);
         self.link_confirmation(ui);
         self.attachment_warning_dialog(ui);
         self.attachment_overwrite_dialog(ui);
@@ -11135,6 +11289,7 @@ enum ReadingAction {
     Close,
     Expand,
     Back,
+    Unsubscribe,
 }
 
 #[derive(Clone, Copy)]
@@ -20251,6 +20406,47 @@ mod tests {
         app.composer.pgp_sign = Some("key_ada".to_owned());
         let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
         painted_visible(&runs, "Ada Lovelace");
+    }
+
+    #[test]
+    fn unsubscribe_choices_open_a_draft_and_never_send_from_the_sheet() {
+        let (mut app, daemon, _path, _key, _vault) = daemon_app("p13d-unsubscribe", |store| {
+            seed_account_rows(store, "acc_u", "u@example.com", None);
+            store.upsert_message(&store_message("fld_acc_u_inbox", "acc_u", "msg_u", "Notiziario")).expect("message row");
+            store
+                .set_meta(
+                    "unsubscribe:msg_u",
+                    &json!({
+                        "targets": ["<mailto:leave@example.com?subject=unsubscribe>", "<https://example.com/u/1>"],
+                        "one_click": true
+                    })
+                    .to_string(),
+                )
+                .expect("unsubscribe meta");
+        });
+        app.selected = Some("msg_u".to_owned());
+        app.reading_open = true;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        let info = app.unsubscribe_info.clone().expect("the stored choices are loaded once");
+        assert_eq!(info.targets.len(), 2);
+        assert!(info.one_click);
+        app.show_unsubscribe = true;
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Disiscrizione");
+        painted_visible(&runs, "Scrivi la disiscrizione");
+        painted_visible(&runs, "Apri la pagina");
+
+        let mailto = info.targets.iter().find(|target| target.method == UnsubscribeMethod::Mailto).expect("a mailto target").clone();
+        app.unsubscribe_mailto(&mailto);
+        assert!(app.composer.open, "the mailto choice opens the ordinary composer");
+        assert_eq!(app.composer.to, "leave@example.com");
+        assert_eq!(app.composer.subject, "unsubscribe");
+        assert!(!app.show_unsubscribe);
+        assert!(app.outbox.entries.is_empty(), "the sheet never queues a send by itself");
+        daemon.shutdown().expect("the daemon stops");
     }
 
     #[test]

@@ -91,6 +91,8 @@ pub const LABEL_SEQ_KEY: &str = "label_seq";
 /// tables already use, keyed by local message id; P9 widens the schema and can move it into a
 /// column. The key is removed with its message.
 pub const REPLY_TO_KEY_PREFIX: &str = "reply_to:";
+/// Per-message `List-Unsubscribe` targets captured at ingest, keyed `unsubscribe:<message id>`.
+pub const UNSUBSCRIBE_KEY_PREFIX: &str = "unsubscribe:";
 
 /// Prefix of the `meta` key that holds one account's persisted sync status. The account id follows.
 /// `postino-sync` writes the JSON value; `Store::delete_account` removes it with the account.

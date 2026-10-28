@@ -73,6 +73,11 @@
   protocol-relative URLs never survive. Remote images are removed and `http`/`https` sources are
   counted; `cid:` images survive. CSS is unsupported, not partially sanitized.
 - Links: show the destination, warn on punycode/IDN homographs, never auto-open.
+- Unsubscribe: only complete `<mailto:>` and `<http(s):>` targets from a bounded `List-Unsubscribe`
+  header are stored, in encrypted per-message `meta` deleted with the message. Reading the choices
+  sends and opens nothing; a `mailto:` choice becomes an ordinary draft, a web choice uses the link
+  confirmation, and plain `http` is labelled insecure. One-Click is reported but never posted in the
+  background.
 - Attachments: never auto-execute; warn on executables and macro-enabled documents; optional
   ClamAV integration later.
 - Phishing: display SPF/DKIM/DMARC results from `Authentication-Results`, flag mismatches, but do

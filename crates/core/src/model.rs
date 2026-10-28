@@ -389,6 +389,34 @@ pub struct SavedSearch {
     pub index_pending: bool,
 }
 
+/// How a `List-Unsubscribe` target is reached. `Http` is kept separate so the UI and CLI can warn
+/// about the insecure transport instead of silently treating it as one-click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsubscribeMethod {
+    Mailto,
+    Https,
+    Http,
+}
+
+/// One usable target from the message's `List-Unsubscribe` header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnsubscribeTarget {
+    pub method: UnsubscribeMethod,
+    /// The complete `mailto:` or `http(s):` URL, never rewritten.
+    pub target: String,
+}
+
+/// The unsubscribe choices carried by one received message. Postino never sends or opens anything
+/// by itself: the person chooses a target and the draft or browser confirmation stays explicit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnsubscribeInfo {
+    pub targets: Vec<UnsubscribeTarget>,
+    /// True when `List-Unsubscribe-Post: One-Click` applies to an HTTPS target. The app still opens
+    /// the provider page; it never posts a background request.
+    pub one_click: bool,
+}
+
 /// One local compose template. Templates never leave the encrypted store and are inserted into a
 /// draft as plain text; they are not provider-side templates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -78,6 +78,7 @@ agent can read the message and recover.
 | `folders_list` | yes | Folders with unread and total counts |
 | `messages_list` | yes | Message summaries, paginated; `label` alone spans every folder, `folder` narrows it |
 | `message_get` | yes | One message with body and attachments |
+| `message_unsubscribe` | yes | RFC 2369/8058 `List-Unsubscribe` targets captured at ingest (`mailto`, `https`, `http`) and the One-Click flag; sends and opens nothing |
 | `attachment_get` | yes | One attachment's metadata and exact bytes as bounded base64 (25 MiB cap); `postino attachment get --out` writes the same bytes |
 | `message_pgp_verify` | yes | Verify a received PGP/MIME signature against the stored public keys using the exact v9 bytes; `kind` says `signed`/`encrypted`/`none`, state is `verified`/`bad`/`no_key`/`unknown`/`not_stored` |
 | `pgp_keys_list` | yes | Stored key metadata: id, fingerprint, key id, primary user id, secret presence and protection; never key material |

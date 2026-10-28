@@ -24,6 +24,7 @@ mod reply;
 mod rules;
 pub mod search;
 mod store_map;
+mod unsubscribe;
 pub mod vault;
 
 pub use engine::{
@@ -33,7 +34,8 @@ pub use engine::{
 pub use model::{
     Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
     MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect,
-    RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
+    RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary, UnsubscribeInfo, UnsubscribeMethod,
+    UnsubscribeTarget,
 };
 pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{

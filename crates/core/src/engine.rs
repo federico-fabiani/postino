@@ -22,7 +22,8 @@ use zeroize::Zeroizing;
 
 use crate::model::{
     Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
-    MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
+    MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary, UnsubscribeInfo,
+    snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::outbox::{
@@ -1460,6 +1461,23 @@ impl Engine {
         let Some(hash) = store.message_raw_blob_hash(message_id).map_err(store_map::read_error)? else { return Ok(not_stored_decrypt()) };
         let raw = store.blobs().get(&hash, crate::pgp_mime::MAX_RAW_MESSAGE_BYTES).map_err(store_map::blob_read_error)?;
         crate::pgp_mime::decrypt(store, &account.id, &raw, passphrase)
+    }
+
+    /// The RFC 2369/8058 choices captured at ingest for one received message.
+    ///
+    /// Reading this operation never sends mail and never opens a URL. A `mailto:` target becomes a
+    /// draft only when the person explicitly asks the composer, and an HTTP target reaches the
+    /// browser only through the existing link confirmation.
+    pub fn message_unsubscribe(&self, message_id: &str, account: Option<&str>) -> Result<UnsubscribeInfo, OpError> {
+        let account = self.requested_account(account, "message_unsubscribe")?;
+        let current = self.message_result(message_id)?.ok_or_else(|| unknown_message(message_id))?;
+        if self.folders.iter().find(|folder| folder.id == current.summary.folder_id).is_none_or(|folder| folder.account_id != account.id) {
+            return Err(OpError::InvalidArgs(format!("message {message_id:?} belongs to another account")));
+        }
+        let Some(value) = self.meta_get(&format!("unsubscribe:{message_id}"))? else {
+            return Ok(UnsubscribeInfo::default());
+        };
+        crate::unsubscribe::decode(&value).map_err(|_| OpError::Failed("the stored unsubscribe headers are damaged".to_owned()))
     }
 
     // -----------------------------------------------------------------------------------------

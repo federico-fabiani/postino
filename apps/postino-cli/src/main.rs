@@ -32,7 +32,7 @@ use postino_core::{
     PgpVerifyResult, PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
     RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult,
     SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult,
-    ThreadsListResult, VaultError,
+    ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod, VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -660,6 +660,12 @@ enum Command {
         /// Mark the message read after printing it.
         #[arg(long)]
         mark_read: bool,
+    },
+    /// Show the List-Unsubscribe choices captured for one message.
+    Unsubscribe {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Search subjects, people and bodies.
     Search {
@@ -1656,6 +1662,7 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } | Command::SearchStatus => true,
         Command::Attachment { .. } => true,
         Command::Read { mark_read, .. } => !mark_read,
+        Command::Unsubscribe { .. } => true,
         Command::Label { command } => matches!(command, LabelCommand::List),
         Command::Threads { .. } => true,
         Command::Thread { command } => matches!(command, ThreadCommand::Get { .. }),
@@ -1726,6 +1733,7 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             | Command::Folders { .. }
             | Command::Messages { .. }
             | Command::Read { .. }
+            | Command::Unsubscribe { .. }
             | Command::Search { .. }
             | Command::Flag { .. }
             | Command::Draft { .. }
@@ -2156,6 +2164,26 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 let _: MessageFlag = decode(call(engine, "message_flag", json!({ "id": id, "unread": false }))?)?;
                 if !json_output {
                     say("Segnato come letto.")?;
+                }
+            }
+        }
+        Command::Unsubscribe { id, account } => {
+            let info: UnsubscribeInfo = decode(call(engine, "message_unsubscribe", json!({ "id": id, "account": account }))?)?;
+            if json_output {
+                print_json(&info)?;
+            } else if info.targets.is_empty() {
+                say("Questo messaggio non offre un'opzione di disiscrizione.")?;
+            } else {
+                for target in &info.targets {
+                    let method = match target.method {
+                        UnsubscribeMethod::Mailto => "mailto",
+                        UnsubscribeMethod::Https => "https",
+                        UnsubscribeMethod::Http => "http (non cifrato)",
+                    };
+                    say(format!("{method}\t{}", target.target))?;
+                }
+                if info.one_click {
+                    say("Il mittente dichiara One-Click; Postino non invia richieste in background.")?;
                 }
             }
         }
@@ -3995,6 +4023,50 @@ mod tests {
         assert_eq!(engine.templates().expect("templates")[0].subject, "Nuovo oggetto");
         run(cli(Command::Templates { command: TemplateCommand::Delete { id } }), &mut engine).expect("template delete");
         assert!(engine.templates().expect("templates").is_empty());
+    }
+
+    #[test]
+    fn cli_unsubscribe_reads_the_captured_targets() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        {
+            let store = fixture.open();
+            store
+                .upsert_message(&postino_store::Message {
+                    summary: postino_store::MessageSummary {
+                        id: "msg_unsub".to_owned(),
+                        account_id: "acc_cli".to_owned(),
+                        folder_id: "inbox".to_owned(),
+                        thread_id: "thr_unsub".to_owned(),
+                        from: postino_store::Address::new("Lista", "lista@example.com"),
+                        to: vec![postino_store::Address::new("Test", "test@example.com")],
+                        subject: "Notiziario".to_owned(),
+                        snippet: "Notiziario".to_owned(),
+                        date: 1_700_000_000_000,
+                        unread: true,
+                        starred: false,
+                        has_attachments: false,
+                        labels: Vec::new(),
+                    },
+                    uid: None,
+                    message_id: None,
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    body_text: "Notiziario".to_owned(),
+                    body_html: None,
+                    remote_images: 0,
+                    size: None,
+                })
+                .expect("message");
+            store
+                .set_meta("unsubscribe:msg_unsub", &json!({ "targets": ["<mailto:leave@example.com>"], "one_click": false }).to_string())
+                .expect("unsubscribe meta");
+        }
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        run(cli(Command::Unsubscribe { id: "msg_unsub".to_owned(), account: Some("acc_cli".to_owned()) }), &mut engine).expect("unsubscribe");
+        let info = engine.message_unsubscribe("msg_unsub", Some("acc_cli")).expect("choices");
+        assert_eq!(info.targets.len(), 1);
+        assert_eq!(info.targets[0].method, UnsubscribeMethod::Mailto);
     }
 
     #[test]

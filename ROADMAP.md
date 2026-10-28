@@ -182,7 +182,8 @@ interaction model before real mail makes them expensive to change. Full spec:
       forward payloads, enabling a stored forward rule and the `sync_now` rule pass behind
       `--allow-send`. Rules page, preview, CLI/MCP parity, 20k/100k evidence and 980×600 light/dark
       captures.
-- [ ] Attachment preview (Save with path confinement shipped in P6c).
+- [x] Attachment preview (P13b): bounded text and image preview through `attachment_get`; Save still
+      writes the complete bytes with path confinement.
 - [ ] Verify: thread fixtures, rule idempotency, no path escape. The search, real-ingest and
       account-wide thread halves of the 100k gate are proven; the folder thread view and open/RSS
       halves remain open. P9c proves rule priority/stop, later-rule effects, idempotency, preview
@@ -221,8 +222,12 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] PGP/MIME verify/decrypt/sign/encrypt (P12c2b); S/MIME later.
 - [x] PGP reading badges, composer toggles and key manager in the app (P12c2c).
 - [x] `.ics` invite parsing and organizer-only reply drafts (P12d).
-- [ ] Unsubscribe, export/import `.eml`/`.mbox`, Thunderbird import.
-- [ ] MCP compact mode, resources, send guardrails, audit log.
+- [x] Unsubscribe (P13d): bounded `List-Unsubscribe` capture, explicit mailto draft or web confirmation,
+      no background request and no automatic send.
+- [ ] Export/import `.eml`/`.mbox`, Thunderbird import.
+- [x] MCP compact mode, resources, send guardrails, audit log (P13a): `--compact`,
+      `--audit-log`, read-only mailbox/message resources, a rolling 300-call guard, and a
+      metadata-only JSONL trail rotated at 8 MiB.
 - [x] Windows per-user packaging source: MSI/ZIP, manifest, external signing (P12e).
 - [ ] Signing/clean-VM verification and DMG/AppImage/deb/rpm.
 - [x] Standalone fuzz targets for MIME/HTML/PGP/calendar and `cargo-deny` security CI (P12f).

@@ -376,6 +376,14 @@ pub fn op_defs() -> Vec<OpDef> {
             true
         ),
         def!(
+            "message_unsubscribe",
+            "Read a message's unsubscribe choices",
+            "Return the RFC 2369/8058 `List-Unsubscribe` targets captured at ingest, classified as `mailto`, `https` or `http`, plus whether `List-Unsubscribe-Post: One-Click` applies to an HTTPS target. Reading this operation sends nothing and opens nothing: the app offers a draft to a `mailto` target and the normal link confirmation to a web target, and the person decides. Malformed or non-mail/http targets are dropped; at most four valid targets are returned. Read-only and offline.",
+            MessageUnsubscribeArgs,
+            true,
+            false
+        ),
+        def!(
             "rules_list",
             "List rules",
             "Local rules of one account in execution order (`priority ASC, id ASC`), with their validated query, 1-5 actions, stop/enabled flags and a computed `valid`/`error`. A rule whose target folder or label was deleted stays visible as stale; it fails with a readable error at run time. Read-only and offline.",
@@ -927,6 +935,15 @@ pub struct PgpKeysListArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessagePgpVerifyArgs {
+    /// Message id returned by messages_list.
+    pub id: String,
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessageUnsubscribeArgs {
     /// Message id returned by messages_list.
     pub id: String,
     /// Account id. Required when the mailbox has several accounts.
@@ -1891,6 +1908,10 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let args: MessagePgpDecryptArgs = parse(args)?;
             let passphrase = Zeroizing::new(args.passphrase);
             value(engine.message_pgp_decrypt(&args.id, args.account.as_deref(), passphrase.as_bytes())?)
+        }
+        "message_unsubscribe" => {
+            let args: MessageUnsubscribeArgs = parse(args)?;
+            value(engine.message_unsubscribe(&args.id, args.account.as_deref())?)
         }
         "rules_list" => {
             let args: RulesListArgs = parse(args)?;

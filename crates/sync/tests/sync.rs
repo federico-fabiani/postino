@@ -75,6 +75,39 @@ fn loop_guard_headers_are_recorded_for_received_mail() {
 }
 
 #[test]
+fn unsubscribe_headers_are_captured_in_encrypted_meta_for_received_mail() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let mut message = synthetic_message(1);
+    let raw = String::from_utf8_lossy(&message.raw).replacen(
+        "From: Synthetic Sender <synthetic1@example.test>",
+        "From: Synthetic Sender <synthetic1@example.test>\r\nList-Unsubscribe: <mailto:leave@example.test?subject=unsubscribe>, <https://example.test/unsubscribe?id=1>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click",
+        1,
+    );
+    message.raw = raw.into_bytes();
+    let server = RunningServer::start(one_inbox(10, vec![TestMessage::synthetic(message)]));
+    sync(&store, &server).expect("sync with unsubscribe headers");
+    server.finish();
+
+    let row = message_by_header(&store, "synthetic-1@example.test");
+    let value = store.get_meta(&format!("unsubscribe:{}", row.summary.id)).expect("meta").expect("unsubscribe meta");
+    let decoded: serde_json::Value = serde_json::from_str(&value).expect("valid meta JSON");
+    let targets = decoded["targets"].as_array().expect("targets");
+    assert_eq!(targets.len(), 1, "one List-Unsubscribe field can carry both targets");
+    let stored = targets[0].as_str().expect("header value");
+    assert!(stored.contains("mailto:leave@example.test"));
+    assert!(stored.contains("https://example.test/unsubscribe?id=1"));
+    assert_eq!(decoded["one_click"], serde_json::json!(true));
+
+    let engine = Engine::open(store).expect("open the engine");
+    let info = engine.message_unsubscribe(&row.summary.id, None).expect("unsubscribe choices");
+    assert_eq!(info.targets.len(), 2);
+    assert_eq!(info.targets[0].method, postino_core::UnsubscribeMethod::Mailto);
+    assert_eq!(info.targets[1].method, postino_core::UnsubscribeMethod::Https);
+    assert!(info.one_click);
+}
+
+#[test]
 fn status_is_absent_before_the_first_run() {
     let harness = Harness::new();
     let store = seeded(&harness);
