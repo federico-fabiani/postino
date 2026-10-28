@@ -242,8 +242,9 @@ interaction model before real mail makes them expensive to change. Full spec:
       metadata-only JSONL trail rotated at 8 MiB.
 - [x] Windows per-user packaging source: MSI/ZIP, manifest, external signing (P12e).
 - [ ] Signing (external certificate), clean-VM verification, DMG/AppImage/deb/rpm. An unsigned
-      per-user MSI and portable ZIP are built from a clean stamped release; Authenticode, clean-VM
-      install/uninstall, and the other platforms are still pending.
+      per-user MSI and portable ZIP are built from a clean stamped release; the MSI installs and
+      uninstalls on the development host, while Authenticode, a fresh VM, upgrade and the other
+      platforms are still pending.
 - [x] Standalone fuzz targets for MIME/HTML/PGP/calendar and `cargo-deny` security CI (P12f).
 - [x] Full security review against `docs/threat-model.md` (two read-only audits, no blocker).
 - [ ] Verify: clean install on a fresh VM; agent sends a dry-run and a real message; offline

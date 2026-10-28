@@ -219,7 +219,9 @@ hash matches `dist\SHA256SUMS.txt`; it does not build the installer or sign anyt
 
 - **The MSI is unsigned.** WiX v4.0.6 built `dist\Postino-0.1.0-windows-x64.msi` from the staged
   payload; no certificate is installed, so the binary carries no Authenticode signature.
-- **No clean-VM run.** Install, upgrade, uninstall and the data-removal checkbox have not been
-  executed on a fresh Windows VM; `smoke-checklist.md` is the manual acceptance list.
+- **No clean-VM run.** The MSI was installed and uninstalled silently on the Windows 11 development
+  host (both exit 0; the staged `postino.exe --version` ran; install folder and Start Menu shortcut
+  were removed). A fresh Windows VM, an upgrade over an older build, and the data-removal checkbox
+  remain manual checks; `smoke-checklist.md` is the acceptance list.
 - The portable ZIP and its `SHA256SUMS.txt` were built from the release binaries in this round; the
   MSI hash is included in `dist\SHA256SUMS.txt`.
