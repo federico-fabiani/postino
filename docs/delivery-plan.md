@@ -159,13 +159,21 @@ none). **P12f** adds standalone libFuzzer targets for MIME, HTML, PGP/MIME struc
 invites, plus a security workflow with `cargo deny check`, Linux 120 s runs and a native Windows MSVC
 AddressSanitizer job. The remaining roadmap work continues as P13 vertical packages: **P13a** MCP
 resources/compact/audit, **P13b** attachment preview, **P13c** local templates, **P13d**
-unsubscribe, **P13e** Gmail label mapping and **P13f** `.eml` export/import are merged and
-CI-green. The audit keeps these vertical packages serial because they touch core/store/app.
+unsubscribe, **P13e** Gmail label mapping, **P13f** `.eml` export/import and **P13g** `.mbox`
+export/import are merged and CI-green. The audit keeps these vertical packages serial because they
+touch core/store/app.
 
 **P13f** adds `message_export`/`message_import`, `postino export|import`, palette and reading-pane
 actions and the local **Import** folder. Export is byte-exact only when the v9 raw blob was retained;
 otherwise it rebuilds from stored sanitized content and threading headers. Both directions cap the
-file at 10 MiB so base64 fits the daemon frame. `.mbox` and Thunderbird import remain open.
+file at 10 MiB so base64 fits the daemon frame.
+
+**P13g** adds `folder_export_mbox`/`folder_import_mbox` and `postino export-mbox|import-mbox`.
+Thunderbird-style archives are split before any folder is created; a separator must be followed by a
+header-looking line, mboxrd quoting is reversible, imports land in a reused named local folder, and
+skips are reported without aborting the rest. The same 10 MiB bound keeps base64 inside the daemon
+frame. The desktop app intentionally has no mbox button in this package; the CLI and MCP are the
+agent-first surfaces, while `.eml` remains the per-message UI action.
 
 ## 5. Delighters backlog
 

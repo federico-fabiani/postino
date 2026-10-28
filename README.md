@@ -98,7 +98,7 @@ MCP      ─┘
 - Typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
   `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_export`, `message_import`,
-  `message_unsubscribe`, `message_flag`, `message_move`,
+  `folder_export_mbox`, `folder_import_mbox`, `message_unsubscribe`, `message_flag`, `message_move`,
   `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
   `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`,
   `search_status`, `search_reindex`, `threads_list`, `thread_get`, `thread_flag`,
@@ -159,6 +159,16 @@ MCP      ─┘
   capped at 10 MiB each way so the base64 stays inside the daemon frame. The reading pane exports the
   selected message, the palette imports one `.eml`, and `postino export <id> --out` /
   `postino import <path>` expose the same operations without a window.
+- **`.mbox` export/import (P13g).** `folder_export_mbox` writes a whole folder as a bounded mbox,
+  and `folder_import_mbox` splits a Thunderbird-style archive before creating anything, so a file
+  without a valid `From ` separator imports zero messages and leaves no half-built folder. A
+  separator is accepted only when the next line looks like a mail header, so prose such as `From the
+  desk` is not mistaken for a new message; mboxrd `>From` quoting is removed on import and restored
+  on export. Imports go to the named local folder (names are bounded and reused from a prior import,
+  never a server folder); duplicate Message-IDs stay copies, are marked read, and never move cached
+  mail. The file is capped at 10 MiB and 2 000 messages so base64 stays inside the daemon frame;
+  `postino export-mbox <folder> --out` / `postino import-mbox <path> --folder` expose the same
+  operations without a window.
 - **Local rules (P9c).** The Rules page (Settings → **Regole locali**, or the palette commands
   **Regole locali**/**Nuova regola**) stores up to 100 rules per account on the encrypted v7 tables.
   A rule is a validated search query plus 1–5 actions: move to a folder, add a label, read/unread,

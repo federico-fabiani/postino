@@ -60,6 +60,12 @@ fn ensure_eml_size(size: usize) -> Result<(), OpError> {
     Ok(())
 }
 
+fn mbox_too_large_error() -> OpError {
+    OpError::InvalidArgs(format!(
+        "the mbox would be larger than {MAX_MBOX_BYTES} bytes; export fewer messages so the base64 stays inside the 16 MiB daemon frame"
+    ))
+}
+
 fn not_stored_verify() -> crate::pgp_mime::PgpVerifyResult {
     crate::pgp_mime::PgpVerifyResult {
         state: crate::pgp_mime::PgpVerifyState::NotStored,
@@ -121,6 +127,11 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// The daemon JSON-RPC frame is 16 MiB in each direction. A 10 MiB file becomes ~13.4 MiB of
 /// standard base64, leaving room for the envelope while keeping CLI, MCP and desktop on one bound.
 pub const MAX_EML_BYTES: u64 = 10 * 1024 * 1024;
+/// Largest mbox imported or exported in one call. It shares the `.eml` budget because both travel
+/// as base64 inside the 16 MiB daemon frame.
+pub const MAX_MBOX_BYTES: u64 = MAX_EML_BYTES;
+/// Largest number of messages one mbox may contain.
+pub const MAX_MBOX_MESSAGES: usize = postino_sync::mime::MAX_MBOX_MESSAGES;
 pub const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 /// A signature is plain text and small: 4 KiB is already a long signature.
 pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
@@ -1589,6 +1600,142 @@ impl Engine {
         let message =
             self.message_result(&imported.message_id)?.ok_or_else(|| OpError::Failed("the imported message could not be read back".to_owned()))?;
         Ok((message, imported.warnings))
+    }
+
+    /// Export every message in one folder as a single mbox, with an exact/reconstructed count.
+    ///
+    /// The bytes are assembled in memory because the operation crosses the daemon as base64; the
+    /// folder is refused before writing when the result would exceed [`MAX_MBOX_BYTES`].
+    pub fn folder_export_mbox(&self, folder: &str, account: Option<&str>) -> Result<(Vec<u8>, usize, usize, usize), OpError> {
+        let account = self.requested_account(account, "folder_export_mbox")?;
+        let folder = self
+            .folders
+            .iter()
+            .find(|candidate| candidate.account_id == account.id && (candidate.id == folder || candidate.name.eq_ignore_ascii_case(folder)))
+            .ok_or_else(|| unknown_folder(folder))?
+            .id
+            .clone();
+        let rows: Vec<(String, chrono::DateTime<Utc>)> =
+            self.messages.iter().filter(|message| message.folder_id == folder).map(|message| (message.id.clone(), message.date)).collect();
+        let mut entries = Vec::with_capacity(rows.len());
+        let mut total = 0usize;
+        let mut exact = 0usize;
+        for (id, date) in rows {
+            let (raw, is_exact) = self.message_export(&id, Some(&account.id))?;
+            total = total.checked_add(raw.len().saturating_add(64)).ok_or_else(|| OpError::Failed("the mbox size overflowed".to_owned()))?;
+            if total as u64 > MAX_MBOX_BYTES {
+                return Err(mbox_too_large_error());
+            }
+            exact += usize::from(is_exact);
+            entries.push((raw, date));
+        }
+        let bytes = postino_sync::mime::write_mbox(&entries);
+        if bytes.len() as u64 > MAX_MBOX_BYTES {
+            return Err(mbox_too_large_error());
+        }
+        let messages = entries.len();
+        Ok((bytes, messages, exact, messages.saturating_sub(exact)))
+    }
+
+    /// Import an mbox into a local folder named `folder` (`Import` when omitted).
+    ///
+    /// Every message goes through the ordinary ingest path. A malformed or over-limit message is
+    /// counted and named in the warnings without aborting the rest of the archive; a duplicate
+    /// Message-ID never moves an existing copy. The folder is local (`uid_validity` stays `NULL`) so
+    /// the next sync can never delete imported UIDs.
+    pub fn folder_import_mbox(
+        &mut self,
+        raw: &[u8],
+        folder: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<(Folder, usize, usize, Vec<String>), OpError> {
+        let account = self.requested_account(account, "folder_import_mbox")?;
+        if raw.len() as u64 > MAX_MBOX_BYTES {
+            return Err(mbox_too_large_error());
+        }
+        let store = self.require_store("folder_import_mbox")?;
+        let account_row = store.get_account(&account.id).map_err(store_map::read_error)?.ok_or_else(|| unknown_account(&account.id))?;
+        let name = folder.unwrap_or("Import").trim();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            return Err(OpError::InvalidArgs("the import folder name must be 1-64 characters without control characters".to_owned()));
+        }
+        let messages = postino_sync::mime::split_mbox(
+            raw,
+            postino_sync::mime::MboxLimits { max_bytes: MAX_MBOX_BYTES as usize, max_messages: MAX_MBOX_MESSAGES },
+        )
+        .map_err(|error| OpError::InvalidArgs(format!("the file is not a usable mbox: {error}")))?;
+        let folder_row = self.local_mbox_folder(store, &account.id, name)?;
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut warnings = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            match postino_sync::import_message(store, &account_row, &folder_row, message, &postino_sync::SyncLimits::default()) {
+                Ok(result) => {
+                    imported += 1;
+                    if warnings.len() < 20 {
+                        warnings.extend(result.warnings.into_iter().take(20 - warnings.len()));
+                    }
+                }
+                Err(error) => {
+                    skipped += 1;
+                    if warnings.len() < 20 {
+                        warnings.push(format!("message {}: {error}", index + 1));
+                    }
+                }
+            }
+        }
+        self.reload_mailbox()?;
+        let folder = self
+            .folders
+            .iter()
+            .find(|candidate| candidate.id == folder_row.id)
+            .cloned()
+            .ok_or_else(|| OpError::Failed("the import folder disappeared after the import".to_owned()))?;
+        Ok((folder, imported, skipped, warnings))
+    }
+
+    fn local_mbox_folder(&self, store: &Store, account: &str, name: &str) -> Result<postino_store::Folder, OpError> {
+        let candidates: Vec<String> = self
+            .folders
+            .iter()
+            .filter(|folder| folder.account_id == account && folder.name.eq_ignore_ascii_case(name) && folder.kind == FolderKind::Custom)
+            .map(|folder| folder.id.clone())
+            .collect();
+        for candidate in candidates {
+            let Some(row) = store.get_folder(&candidate).map_err(store_map::read_error)? else {
+                continue;
+            };
+            if row.uid_validity.is_none() {
+                return Ok(row);
+            }
+        }
+        let id = if name.eq_ignore_ascii_case("Import") {
+            format!("fld_import_{account}")
+        } else {
+            let digest = blake3::hash(format!("{}\u{0}{}", account, name.to_lowercase()).as_bytes()).to_hex();
+            format!("fld_mbox_{}", digest.chars().take(16).collect::<String>())
+        };
+        if let Some(existing) = store.get_folder(&id).map_err(store_map::read_error)? {
+            if existing.account_id != account || existing.uid_validity.is_some() || existing.kind != postino_store::FolderKind::Custom {
+                return Err(OpError::Failed(format!(
+                    "the reserved local import folder id {id:?} is already used by a server folder; rename that folder or import into a different store"
+                )));
+            }
+            return Ok(existing);
+        }
+        let row = postino_store::Folder {
+            id,
+            account_id: account.to_owned(),
+            name: name.to_owned(),
+            kind: postino_store::FolderKind::Custom,
+            unread: 0,
+            total: 0,
+            uid_validity: None,
+            uid_next: None,
+            last_sync_at: None,
+        };
+        store.upsert_folder(&row).map_err(store_map::write_error)?;
+        Ok(row)
     }
 
     /// The RFC 2369/8058 choices captured at ingest for one received message.

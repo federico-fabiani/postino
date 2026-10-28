@@ -29,7 +29,8 @@ pub mod vault;
 
 pub use engine::{
     AccountRequest, AccountSetup, AccountUpdateRequest, Engine, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS,
-    MAX_EML_BYTES, MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup, ThreadDetailResult, ThreadFlagResult, ThreadListRequest, ThreadPageResult,
+    MAX_EML_BYTES, MAX_MBOX_BYTES, MAX_MBOX_MESSAGES, MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup, ThreadDetailResult, ThreadFlagResult,
+    ThreadListRequest, ThreadPageResult,
 };
 pub use model::{
     Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
@@ -40,11 +41,11 @@ pub use model::{
 pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{
     AccountAdd, AccountRemove, AccountSignature, AccountTest, AccountUpdate, AccountsList, AppInfo, AttachmentGet, DraftAttachmentResult, DraftSave,
-    DryRunResult, FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageExport, MessageFlag, MessageGet, MessageImport,
-    MessagesList, OpDef, OutboxAction, OutboxListResult, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
-    RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchHit,
-    SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView,
-    TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, op_defs,
+    DryRunResult, FolderExportMbox, FolderImportMbox, FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageExport,
+    MessageFlag, MessageGet, MessageImport, MessagesList, OpDef, OutboxAction, OutboxListResult, RuleDeleteResult, RuleResult, RulesListResult,
+    RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult,
+    SavedSearchesListResult, SearchHit, SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport,
+    SyncStatusReport, SyncStatusView, TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, op_defs,
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
 pub use pgp_mime::{

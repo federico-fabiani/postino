@@ -111,6 +111,22 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
+            "folder_export_mbox",
+            "Export a folder as mbox",
+            "Return every message in one folder as one mbox file, base64-encoded, at most 10 MiB. Each message is separated by a `From - <date>` line and body lines that look like a separator are quoted; messages with retained v9 raw bytes stay exact, the others are rebuilt from stored headers, sanitized bodies and attachments. The folder is selected by id or exact name. Read-only and offline; `postino export-mbox` writes the same bytes and never overwrites unless `--force`.",
+            FolderExportMboxArgs,
+            true,
+            false
+        ),
+        def!(
+            "folder_import_mbox",
+            "Import an mbox folder",
+            "Import one mbox file (standard base64, at most 10 MiB, at most 2000 messages) into a local folder named by `folder` (default `Import`). This is the format Thunderbird's folder export produces. Every message runs through the ordinary MIME sanitizer and attachment bounds; mboxrd `>From` quoting is removed and a `From ` prose line is not mistaken for a separator. A malformed message is counted in `skipped` instead of aborting the archive, and a duplicate Message-ID never moves cached mail. The folder is local, so a later sync cannot delete its synthetic UIDs. Returns the folder, counts and at most 20 warnings.",
+            FolderImportMboxArgs,
+            false,
+            false
+        ),
+        def!(
             "message_invite",
             "Read a calendar invite",
             "Parse the first text/calendar attachment of one message into an invite card: METHOD, summary, organizer, attendees, start/end, location, recurrence and timezone flags, validity and warnings. The part is capped at 256 KiB, 1000 components and 2000 attendees; malformed or hostile input returns `invite: null` and the file stays a normal attachment. Read-only and offline: nothing is stored, expanded or added to a calendar.",
@@ -637,8 +653,28 @@ pub struct MessageExportArgs {
 pub struct MessageImportArgs {
     /// Account id. Required when the mailbox has several accounts.
     pub account: Option<String>,
-    /// Standard base64 of the `.eml` bytes. At most 25 MiB before encoding.
+    /// Standard base64 of the `.eml` bytes. At most 10 MiB before encoding.
     pub eml_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FolderExportMboxArgs {
+    /// Folder id or exact name.
+    pub folder: String,
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FolderImportMboxArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Local destination folder name, 1-64 characters. Defaults to `Import`.
+    pub folder: Option<String>,
+    /// Standard base64 of the mbox bytes. At most 10 MiB before encoding.
+    pub mbox_base64: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1458,6 +1494,26 @@ pub struct MessageImport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderExportMbox {
+    pub folder_id: String,
+    pub filename: String,
+    /// Standard base64 of the mbox bytes.
+    pub mbox_base64: String,
+    pub messages: usize,
+    pub exact_messages: usize,
+    pub reconstructed_messages: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderImportMbox {
+    pub folder: Folder,
+    pub imported: usize,
+    pub skipped: usize,
+    /// At most 20 entries; a larger archive reports the remaining failures only in `skipped`.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageFlag {
     pub message: MessageSummary,
 }
@@ -1794,6 +1850,14 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "message_import" => {
             let args: MessageImportArgs = parse(args)?;
             import(engine, args)
+        }
+        "folder_export_mbox" => {
+            let args: FolderExportMboxArgs = parse(args)?;
+            export_mbox(engine, args)
+        }
+        "folder_import_mbox" => {
+            let args: FolderImportMboxArgs = parse(args)?;
+            import_mbox(engine, args)
         }
         "message_invite" => {
             let args: MessageInviteArgs = parse(args)?;
@@ -2306,20 +2370,30 @@ fn attachment(engine: &Engine, args: AttachmentGetArgs) -> Result<Value, OpError
     value(AttachmentGet { attachment, data_base64 })
 }
 
-fn export_filename(engine: &Engine, id: &str) -> String {
-    let Ok(Some(message)) = engine.message_result(id) else { return format!("{id}.eml") };
+fn ascii_slug(value: &str) -> String {
     let mut slug = String::new();
-    for character in message.summary.subject.chars() {
+    for character in value.chars() {
         if character.is_ascii_alphanumeric() {
             slug.push(character.to_ascii_lowercase());
         } else if !slug.is_empty() && !slug.ends_with('-') {
             slug.push('-');
         }
     }
-    let slug = slug.trim_matches('-');
+    slug.trim_matches('-').chars().take(60).collect()
+}
+
+fn export_filename(engine: &Engine, id: &str) -> String {
+    let Ok(Some(message)) = engine.message_result(id) else { return format!("{id}.eml") };
+    let slug = ascii_slug(&message.summary.subject);
     let date = message.summary.date.format("%Y-%m-%d").to_string();
     let short_id: String = id.chars().take(16).collect();
-    if slug.is_empty() { format!("{date}-{short_id}.eml") } else { format!("{date}-{}-{short_id}.eml", &slug[..slug.len().min(60)]) }
+    if slug.is_empty() { format!("{date}-{short_id}.eml") } else { format!("{date}-{slug}-{short_id}.eml") }
+}
+
+fn mbox_filename(folder: &Folder) -> String {
+    let slug = ascii_slug(&folder.name);
+    let short_id: String = folder.id.chars().filter(|character| character.is_ascii_alphanumeric() || *character == '_').take(16).collect();
+    if slug.is_empty() { format!("folder-{short_id}.mbox") } else { format!("{slug}-{short_id}.mbox") }
 }
 
 fn export(engine: &Engine, args: MessageExportArgs) -> Result<Value, OpError> {
@@ -2340,6 +2414,40 @@ fn import(engine: &mut Engine, args: MessageImportArgs) -> Result<Value, OpError
         .map_err(|_| OpError::InvalidArgs("the `.eml` payload is not valid base64".to_owned()))?;
     let (message, warnings) = engine.message_import(args.account.as_deref(), &raw)?;
     value(MessageImport { message, warnings })
+}
+
+fn export_mbox(engine: &Engine, args: FolderExportMboxArgs) -> Result<Value, OpError> {
+    let account = engine.requested_account_id(args.account.as_deref(), "folder_export_mbox")?;
+    let folder = engine
+        .folders()
+        .iter()
+        .find(|candidate| candidate.account_id == account && (candidate.id == args.folder || candidate.name.eq_ignore_ascii_case(&args.folder)))
+        .cloned()
+        .ok_or_else(|| unknown_folder(&args.folder))?;
+    let filename = mbox_filename(&folder);
+    let (raw, messages, exact_messages, reconstructed_messages) = engine.folder_export_mbox(&folder.id, Some(&account))?;
+    value(FolderExportMbox {
+        folder_id: folder.id,
+        filename,
+        mbox_base64: base64::engine::general_purpose::STANDARD.encode(raw),
+        messages,
+        exact_messages,
+        reconstructed_messages,
+    })
+}
+
+fn import_mbox(engine: &mut Engine, args: FolderImportMboxArgs) -> Result<Value, OpError> {
+    if args.mbox_base64.len() > MAX_EML_BASE64_CHARS {
+        return Err(OpError::InvalidArgs(format!(
+            "the mbox payload is too large; the decoded file must be at most {} bytes",
+            crate::engine::MAX_MBOX_BYTES
+        )));
+    }
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(args.mbox_base64.as_bytes())
+        .map_err(|_| OpError::InvalidArgs("the mbox payload is not valid base64".to_owned()))?;
+    let (folder, imported, skipped, warnings) = engine.folder_import_mbox(&raw, args.folder.as_deref(), args.account.as_deref())?;
+    value(FolderImportMbox { folder, imported, skipped, warnings })
 }
 
 fn flag(engine: &mut Engine, args: MessageFlagArgs) -> Result<Value, OpError> {

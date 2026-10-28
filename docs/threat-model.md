@@ -129,6 +129,13 @@
   hostile file cannot relocate cached mail. Export returns exact retained v9 bytes or a reconstruction
   from stored sanitized content; the app writes the chosen path through the injected file saver and
   never opens the result, and no operation executes an imported file.
+- `.mbox` import/export (P13g) applies the same 10 MiB transport bound before splitting and accepts a
+  separator only when the following line is header-shaped, so a body line such as `From the desk`
+  cannot inject a message. It removes exactly one layer of mboxrd `>From` quoting, caps a file at
+  2 000 messages, and imports into a named local folder (never a synced folder) through the ordinary
+  MIME/attachment bounds. A malformed file creates nothing; per-message failures are reported and
+  skipped, and duplicates never relocate cached mail. Export re-quotes separator-looking lines and
+  never executes an imported file.
 
 ### 4.2 Account compromise
 

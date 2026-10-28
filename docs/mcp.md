@@ -80,6 +80,8 @@ agent can read the message and recover.
 | `message_get` | yes | One message with body and attachments |
 | `message_export` | yes | One message as an RFC 5322 `.eml` in bounded base64 (10 MiB); byte-exact when the v9 raw blob was retained, otherwise reconstructed from sanitized text/HTML, threading headers and attachments |
 | `message_import` | no | Store one `.eml` (bounded base64, 10 MiB) in the account's local **Import** folder through the ordinary ingest path; a duplicate Message-ID never moves existing mail and the copy is marked read |
+| `folder_export_mbox` | yes | One folder as a Thunderbird-style mbox (bounded base64, 10 MiB); separator-looking body lines are quoted, exact/reconstructed message counts are reported |
+| `folder_import_mbox` | no | Split a bounded mbox (10 MiB, at most 2 000 messages) only after every separator and quoted `>From` line is validated; import into a named local folder through the ordinary ingest path, skipping failures with bounded warnings and never moving existing mail |
 | `message_unsubscribe` | yes | RFC 2369/8058 `List-Unsubscribe` targets captured at ingest (`mailto`, `https`, `http`) and the One-Click flag; sends and opens nothing |
 | `attachment_get` | yes | One attachment's metadata and exact bytes as bounded base64 (25 MiB cap); `postino attachment get --out` writes the same bytes |
 | `message_pgp_verify` | yes | Verify a received PGP/MIME signature against the stored public keys using the exact v9 bytes; `kind` says `signed`/`encrypted`/`none`, state is `verified`/`bad`/`no_key`/`unknown`/`not_stored` |

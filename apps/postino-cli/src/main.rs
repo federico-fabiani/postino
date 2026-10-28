@@ -26,13 +26,14 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
-    AttachmentGet, CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate,
-    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MAX_EML_BYTES, MailTls, MessageExport, MessageFlag, MessageGet, MessageImport,
-    MessageSummary, MessageTemplate, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult,
-    PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult, PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult,
-    RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult,
-    SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, TemplateDeleteResult,
-    ThreadFlagOutput, ThreadGetResult, ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod, VaultError,
+    AttachmentGet, CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FolderExportMbox, FolderImportMbox, FoldersList,
+    LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MAX_EML_BYTES, MAX_MBOX_BYTES, MailTls, MessageExport,
+    MessageFlag, MessageGet, MessageImport, MessageSummary, MessageTemplate, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction,
+    OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult, PgpVerifyState,
+    Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult,
+    SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow,
+    SyncReport, SyncStatusReport, TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod,
+    VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -677,6 +678,28 @@ enum Command {
     Export {
         id: String,
         /// Write the RFC 5322 bytes here instead of printing base64 JSON.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite an existing output file. Without it the export refuses to truncate.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Import one `.mbox` folder (for example a Thunderbird folder export) into a local folder.
+    ImportMbox {
+        path: PathBuf,
+        /// Local destination folder name; defaults to Import.
+        #[arg(long)]
+        folder: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Export one folder as a `.mbox` file, or print its base64 with --json.
+    ExportMbox {
+        /// Folder id or exact name.
+        folder: String,
+        /// Write the mbox bytes here instead of printing base64 JSON.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Overwrite an existing output file. Without it the export refuses to truncate.
@@ -1681,8 +1704,8 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Attachment { .. } => true,
         Command::Read { mark_read, .. } => !mark_read,
         Command::Unsubscribe { .. } => true,
-        Command::Export { .. } => true,
-        Command::Import { .. } => false,
+        Command::Export { .. } | Command::ExportMbox { .. } => true,
+        Command::Import { .. } | Command::ImportMbox { .. } => false,
         Command::Label { command } => matches!(command, LabelCommand::List),
         Command::Threads { .. } => true,
         Command::Thread { command } => matches!(command, ThreadCommand::Get { .. }),
@@ -1756,6 +1779,8 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             | Command::Unsubscribe { .. }
             | Command::Import { .. }
             | Command::Export { .. }
+            | Command::ImportMbox { .. }
+            | Command::ExportMbox { .. }
             | Command::Search { .. }
             | Command::Flag { .. }
             | Command::Draft { .. }
@@ -2266,6 +2291,78 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     exported.filename,
                     raw.len(),
                     if exported.exact { "byte originali conservati" } else { "ricostruito dai dati salvati" }
+                ))?;
+            }
+        }
+        Command::ImportMbox { path, folder, account } => {
+            let size = std::fs::metadata(&path).with_context(|| format!("lettura di {}", path.display()))?.len();
+            if size > MAX_MBOX_BYTES {
+                bail!("il file è troppo grande: {size} byte, il limite è {MAX_MBOX_BYTES}");
+            }
+            let file = std::fs::File::open(&path).with_context(|| format!("lettura di {}", path.display()))?;
+            let mut raw = Vec::new();
+            file.take(MAX_MBOX_BYTES.saturating_add(1)).read_to_end(&mut raw).with_context(|| format!("lettura di {}", path.display()))?;
+            if raw.len() as u64 > MAX_MBOX_BYTES {
+                bail!("il file è troppo grande: il limite è {MAX_MBOX_BYTES} byte");
+            }
+            let imported: FolderImportMbox = decode(call(
+                engine,
+                "folder_import_mbox",
+                json!({
+                    "account": account,
+                    "folder": folder,
+                    "mbox_base64": base64::engine::general_purpose::STANDARD.encode(&raw)
+                }),
+            )?)?;
+            if json_output {
+                print_json(&imported)?;
+            } else {
+                say(format!(
+                    "Importati {} messaggi in «{}» ({} saltati, {} avvisi).\nUsa `postino folders` per l'id della cartella.",
+                    imported.imported,
+                    imported.folder.name,
+                    imported.skipped,
+                    imported.warnings.len()
+                ))?;
+            }
+        }
+        Command::ExportMbox { folder, out, force, account } => {
+            let exported: FolderExportMbox = decode(call(engine, "folder_export_mbox", json!({ "folder": folder, "account": account }))?)?;
+            let raw = base64::engine::general_purpose::STANDARD.decode(exported.mbox_base64.as_bytes()).context("decodifica dei byte mbox")?;
+            if let Some(path) = out {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true);
+                if force {
+                    options.create(true).truncate(true);
+                } else {
+                    options.create_new(true);
+                }
+                let mut file = options
+                    .open(&path)
+                    .with_context(|| format!("scrittura di {} (il file esiste già? usa --force per sovrascriverlo)", path.display()))?;
+                file.write_all(&raw).with_context(|| format!("scrittura di {}", path.display()))?;
+                if json_output {
+                    print_json(&exported)?;
+                } else {
+                    say(format!(
+                        "Esportati {} messaggi in {} ({} byte, {} esatti, {} ricostruiti).",
+                        exported.messages,
+                        path.display(),
+                        raw.len(),
+                        exported.exact_messages,
+                        exported.reconstructed_messages
+                    ))?;
+                }
+            } else if json_output {
+                print_json(&exported)?;
+            } else {
+                say(format!(
+                    "{}: {} messaggi, {} byte ({} esatti, {} ricostruiti).\nUsa --out <file> per salvarlo, oppure --json per il base64.",
+                    exported.filename,
+                    exported.messages,
+                    raw.len(),
+                    exported.exact_messages,
+                    exported.reconstructed_messages
                 ))?;
             }
         }
@@ -4234,6 +4331,65 @@ mod tests {
         assert!(raw.starts_with("From: "), "{}", &raw[..raw.len().min(80)]);
         assert!(raw.contains("Subject: Synthetic message with attachment 1"));
         assert!(raw.contains("nota.txt"));
+    }
+
+    #[test]
+    fn cli_mbox_import_and_export_round_trip_a_thunderbird_folder() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        let dir = fixture.path().parent().expect("temp dir").to_path_buf();
+        let source_path = dir.join("thunderbird.mbox");
+        std::fs::write(
+            &source_path,
+            b"From - Mon Oct 26 10:00:00 2026\nFrom: Ada <ada@example.com>\nTo: Bruno <bruno@example.com>\nSubject: Thunderbird folder\nDate: Mon, 26 Oct 2026 10:00:00 +0000\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\n\n>From the archive\n",
+        )
+        .expect("fixture mbox");
+
+        run(
+            cli(Command::ImportMbox { path: source_path, folder: Some("Thunderbird Inbox".to_owned()), account: Some("acc_cli".to_owned()) }),
+            &mut engine,
+        )
+        .expect("import mbox");
+        let imported = engine.messages().iter().find(|message| message.subject == "Thunderbird folder").cloned().expect("imported message");
+        assert!(imported.folder_id.starts_with("fld_mbox_"), "{}", imported.folder_id);
+
+        let out = dir.join("esportata.mbox");
+        run(
+            cli(Command::ExportMbox {
+                folder: "Thunderbird Inbox".to_owned(),
+                out: Some(out.clone()),
+                force: false,
+                account: Some("acc_cli".to_owned()),
+            }),
+            &mut engine,
+        )
+        .expect("export mbox");
+        let error = run(
+            cli(Command::ExportMbox {
+                folder: "Thunderbird Inbox".to_owned(),
+                out: Some(out.clone()),
+                force: false,
+                account: Some("acc_cli".to_owned()),
+            }),
+            &mut engine,
+        )
+        .expect_err("an existing mbox must not be truncated");
+        assert!(format!("{error:#}").contains("--force"), "{error:#}");
+        run(
+            cli(Command::ExportMbox {
+                folder: "Thunderbird Inbox".to_owned(),
+                out: Some(out.clone()),
+                force: true,
+                account: Some("acc_cli".to_owned()),
+            }),
+            &mut engine,
+        )
+        .expect("forced export");
+        let raw = String::from_utf8_lossy(&std::fs::read(&out).expect("exported mbox")).into_owned();
+        assert!(raw.starts_with("From - "), "{}", &raw[..raw.len().min(80)]);
+        assert!(raw.contains("Subject: Thunderbird folder"));
+        assert!(raw.contains(">From the archive"));
     }
 
     #[test]
