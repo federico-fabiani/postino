@@ -26,7 +26,7 @@
 | Local thief | Reads disk, backups, swap | Encrypted DB, encrypted blobs, keyring-held key |
 | Malicious local process | Same user, tries the daemon pipe | Per-user pipe, per-launch token, owner-only token file |
 | Malicious agent / MCP client | Calls tools, composes, sends | Explicit send opt-in policy, dry-run, rate limits, audit log, no network listener |
-| Supply chain | Compromised crate, font, installer | `cargo-deny`/`cargo-audit`, pinned lockfile, asset hashes, signed releases |
+| Supply chain | Compromised crate, font, installer | `cargo-deny`, pinned lockfile, asset hashes, signed releases |
 | Provider | Sees the mailbox anyway | Out of scope; documented honestly |
 | Compromised OS / kernel | Reads memory, keylogs | Out of scope |
 
@@ -64,7 +64,12 @@
 - MIME parser (`postino-mime`, P4a): raw size, header block, part count and multipart depth are
   bounded before and inside the parser; decoded part size, total attachment bytes and HTML size are
   capped. `message/rfc822` parts are not expanded. Malformed structure is repaired and recorded as
-  warnings. A mutation corpus runs in CI; `cargo-fuzz` and the network-fed corpus remain M6 work.
+  warnings. A deterministic mutation corpus runs in `cargo xtask ci`
+  (`crates/mime/tests/no_panic.rs`); `fuzz/` adds libFuzzer targets for `parse`, the HTML
+  sanitizer/text converter, PGP/MIME structure detection and `.ics` parsing. The security workflow
+  runs each target for 120 s on Linux; Windows cannot host `cargo-fuzz` (no GNU libFuzzer build and
+  no MSVC `link.exe` here), so the local CI keeps the deterministic corpus and the fuzz build stays
+  a Linux gate. A 120 s run is a smoke gate, not a proof.
 - HTML (`postino-mime`, P4a): ammonia allowlist, no `<script>`, `<iframe>`, forms, SVG/MathML,
   `style`, `class`/`id` or `on*`; `javascript:`, `vbscript:`, `data:`, `file:`, relative and
   protocol-relative URLs never survive. Remote images are removed and `http`/`https` sources are
@@ -249,7 +254,8 @@ crash-dump entry above.
 
 ### 4.5 Supply chain
 
-- `Cargo.lock` committed; `cargo-deny` for licences and advisories; `cargo-audit` in CI.
+- `Cargo.lock` committed; `cargo deny check` in the security workflow covers licences and RustSec
+  advisories. The workflow also runs the libFuzzer targets; it is a Linux gate.
 - Minimal dependency surface; no npm in M0. If a webview renderer arrives, it is an OS component,
   not a bundled browser, and it gets its own sandbox review.
 - Fonts and logos are hashed and attributed; `cargo xtask assets` fails on drift.

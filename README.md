@@ -473,6 +473,10 @@ asset check. `cargo xtask layers` enforces that `postino-core` stays headless. `
 verifies every font and logo against `ATTRIBUTION.toml`; `cargo xtask assets --write` regenerates
 `ATTRIBUTION.md`.
 
+The separate security workflow runs `cargo deny check` and the libFuzzer targets in `fuzz/` on
+Linux (120 s per target). Local CI deliberately does not build them: `cargo-fuzz` needs nightly and
+a sanitizer, and this Windows GNU host cannot link `libfuzzer-sys`. See `fuzz/README.md`.
+
 ### Windows note
 
 The repository currently builds with the GNU Rust toolchain, which needs `dlltool.exe` for the

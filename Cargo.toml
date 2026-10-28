@@ -47,9 +47,9 @@ getrandom = { version = "0.3", features = ["std"] }
 zeroize = "1"
 
 # network
-tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
 tokio-rustls = { version = "=0.26.5", default-features = false, features = ["logging", "tls12", "ring"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-platform-verifier = "=0.7.1"
 base64 = "=0.22.1"
 

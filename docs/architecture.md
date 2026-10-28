@@ -1711,7 +1711,10 @@ The full threat model is in `docs/threat-model.md`.
 
 `cargo xtask ci` runs formatting, clippy (`-D warnings`), tests, the layering check and the asset
 check. The UI has a headless render test; the operation registry has a schema/name test; MCP has
-protocol tests. Every future feature adds an end-to-end operation test.
+protocol tests. Every future feature adds an end-to-end operation test. The security workflow
+(`.github/workflows/security.yml`) is separate: it runs `cargo deny check` against `deny.toml` and
+the four libFuzzer targets in `fuzz/` for 120 s each on Linux. Windows cannot host `cargo-fuzz` here,
+so the local gate keeps the deterministic mutation corpus and the fuzz build remains a Linux gate.
 
 ## 9. Revision history
 
@@ -1737,3 +1740,4 @@ protocol tests. Every future feature adds an end-to-end operation test.
 | 2026-10-27 | major | P10a1: `postino-ipc` (per-user named pipe/DACL or 0600 UDS, per-launch owner-only token, 16 MiB JSON-RPC frames, bounded queues, cancel, heartbeat), `postino-daemon` (independent `<store>.lock`/owner record, outbox recovery at every P7 state, sync/rules/index batches/GC scheduler, `daemon_status`), single-writer refusal for direct CLI/app writers, CLI and MCP daemon clients, absent-daemon fallback matrix; tray/autostart/notifications remain P10b and the app client is P10a2 |
 | 2026-10-27 | major | P10b1: platform `Tray`/`Autostart`/`Notifier` seams with recorders and one scoped Win32 module (`Shell_NotifyIcon`, hidden daemon window, ICO asset), daemon-owned tray/menu state, per-user HKCU Run autostart and `postino daemon autostart status|on|off`, privacy-preserving debounced notices with one encrypted scalar horizon, atomic `%APPDATA%\Postino\daemon.json`, release GUI subsystem and bounded log; ADR-0006 records the Run-key deviation from Task Scheduler; app settings/close-to-tray remain P10b2 |
 | 2026-10-27 | minor | P12d: parse-only `icalendar 0.17.17` behind the MIME bounds (256 KiB, 1 000 components, 2 000 attendees, 64-character organizer/attendee lines), `message_invite` read and organizer-only `invite_reply_draft` with a METHOD:REPLY part that preserves DTSTART/DTEND parameters and SEQUENCE, a reading-pane invite card driven by the shared command table, CLI/MCP parity and one 980 screenshot; only received mail is answerable; the synthetic demo has no calendar part, so the full text+calendar reply is exercised on the encrypted store; no calendar store, RRULE expansion, timezone database, auto-send or schema migration |
+| 2026-10-28 | major | P12f: standalone libFuzzer targets for MIME/HTML/PGP-MIME/calendar outside the workspace, a Linux `security` workflow with `cargo deny check` and 120 s per target, and rustls 0.23.46/tokio 1.53.3 security updates; Windows cannot host cargo-fuzz, so local CI keeps the deterministic corpus |

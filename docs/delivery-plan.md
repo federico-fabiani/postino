@@ -101,7 +101,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P12c2c | M6 ship | PGP reading badges, composer toggles, key manager | done |
 | P12d | M6 ship | iCalendar invites, RSVP drafts | done |
 | P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | done |
-| P12f | M6 ship | standalone fuzz targets and security CI | todo |
+| P12f | M6 ship | standalone fuzz targets and security CI | done |
 
 P0-P2 close U0. P3-P6d make M1 real; P7-P8 close M2. Each package may split when the brief is too
 large; splits are recorded here. The P6c blind review found one filename-warning blocker and several
@@ -155,7 +155,8 @@ M6 is split. **P12a** Gmail OAuth, **P12e** Windows packaging, **P12d** iCalenda
 and CI-green. **P12c2c** completes the app surface (reading badges, decrypt sheet, composer
 sign/encrypt choices, key table with import/public export/delete) and is CI-green. **P12b**
 ManageSieve is deferred until a provider with a real ManageSieve endpoint is confirmed (Gmail has
-none); **P12f** fuzz is the remaining M6 package. The audit keeps the vertical packages serial because they touch core/store/app.
+none). **P12f** adds standalone libFuzzer targets for MIME, HTML, PGP/MIME structure and calendar
+invites, plus a Linux security workflow with `cargo deny check`; M6 has no active package left. The audit keeps the vertical packages serial because they touch core/store/app.
 
 ## 5. Delighters backlog
 

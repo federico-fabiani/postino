@@ -1,0 +1,57 @@
+name: security
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - mime_parse
+          - html_sanitize
+          - pgp_mime_detect
+          - calendar_parse
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo install cargo-fuzz --locked
+      - name: Seed the corpus
+        run: |
+          mkdir -p fuzz/corpus/mime_parse fuzz/corpus/pgp_mime_detect
+          mkdir -p fuzz/corpus/html_sanitize fuzz/corpus/calendar_parse
+          cp crates/mime/tests/fixtures/*.eml fuzz/corpus/mime_parse/
+          cp crates/mime/tests/fixtures/*.eml fuzz/corpus/pgp_mime_detect/
+          cp fuzz/seeds/html.html fuzz/corpus/html_sanitize/seed.html
+          cp fuzz/seeds/calendar.ics fuzz/corpus/calendar_parse/seed.ics
+      - name: Run ${{ matrix.target }}
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -max_total_time=120 -rss_limit_mb=2048 -timeout=10
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

@@ -225,7 +225,8 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [ ] MCP compact mode, resources, send guardrails, audit log.
 - [x] Windows per-user packaging source: MSI/ZIP, manifest, external signing (P12e).
 - [ ] Signing/clean-VM verification and DMG/AppImage/deb/rpm.
-- [ ] Security review against `docs/threat-model.md`; fuzz MIME/HTML; `cargo-deny`/`audit`.
+- [x] Standalone fuzz targets for MIME/HTML/PGP/calendar and `cargo-deny` security CI (P12f).
+- [ ] Full security review against `docs/threat-model.md`; clean-VM install and restore.
 - [ ] Verify: clean install on a fresh VM; agent sends a dry-run and a real message; offline
       restore from backup.
 

@@ -1,0 +1,44 @@
+[package]
+name = "postino-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+postino-mime = { path = "../crates/mime" }
+
+[[bin]]
+name = "mime_parse"
+path = "fuzz_targets/mime_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "html_sanitize"
+path = "fuzz_targets/html_sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgp_mime_detect"
+path = "fuzz_targets/pgp_mime_detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "calendar_parse"
+path = "fuzz_targets/calendar_parse.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz crate is a standalone workspace: it must not inherit the product's release profile or
+# pull the product workspace into a nightly sanitizer build.
+[workspace]

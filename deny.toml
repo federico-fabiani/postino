@@ -1,0 +1,46 @@
+# Supply-chain policy checked by `cargo deny check` in the security workflow. The local
+# `cargo xtask ci` stays independent of this tool so the Windows GNU host does not need it.
+[advisories]
+yanked = "deny"
+# Reviewed 2026-10-28. These advisories are upstream constraints, not accepted risk for a network
+# service: rpgp 0.21.0 pins the RSA/curve arithmetic (local PGP only; the rsa advisory itself says
+# local use on a non-compromised machine is fine), and eframe 0.36 pulls the unmaintained zbus 5.x
+# Linux accessibility stack. Re-check on every rpgp/eframe upgrade.
+ignore = [
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 comes from cx448 0.1.1/elliptic-curve 0.13 via rpgp; no upgrade path, PGP is local-only" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 has no patched release; PGP decryption/signing is local-only, not a network oracle" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is unmaintained, pulled by eframe's Linux accessibility backend; no safe 5.x migration in eframe 0.36" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is unmaintained, pulled by eframe's Linux accessibility backend; no safe 5.x migration in eframe 0.36" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is unmaintained, pulled by eframe's Linux accessibility backend; no safe 5.x migration in eframe 0.36" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unlicense",
+    "WTFPL",
+    "blessing",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
