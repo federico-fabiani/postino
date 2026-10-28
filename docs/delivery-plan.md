@@ -159,7 +159,7 @@ none). **P12f** adds standalone libFuzzer targets for MIME, HTML, PGP/MIME struc
 invites, plus a security workflow with `cargo deny check`, Linux 120 s runs and a native Windows MSVC
 AddressSanitizer job. The remaining roadmap work continues as P13 vertical packages: **P13a** MCP
 resources/compact/audit, **P13b** attachment preview, **P13c** local templates, **P13d**
-unsubscribe, **P13e** Gmail label mapping, **P13f** `.eml` export/import and **P13g** `.mbox`
+unsubscribe, **P13e** Gmail label mapping, **P13f** `.eml` export/import, **P13g** `.mbox`
 export/import are merged and CI-green. The audit keeps these vertical packages serial because they
 touch core/store/app.
 
@@ -172,8 +172,14 @@ file at 10 MiB so base64 fits the daemon frame.
 Thunderbird-style archives are split before any folder is created; a separator must be followed by a
 header-looking line, mboxrd quoting is reversible, imports land in a reused named local folder, and
 skips are reported without aborting the rest. The same 10 MiB bound keeps base64 inside the daemon
-frame. The desktop app intentionally has no mbox button in this package; the CLI and MCP are the
+frame and the app intentionally has no mbox button; the CLI and MCP are the
 agent-first surfaces, while `.eml` remains the per-message UI action.
+
+**P13h** adds email-safe HTML composition. `draft_save.body_format` compiles the Markdown-like source
+into inline-CSS tables and a matching text alternative; the composer toggles plain/HTML and previews
+the exact output, and the engine recompiles compiler-owned drafts at send time. The CLI mirrors the
+flag with `--html`/`--plain`; raw HTML is never accepted and the source is capped at 1 MiB. The block
+editor and Tailwind mode remain open.
 
 ## 5. Delighters backlog
 

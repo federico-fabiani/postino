@@ -72,7 +72,7 @@ Current operations: `app_info`, `accounts_list`, `account_add`, `account_update`
 `draft_attachment_remove`, `message_send`, `send_schedule`, `outbox_list`, `outbox_cancel`,
 `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `search_status`, `search_reindex`,
 `labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`. They are enough to
-prove the path through all three clients. `draft_save` updates one draft in place;
+prove the path through all three clients. `draft_save` updates one draft in place and `body_format: "html"` compiles its Markdown-like source into email-safe HTML plus a text alternative (raw HTML is never accepted);
 `draft_attachment_add/remove` own the attachment bytes; `message_send` queues it with the undo
 window; `send_dry_run` returns the exact bytes without a row. Labels are local metadata: in memory in
 the demo, in the encrypted store otherwise, and never synced to a server. `search` is SQL over the
@@ -1752,3 +1752,4 @@ mutation corpus so `cargo xtask ci` stays fast.
 | 2026-10-28 | minor | P13e: with `X-GM-EXT-1`, sync reads `X-GM-LABELS` in envelopes and in the liveness scan and maps custom labels to mailbox-wide labels (system labels stay folders); applied ids live in encrypted `meta`, so later syncs remove only their own labels, and names/counts are bounded with control/bidi characters rejected |
 | 2026-10-28 | minor | P13f: `message_export` returns the exact retained v9 raw bytes or rebuilds a sanitized `.eml`, `message_import` runs a chosen file through the ordinary ingest path into a local **Import** folder without treating a duplicate Message-ID as a move, and the CLI/app/MCP share the same 10 MiB bound so base64 stays inside the 16 MiB daemon frame |
 | 2026-10-28 | minor | P13g: `folder_export_mbox`/`folder_import_mbox` add bounded Thunderbird-style mbox transfer; the splitter validates every separator against the following header before any folder is created, removes one mboxrd quote layer, imports into a named local folder through the ordinary ingest path, reports skip counts and keeps the same 10 MiB daemon-frame bound |
+| 2026-10-28 | minor | P13h: `draft_save.body_format` compiles the Markdown-like source into table-based HTML with inline CSS and a matching text alternative; the composer toggles plain/HTML and previews the exact output, the engine recompiles compiler-owned drafts at send time, raw HTML is never accepted and the source is capped at 1 MiB |

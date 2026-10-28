@@ -21,9 +21,9 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::model::{
-    Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
-    MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary, UnsubscribeInfo,
-    snippet,
+    Account, AccountView, Address, Attachment, BodyFormat, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor,
+    LabelSummary, MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary,
+    UnsubscribeInfo, snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::outbox::{
@@ -60,10 +60,34 @@ fn ensure_eml_size(size: usize) -> Result<(), OpError> {
     Ok(())
 }
 
-fn mbox_too_large_error() -> OpError {
+fn mbox_export_too_large_error() -> OpError {
     OpError::InvalidArgs(format!(
         "the mbox would be larger than {MAX_MBOX_BYTES} bytes; export fewer messages so the base64 stays inside the 16 MiB daemon frame"
     ))
+}
+
+fn mbox_import_too_large_error() -> OpError {
+    OpError::InvalidArgs(format!("the mbox file is larger than {MAX_MBOX_BYTES} bytes; split it into smaller archives before importing"))
+}
+
+/// One folder exported as mbox plus the export counts. `skipped` names rows that could not be
+/// reconstructed even after the ordinary error handling; they never make the whole folder vanish.
+#[derive(Debug)]
+pub struct FolderMboxExport {
+    /// Encoded mbox bytes.
+    pub bytes: Vec<u8>,
+    /// Folder whose messages were exported.
+    pub folder_id: String,
+    /// Messages written into the archive.
+    pub messages: usize,
+    /// Messages returned from retained raw bytes.
+    pub exact: usize,
+    /// Messages rebuilt from stored headers, body and attachments.
+    pub reconstructed: usize,
+    /// Messages omitted because they could not be exported.
+    pub skipped: usize,
+    /// At most 20 skip reasons.
+    pub warnings: Vec<String>,
 }
 
 fn not_stored_verify() -> crate::pgp_mime::PgpVerifyResult {
@@ -1534,6 +1558,18 @@ impl Engine {
         let date = chrono::DateTime::<Utc>::from_timestamp_millis(message.summary.date)
             .ok_or_else(|| OpError::Failed(format!("message {message_id:?} has an invalid date and cannot be exported")))?;
         let threading = store.message_threading(message_id).map_err(store_map::read_error)?.ok_or_else(|| unknown_message(message_id))?;
+        let composed = if message.body_html.as_deref().is_some_and(is_composed_html) {
+            Some(
+                postino_sync::mime::compile_html_email(&message.body_text)
+                    .map_err(|error| OpError::InvalidArgs(format!("the HTML body cannot be compiled: {error}")))?,
+            )
+        } else {
+            None
+        };
+        let (text, html) = match composed {
+            Some(composed) => (composed.text, Some(composed.html)),
+            None => (message.body_text, message.body_html),
+        };
         let outgoing = postino_sync::mime::OutgoingMessage {
             from: outgoing_mailbox(&message.summary.from),
             to: message.summary.to.iter().map(outgoing_mailbox).collect(),
@@ -1541,8 +1577,8 @@ impl Engine {
             bcc: message.bcc.iter().map(outgoing_mailbox).collect(),
             subject: message.summary.subject,
             date,
-            text: message.body_text,
-            html: message.body_html,
+            text,
+            html,
             attachments: parts,
             in_reply_to: threading.in_reply_to,
             references: threading.references,
@@ -1602,39 +1638,76 @@ impl Engine {
         Ok((message, imported.warnings))
     }
 
-    /// Export every message in one folder as a single mbox, with an exact/reconstructed count.
+    /// Export every exportable message in one folder as a single mbox.
     ///
     /// The bytes are assembled in memory because the operation crosses the daemon as base64; the
-    /// folder is refused before writing when the result would exceed [`MAX_MBOX_BYTES`].
-    pub fn folder_export_mbox(&self, folder: &str, account: Option<&str>) -> Result<(Vec<u8>, usize, usize, usize), OpError> {
+    /// folder is refused before writing when the result would exceed [`MAX_MBOX_BYTES`] or the
+    /// importer's message cap. A row that cannot be reconstructed (an imported message without a
+    /// sender, an attachment whose blob is gone) is counted in `skipped` with a bounded warning,
+    /// so one damaged row does not make the rest of a folder unexportable.
+    pub fn folder_export_mbox(&self, folder: &str, account: Option<&str>) -> Result<FolderMboxExport, OpError> {
         let account = self.requested_account(account, "folder_export_mbox")?;
-        let folder = self
-            .folders
-            .iter()
-            .find(|candidate| candidate.account_id == account.id && (candidate.id == folder || candidate.name.eq_ignore_ascii_case(folder)))
-            .ok_or_else(|| unknown_folder(folder))?
-            .id
-            .clone();
+        let folder_id = self.resolve_mbox_folder(&account.id, folder)?;
         let rows: Vec<(String, chrono::DateTime<Utc>)> =
-            self.messages.iter().filter(|message| message.folder_id == folder).map(|message| (message.id.clone(), message.date)).collect();
+            self.messages.iter().filter(|message| message.folder_id == folder_id).map(|message| (message.id.clone(), message.date)).collect();
+        if rows.len() > MAX_MBOX_MESSAGES {
+            return Err(OpError::InvalidArgs(format!("the folder has {} messages; an mbox can carry at most {MAX_MBOX_MESSAGES}", rows.len())));
+        }
+        if rows.is_empty() {
+            return Err(OpError::InvalidArgs(format!("folder {folder_id:?} has no messages to export")));
+        }
         let mut entries = Vec::with_capacity(rows.len());
         let mut total = 0usize;
         let mut exact = 0usize;
+        let mut skipped = 0usize;
+        let mut warnings = Vec::new();
         for (id, date) in rows {
-            let (raw, is_exact) = self.message_export(&id, Some(&account.id))?;
-            total = total.checked_add(raw.len().saturating_add(64)).ok_or_else(|| OpError::Failed("the mbox size overflowed".to_owned()))?;
-            if total as u64 > MAX_MBOX_BYTES {
-                return Err(mbox_too_large_error());
+            match self.message_export(&id, Some(&account.id)) {
+                Ok((raw, is_exact)) => {
+                    total = total.checked_add(raw.len().saturating_add(64)).ok_or_else(|| OpError::Failed("the mbox size overflowed".to_owned()))?;
+                    if total as u64 > MAX_MBOX_BYTES {
+                        return Err(mbox_export_too_large_error());
+                    }
+                    exact += usize::from(is_exact);
+                    entries.push((raw, date));
+                }
+                Err(error) => {
+                    skipped += 1;
+                    if warnings.len() < 20 {
+                        warnings.push(format!("message {id}: {error}"));
+                    }
+                }
             }
-            exact += usize::from(is_exact);
-            entries.push((raw, date));
+        }
+        if entries.is_empty() {
+            return Err(OpError::Failed(format!(
+                "none of the {skipped} messages in folder {folder_id:?} could be exported: {}",
+                warnings.first().map_or_else(|| "unknown error".to_owned(), Clone::clone)
+            )));
         }
         let bytes = postino_sync::mime::write_mbox(&entries);
         if bytes.len() as u64 > MAX_MBOX_BYTES {
-            return Err(mbox_too_large_error());
+            return Err(mbox_export_too_large_error());
         }
         let messages = entries.len();
-        Ok((bytes, messages, exact, messages.saturating_sub(exact)))
+        Ok(FolderMboxExport { bytes, folder_id, messages, exact, reconstructed: messages.saturating_sub(exact), skipped, warnings })
+    }
+
+    fn resolve_mbox_folder(&self, account: &str, query: &str) -> Result<String, OpError> {
+        if let Some(folder) = self.folders.iter().find(|folder| folder.account_id == account && folder.id == query) {
+            return Ok(folder.id.clone());
+        }
+        let matches = self
+            .folders
+            .iter()
+            .filter(|folder| folder.account_id == account && folder.name.eq_ignore_ascii_case(query))
+            .map(|folder| folder.id.clone())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => Err(unknown_folder(query)),
+            _ => Err(OpError::InvalidArgs(format!("folder name {query:?} matches more than one folder; pass the exact folder id"))),
+        }
     }
 
     /// Import an mbox into a local folder named `folder` (`Import` when omitted).
@@ -1651,20 +1724,22 @@ impl Engine {
     ) -> Result<(Folder, usize, usize, Vec<String>), OpError> {
         let account = self.requested_account(account, "folder_import_mbox")?;
         if raw.len() as u64 > MAX_MBOX_BYTES {
-            return Err(mbox_too_large_error());
+            return Err(mbox_import_too_large_error());
         }
         let store = self.require_store("folder_import_mbox")?;
         let account_row = store.get_account(&account.id).map_err(store_map::read_error)?.ok_or_else(|| unknown_account(&account.id))?;
         let name = folder.unwrap_or("Import").trim();
-        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
-            return Err(OpError::InvalidArgs("the import folder name must be 1-64 characters without control characters".to_owned()));
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(invalid_folder_name_char) {
+            return Err(OpError::InvalidArgs(
+                "the import folder name must be 1-64 visible characters without control, bidi or zero-width marks".to_owned(),
+            ));
         }
         let messages = postino_sync::mime::split_mbox(
             raw,
             postino_sync::mime::MboxLimits { max_bytes: MAX_MBOX_BYTES as usize, max_messages: MAX_MBOX_MESSAGES },
         )
         .map_err(|error| OpError::InvalidArgs(format!("the file is not a usable mbox: {error}")))?;
-        let folder_row = self.local_mbox_folder(store, &account.id, name)?;
+        let (folder_row, created) = self.local_mbox_folder(store, &account.id, name)?;
         let mut imported = 0usize;
         let mut skipped = 0usize;
         let mut warnings = Vec::new();
@@ -1676,6 +1751,15 @@ impl Engine {
                         warnings.extend(result.warnings.into_iter().take(20 - warnings.len()));
                     }
                 }
+                Err(postino_sync::SyncError::Store(error)) => {
+                    // A store failure means the archive itself is unusable. A folder created only
+                    // for this attempt must not survive an import that stored nothing.
+                    if imported == 0 && created {
+                        let _ = store.delete_empty_folder(&folder_row.id);
+                    }
+                    let _ = self.reload_mailbox();
+                    return Err(OpError::Failed(format!("the local store refused an imported message: {error}")));
+                }
                 Err(error) => {
                     skipped += 1;
                     if warnings.len() < 20 {
@@ -1683,6 +1767,16 @@ impl Engine {
                     }
                 }
             }
+        }
+        if imported == 0 {
+            if created {
+                store.delete_empty_folder(&folder_row.id).map_err(store_map::write_error)?;
+            }
+            let _ = self.reload_mailbox();
+            return Err(OpError::InvalidArgs(format!(
+                "no message in the mbox could be imported: {}",
+                warnings.first().map_or_else(|| "the archive is empty".to_owned(), Clone::clone)
+            )));
         }
         self.reload_mailbox()?;
         let folder = self
@@ -1694,20 +1788,21 @@ impl Engine {
         Ok((folder, imported, skipped, warnings))
     }
 
-    fn local_mbox_folder(&self, store: &Store, account: &str, name: &str) -> Result<postino_store::Folder, OpError> {
+    fn local_mbox_folder(&self, store: &Store, account: &str, name: &str) -> Result<(postino_store::Folder, bool), OpError> {
         let candidates: Vec<String> = self
             .folders
             .iter()
-            .filter(|folder| folder.account_id == account && folder.name.eq_ignore_ascii_case(name) && folder.kind == FolderKind::Custom)
+            .filter(|folder| folder.account_id == account && folder.name.eq_ignore_ascii_case(name))
             .map(|folder| folder.id.clone())
             .collect();
         for candidate in candidates {
             let Some(row) = store.get_folder(&candidate).map_err(store_map::read_error)? else {
                 continue;
             };
-            if row.uid_validity.is_none() {
-                return Ok(row);
+            if row.uid_validity.is_none() && row.kind == postino_store::FolderKind::Custom {
+                return Ok((row, false));
             }
+            return Err(OpError::InvalidArgs(format!("a server folder named {name:?} already exists; choose a different local import folder name")));
         }
         let id = if name.eq_ignore_ascii_case("Import") {
             format!("fld_import_{account}")
@@ -1721,7 +1816,7 @@ impl Engine {
                     "the reserved local import folder id {id:?} is already used by a server folder; rename that folder or import into a different store"
                 )));
             }
-            return Ok(existing);
+            return Ok((existing, false));
         }
         let row = postino_store::Folder {
             id,
@@ -1735,7 +1830,7 @@ impl Engine {
             last_sync_at: None,
         };
         store.upsert_folder(&row).map_err(store_map::write_error)?;
-        Ok(row)
+        Ok((row, true))
     }
 
     /// The RFC 2369/8058 choices captured at ingest for one received message.
@@ -3044,8 +3139,28 @@ impl Engine {
     /// With a store the message, attachments, revision and folder counts are one transaction. A
     /// failure returns before memory changes and leaves the previous rows exactly as they were.
     pub fn save_draft(&mut self, account: Option<&str>, id: Option<&str>, draft: DraftContent) -> Result<Message, OpError> {
+        self.save_draft_with_format(account, id, draft, None)
+    }
+
+    /// Save a draft, optionally compiling its source into the email-safe HTML part.
+    ///
+    /// `None` keeps the current representation: a plain draft stays plain, a draft already carrying
+    /// compiler output is recompiled when its source changed, and a manually stored HTML part is
+    /// left untouched (the legacy test seam). `Some(Plain)` removes the HTML part; `Some(Html)`
+    /// validates and compiles the source before any row is written.
+    pub fn save_draft_with_format(
+        &mut self,
+        account: Option<&str>,
+        id: Option<&str>,
+        draft: DraftContent,
+        body_format: Option<BodyFormat>,
+    ) -> Result<Message, OpError> {
         let draft = normalize_draft_attachment_names(draft);
         validate_draft(&draft)?;
+        let requested_html = match body_format {
+            Some(BodyFormat::Html) => Some(compose_draft_html(&draft.body_text)?),
+            _ => None,
+        };
         // Validate the reply linkage before any write. `None` means "keep what the row has"; the
         // store's COALESCE enforces that, and this map is updated from the row it returns.
         let requested_link = match draft.in_reply_to.as_deref() {
@@ -3158,9 +3273,10 @@ impl Engine {
             .unwrap_or_default();
         let summary_snippet = snippet(&draft.body_text);
         // An update keeps what the draft form does not own: its thread, starred flag, labels and
-        // HTML body. The composer patches `body_text`; a subject-only save must not destroy the
-        // stored HTML part.
-        let (thread_id, starred, labels, body_html) = match index.and_then(|index| self.messages.get(index)) {
+        // body representation. A subject-only save must not destroy a stored HTML part. When the
+        // source of a compiler-produced part changed without an explicit format, recompile it so
+        // the two parts cannot drift; a manually stored legacy HTML part stays byte-identical.
+        let (thread_id, starred, labels, mut body_html) = match index.and_then(|index| self.messages.get(index)) {
             Some(current) => (
                 current.thread_id.clone(),
                 current.starred,
@@ -3169,6 +3285,17 @@ impl Engine {
             ),
             None => (format!("thr_{message_id}"), false, Vec::new(), None),
         };
+        if body_format.is_none()
+            && body_html.as_deref().is_some_and(is_composed_html)
+            && current_full.as_ref().is_some_and(|message| message.body_text != draft.body_text)
+        {
+            body_html = Some(compose_draft_html(&draft.body_text)?);
+        }
+        match body_format {
+            Some(BodyFormat::Plain) => body_html = None,
+            Some(BodyFormat::Html) => body_html = requested_html.clone(),
+            None => {}
+        }
         let mut saved = Message {
             summary: MessageSummary {
                 id: message_id.clone(),
@@ -3509,6 +3636,7 @@ impl Engine {
         if current.summary.to.is_empty() && current.cc.is_empty() && current.bcc.is_empty() {
             return Err(OpError::InvalidArgs("a message needs at least one recipient".to_owned()));
         }
+        let composed = composed_draft_parts(&current)?;
         let mut attachments = Vec::with_capacity(current.attachments.len());
         for attachment in &current.attachments {
             let data = self.attachment_bytes(&attachment.id).map_err(|error| {
@@ -3531,8 +3659,8 @@ impl Engine {
             bcc: current.bcc.iter().map(mailbox).collect(),
             subject: current.summary.subject.clone(),
             date: current.summary.date,
-            text: current.body_text.clone(),
-            html: current.body_html.clone(),
+            text: composed.as_ref().map_or_else(|| current.body_text.clone(), |body| body.text.clone()),
+            html: composed.map(|body| body.html).or_else(|| current.body_html.clone()),
             attachments,
             in_reply_to: self.reply_links.get(draft_id).cloned(),
             // P8 has the parent Message-ID but not the parent's own References list. The parent id
@@ -5172,6 +5300,34 @@ fn validate_saved_query(engine: &Engine, account: &str, query: &str) -> Result<S
     }
     crate::ops::validate_search_query(engine, query, Some(account))?;
     Ok(query.to_owned())
+}
+
+/// Compiler output carries this marker so the engine can tell its own HTML from a legacy row that a
+/// caller stored directly. It is an internal format marker, not a security boundary.
+fn invalid_folder_name_char(character: char) -> bool {
+    character.is_control() || matches!(character as u32, 0x061C | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFEFF)
+}
+
+fn is_composed_html(html: &str) -> bool {
+    html.contains("data-postino-compose=\"v1\"")
+}
+
+fn compose_draft_html(source: &str) -> Result<String, OpError> {
+    postino_sync::mime::compile_html_email(source)
+        .map(|body| body.html)
+        .map_err(|error| OpError::InvalidArgs(format!("the HTML body cannot be compiled: {error}")))
+}
+
+/// Rebuild both parts from the compose source for a draft this engine compiled. The source remains
+/// `body_text` so reopening the draft edits what the person typed, while the wire message gets a
+/// plain alternative without Markdown markers.
+fn composed_draft_parts(message: &Message) -> Result<Option<postino_sync::mime::ComposedEmail>, OpError> {
+    if !message.body_html.as_deref().is_some_and(is_composed_html) {
+        return Ok(None);
+    }
+    postino_sync::mime::compile_html_email(&message.body_text)
+        .map(Some)
+        .map_err(|error| OpError::InvalidArgs(format!("the HTML body cannot be compiled: {error}")))
 }
 
 fn validate_draft(draft: &DraftContent) -> Result<(), OpError> {

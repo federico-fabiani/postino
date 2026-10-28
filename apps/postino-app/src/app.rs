@@ -15,11 +15,11 @@ use eframe::egui::{
     RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
-    Account, Address, Attachment, AttachmentGet, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor,
-    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, MAX_EML_BYTES, Message, MessageExport, MessageImport, MessageSummary, MessageTemplate,
-    MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult,
-    PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult, UnsubscribeInfo,
-    UnsubscribeMethod, UnsubscribeTarget,
+    Account, Address, Attachment, AttachmentGet, BodyFormat, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply,
+    LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, MAX_EML_BYTES, Message, MessageExport, MessageImport, MessageSummary,
+    MessageTemplate, MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey,
+    PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
+    UnsubscribeInfo, UnsubscribeMethod, UnsubscribeTarget,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
@@ -449,6 +449,9 @@ pub struct PostinoApp {
     settings_dirty: bool,
     settings_saved_at: f64,
     composer: ComposerState,
+    /// The email-safe HTML preview sheet over the composer. It is display-only and rebuilds from
+    /// the source every frame.
+    composer_preview: bool,
     /// The widget that owned the keyboard when the composer opened. Closing the modal returns
     /// focus there instead of dropping the user on the shell with no focus at all.
     composer_return_focus: Option<Id>,
@@ -1178,6 +1181,7 @@ impl PostinoApp {
             settings_dirty: false,
             settings_saved_at: 0.0,
             composer: ComposerState::closed(),
+            composer_preview: false,
             composer_return_focus: None,
             composer_focus_pending: false,
             row_ids: BTreeMap::new(),
@@ -4767,6 +4771,13 @@ impl PostinoApp {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
+        if self.composer_preview {
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.composer_preview = false;
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            }
+            return;
+        }
         if self.show_unsubscribe {
             if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.show_unsubscribe = false;
@@ -4787,6 +4798,7 @@ impl PostinoApp {
             || self.attachment_overwrite.is_some()
             || self.attachment_preview.is_some()
             || self.pgp_prompt.is_some()
+            || self.composer_preview
             || self.pgp_import.is_some()
             || self.pgp_delete.is_some()
             || self.template_editor.is_some()
@@ -5087,6 +5099,7 @@ impl PostinoApp {
         state.focus = Some(state.first_empty_focus());
         self.composer = state;
         self.pgp_prompt = None;
+        self.composer_preview = false;
         self.composer_focus_pending = true;
         self.show_palette = false;
         self.show_shortcuts = false;
@@ -5162,6 +5175,9 @@ impl PostinoApp {
         state.show_bcc = !message.bcc.is_empty();
         state.subject = message.summary.subject.clone();
         state.body = message.body_text.clone();
+        if message.body_html.is_some() {
+            state.body_format = BodyFormat::Html;
+        }
         state.attachments = message.attachments.clone();
         state.in_reply_to = self.engine.draft_reply_link(&message.summary.id).map(str::to_owned);
         state.saved_at = Some(format_time(message.summary.date));
@@ -5217,6 +5233,11 @@ impl PostinoApp {
             "body_text": self.composer.body,
             "attachments": attachments_for_save,
         });
+        if (self.composer.draft_id.is_none() || self.composer.body_format_explicit)
+            && let Some(object) = args.as_object_mut()
+        {
+            object.insert("body_format".to_owned(), json!(self.composer.body_format));
+        }
         if let Some(link) = &self.composer.in_reply_to
             && let Some(object) = args.as_object_mut()
         {
@@ -5401,6 +5422,7 @@ impl PostinoApp {
                 Ok(queued) => {
                     let row = queued.queued.outbox;
                     let until = queued.queued.undo_until;
+                    self.composer_preview = false;
                     self.composer = ComposerState::closed();
                     self.status = "Messaggio in coda: puoi annullarlo entro pochi secondi".to_owned();
                     self.pending_send = Some(row.send_at);
@@ -5566,6 +5588,7 @@ impl PostinoApp {
             return;
         }
         self.pgp_prompt = None;
+        self.composer_preview = false;
         self.composer = ComposerState::closed();
     }
 
@@ -5586,6 +5609,7 @@ impl PostinoApp {
                 Ok(_) => {
                     self.composer = ComposerState::closed();
                     self.pgp_prompt = None;
+                    self.composer_preview = false;
                     self.status = "Bozza spostata nel cestino".to_owned();
                     self.push_toast("Bozza scartata", UndoAction::Move(vec![(id, previous)]));
                 }
@@ -5594,6 +5618,7 @@ impl PostinoApp {
             return;
         }
         self.composer = ComposerState::closed();
+        self.composer_preview = false;
         self.status = "Bozza scartata".to_owned();
     }
 
@@ -7822,6 +7847,9 @@ impl PostinoApp {
                     state.show_bcc = !draft.bcc.is_empty();
                     state.subject = draft.summary.subject.clone();
                     state.body = draft.body_text.clone();
+                    if draft.body_html.is_some() {
+                        state.body_format = BodyFormat::Html;
+                    }
                     state.attachments = draft.attachments.clone();
                     state.in_reply_to = parent;
                     state.saved_at = Some(format_time(draft.summary.date));
@@ -8543,6 +8571,71 @@ impl PostinoApp {
             state.error = Some("Anteprima non disponibile per questo tipo di file. Puoi salvarlo e aprirlo con un'altra applicazione.".to_owned());
         }
         self.attachment_preview = Some(state);
+    }
+
+    /// Show the exact HTML part the engine will compile from the current source. Nothing is sent,
+    /// stored or fetched: the preview is a local render of the email-safe compiler output.
+    fn composer_preview_modal(&mut self, ui: &mut Ui) {
+        if !self.composer_preview || !self.composer.open {
+            return;
+        }
+        let source = self.composer.body.clone();
+        let compiled = postino_mime::compile_html_email(&source);
+        let t = theme::tokens(self.dark);
+        let mut close = false;
+        let mut clicked_link = None;
+        let response = egui::Modal::new(Id::new("postino-composer-preview"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(760.0_f32.min(ui.ctx().content_rect().width() - 40.0));
+                ui.label(typography::strong(Role::Emphasis, "Anteprima HTML", t.text));
+                ui.label(typography::text(
+                    Role::Caption,
+                    "Email-safe: tabelle con CSS inline, nessuna richiesta remota, nessuno script.",
+                    t.text_faint,
+                ));
+                ui.add_space(space::MD);
+                let max_height = (ui.ctx().content_rect().height() - 260.0).clamp(180.0, 430.0);
+                ScrollArea::vertical().max_height(max_height).auto_shrink([false, false]).show(ui, |ui| match &compiled {
+                    Ok(composed) => {
+                        let view = body::SubsetBodyRenderer.render(&body::StoredBody { html: Some(&composed.html), text: &composed.text });
+                        let mut budget = reading::MAX_LINKS_PER_MESSAGE;
+                        match view {
+                            body::View::Blocks(body) => clicked_link = body_ui::blocks(ui, &body, &t, &mut budget),
+                            body::View::Text { text, .. } => {
+                                for paragraph in text.split("\n\n") {
+                                    let paragraph = paragraph.trim();
+                                    if paragraph.is_empty() {
+                                        continue;
+                                    }
+                                    let (link, used) = link_paragraph(ui, paragraph, &t, false, budget);
+                                    if link.is_some() {
+                                        clicked_link = link;
+                                    }
+                                    budget = budget.saturating_sub(used);
+                                    ui.add_space(space::SM);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        ui.label(typography::text(Role::Secondary, format!("Il corpo non può essere compilato: {error}"), t.text_muted));
+                    }
+                });
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = Button::primary("Chiudi").show(ui).clicked();
+                });
+            });
+        #[cfg(test)]
+        probe::composer_preview_modal(ui, response.response.rect);
+        if let Some(link) = clicked_link {
+            self.request_link_open(&link);
+        }
+        if close || response.should_close() {
+            self.composer_preview = false;
+        }
     }
 
     fn attachment_preview_dialog(&mut self, ui: &mut Ui) {
@@ -10558,6 +10651,7 @@ impl PostinoApp {
         }
         self.refresh_templates();
         let Some(account) = self.account().cloned() else {
+            self.composer_preview = false;
             self.composer = ComposerState::closed();
             return;
         };
@@ -10616,6 +10710,9 @@ impl PostinoApp {
         }
         if !action.dropped_files.is_empty() {
             self.attach_composer_files(action.dropped_files);
+        }
+        if action.preview {
+            self.composer_preview = true;
         }
         if action.send {
             self.send_composer();
@@ -11367,6 +11464,7 @@ impl PostinoApp {
             self.composer_focus_pending = false;
         }
         self.composer_window(ui);
+        self.composer_preview_modal(ui);
         // The passphrase sheet belongs to the composer when it signs: draw it after the composer so
         // it sits on top instead of behind the composer modal.
         self.pgp_prompt_dialog(ui);
@@ -13660,6 +13758,14 @@ pub(crate) mod probe {
         ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("attachment-previews"))).and_then(|rows| rows.get(attachment_id).copied())
     }
 
+    pub fn composer_preview_modal(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(Id::new("probe-composer-preview-modal"), rect));
+    }
+
+    pub fn composer_preview_modal_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(Id::new("probe-composer-preview-modal")))
+    }
+
     pub fn attachment_preview_modal(ui: &Ui, rect: Rect) {
         ui.ctx().data_mut(|data| data.insert_temp(id("attachment-preview-modal"), rect));
     }
@@ -14105,6 +14211,14 @@ pub(crate) mod probe {
 
     pub fn reading_pgp_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("reading-pgp")))
+    }
+
+    pub fn composer_preview_button(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-preview-button"), rect));
+    }
+
+    pub fn composer_preview_button_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-preview-button")))
     }
 
     pub fn composer_pgp(ui: &Ui, rect: Rect) {
@@ -20707,6 +20821,49 @@ mod tests {
         painted_visible(&runs, "Ada Lovelace");
         painted_visible(&runs, "Copia pubblica");
         painted_visible(&runs, "Elimina");
+    }
+
+    #[test]
+    fn the_composer_previews_the_compiled_html_and_escape_keeps_the_draft_open() {
+        let (ctx, mut app) = ready_app();
+        app.compose_new();
+        let size = Vec2::new(980.0, 600.0);
+        let runs = painted_runs(&ctx, &mut app, size);
+        assert!(probe::composer_preview_button_rect(&ctx).is_none(), "plain text has no HTML preview to offer");
+        let toggle = runs.iter().find(|run| run.text == "Testo").expect("the body format toggle is painted");
+        click_at(&ctx, &mut app, toggle.rect.center(), size);
+        assert_eq!(app.composer.body_format, BodyFormat::Html, "the toggle must really switch to HTML");
+        app.composer.body = "**Ciao** Ada,\n\n| Voce | Importo |\n| --- | ---: |\n| Progetto | 120 |\n".to_owned();
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "HTML");
+        let eye = probe::composer_preview_button_rect(&ctx).expect("HTML mode offers the preview");
+        click_at(&ctx, &mut app, eye.center(), size);
+        assert!(app.composer_preview, "the eye button opens the preview");
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "Anteprima HTML");
+        painted_visible(&runs, "Email-safe");
+        painted_visible(&runs, "Ciao");
+        painted_visible(&runs, "Progetto");
+        let modal = probe::composer_preview_modal_rect(&ctx).expect("the preview is probe-able");
+        assert!(ctx.content_rect().contains_rect(modal), "the preview stays inside the 980x600 shell");
+        app.dark = true;
+        theme::apply(&ctx, true);
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "Email-safe");
+        let modal = probe::composer_preview_modal_rect(&ctx).expect("the dark preview is probe-able");
+        assert!(ctx.content_rect().contains_rect(modal), "the dark preview stays inside the 980x600 shell");
+        app.dark = false;
+        theme::apply(&ctx, false);
+
+        frame_at(
+            &ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+        );
+        assert!(!app.composer_preview, "Escape closes only the preview sheet");
+        assert!(app.composer.open, "the draft remains open with its text");
+        assert_eq!(app.composer.body, "**Ciao** Ada,\n\n| Voce | Importo |\n| --- | ---: |\n| Progetto | 120 |\n");
     }
 
     #[test]

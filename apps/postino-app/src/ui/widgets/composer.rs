@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eframe::egui::containers::Sides;
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{self, Align, FontFamily, FontId, Frame, Layout, Margin, Rect, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2, pos2};
-use postino_core::{Account, Address, Attachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS, MessageTemplate, PgpKey};
+use postino_core::{
+    Account, Address, Attachment, BodyFormat, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS, MessageTemplate, PgpKey,
+};
 
 use crate::theme::Tokens;
 use crate::ui::icons;
@@ -87,6 +89,12 @@ pub struct ComposerState {
     pub show_bcc: bool,
     pub subject: String,
     pub body: String,
+    /// Plain source or compiled email-safe HTML. The source is always `body`; the engine owns the
+    /// compilation and never accepts raw HTML from the composer.
+    pub body_format: BodyFormat,
+    /// Whether this edit explicitly chose a representation. An unchanged existing draft omits
+    /// `body_format` so a legacy HTML part is preserved instead of being recompiled by accident.
+    pub body_format_explicit: bool,
     pub attachments: Vec<Attachment>,
     /// Parent `Message-ID` for a reply. It is part of the draft, not of the body.
     pub in_reply_to: Option<String>,
@@ -127,6 +135,8 @@ impl ComposerState {
             show_bcc: false,
             subject: String::new(),
             body: String::new(),
+            body_format: BodyFormat::Plain,
+            body_format_explicit: false,
             attachments: Vec::new(),
             in_reply_to: None,
             forward_sources: Vec::new(),
@@ -270,6 +280,8 @@ pub struct ComposerResponse {
     pub remove_attachment: Option<String>,
     /// Ask the screen to insert one local template. The component never edits the body itself.
     pub insert_template: Option<String>,
+    /// Ask the screen to show the email-safe HTML preview.
+    pub preview: bool,
 }
 
 pub struct Composer<'a> {
@@ -590,6 +602,26 @@ impl<'a> Composer<'a> {
                     action = Some(FormatAction::Link);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.state.body_format == BodyFormat::Html {
+                        let preview = IconButton::new(icons::EYE, "Anteprima HTML").size(IconButtonSize::Sm).show(ui);
+                        #[cfg(test)]
+                        crate::app::probe::composer_preview_button(ui, preview.rect);
+                        if preview.clicked() {
+                            response.preview = true;
+                        }
+                    }
+                    let format = match self.state.body_format {
+                        BodyFormat::Plain => "Testo",
+                        BodyFormat::Html => "HTML",
+                    };
+                    if Button::ghost(format).size(ButtonSize::Sm).show(ui).clicked() {
+                        self.state.body_format = match self.state.body_format {
+                            BodyFormat::Plain => BodyFormat::Html,
+                            BodyFormat::Html => BodyFormat::Plain,
+                        };
+                        self.state.body_format_explicit = true;
+                        self.state.touch(now);
+                    }
                     if !self.templates.is_empty() {
                         ui.menu_button(format!("{} Modelli", icons::TEMPLATE), |ui| {
                             for template in self.templates {

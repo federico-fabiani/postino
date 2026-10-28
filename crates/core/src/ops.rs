@@ -15,8 +15,8 @@ use postino_sync::SyncStatus;
 
 use crate::engine::{AccountSetup, Engine, OpError, unknown_account, unknown_folder, unknown_label, unknown_message};
 use crate::model::{
-    AccountView, Address, Attachment, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message, MessageSummary, Provider,
-    RuleAction, RuleRunScope,
+    AccountView, Address, Attachment, BodyFormat, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message,
+    MessageSummary, Provider, RuleAction, RuleRunScope,
 };
 use crate::store_map;
 
@@ -113,7 +113,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "folder_export_mbox",
             "Export a folder as mbox",
-            "Return every message in one folder as one mbox file, base64-encoded, at most 10 MiB. Each message is separated by a `From - <date>` line and body lines that look like a separator are quoted; messages with retained v9 raw bytes stay exact, the others are rebuilt from stored headers, sanitized bodies and attachments. The folder is selected by id or exact name. Read-only and offline; `postino export-mbox` writes the same bytes and never overwrites unless `--force`.",
+            "Export one folder as one mbox file, base64-encoded, at most 10 MiB and 2000 messages. Each message is separated by a `From - <date>` line and body lines that look like a separator are quoted; messages with retained v9 raw bytes stay exact, the others are rebuilt from stored headers, sanitized bodies and attachments. Rows that cannot be rebuilt are reported in `skipped` with bounded warnings instead of aborting the folder; a folder with nothing exportable is an error. The folder is selected by id or a unique exact name. Read-only and offline; `postino export-mbox` writes the same bytes and never overwrites unless `--force`.",
             FolderExportMboxArgs,
             true,
             false
@@ -121,7 +121,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "folder_import_mbox",
             "Import an mbox folder",
-            "Import one mbox file (standard base64, at most 10 MiB, at most 2000 messages) into a local folder named by `folder` (default `Import`). This is the format Thunderbird's folder export produces. Every message runs through the ordinary MIME sanitizer and attachment bounds; mboxrd `>From` quoting is removed and a `From ` prose line is not mistaken for a separator. A malformed message is counted in `skipped` instead of aborting the archive, and a duplicate Message-ID never moves cached mail. The folder is local, so a later sync cannot delete its synthetic UIDs. Returns the folder, counts and at most 20 warnings.",
+            "Import one mbox file (standard base64, at most 10 MiB, at most 2000 messages) into a local folder named by `folder` (default `Import`). This is the format Thunderbird's folder export produces. Every message runs through the ordinary MIME sanitizer and attachment bounds; mboxrd `>From` quoting is removed and a `From ` prose line is not mistaken for a separator. A damaged separator or missing first boundary refuses the whole file before anything is created; a per-message ingest failure is counted in `skipped` instead of aborting the archive, and a duplicate Message-ID never moves cached mail. The folder is local, so a later sync cannot delete its synthetic UIDs. Returns the folder, counts and at most 20 warnings.",
             FolderImportMboxArgs,
             false,
             false
@@ -732,8 +732,13 @@ pub struct DraftSaveArgs {
     pub bcc: Option<Vec<Address>>,
     /// Subject. Omit to keep the current subject on update; an empty string clears it.
     pub subject: Option<String>,
-    /// Body text. Omit to keep the current body on update; an empty string clears it.
+    /// Body source. Omit to keep the current body on update; an empty string clears it. In HTML
+    /// mode this same source is compiled into the HTML part and its plain-text alternative.
     pub body_text: Option<String>,
+    /// `plain` (default for a new draft) or `html`. Omit on update to keep the current
+    /// representation; `html` compiles `body_text` with the email-safe inline-CSS compiler, and
+    /// `plain` removes the HTML part. Raw HTML is never accepted.
+    pub body_format: Option<BodyFormat>,
     /// Attachment metadata. Omit to keep the current attachments on update; an empty list clears
     /// them. The bytes are stored through the encrypted attachment seam; sending requires them.
     pub attachments: Option<Vec<DraftAttachment>>,
@@ -1502,6 +1507,10 @@ pub struct FolderExportMbox {
     pub messages: usize,
     pub exact_messages: usize,
     pub reconstructed_messages: usize,
+    /// Messages omitted because they could not be reconstructed.
+    pub skipped: usize,
+    /// At most 20 skip reasons.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2186,7 +2195,7 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
 /// Merge a `draft_save` request into full draft content. On create absent fields are empty; on
 /// update absent fields keep the current value and present fields (including empty ones) replace it.
 fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, OpError> {
-    let DraftSaveArgs { id, account, to, cc, bcc, subject, body_text, attachments, in_reply_to } = args;
+    let DraftSaveArgs { id, account, to, cc, bcc, subject, body_text, body_format, attachments, in_reply_to } = args;
     let content = match &id {
         Some(id) => {
             let current = engine.message(id).ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}; omit id to create a draft")))?;
@@ -2213,7 +2222,7 @@ fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, Op
             in_reply_to,
         },
     };
-    engine.save_draft(account.as_deref(), id.as_deref(), content)
+    engine.save_draft_with_format(account.as_deref(), id.as_deref(), content, body_format)
 }
 
 fn draft_attachments(attachments: Vec<DraftAttachment>) -> Vec<Attachment> {
@@ -2418,21 +2427,18 @@ fn import(engine: &mut Engine, args: MessageImportArgs) -> Result<Value, OpError
 
 fn export_mbox(engine: &Engine, args: FolderExportMboxArgs) -> Result<Value, OpError> {
     let account = engine.requested_account_id(args.account.as_deref(), "folder_export_mbox")?;
-    let folder = engine
-        .folders()
-        .iter()
-        .find(|candidate| candidate.account_id == account && (candidate.id == args.folder || candidate.name.eq_ignore_ascii_case(&args.folder)))
-        .cloned()
-        .ok_or_else(|| unknown_folder(&args.folder))?;
+    let exported = engine.folder_export_mbox(&args.folder, Some(&account))?;
+    let folder = engine.folders().iter().find(|candidate| candidate.id == exported.folder_id).cloned().ok_or_else(|| unknown_folder(&args.folder))?;
     let filename = mbox_filename(&folder);
-    let (raw, messages, exact_messages, reconstructed_messages) = engine.folder_export_mbox(&folder.id, Some(&account))?;
     value(FolderExportMbox {
-        folder_id: folder.id,
+        folder_id: exported.folder_id,
         filename,
-        mbox_base64: base64::engine::general_purpose::STANDARD.encode(raw),
-        messages,
-        exact_messages,
-        reconstructed_messages,
+        mbox_base64: base64::engine::general_purpose::STANDARD.encode(exported.bytes),
+        messages: exported.messages,
+        exact_messages: exported.exact,
+        reconstructed_messages: exported.reconstructed,
+        skipped: exported.skipped,
+        warnings: exported.warnings,
     })
 }
 

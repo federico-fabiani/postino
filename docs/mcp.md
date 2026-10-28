@@ -92,7 +92,7 @@ agent can read the message and recover.
 | `invite_reply_draft` | no | Draft accept/tentative/decline to the organizer only, with `text/calendar` METHOD:REPLY; only a received REQUEST is answerable, a Sent copy is informational; never sends and never updates a calendar |
 | `message_flag` | no | Set read/unread and/or starred |
 | `message_move` | no | Move a message to a regular folder |
-| `draft_save` | no | Create a draft or patch one in place; metadata only, including the optional `in_reply_to` |
+| `draft_save` | no | Create a draft or patch one in place; metadata only, including the optional `in_reply_to`. `body_format: "html"` compiles the same Markdown-like `body_text` into email-safe inline-CSS HTML plus a text alternative; `"plain"` removes the HTML part, and omitting it keeps the current representation. Raw HTML is never accepted |
 | `draft_attachment_add` | no | Store one file's exact bytes (bounded base64) in the encrypted blob store; 20 files, 25 MiB each, 25 MiB total |
 | `draft_attachment_remove` | no | Remove one attachment row by id or exact filename; the blob waits for a later GC |
 | `account_signature_set` | no | Set an account's plain-text signature (≤ 4 KiB, newline/tab only) |

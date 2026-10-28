@@ -122,6 +122,11 @@
   guess a type, and stores only a content hash and the encrypted blob. A missing or corrupt blob is a
   send-time refusal naming the file, not a silent drop. Removing a row does not delete a blob another
   draft may share; the unreferenced sweep remains P9 work and is documented as such.
+- HTML composition (P13h) accepts only the Markdown-like source, never raw HTML. The compiler caps
+  the source at 1 MiB, emits inline CSS and presentation tables with no script, class, stylesheet,
+  remote image or web font, and allows only absolute `http`/`https`/`mailto` links. The same blocks
+  produce the plain-text alternative; parser limits, the 1 MiB body cap and the sanitizer still
+  apply when the message comes back through IMAP.
 - `.eml` import/export (P13f) bounds the base64 string and decodes at most 10 MiB (so the encoded
   file stays inside the 16 MiB daemon frame), then feeds the
   bytes through the same MIME parser, sanitizer and attachment bounds as a server fetch. Import writes
@@ -130,10 +135,12 @@
   from stored sanitized content; the app writes the chosen path through the injected file saver and
   never opens the result, and no operation executes an imported file.
 - `.mbox` import/export (P13g) applies the same 10 MiB transport bound before splitting and accepts a
-  separator only when the following line is header-shaped, so a body line such as `From the desk`
-  cannot inject a message. It removes exactly one layer of mboxrd `>From` quoting, caps a file at
+  separator only when it names a plausible date and the following block has at least two headers, so
+  a body line such as `From the desk` cannot inject a message and a damaged boundary is refused
+  instead of merged. It removes exactly one layer of mboxrd `>From` quoting, caps a file at
   2 000 messages, and imports into a named local folder (never a synced folder) through the ordinary
-  MIME/attachment bounds. A malformed file creates nothing; per-message failures are reported and
+  MIME/attachment bounds. Export reports unrebuildable rows as `skipped`, and a file that yields no
+  message creates nothing; per-message failures are reported and
   skipped, and duplicates never relocate cached mail. Export re-quotes separator-looking lines and
   never executes an imported file.
 

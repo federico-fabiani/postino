@@ -28,8 +28,7 @@ registry shared by the desktop app, the CLI and an MCP server.
 > the SMTP submission client; and `postino-sync` reconciles one account into the encrypted store.
 > Attachment bytes are encrypted at rest in a content-addressed blob directory next to the database.
 > Gmail OAuth is P12 and the background daemon is P10a; the tray, autostart and notifications are
-> P10b; inline `cid:` images, HTML compose and
-> server-side signatures are explicitly out of scope for M2.
+> P10b; inline `cid:` images and server-side signatures are explicitly out of scope for M2.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -151,6 +150,15 @@ MCP      ─┘
   text already written, never discarding it. `templates_list`, `template_create`, `template_update`
   and `template_delete` are the same registry surface for the CLI and MCP; the demo mailbox has no
   local store, so its template list is empty and the create button is disabled with a reason.
+- **Email-safe HTML composition (P13h).** The composer's **Testo/HTML** toggle compiles the same
+  Markdown-like source into a table-based HTML part with inline CSS and a matching plain-text
+  alternative; raw HTML is never accepted from the UI, CLI or MCP. In HTML mode the eye button opens
+  a live preview of the exact compiled output without sending or storing anything. `draft_save` takes
+  `body_format: "html" | "plain"` (omit to keep the current representation), the CLI uses
+  `postino draft save --html` / `--plain`, and the engine recompiles compiler-owned drafts at send
+  time so the two parts cannot drift. The source is capped at 1 MiB; links are absolute
+  `http(s)`/`mailto` only, and the output carries no script, class, stylesheet, remote image or web
+  font.
 - **`.eml` export/import (P13f).** `message_export` returns an RFC 5322 file: the exact retained v9
   bytes for signed/encrypted mail, otherwise a reconstruction from the stored sanitized body and
   attachments and threading headers. `message_import` runs a chosen file through the same MIME and
@@ -162,13 +170,17 @@ MCP      ─┘
 - **`.mbox` export/import (P13g).** `folder_export_mbox` writes a whole folder as a bounded mbox,
   and `folder_import_mbox` splits a Thunderbird-style archive before creating anything, so a file
   without a valid `From ` separator imports zero messages and leaves no half-built folder. A
-  separator is accepted only when the next line looks like a mail header, so prose such as `From the
-  desk` is not mistaken for a new message; mboxrd `>From` quoting is removed on import and restored
-  on export. Imports go to the named local folder (names are bounded and reused from a prior import,
-  never a server folder); duplicate Message-IDs stay copies, are marked read, and never move cached
-  mail. The file is capped at 10 MiB and 2 000 messages so base64 stays inside the daemon frame;
+  separator is accepted only when it also names a month, year and time and the following block has
+  at least two headers, so prose such as `From the desk` is not a message and a damaged boundary is
+  refused rather than merged; mboxrd `>From` quoting is removed on import and restored on export.
+  Imports go to the named local folder (names are bounded, reuse a prior import, and refuse a server
+  folder with the same name); duplicate Message-IDs stay copies, are marked read, and never move
+  cached mail. Export counts rows it cannot rebuild in `skipped`; only a folder with no exportable
+  message fails. Both directions are capped at 10 MiB and 2 000 messages so base64 stays inside the
+  daemon frame.
   `postino export-mbox <folder> --out` / `postino import-mbox <path> --folder` expose the same
-  operations without a window.
+  operations without a window; `--force` writes through a sibling temporary file before replacing
+  the destination.
 - **Local rules (P9c).** The Rules page (Settings → **Regole locali**, or the palette commands
   **Regole locali**/**Nuova regola**) stores up to 100 rules per account on the encrypted v7 tables.
   A rule is a validated search query plus 1–5 actions: move to a folder, add a label, read/unread,

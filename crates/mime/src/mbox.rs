@@ -39,6 +39,12 @@ pub enum MboxError {
         /// Configured limit.
         limit: usize,
     },
+    /// A line looks like a separator but the message after it has no usable header block.
+    #[error("line {line} looks like an mbox separator but the message after it has no valid header block")]
+    AmbiguousSeparator {
+        /// One-based line number.
+        line: usize,
+    },
     /// One message slice was empty after unquoting.
     #[error("mbox message {index} is empty")]
     EmptyMessage {
@@ -71,33 +77,44 @@ pub fn split_mbox(raw: &[u8], limits: MboxLimits) -> Result<Vec<Vec<u8>>, MboxEr
     if raw.len() > limits.max_bytes {
         return Err(MboxError::TooLarge { size: raw.len(), limit: limits.max_bytes });
     }
+    let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
     let max_messages = limits.max_messages.max(1);
     let mut starts = Vec::new();
     let mut line_start = 0;
     let mut first = None;
+    let mut line_number = 1usize;
     while line_start < raw.len() {
         let line_end = line_end(raw, line_start);
         let next = (line_end + 1).min(raw.len());
-        if raw[line_start..line_end].starts_with(b"From ")
-            && raw[line_start..line_end].len() <= MAX_SEPARATOR_LINE_BYTES
-            && looks_like_message(raw, next)
-        {
-            if first.is_none() {
-                first = Some(line_start);
-            }
-            starts.push(line_start);
-            if starts.len() > max_messages {
-                return Err(MboxError::TooManyMessages { limit: max_messages });
+        let line = &raw[line_start..line_end];
+        if line.len() <= MAX_SEPARATOR_LINE_BYTES && line.starts_with(b"From ") {
+            let header_block = looks_like_message(raw, next);
+            if plausible_separator(line) && header_block {
+                if first.is_none() {
+                    first = Some(line_start);
+                }
+                starts.push(line_start);
+                if starts.len() > max_messages {
+                    return Err(MboxError::TooManyMessages { limit: max_messages });
+                }
+            } else if header_block || plausible_separator(line) {
+                // A plausible separator without a complete header block, or a `From ` line with an
+                // unrecognised date followed by a real header block, is a damaged boundary rather
+                // than prose. Refusing it is safer than silently merging two messages.
+                if starts.is_empty() && raw[..line_start].iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    return Err(MboxError::ContentBeforeSeparator);
+                }
+                return Err(MboxError::AmbiguousSeparator { line: line_number });
             }
         }
         if next == raw.len() {
             break;
         }
         line_start = next;
+        line_number += 1;
     }
     let first = first.ok_or(MboxError::MissingSeparator)?;
-    let prefix = raw[..first].strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw[..first]);
-    if prefix.iter().any(|byte| !byte.is_ascii_whitespace()) {
+    if raw[..first].iter().any(|byte| !byte.is_ascii_whitespace()) {
         return Err(MboxError::ContentBeforeSeparator);
     }
     let mut messages = Vec::with_capacity(starts.len());
@@ -141,24 +158,62 @@ fn line_end(raw: &[u8], start: usize) -> usize {
     raw[start..].iter().position(|byte| *byte == b'\n').map_or(raw.len(), |offset| start + offset)
 }
 
-fn looks_like_message(raw: &[u8], mut start: usize) -> bool {
-    for _ in 0..3 {
-        if start >= raw.len() {
-            return false;
-        }
-        let end = line_end(raw, start);
-        let line = raw[start..end].strip_suffix(b"\r").unwrap_or(&raw[start..end]);
+fn looks_like_message(raw: &[u8], start: usize) -> bool {
+    let mut position = start;
+    let mut headers = 0usize;
+    let mut previous_was_header = false;
+    while position < raw.len() && position.saturating_sub(start) <= 64 * 1024 {
+        let end = line_end(raw, position);
+        let line = raw[position..end].strip_suffix(b"\r").unwrap_or(&raw[position..end]);
         if line.is_empty() {
-            start = (end + 1).min(raw.len());
-            continue;
+            return headers >= 1;
         }
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+        if line[0] == b' ' || line[0] == b'\t' {
+            if !previous_was_header {
+                return false;
+            }
+        } else if header_name(line).is_some() {
+            headers += 1;
+            previous_was_header = true;
+        } else {
             return false;
-        };
-        let name = &line[..colon];
-        return !name.is_empty() && name.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-');
+        }
+        if end == raw.len() {
+            return false;
+        }
+        position = end + 1;
     }
     false
+}
+
+fn header_name(line: &[u8]) -> Option<&[u8]> {
+    let colon = line.iter().position(|byte| *byte == b':')?;
+    if colon == 0 {
+        return None;
+    }
+    let name = &line[..colon];
+    name.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-').then_some(name)
+}
+
+fn plausible_separator(line: &[u8]) -> bool {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Some(rest) = line.strip_prefix(b"From ") else { return false };
+    let mut tokens = rest.split(|byte| byte.is_ascii_whitespace()).filter(|token| !token.is_empty());
+    if tokens.next().is_none() {
+        return false;
+    }
+    let mut month = false;
+    let mut year = false;
+    let mut time = false;
+    for token in tokens.take(16) {
+        month |= matches!(token, b"Jan" | b"Feb" | b"Mar" | b"Apr" | b"May" | b"Jun" | b"Jul" | b"Aug" | b"Sep" | b"Oct" | b"Nov" | b"Dec");
+        year |= token.len() == 4 && token.iter().all(u8::is_ascii_digit) && token != b"0000";
+        time |= token.len() == 8
+            && token.get(2) == Some(&b':')
+            && token.get(5) == Some(&b':')
+            && token.iter().enumerate().all(|(index, byte)| index == 2 || index == 5 || byte.is_ascii_digit());
+    }
+    month && year && time
 }
 
 fn unquote_mboxrd(bytes: &[u8]) -> Vec<u8> {
@@ -213,7 +268,8 @@ fn append_quoted(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn is_from_line(line: &[u8]) -> bool {
-    line.starts_with(b"From ") || line == b"From"
+    // mboxrd quotes `From ` only. A bare `From` is ordinary body text and must survive a round-trip.
+    line.starts_with(b"From ")
 }
 
 #[cfg(test)]
@@ -239,7 +295,7 @@ mod tests {
 
     #[test]
     fn prose_that_starts_with_from_is_not_a_separator() {
-        let raw = b"From - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\n\nFrom the desk of Ada\nnot a header: still prose\n";
+        let raw = b"From - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\nSubject: prose\n\nFrom the desk of Ada\nnot a header: still prose\n";
         let messages = split_mbox(raw, MboxLimits::default()).expect("split");
         assert_eq!(messages.len(), 1);
         assert!(messages[0].windows(20).any(|window| window == b"From the desk of Ada"));
@@ -260,14 +316,46 @@ mod tests {
     fn refuses_a_missing_separator_and_a_leading_garbage_prefix() {
         assert_eq!(split_mbox(b"From: a@example.com\n\nbody\n", MboxLimits::default()), Err(MboxError::MissingSeparator));
         assert_eq!(
-            split_mbox(b"garbage\nFrom - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\n\nbody\n", MboxLimits::default()),
+            split_mbox(b"garbage\nFrom - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\nSubject: x\n\nbody\n", MboxLimits::default()),
             Err(MboxError::ContentBeforeSeparator)
         );
     }
 
     #[test]
+    fn accepts_a_bom_and_crlf_separators_without_losing_the_boundary() {
+        let mut raw = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice(
+            b"From - Mon Oct 26 10:00:00 2026\r\nFrom: a@example.com\r\nSubject: one\r\n\r\nbody one\r\nFrom - Mon Oct 26 11:00:00 2026\r\nFrom: b@example.com\r\nSubject: two\r\n\r\nbody two\r\n",
+        );
+        let messages = split_mbox(&raw, MboxLimits::default()).expect("split BOM/CRLF mbox");
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].windows(10).any(|window| window == b"Subject: o"));
+        assert!(messages[1].windows(10).any(|window| window == b"Subject: t"));
+    }
+
+    #[test]
+    fn an_unparsable_from_line_before_a_header_block_is_refused_not_merged() {
+        let raw = b"From - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\nSubject: one\n\nbody\nFrom Ada Lovelace\nFrom: b@example.com\nSubject: two\n\nbody two\n";
+        assert_eq!(split_mbox(raw, MboxLimits::default()), Err(MboxError::AmbiguousSeparator { line: 6 }));
+    }
+
+    #[test]
+    fn a_single_header_message_is_still_a_message() {
+        let raw = b"From - Mon Oct 26 10:00:00 2026\nSubject: solo\n\nbody\n";
+        let messages = split_mbox(raw, MboxLimits::default()).expect("split a one-header message");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with(b"Subject: solo\n"));
+    }
+
+    #[test]
+    fn a_plausible_separator_with_a_damaged_header_block_is_refused_not_merged() {
+        let raw = b"From - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\nSubject: one\n\nbody\nFrom - Mon Oct 26 11:00:00 2026\n_bad-header: two\nSubject: two\n\nbody\n";
+        assert_eq!(split_mbox(raw, MboxLimits::default()), Err(MboxError::AmbiguousSeparator { line: 6 }));
+    }
+
+    #[test]
     fn enforces_the_message_and_byte_bounds_before_allocating_messages() {
-        let raw = b"From - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\n\none\nFrom - Mon Oct 26 11:00:00 2026\nFrom: b@example.com\n\ntwo\n";
+        let raw = b"From - Mon Oct 26 10:00:00 2026\nFrom: a@example.com\nSubject: one\n\none\nFrom - Mon Oct 26 11:00:00 2026\nFrom: b@example.com\nSubject: two\n\ntwo\n";
         assert_eq!(split_mbox(raw, MboxLimits { max_bytes: MAX_MBOX_BYTES, max_messages: 1 }), Err(MboxError::TooManyMessages { limit: 1 }));
         assert_eq!(split_mbox(raw, MboxLimits { max_bytes: 16, max_messages: 10 }), Err(MboxError::TooLarge { size: raw.len(), limit: 16 }));
     }

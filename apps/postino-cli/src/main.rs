@@ -18,7 +18,7 @@ use std::io::{BufRead, IsTerminal, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -90,6 +90,14 @@ enum DraftCommand {
         /// Body text. Omit to keep it on update; pass --body "" to clear it.
         #[arg(long)]
         body: Option<String>,
+        /// Compile the body as email-safe HTML (tables and inline CSS) with a plain-text
+        /// alternative. Markdown-like source, never raw HTML.
+        #[arg(long, conflicts_with = "plain")]
+        html: bool,
+        /// Store the body as plain text and remove any HTML part. The default on update keeps the
+        /// current representation.
+        #[arg(long, conflicts_with = "html")]
+        plain: bool,
         /// Save the draft and queue it for real submission in the same command.
         #[arg(long)]
         send: bool,
@@ -703,7 +711,7 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
         /// Overwrite an existing output file. Without it the export refuses to truncate.
-        #[arg(long)]
+        #[arg(long, requires = "out")]
         force: bool,
         #[arg(long)]
         account: Option<String>,
@@ -2262,22 +2270,12 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             let exported: MessageExport = decode(call(engine, "message_export", json!({ "id": id, "account": account }))?)?;
             let raw = base64::engine::general_purpose::STANDARD.decode(exported.eml_base64.as_bytes()).context("decodifica dei byte .eml")?;
             if let Some(path) = out {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true);
-                if force {
-                    options.create(true).truncate(true);
-                } else {
-                    options.create_new(true);
-                }
-                let mut file = options
-                    .open(&path)
-                    .with_context(|| format!("scrittura di {} (il file esiste già? usa --force per sovrascriverlo)", path.display()))?;
-                file.write_all(&raw).with_context(|| format!("scrittura di {}", path.display()))?;
+                write_output_file(&path, &raw, force)?;
                 if json_output {
                     print_json(&exported)?;
                 } else {
                     say(format!(
-                        "Esportato: {}\n{} byte ({})",
+                        "Esportato in {} ({} byte, {}).",
                         path.display(),
                         raw.len(),
                         if exported.exact { "byte originali conservati" } else { "ricostruito dai dati salvati" }
@@ -2330,39 +2328,31 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             let exported: FolderExportMbox = decode(call(engine, "folder_export_mbox", json!({ "folder": folder, "account": account }))?)?;
             let raw = base64::engine::general_purpose::STANDARD.decode(exported.mbox_base64.as_bytes()).context("decodifica dei byte mbox")?;
             if let Some(path) = out {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true);
-                if force {
-                    options.create(true).truncate(true);
-                } else {
-                    options.create_new(true);
-                }
-                let mut file = options
-                    .open(&path)
-                    .with_context(|| format!("scrittura di {} (il file esiste già? usa --force per sovrascriverlo)", path.display()))?;
-                file.write_all(&raw).with_context(|| format!("scrittura di {}", path.display()))?;
+                write_output_file(&path, &raw, force)?;
                 if json_output {
                     print_json(&exported)?;
                 } else {
                     say(format!(
-                        "Esportati {} messaggi in {} ({} byte, {} esatti, {} ricostruiti).",
+                        "Esportati {} messaggi in {} ({} byte, {} esatti, {} ricostruiti, {} saltati).",
                         exported.messages,
                         path.display(),
                         raw.len(),
                         exported.exact_messages,
-                        exported.reconstructed_messages
+                        exported.reconstructed_messages,
+                        exported.skipped
                     ))?;
                 }
             } else if json_output {
                 print_json(&exported)?;
             } else {
                 say(format!(
-                    "{}: {} messaggi, {} byte ({} esatti, {} ricostruiti).\nUsa --out <file> per salvarlo, oppure --json per il base64.",
+                    "{}: {} messaggi, {} byte ({} esatti, {} ricostruiti, {} saltati).\nUsa --out <file> per salvarlo, oppure --json per il base64.",
                     exported.filename,
                     exported.messages,
                     raw.len(),
                     exported.exact_messages,
-                    exported.reconstructed_messages
+                    exported.reconstructed_messages,
+                    exported.skipped
                 ))?;
             }
         }
@@ -2464,8 +2454,15 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             }
         }
         Command::Draft { command } => match command {
-            DraftCommand::Save { id, account, to, cc, bcc, subject, body, send, in_reply_to } => {
-                let args = draft_save_args(id, account, to, cc, bcc, subject, body, in_reply_to)?;
+            DraftCommand::Save { id, account, to, cc, bcc, subject, body, html, plain, send, in_reply_to } => {
+                let body_format = if html {
+                    Some(postino_core::BodyFormat::Html)
+                } else if plain {
+                    Some(postino_core::BodyFormat::Plain)
+                } else {
+                    None
+                };
+                let args = draft_save_args(id, account, to, cc, bcc, subject, body, body_format, in_reply_to)?;
                 let saved: DraftSave = decode(call(engine, "draft_save", args)?)?;
                 let draft_id = saved.draft.summary.id.clone();
                 if send {
@@ -3661,6 +3658,41 @@ fn pgp_request(pgp: &PgpSendOptions) -> Option<Value> {
 /// Only an explicit `--at` in the future leaves the row queued: there is no daemon in this build, so
 /// the CLI says when it will be attempted. A plain `postino send` always waits out the 5-second undo
 /// window and runs the pass; the undo window is not a scheduled time.
+/// Write an archive without truncating an existing file until the new bytes are complete. Without
+/// `--force` the destination must not exist; with it, a sibling temporary file is written first so
+/// a failed export leaves the previous archive intact.
+fn write_output_file(path: &Path, raw: &[u8], force: bool) -> Result<()> {
+    if !force {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("scrittura di {} (il file esiste gia? usa --force per sovrascriverlo)", path.display()))?;
+        file.write_all(raw).with_context(|| format!("scrittura di {}", path.display()))?;
+        return Ok(());
+    }
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("mail.mbox");
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_nanos());
+    let temp = parent.join(format!(".{name}.{}.{stamp}.tmp", std::process::id()));
+    let written = (|| -> Result<()> {
+        let mut file =
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&temp).with_context(|| format!("scrittura di {}", temp.display()))?;
+        file.write_all(raw).with_context(|| format!("scrittura di {}", temp.display()))?;
+        file.sync_all().with_context(|| format!("scrittura di {}", temp.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error).with_context(|| format!("sostituzione di {}", path.display()));
+    }
+    Ok(())
+}
+
 fn send_now<B: CliBackend>(engine: &mut B, draft: &str, at: Option<&str>, pgp: &PgpSendOptions, json_output: bool) -> Result<()> {
     let operation = if at.is_some() { "send_schedule" } else { "message_send" };
     let mut args = match at {
@@ -3808,6 +3840,7 @@ fn draft_save_args(
     bcc: Option<Vec<String>>,
     subject: Option<String>,
     body: Option<String>,
+    body_format: Option<postino_core::BodyFormat>,
     in_reply_to: Option<String>,
 ) -> Result<Value> {
     let mut args = serde_json::Map::new();
@@ -3831,6 +3864,9 @@ fn draft_save_args(
     }
     if let Some(body) = body {
         args.insert("body_text".to_owned(), json!(body));
+    }
+    if let Some(body_format) = body_format {
+        args.insert("body_format".to_owned(), json!(body_format));
     }
     if let Some(in_reply_to) = in_reply_to {
         args.insert("in_reply_to".to_owned(), json!(in_reply_to));
@@ -4105,6 +4141,8 @@ mod tests {
                     bcc: None,
                     subject: Some("Progetto".to_owned()),
                     body: Some("Prima versione".to_owned()),
+                    html: false,
+                    plain: false,
                     send: false,
                     in_reply_to: None,
                 },
@@ -4124,6 +4162,8 @@ mod tests {
                     bcc: None,
                     subject: None,
                     body: Some("Solo il corpo".to_owned()),
+                    html: false,
+                    plain: false,
                     send: false,
                     in_reply_to: None,
                 },
@@ -4147,6 +4187,8 @@ mod tests {
                     bcc: None,
                     subject: Some(String::new()),
                     body: None,
+                    html: false,
+                    plain: false,
                     send: false,
                     in_reply_to: None,
                 },
@@ -4164,6 +4206,8 @@ mod tests {
                     bcc: None,
                     subject: Some(String::new()),
                     body: None,
+                    html: false,
+                    plain: false,
                     send: false,
                     in_reply_to: None,
                 },
@@ -4263,6 +4307,8 @@ mod tests {
                     bcc: None,
                     subject: Some("Allegato".to_owned()),
                     body: Some("Corpo".to_owned()),
+                    html: false,
+                    plain: false,
                     send: false,
                     in_reply_to: None,
                 },
@@ -4412,15 +4458,66 @@ mod tests {
 
     #[test]
     fn draft_save_args_omit_unset_flags_and_keep_an_explicit_account() {
-        let args = draft_save_args(None, Some("acc_b".to_owned()), None, None, None, None, Some("Corpo".to_owned()), None).expect("args");
+        let args = draft_save_args(None, Some("acc_b".to_owned()), None, None, None, None, Some("Corpo".to_owned()), None, None).expect("args");
         assert_eq!(args["account"], "acc_b");
         assert_eq!(args["body_text"], "Corpo");
         assert!(args.get("to").is_none(), "an omitted --to must stay absent for patch semantics");
         assert!(args.get("subject").is_none(), "an omitted --subject must stay absent for patch semantics");
 
-        let empty = draft_save_args(None, None, Some(Vec::new()), None, None, Some(String::new()), None, None).expect("empty args");
+        let empty = draft_save_args(None, None, Some(Vec::new()), None, None, Some(String::new()), None, None, None).expect("empty args");
         assert_eq!(empty["to"], json!([]));
         assert_eq!(empty["subject"], "");
+    }
+
+    #[test]
+    fn cli_draft_html_compiles_the_source_and_plain_removes_the_part() {
+        let mut engine = Engine::demo();
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: None,
+                    account: None,
+                    to: Some(vec!["Ada <ada@example.com>".to_owned()]),
+                    cc: None,
+                    bcc: None,
+                    subject: Some("HTML dalla CLI".to_owned()),
+                    body: Some("**Ciao** Ada\n\n| Voce | Importo |\n| --- | ---: |\n| Progetto | 120 |".to_owned()),
+                    html: true,
+                    plain: false,
+                    send: false,
+                    in_reply_to: None,
+                },
+            }),
+            &mut engine,
+        )
+        .expect("save an HTML draft");
+        let id = engine.messages().iter().find(|message| message.subject == "HTML dalla CLI").map(|message| message.id.clone()).expect("draft");
+        let draft = engine.message(&id).expect("draft");
+        let html = draft.body_html.as_deref().expect("compiled HTML");
+        assert!(html.contains("data-postino-compose=\"v1\""), "{html}");
+        assert!(html.contains("<table"), "{html}");
+        assert!(!html.contains("**Ciao**"), "{html}");
+
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: Some(draft.summary.id.clone()),
+                    account: None,
+                    to: None,
+                    cc: None,
+                    bcc: None,
+                    subject: None,
+                    body: None,
+                    html: false,
+                    plain: true,
+                    send: false,
+                    in_reply_to: None,
+                },
+            }),
+            &mut engine,
+        )
+        .expect("remove the HTML part");
+        assert!(engine.message(&draft.summary.id).expect("draft").body_html.is_none());
     }
 
     #[test]
@@ -4745,6 +4842,8 @@ mod tests {
                         bcc: None,
                         subject: Some("Bozza patch".to_owned()),
                         body: Some("Prima versione".to_owned()),
+                        html: false,
+                        plain: false,
                         send: false,
                         in_reply_to: None,
                     },
@@ -4764,6 +4863,8 @@ mod tests {
                         bcc: None,
                         subject: None,
                         body: Some("Solo il corpo".to_owned()),
+                        html: false,
+                        plain: false,
                         send: false,
                         in_reply_to: None,
                     },
@@ -4808,6 +4909,8 @@ mod tests {
                         bcc: None,
                         subject: Some("Per B".to_owned()),
                         body: Some("Corpo".to_owned()),
+                        html: false,
+                        plain: false,
                         send: false,
                         in_reply_to: None,
                     },
@@ -5672,6 +5775,27 @@ mod tests {
         assert_eq!(request["sign"], json!("pgp_2"));
         assert_eq!(request["passphrase"], json!("segreto"), "the real send request must carry the passphrase the CLI read from stdin");
         assert!(!format!("{signed:?}").contains("segreto"), "Debug must redact the passphrase");
+    }
+
+    #[test]
+    fn forced_output_keeps_the_previous_archive_when_the_replacement_fails() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_nanos());
+        let root = std::env::temp_dir().join(format!("postino-write-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp folder");
+        let destination = root.join("archive.mbox");
+        std::fs::create_dir(&destination).expect("a directory cannot be replaced by a file rename");
+        let marker = destination.join("old.txt");
+        std::fs::write(&marker, b"precious").expect("old archive marker");
+
+        assert!(write_output_file(&destination, b"new archive", true).is_err());
+        assert_eq!(std::fs::read(&marker).expect("the old marker survives"), b"precious");
+        let leftovers = std::fs::read_dir(&root)
+            .expect("temp folder entries")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".archive.mbox."))
+            .count();
+        assert_eq!(leftovers, 0, "a failed replacement must remove its temporary file");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -28,15 +28,15 @@ mod unsubscribe;
 pub mod vault;
 
 pub use engine::{
-    AccountRequest, AccountSetup, AccountUpdateRequest, Engine, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS,
-    MAX_EML_BYTES, MAX_MBOX_BYTES, MAX_MBOX_MESSAGES, MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup, ThreadDetailResult, ThreadFlagResult,
-    ThreadListRequest, ThreadPageResult,
+    AccountRequest, AccountSetup, AccountUpdateRequest, Engine, FolderMboxExport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES,
+    MAX_DRAFT_ATTACHMENTS, MAX_EML_BYTES, MAX_MBOX_BYTES, MAX_MBOX_MESSAGES, MAX_SIGNATURE_BYTES, OpError, ReplyTarget, SmtpSetup,
+    ThreadDetailResult, ThreadFlagResult, ThreadListRequest, ThreadPageResult,
 };
 pub use model::{
-    Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
-    MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect,
-    RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary, UnsubscribeInfo, UnsubscribeMethod,
-    UnsubscribeTarget,
+    Account, AccountView, Address, Attachment, BodyFormat, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor,
+    LabelSummary, MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleEffectStatus,
+    RulePreviewEffect, RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary, UnsubscribeInfo,
+    UnsubscribeMethod, UnsubscribeTarget,
 };
 pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{

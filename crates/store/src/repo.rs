@@ -594,6 +594,13 @@ impl Store {
         Ok(rows)
     }
 
+    /// Delete a folder only when no message references it. Used to undo a freshly created local
+    /// import folder whose whole archive was rejected.
+    pub fn delete_empty_folder(&self, id: &str) -> Result<bool, StoreError> {
+        let deleted = self.conn.execute("DELETE FROM folders WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE folder_id = ?1)", [id])?;
+        Ok(deleted > 0)
+    }
+
     pub fn get_folder(&self, id: &str) -> Result<Option<Folder>, StoreError> {
         self.conn
             .query_row(&format!("SELECT {FOLDER_COLUMNS} FROM folders WHERE id = ?1"), [id], row_to_folder)

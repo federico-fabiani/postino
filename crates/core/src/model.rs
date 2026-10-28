@@ -597,6 +597,21 @@ pub struct Attachment {
     pub size: u64,
 }
 
+/// Which body part a draft carries.
+///
+/// `Plain` stores only `body_text`. `Html` compiles the same `body_text` source into email-safe
+/// inline-CSS HTML at save time and again at send time, so the message always carries an HTML part
+/// and a matching generated text alternative. Raw HTML is never accepted from a caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyFormat {
+    /// Plain text only.
+    #[default]
+    Plain,
+    /// Compile the compose source into an HTML part plus a text alternative.
+    Html,
+}
+
 /// The editable state of a draft. M0 stores it as a message in the Drafts folder; M1 moves it to
 /// the encrypted draft blob without changing the operation surface.
 #[derive(Debug, Clone, PartialEq, Eq)]

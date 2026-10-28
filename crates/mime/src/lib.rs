@@ -24,6 +24,7 @@
 
 mod blocks;
 mod calendar;
+mod compose;
 mod encode;
 mod error;
 mod headers;
@@ -46,6 +47,7 @@ pub use calendar::{
     CalendarInvite, InviteError, InviteWarning, MAX_CALENDAR_BYTES, MAX_CALENDAR_COMPONENTS, MAX_INVITE_ATTENDEES, MAX_INVITE_FIELD_CHARS,
     parse_invite, reply_calendar,
 };
+pub use compose::{ComposedEmail, MAX_COMPOSE_SOURCE_BYTES, compile_html_email};
 pub use error::MimeError;
 pub use headers::Headers;
 pub use html_text::html_to_text;

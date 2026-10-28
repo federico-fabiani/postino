@@ -205,9 +205,12 @@ interaction model before real mail makes them expensive to change. Full spec:
 ## M5 — make it professional
 
 - [x] `BodyRenderer` with the sanitized subset (P11a1/P11a2); optional sandboxed webview backend is P11b.
-- [ ] Block composer and advanced HTML/Tailwind mode; live preview.
-- [ ] Email-safe HTML compiler (tables + inline CSS), plain-text alternative.
-- [ ] Templates, signatures, identities, remote-content policy, tracking-pixel stripping.
+- [ ] Block composer and advanced HTML/Tailwind mode in the editor; the current preview renders the
+      compiler output but the editor itself stays a Markdown-like text field.
+- [x] Email-safe HTML compiler (P13h): tables and inline CSS, matching plain-text alternative, source
+      capped at 1 MiB, no raw HTML from UI/CLI/MCP, live preview over the composer.
+- [x] Templates, per-account signatures, remote-content policy and tracking-pixel stripping.
+- [ ] Multiple identities per account.
 - [ ] Dark theme polish, accessibility pass, Italian/English catalogs.
 - [ ] Verify: render a 20-newsletter corpus on Windows/macOS/Linux; sanitizer tests; no remote
       request in the default profile.
