@@ -9,10 +9,20 @@ postino mcp
 postino --demo mcp
 postino --store <path> mcp
 postino --store <path> mcp --allow-send
+postino --store <path> mcp --compact --audit-log <path>
 ```
 
 - Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout.
 - It opens no port, starts nothing else, and stops at EOF.
+- `--compact` removes titles, annotation hints and schema prose from `tools/list`; names, types,
+  required fields and enums stay, so the list is smaller without becoming unusable.
+- Every `tools/call` and `resources/read` is appended to `mcp-audit.jsonl` beside the store by
+  default (`--audit-log` overrides it; demo uses the OS temp directory). The log stores the
+  timestamp, event, tool/resource name and outcome, never arguments, bodies or credentials. It
+  rotates to `.jsonl.1` at 8 MiB. A failed audit write is reported on stderr and does not change a
+  successful operation into a failure.
+- A session allows 300 tool/resource calls per rolling 60-second window. Exceeding it returns an
+  `isError` result (or a JSON-RPC error for a resource) without calling the operation.
 - Logs, if any, go to stderr. stdout carries protocol messages only.
 - When a daemon is running, this process is a daemon client: it reads `<store>.token`, speaks the
   same JSON-RPC 2.0 over the per-user pipe/socket and calls `op`. The tools, schemas and error shape
@@ -379,8 +389,28 @@ an alias of `postino send --draft <id>`, and both now submit for real.
   log line or an MCP refusal; `account_add` and `account_remove` are not reachable over MCP at all.
 - Never put credentials, tokens or message bodies in logs.
 
-## Resources (planned)
+## Resources
 
-M6 will expose read-only resources for open threads and messages, for example
-`postino://thread/{id}` and `postino://message/{id}/html`, plus a compact tool mode for agents with
-small context budgets.
+The server advertises `resources` and supports `resources/list`, `resources/templates/list` and
+`resources/read`. Resources are read-only and use the same registry operations as tools, so account
+ownership and bounds are unchanged.
+
+Static resources:
+
+| URI | Content |
+|---|---|
+| `postino://mailbox/status` | Accounts plus their last sync status, never a credential |
+| `postino://folders` | Folder ids, names, unread and total counts |
+| `postino://messages/recent` | The newest 50 inbox summaries |
+
+Templates:
+
+| URI template | Content |
+|---|---|
+| `postino://message/{id}` | `message_get` JSON: body, recipients and attachment metadata |
+| `postino://message/{id}/text` | Stored plain-text body |
+| `postino://message/{id}/html` | Sanitized HTML body; plain-text mail is wrapped in `<pre>` |
+| `postino://thread/{id}` | `thread_get` JSON: one conversation and its summaries |
+
+A missing message or thread is `-32002`; a malformed id (including path-like or oversized values) is
+`-32602`. The HTML variant returns only the sanitizer's output, never a remote fetch or a script.

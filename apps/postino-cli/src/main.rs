@@ -751,6 +751,12 @@ enum Command {
         /// Allow message_send, send_schedule and outbox_retry over MCP. Off by default.
         #[arg(long)]
         allow_send: bool,
+        /// Omit tool titles, annotations and schema prose to save agent context.
+        #[arg(long)]
+        compact: bool,
+        /// Append-only JSONL audit log. Defaults to mcp-audit.jsonl beside the store.
+        #[arg(long, value_name = "PATH")]
+        audit_log: Option<std::path::PathBuf>,
     },
     /// Inspect or control the background daemon.
     Daemon {
@@ -994,8 +1000,8 @@ fn main() -> ExitCode {
     if matches!(cli.command, Command::Daemon { .. }) {
         return finish(run_daemon_command(cli));
     }
-    if let Command::Mcp { allow_send } = &cli.command {
-        return finish(run_mcp_command(&cli, *allow_send));
+    if let Command::Mcp { allow_send, compact, audit_log } = &cli.command {
+        return finish(run_mcp_command(&cli, *allow_send, *compact, audit_log.as_deref()));
     }
     let paths = match daemon_paths(&cli) {
         Ok(paths) => paths,
@@ -1321,31 +1327,49 @@ fn autostart_test_key() -> Option<String> {
     None
 }
 
-fn run_mcp_command(cli: &Cli, allow_send: bool) -> Result<()> {
+fn run_mcp_command(cli: &Cli, allow_send: bool, compact: bool, audit_log: Option<&std::path::Path>) -> Result<()> {
+    let options = mcp::McpOptions {
+        allow_send,
+        compact,
+        audit: Some(audit_log.map(std::path::Path::to_path_buf).unwrap_or_else(|| default_mcp_audit_path(cli))),
+    };
     if cli.demo {
         let mut engine = Engine::demo();
-        return mcp::serve(&mut engine, allow_send);
+        return mcp::serve(&mut engine, options);
     }
     if cli.in_process {
         let mut engine = open_engine(cli)?;
-        return mcp::serve(&mut engine, allow_send);
+        return mcp::serve(&mut engine, options);
     }
     let Some(paths) = daemon_paths(cli)? else {
         let mut engine = Engine::demo();
-        return mcp::serve(&mut engine, allow_send);
+        return mcp::serve(&mut engine, options);
     };
     match DaemonSession::try_connect_with(&paths, "mcp", allow_send) {
         Ok(session) => {
             let mut backend = DaemonMcp::new(session.client, paths);
-            mcp::serve_backend(&mut backend, allow_send)
+            mcp::serve_backend(&mut backend, options)
         }
         Err(error) if daemon_absent(&error, &paths) => {
             let engine = open_engine_read_only(cli)?;
             let mut backend = LocalMcp { engine, mutations: false };
-            mcp::serve_backend(&mut backend, allow_send)
+            mcp::serve_backend(&mut backend, options)
         }
         Err(error) => Err(daemon_error(error)),
     }
+}
+
+/// The audit file is metadata only. Keep it beside the store (or in the platform data directory)
+/// so each mailbox has its own trail; demo sessions use the OS temp directory and never touch the
+/// user's real data directory.
+fn default_mcp_audit_path(cli: &Cli) -> std::path::PathBuf {
+    if let Some(store) = &cli.store {
+        return store.parent().map(|parent| parent.join("mcp-audit.jsonl")).unwrap_or_else(|| std::path::PathBuf::from("mcp-audit.jsonl"));
+    }
+    if cli.demo || cli.in_process {
+        return std::env::temp_dir().join("postino-demo-mcp-audit.jsonl");
+    }
+    Engine::data_dir().map(|directory| directory.join("mcp-audit.jsonl")).unwrap_or_else(|| std::env::temp_dir().join("postino-mcp-audit.jsonl"))
 }
 
 /// Read-only engine for an MCP process when the daemon is absent. It deliberately does not take the

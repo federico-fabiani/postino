@@ -233,7 +233,8 @@ crash-dump entry above.
 - `send_dry_run` returns the exact RFC 822 bytes and the envelope recipients without queueing.
 - Idempotency keys make a retried queue operation safe: the key is stable per draft content and a
   partial unique index makes a second queued/sending row for one draft impossible. The outbox and the
-  100-recipient/40 MiB caps bound a runaway loop; a per-call rate limit and audit log are M6 work.
+  100-recipient/40 MiB caps bound a runaway loop; MCP additionally caps tool/resource calls at 300 per
+  rolling minute and appends every call to a metadata-only JSONL audit log.
 - The agent never receives credentials; it receives operations. `account_add` and `account_remove`
   are `sensitive`: they are absent from `tools/list` and `tools/call` refuses them before parsing the
   arguments, so an agent can neither create an account nor ask for a password to be stored.
@@ -335,8 +336,8 @@ crash-dump entry above.
   `outbox_list` and `outbox_cancel` stay available; a dry run is read-only and a cancel discards a
   queued or permanently failed submission without sending. The MCP server only queues: it never runs
   the outbox pass, so a queued message leaves only when the desktop app or `postino send` processes it.
-  There is still no rate limit or audit log beyond the outbox row: M6 adds the audit log and a compact
-  tool mode, and P8/P9 add richer guardrails.
+  The MCP layer adds a 300-call rolling-minute limit, a compact tool listing for small context
+  budgets and an append-only JSONL audit log that stores only timestamp, event, name and outcome.
 - **Demo is honest.** The demo mailbox has no SMTP endpoint; Send is disabled with a visible reason
   and `message_send` refuses. A demo send never claims to leave the machine.
 

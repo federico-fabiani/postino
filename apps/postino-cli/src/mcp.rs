@@ -3,13 +3,29 @@
 //! It is opt-in: only `postino mcp` starts it, it opens no port and it stops at EOF. Tool names,
 //! descriptions and input schemas come from the same operation registry the CLI and the GUI use.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{SecondsFormat, Utc};
 use postino_core::Engine;
 use serde_json::{Value, json};
 
 const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// A per-session ceiling for tool and resource calls. It is deliberately generous for normal agent
+/// work and small enough to stop a runaway loop before it drains a mailbox or floods the audit log.
+const MAX_CALLS_PER_WINDOW: u32 = 300;
+const CALL_WINDOW: Duration = Duration::from_secs(60);
+
+/// A single compact description is enough for an agent that already has the schema; full mode keeps
+/// the registry's long, actionable text.
+const COMPACT_DESCRIPTION_CHARS: usize = 180;
+
+/// The audit file is rotated once it reaches this size. Operation names and resource ids are
+/// metadata, never message bodies or credentials.
+const MAX_AUDIT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A legitimate 25 MiB attachment is a ~35 MB base64 string inside JSON. Anything above that plus
 /// headroom is not a request this server can serve, and must not become an unbounded `String`.
@@ -58,12 +74,22 @@ impl McpBackend for Engine {
     }
 }
 
-pub fn serve(engine: &mut Engine, allow_send: bool) -> Result<()> {
-    serve_backend(engine, allow_send)
+/// Deployment options for one MCP process. The audit path is kept as an owned path so it can be
+/// derived from the store or the platform data directory before stdin is opened.
+#[derive(Debug, Clone, Default)]
+pub struct McpOptions {
+    pub allow_send: bool,
+    pub compact: bool,
+    pub audit: Option<PathBuf>,
 }
 
-pub fn serve_backend<B: McpBackend + ?Sized>(backend: &mut B, allow_send: bool) -> Result<()> {
-    backend.set_allow_send(allow_send);
+pub fn serve(engine: &mut Engine, options: McpOptions) -> Result<()> {
+    serve_backend(engine, options)
+}
+
+pub fn serve_backend<B: McpBackend + ?Sized>(backend: &mut B, options: McpOptions) -> Result<()> {
+    backend.set_allow_send(options.allow_send);
+    let mut session = Session::new(options);
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
@@ -89,7 +115,7 @@ pub fn serve_backend<B: McpBackend + ?Sized>(backend: &mut B, allow_send: bool) 
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => handle(backend, &request, allow_send),
+            Ok(request) => handle_session(backend, &request, &mut session),
             Err(error) => Some(error_response(Value::Null, -32700, &format!("parse error: {error}"))),
         };
         if let Some(response) = response {
@@ -98,6 +124,110 @@ pub fn serve_backend<B: McpBackend + ?Sized>(backend: &mut B, allow_send: bool) 
         }
     }
     Ok(())
+}
+
+/// State that belongs to one stdio session: the send gate, compact listing, rate guardrail and the
+/// append-only audit trail. It never holds a message body or a credential.
+struct Session {
+    allow_send: bool,
+    compact: bool,
+    rate: RateLimiter,
+    audit: AuditLog,
+}
+
+impl Session {
+    fn new(options: McpOptions) -> Self {
+        Self {
+            allow_send: options.allow_send,
+            compact: options.compact,
+            rate: RateLimiter::new(MAX_CALLS_PER_WINDOW, CALL_WINDOW),
+            audit: AuditLog::new(options.audit.as_deref()),
+        }
+    }
+}
+
+struct RateLimiter {
+    limit: u32,
+    window: Duration,
+    started: Instant,
+    used: u32,
+}
+
+impl RateLimiter {
+    fn new(limit: u32, window: Duration) -> Self {
+        Self { limit: limit.max(1), window, started: Instant::now(), used: 0 }
+    }
+
+    fn allow(&mut self) -> bool {
+        if self.started.elapsed() >= self.window {
+            self.started = Instant::now();
+            self.used = 0;
+        }
+        self.used = self.used.saturating_add(1);
+        self.used <= self.limit
+    }
+
+    fn refusal(&self) -> String {
+        format!(
+            "rate limit exceeded: at most {} MCP calls per {} seconds; wait and retry. No operation was performed.",
+            self.limit,
+            self.window.as_secs()
+        )
+    }
+}
+
+/// Best-effort append-only JSONL audit. A broken audit file must not turn a correct read into a
+/// protocol failure, but the failure is visible on stderr and the server keeps serving.
+struct AuditLog {
+    writer: Option<BufWriter<std::fs::File>>,
+}
+
+impl AuditLog {
+    fn new(path: Option<&Path>) -> Self {
+        let Some(path) = path else { return Self { writer: None } };
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("postino mcp: cannot create the audit directory {}: {error}", parent.display());
+            return Self { writer: None };
+        }
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() >= MAX_AUDIT_BYTES) {
+            let rotated = path.with_extension("jsonl.1");
+            if let Err(error) = std::fs::rename(path, &rotated) {
+                eprintln!("postino mcp: cannot rotate the audit log {}: {error}", path.display());
+                return Self { writer: None };
+            }
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(file) => Self { writer: Some(BufWriter::new(file)) },
+            Err(error) => {
+                eprintln!("postino mcp: cannot open the audit log {}: {error}", path.display());
+                Self { writer: None }
+            }
+        }
+    }
+
+    fn record(&mut self, event: &str, name: &str, outcome: &str) {
+        let Some(writer) = self.writer.as_mut() else { return };
+        let name = name.chars().take(512).collect::<String>();
+        let line = json!({
+            "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "event": event,
+            "name": name,
+            "outcome": outcome
+        });
+        if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
+            eprintln!("postino mcp: the audit log write failed; the operation result is unchanged");
+            self.writer = None;
+        }
+    }
 }
 
 /// Read one newline-delimited request with a hard ceiling. An over-long line is consumed (so the
@@ -134,7 +264,7 @@ fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<B
     }
 }
 
-fn handle<B: McpBackend + ?Sized>(backend: &mut B, request: &Value, allow_send: bool) -> Option<Value> {
+fn handle_session<B: McpBackend + ?Sized>(backend: &mut B, request: &Value, session: &mut Session) -> Option<Value> {
     let id = request.get("id").cloned();
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return id.map(|id| error_response(id, -32600, "invalid request: missing method"));
@@ -145,8 +275,46 @@ fn handle<B: McpBackend + ?Sized>(backend: &mut B, request: &Value, allow_send: 
     let outcome = match method {
         "initialize" => Ok(initialize(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools_list(backend, allow_send)),
-        "tools/call" => tools_call(backend, &params, allow_send),
+        "tools/list" => Ok(tools_list(backend, session.allow_send, session.compact)),
+        "tools/call" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("<missing>").to_owned();
+            if !session.rate.allow() {
+                session.audit.record("tool", &name, "rate_limited");
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id.unwrap_or(Value::Null),
+                    "result": {
+                        "content": [{ "type": "text", "text": session.rate.refusal() }],
+                        "isError": true
+                    }
+                }));
+            }
+            let result = tools_call(backend, &params, session.allow_send);
+            let outcome = match &result {
+                Ok(value) if value.get("isError").and_then(Value::as_bool) == Some(true) => "error",
+                Ok(_) => "ok",
+                Err(_) => "error",
+            };
+            session.audit.record("tool", &name, outcome);
+            result
+        }
+        "resources/list" => Ok(resources_list()),
+        "resources/templates/list" => Ok(resource_templates()),
+        "resources/read" => {
+            let uri = params.get("uri").and_then(Value::as_str).unwrap_or("<missing>").to_owned();
+            if !session.rate.allow() {
+                session.audit.record("resource", &uri, "rate_limited");
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id.unwrap_or(Value::Null),
+                    "error": { "code": -32000, "message": session.rate.refusal() }
+                }));
+            }
+            let result = resources_read(backend, &params);
+            let outcome = if result.is_ok() { "ok" } else { "error" };
+            session.audit.record("resource", &uri, outcome);
+            result
+        }
         "notifications/initialized" | "notifications/cancelled" => return None,
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -166,7 +334,10 @@ fn initialize(params: &Value) -> Value {
     let protocol = if SUPPORTED_PROTOCOLS.contains(&requested) { requested } else { SUPPORTED_PROTOCOLS[0] };
     json!({
         "protocolVersion": protocol,
-        "capabilities": { "tools": { "listChanged": false } },
+        "capabilities": {
+            "tools": { "listChanged": false },
+            "resources": { "listChanged": false, "subscribe": false }
+        },
         "serverInfo": {
             "name": "postino",
             "title": "Postino",
@@ -176,7 +347,7 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-fn tools_list<B: McpBackend + ?Sized>(backend: &B, allow_send: bool) -> Value {
+fn tools_list<B: McpBackend + ?Sized>(backend: &B, allow_send: bool, compact: bool) -> Value {
     let tools = backend
         .tools()
         .into_iter()
@@ -186,6 +357,23 @@ fn tools_list<B: McpBackend + ?Sized>(backend: &B, allow_send: bool) -> Value {
         .map(|def| {
             let gated = SEND_GATED.contains(&def.name) && !allow_send;
             let description = if gated { format!("{} DISABLED: {SEND_DISABLED_REASON}", def.description) } else { def.description.to_owned() };
+            if compact {
+                let short = compact_description(&description);
+                let mut schema = def.input_schema;
+                compact_schema(&mut schema);
+                let mut tool = json!({
+                    "name": def.name,
+                    "description": short,
+                    "inputSchema": schema
+                });
+                if let Some(object) = tool.as_object_mut() {
+                    object.insert("enabled".to_owned(), json!(!gated));
+                    if gated {
+                        object.insert("disabledReason".to_owned(), json!(SEND_DISABLED_REASON));
+                    }
+                }
+                return tool;
+            }
             let mut tool = json!({
                 "name": def.name,
                 "title": def.title,
@@ -208,6 +396,185 @@ fn tools_list<B: McpBackend + ?Sized>(backend: &B, allow_send: bool) -> Value {
         })
         .collect::<Vec<_>>();
     json!({ "tools": tools })
+}
+
+/// Keep the first sentence, or a bounded prefix when the text has no sentence break. The full
+/// registry text stays available without `--compact`.
+fn compact_description(description: &str) -> String {
+    let first = description.split_inclusive(['.', '!', '?']).next().unwrap_or(description).trim();
+    let first = if first.is_empty() { description.trim() } else { first };
+    if first.chars().count() <= COMPACT_DESCRIPTION_CHARS {
+        return first.to_owned();
+    }
+    let mut short = first.chars().take(COMPACT_DESCRIPTION_CHARS.saturating_sub(1)).collect::<String>();
+    short.push('…');
+    short
+}
+
+/// Strip prose that a schema-aware agent can infer from the registry's compact description. Types,
+/// properties, required fields and enums stay untouched, so the schema remains usable.
+fn compact_schema(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("description");
+            object.remove("title");
+            for child in object.values_mut() {
+                compact_schema(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                compact_schema(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resources_list() -> Value {
+    json!({
+        "resources": [
+            {
+                "uri": "postino://mailbox/status",
+                "name": "Mailbox status",
+                "description": "Accounts and their last sync status, without credentials.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "postino://folders",
+                "name": "Folders",
+                "description": "Folders with unread and total counts.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "postino://messages/recent",
+                "name": "Recent messages",
+                "description": "The newest 50 inbox summaries. Bodies are read with the message resource.",
+                "mimeType": "application/json"
+            }
+        ]
+    })
+}
+
+fn resource_templates() -> Value {
+    json!({
+        "resourceTemplates": [
+            {
+                "uriTemplate": "postino://message/{id}",
+                "name": "Message",
+                "description": "One stored message with its body, recipients and attachment metadata.",
+                "mimeType": "application/json"
+            },
+            {
+                "uriTemplate": "postino://message/{id}/text",
+                "name": "Message text",
+                "description": "The stored plain-text body of one message.",
+                "mimeType": "text/plain"
+            },
+            {
+                "uriTemplate": "postino://message/{id}/html",
+                "name": "Message HTML",
+                "description": "The sanitized HTML body of one message; plain-text mail is wrapped in a preformatted block.",
+                "mimeType": "text/html"
+            },
+            {
+                "uriTemplate": "postino://thread/{id}",
+                "name": "Thread",
+                "description": "One conversation with an ascending page of message summaries.",
+                "mimeType": "application/json"
+            }
+        ]
+    })
+}
+
+fn resources_read<B: McpBackend + ?Sized>(backend: &mut B, params: &Value) -> Result<Value, (i64, String)> {
+    let uri = params.get("uri").and_then(Value::as_str).ok_or_else(|| (-32602, "resources/read needs a string `uri`".to_owned()))?;
+    match uri {
+        "postino://mailbox/status" => {
+            let accounts = resource_call(backend, "accounts_list", json!({}), uri)?;
+            let status = resource_call(backend, "sync_status", json!({}), uri)?;
+            json_resource(uri, json!({ "accounts": accounts, "sync": status }))
+        }
+        "postino://folders" => {
+            let folders = resource_call(backend, "folders_list", json!({}), uri)?;
+            json_resource(uri, folders)
+        }
+        "postino://messages/recent" => {
+            let messages = resource_call(backend, "messages_list", json!({ "folder": "inbox", "limit": 50 }), uri)?;
+            json_resource(uri, messages)
+        }
+        _ => {
+            if let Some(rest) = uri.strip_prefix("postino://message/") {
+                let (id, view) = if let Some(id) = rest.strip_suffix("/html") {
+                    (id, ResourceView::Html)
+                } else if let Some(id) = rest.strip_suffix("/text") {
+                    (id, ResourceView::Text)
+                } else {
+                    (rest, ResourceView::Json)
+                };
+                if !valid_resource_id(id) {
+                    return Err((-32602, format!("invalid message resource id in {uri:?}")));
+                }
+                let value = resource_call(backend, "message_get", json!({ "id": id }), uri)?;
+                return message_resource(uri, &value, view);
+            }
+            if let Some(id) = uri.strip_prefix("postino://thread/") {
+                if !valid_resource_id(id) {
+                    return Err((-32602, format!("invalid thread resource id in {uri:?}")));
+                }
+                let value = resource_call(backend, "thread_get", json!({ "id": id }), uri)?;
+                return json_resource(uri, value);
+            }
+            Err((-32002, format!("resource not found: {uri}")))
+        }
+    }
+}
+
+enum ResourceView {
+    Json,
+    Text,
+    Html,
+}
+
+fn resource_call<B: McpBackend + ?Sized>(backend: &mut B, operation: &str, args: Value, uri: &str) -> Result<Value, (i64, String)> {
+    backend.call(operation, args).map_err(|error| (-32002, format!("resource {uri:?} is not available: {error}")))
+}
+
+fn json_resource(uri: &str, value: Value) -> Result<Value, (i64, String)> {
+    let text = serde_json::to_string(&value).map_err(|error| (-32603, format!("serializing resource {uri:?}: {error}")))?;
+    Ok(json!({
+        "contents": [{ "uri": uri, "mimeType": "application/json", "text": text }]
+    }))
+}
+
+fn message_resource(uri: &str, value: &Value, view: ResourceView) -> Result<Value, (i64, String)> {
+    let message = value.get("message").ok_or_else(|| (-32603, format!("message resource {uri:?} has no message object")))?;
+    match view {
+        ResourceView::Json => json_resource(uri, value.clone()),
+        ResourceView::Text => {
+            let text = message.get("body_text").and_then(Value::as_str).unwrap_or_default();
+            Ok(json!({
+                "contents": [{ "uri": uri, "mimeType": "text/plain", "text": text }]
+            }))
+        }
+        ResourceView::Html => {
+            let html = message.get("body_html").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| {
+                let text = message.get("body_text").and_then(Value::as_str).unwrap_or_default();
+                format!("<pre>{}</pre>", escape_html(text))
+            });
+            Ok(json!({
+                "contents": [{ "uri": uri, "mimeType": "text/html", "text": html }]
+            }))
+        }
+    }
+}
+
+fn valid_resource_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
 fn tools_call<B: McpBackend + ?Sized>(backend: &mut B, params: &Value, allow_send: bool) -> Result<Value, (i64, String)> {
@@ -331,8 +698,12 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::handle as raw_handle;
     use super::*;
+
+    fn raw_handle<B: McpBackend + ?Sized>(backend: &mut B, request: &Value, allow_send: bool) -> Option<Value> {
+        let mut session = Session::new(McpOptions { allow_send, ..McpOptions::default() });
+        handle_session(backend, request, &mut session)
+    }
 
     /// Existing protocol tests exercise the normal, send-enabled server.
     fn handle(engine: &mut Engine, request: &Value) -> Option<Value> {
@@ -1229,5 +1600,113 @@ mod tests {
         .expect("response");
         assert_eq!(response["result"]["isError"], true, "{response}");
         assert!(response["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("refused")), "{response}");
+    }
+
+    #[test]
+    fn compact_tools_keep_the_schema_but_drop_prose_and_annotations() {
+        let mut engine = Engine::demo();
+        let full = raw_handle(&mut engine, &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), true).expect("full");
+        let mut session = Session::new(McpOptions { allow_send: true, compact: true, ..McpOptions::default() });
+        let compact = handle_session(&mut engine, &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }), &mut session).expect("compact");
+        let full_tools = full["result"]["tools"].as_array().expect("full tools");
+        let compact_tools = compact["result"]["tools"].as_array().expect("compact tools");
+        assert_eq!(full_tools.len(), compact_tools.len());
+        assert!(compact_tools.iter().all(|tool| tool.get("title").is_none() && tool.get("annotations").is_none()));
+        let messages = compact_tools.iter().find(|tool| tool["name"] == "messages_list").expect("messages_list");
+        assert!(messages["inputSchema"]["properties"]["folder"].is_object(), "field schemas stay available");
+        assert!(messages["inputSchema"]["properties"].get("description").is_none());
+        let compact_json = serde_json::to_string(&compact).expect("JSON");
+        let full_json = serde_json::to_string(&full).expect("JSON");
+        assert!(compact_json.len() < full_json.len(), "compact mode must reduce the payload");
+        assert!(!compact_json.contains("\"description\":\"Folder id"), "nested schema prose is removed");
+    }
+
+    #[test]
+    fn resources_expose_a_message_thread_and_mailbox_metadata() {
+        let mut engine = Engine::demo();
+        let list = request(&mut engine, "resources/list");
+        assert!(
+            list["result"]["resources"]
+                .as_array()
+                .is_some_and(|resources| resources.iter().any(|resource| resource["uri"] == "postino://mailbox/status"))
+        );
+        let templates = request(&mut engine, "resources/templates/list");
+        let templates = templates["result"]["resourceTemplates"].as_array().expect("templates");
+        assert!(templates.iter().any(|template| template["uriTemplate"] == "postino://message/{id}/html"));
+        assert!(templates.iter().any(|template| template["uriTemplate"] == "postino://thread/{id}"));
+
+        let message = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                "params": { "uri": "postino://message/msg_001" }
+            }),
+        )
+        .expect("message resource");
+        assert_eq!(message["result"]["contents"][0]["mimeType"], "application/json");
+        assert!(message["result"]["contents"][0]["text"].as_str().is_some_and(|text| text.contains("msg_001")));
+
+        let text = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+                "params": { "uri": "postino://message/msg_001/text" }
+            }),
+        )
+        .expect("text resource");
+        assert_eq!(text["result"]["contents"][0]["mimeType"], "text/plain");
+
+        let threads = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": { "name": "threads_list", "arguments": {} }
+            }),
+        )
+        .expect("threads");
+        let thread_id = threads["result"]["structuredContent"]["threads"][0]["id"].as_str().expect("thread id");
+        let thread = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 5, "method": "resources/read",
+                "params": { "uri": format!("postino://thread/{thread_id}") }
+            }),
+        )
+        .expect("thread resource");
+        assert!(thread["result"]["contents"][0]["text"].as_str().is_some_and(|text| text.contains(thread_id)));
+
+        let invalid = handle(
+            &mut engine,
+            &json!({
+                "jsonrpc": "2.0", "id": 6, "method": "resources/read",
+                "params": { "uri": "postino://message/../secret" }
+            }),
+        )
+        .expect("invalid resource");
+        assert_eq!(invalid["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn audit_log_records_names_and_outcomes_without_arguments_and_the_rate_limit_stops_a_loop() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let audit_path = directory.path().join("audit.jsonl");
+        let mut session = Session::new(McpOptions { allow_send: true, audit: Some(audit_path.clone()), ..McpOptions::default() });
+        session.rate = RateLimiter::new(1, Duration::from_secs(60));
+        let mut engine = Engine::demo();
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "message_get", "arguments": { "id": "SENTINEL-ARGUMENT" } }
+        });
+        let first = handle_session(&mut engine, &call, &mut session).expect("first");
+        assert_eq!(first["result"]["isError"], true, "the missing id is a normal tool error");
+        let second = handle_session(&mut engine, &call, &mut session).expect("second");
+        assert_eq!(second["result"]["isError"], true);
+        assert!(second["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("rate limit")));
+        let log = std::fs::read_to_string(&audit_path).expect("audit log");
+        assert!(log.contains("\"name\":\"message_get\""), "{log}");
+        assert!(log.contains("\"outcome\":\"error\""), "{log}");
+        assert!(log.contains("\"outcome\":\"rate_limited\""), "{log}");
+        assert!(!log.contains("SENTINEL-ARGUMENT"), "arguments never enter the audit log: {log}");
+        assert_eq!(log.lines().count(), 2);
     }
 }
