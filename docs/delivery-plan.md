@@ -98,7 +98,7 @@ Status: `todo` · `active` · `review` · `done`.
 | P12c1 | M6 ship | PGP key store v8, key ops, CLI | done |
 | P12c2a | M6 ship | v9 raw retention for signed/encrypted mail, GC | done |
 | P12c2b | M6 ship | PGP/MIME verify/decrypt/sign/encrypt, ops/CLI | done |
-| P12c2c | M6 ship | PGP reading badges, composer toggles, key manager | active |
+| P12c2c | M6 ship | PGP reading badges, composer toggles, key manager | done |
 | P12d | M6 ship | iCalendar invites, RSVP drafts | done |
 | P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | done |
 | P12f | M6 ship | standalone fuzz targets and security CI | todo |
@@ -152,9 +152,10 @@ egui in the reading pane, keeps the link sheet/text fallback and the 980×600 bu
 green on the merged tree. P11b (optional sandboxed WebView2) remains after P11a2.
 M6 is split. **P12a** Gmail OAuth, **P12e** Windows packaging, **P12d** iCalendar invites,
 **P12c1** PGP key storage, **P12c2a** v9 raw retention and **P12c2b** PGP/MIME MIME/ops/CLI are merged
-and CI-green; **P12c2c** app UI is active. **P12b** ManageSieve is deferred
-until a provider with a real ManageSieve endpoint is confirmed (Gmail has none); **P12f** fuzz
-remains infrastructure. The audit keeps the vertical packages serial because they touch core/store/app.
+and CI-green. **P12c2c** completes the app surface (reading badges, decrypt sheet, composer
+sign/encrypt choices, key table with import/public export/delete) and is CI-green. **P12b**
+ManageSieve is deferred until a provider with a real ManageSieve endpoint is confirmed (Gmail has
+none); **P12f** fuzz is the remaining M6 package. The audit keeps the vertical packages serial because they touch core/store/app.
 
 ## 5. Delighters backlog
 

@@ -219,7 +219,7 @@ interaction model before real mail makes them expensive to change. Full spec:
       no confirmed provider; Gmail has none).
 - [x] PGP key storage/import/export with a passphrase-protected v8 store (P12c1).
 - [x] PGP/MIME verify/decrypt/sign/encrypt (P12c2b); S/MIME later.
-- [ ] PGP reading badges, composer toggles and key manager in the app (P12c2c).
+- [x] PGP reading badges, composer toggles and key manager in the app (P12c2c).
 - [x] `.ics` invite parsing and organizer-only reply drafts (P12d).
 - [ ] Unsubscribe, export/import `.eml`/`.mbox`, Thunderbird import.
 - [ ] MCP compact mode, resources, send guardrails, audit log.
