@@ -149,22 +149,24 @@ impl Session {
 struct RateLimiter {
     limit: u32,
     window: Duration,
-    started: Instant,
-    used: u32,
+    calls: std::collections::VecDeque<Instant>,
 }
 
 impl RateLimiter {
     fn new(limit: u32, window: Duration) -> Self {
-        Self { limit: limit.max(1), window, started: Instant::now(), used: 0 }
+        Self { limit: limit.max(1), window, calls: std::collections::VecDeque::new() }
     }
 
     fn allow(&mut self) -> bool {
-        if self.started.elapsed() >= self.window {
-            self.started = Instant::now();
-            self.used = 0;
+        let now = Instant::now();
+        while self.calls.front().is_some_and(|at| now.duration_since(*at) >= self.window) {
+            self.calls.pop_front();
         }
-        self.used = self.used.saturating_add(1);
-        self.used <= self.limit
+        if self.calls.len() >= self.limit as usize {
+            return false;
+        }
+        self.calls.push_back(now);
+        true
     }
 
     fn refusal(&self) -> String {
@@ -179,25 +181,30 @@ impl RateLimiter {
 /// Best-effort append-only JSONL audit. A broken audit file must not turn a correct read into a
 /// protocol failure, but the failure is visible on stderr and the server keeps serving.
 struct AuditLog {
+    path: Option<std::path::PathBuf>,
     writer: Option<BufWriter<std::fs::File>>,
+    written: u64,
 }
 
 impl AuditLog {
     fn new(path: Option<&Path>) -> Self {
-        let Some(path) = path else { return Self { writer: None } };
+        let Some(path) = path else { return Self { path: None, writer: None, written: 0 } };
         if let Some(parent) = path.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {
             eprintln!("postino mcp: cannot create the audit directory {}: {error}", parent.display());
-            return Self { writer: None };
+            return Self { path: None, writer: None, written: 0 };
         }
+        let mut log = Self { path: Some(path.to_path_buf()), writer: None, written: 0 };
         if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() >= MAX_AUDIT_BYTES) {
-            let rotated = path.with_extension("jsonl.1");
-            if let Err(error) = std::fs::rename(path, &rotated) {
-                eprintln!("postino mcp: cannot rotate the audit log {}: {error}", path.display());
-                return Self { writer: None };
-            }
+            log.rotate_file();
         }
+        log.open();
+        log
+    }
+
+    fn open(&mut self) {
+        let Some(path) = self.path.as_deref() else { return };
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -206,16 +213,36 @@ impl AuditLog {
             options.mode(0o600);
         }
         match options.open(path) {
-            Ok(file) => Self { writer: Some(BufWriter::new(file)) },
+            Ok(file) => {
+                self.written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+                self.writer = Some(BufWriter::new(file));
+            }
             Err(error) => {
                 eprintln!("postino mcp: cannot open the audit log {}: {error}", path.display());
-                Self { writer: None }
+                self.writer = None;
             }
         }
     }
 
+    fn rotate_file(&mut self) {
+        let Some(path) = self.path.as_deref() else { return };
+        let rotated = path.with_extension("jsonl.1");
+        if let Err(error) = std::fs::rename(path, &rotated) {
+            eprintln!("postino mcp: cannot rotate the audit log {}: {error}", path.display());
+        }
+    }
+
+    fn rotate(&mut self) {
+        self.writer = None;
+        self.rotate_file();
+        self.written = 0;
+        self.open();
+    }
+
     fn record(&mut self, event: &str, name: &str, outcome: &str) {
-        let Some(writer) = self.writer.as_mut() else { return };
+        if self.writer.is_none() {
+            return;
+        }
         let name = name.chars().take(512).collect::<String>();
         let line = json!({
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -223,9 +250,17 @@ impl AuditLog {
             "name": name,
             "outcome": outcome
         });
-        if writeln!(writer, "{line}").is_err() || writer.flush().is_err() {
+        let mut text = line.to_string();
+        text.push('\n');
+        if self.written.saturating_add(text.len() as u64) > MAX_AUDIT_BYTES {
+            self.rotate();
+        }
+        let Some(writer) = self.writer.as_mut() else { return };
+        if writer.write_all(text.as_bytes()).is_err() || writer.flush().is_err() {
             eprintln!("postino mcp: the audit log write failed; the operation result is unchanged");
             self.writer = None;
+        } else {
+            self.written = self.written.saturating_add(text.len() as u64);
         }
     }
 }
@@ -271,6 +306,11 @@ fn handle_session<B: McpBackend + ?Sized>(backend: &mut B, request: &Value, sess
     };
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
     let is_notification = id.is_none();
+    // JSON-RPC notifications never receive a response, including the rate-limit and resource-error
+    // branches below. Nothing in Postino's MCP surface needs a notification to perform work.
+    if is_notification {
+        return None;
+    }
 
     let outcome = match method {
         "initialize" => Ok(initialize(&params)),
@@ -500,7 +540,9 @@ fn resources_read<B: McpBackend + ?Sized>(backend: &mut B, params: &Value) -> Re
             json_resource(uri, folders)
         }
         "postino://messages/recent" => {
-            let messages = resource_call(backend, "messages_list", json!({ "folder": "inbox", "limit": 50 }), uri)?;
+            // `messages_list` resolves an omitted folder through `FolderKind::Inbox`; real synced
+            // inbox ids are `fld_<hash>`, never the demo literal "inbox".
+            let messages = resource_call(backend, "messages_list", json!({ "limit": 50 }), uri)?;
             json_resource(uri, messages)
         }
         _ => {
@@ -570,7 +612,11 @@ fn message_resource(uri: &str, value: &Value, view: ResourceView) -> Result<Valu
 }
 
 fn valid_resource_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    !id.is_empty()
+        && id.len() <= 128
+        && id != "."
+        && id != ".."
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn escape_html(text: &str) -> String {
@@ -1684,6 +1730,65 @@ mod tests {
         )
         .expect("invalid resource");
         assert_eq!(invalid["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn a_notification_never_receives_a_rate_limit_response_and_the_recent_resource_omits_a_folder() {
+        struct Capturing {
+            engine: Engine,
+            calls: Vec<(String, Value)>,
+        }
+        impl McpBackend for Capturing {
+            fn tools(&self) -> Vec<postino_core::OpDef> {
+                postino_core::op_defs()
+            }
+            fn call(&mut self, name: &str, args: Value) -> std::result::Result<Value, String> {
+                self.calls.push((name.to_owned(), args.clone()));
+                self.engine.call(name, args).map_err(|error| error.to_string())
+            }
+            fn rule_has_forward(&self, _id: &str) -> std::result::Result<Option<bool>, String> {
+                Ok(None)
+            }
+            fn set_allow_send(&mut self, allow_send: bool) {
+                self.engine.set_allow_send(allow_send);
+            }
+        }
+        let mut backend = Capturing { engine: Engine::demo(), calls: Vec::new() };
+        let response = raw_handle(
+            &mut backend,
+            &json!({
+                "jsonrpc": "2.0", "method": "tools/call",
+                "params": { "name": "message_get", "arguments": { "id": "msg_001" } }
+            }),
+            false,
+        );
+        assert!(response.is_none(), "a notification must not receive a JSON-RPC response");
+        assert!(backend.calls.is_empty(), "a notification must not perform work");
+
+        let recent = raw_handle(
+            &mut backend,
+            &json!({ "jsonrpc": "2.0", "id": 41, "method": "resources/read", "params": { "uri": "postino://messages/recent" } }),
+            false,
+        )
+        .expect("recent resource");
+        assert!(recent["result"]["contents"][0]["text"].as_str().is_some_and(|text| text.contains("msg_")));
+        let (name, args) = backend.calls.iter().find(|(name, _)| name == "messages_list").expect("messages_list call");
+        assert_eq!(name, "messages_list");
+        assert!(args.get("folder").is_none(), "the recent resource must use the inbox kind, not a literal id: {args}");
+        assert_eq!(args["limit"], 50);
+    }
+
+    #[test]
+    fn the_preview_and_audit_sheets_rotate_the_log_at_the_documented_boundary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("audit.jsonl");
+        std::fs::write(&path, vec![b'x'; MAX_AUDIT_BYTES as usize]).expect("full log");
+        let mut log = AuditLog::new(Some(&path));
+        log.record("tool", "messages_list", "ok");
+        assert!(path.with_extension("jsonl.1").exists(), "the old log must be rotated");
+        let current = std::fs::read_to_string(&path).expect("new log");
+        assert!(current.contains("messages_list"), "{current}");
+        assert!(current.len() < MAX_AUDIT_BYTES as usize);
     }
 
     #[test]

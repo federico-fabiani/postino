@@ -1383,7 +1383,7 @@ fn default_mcp_audit_path(cli: &Cli) -> std::path::PathBuf {
     if let Some(store) = &cli.store {
         return store.parent().map(|parent| parent.join("mcp-audit.jsonl")).unwrap_or_else(|| std::path::PathBuf::from("mcp-audit.jsonl"));
     }
-    if cli.demo || cli.in_process {
+    if cli.demo {
         return std::env::temp_dir().join("postino-demo-mcp-audit.jsonl");
     }
     Engine::data_dir().map(|directory| directory.join("mcp-audit.jsonl")).unwrap_or_else(|| std::env::temp_dir().join("postino-mcp-audit.jsonl"))
