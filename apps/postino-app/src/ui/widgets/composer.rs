@@ -484,7 +484,7 @@ impl<'a> Composer<'a> {
         ui.scope_builder(UiBuilder::new().max_rect(account_rect), |ui| {
             ui.horizontal(|ui| {
                 ui.add_sized([24.0, ui_size::COMPOSER_ACCOUNT_ROW], egui::Label::new(typography::text(Role::Meta, "Da", t.text_faint)));
-                if self.identities.is_empty() {
+                if self.identities.is_empty() && self.state.sender.is_none() {
                     ui.add(
                         egui::Label::new(typography::text(Role::Meta, format!("{} <{}>", self.account.name, self.account.email), t.text_muted))
                             .truncate(),
@@ -492,16 +492,27 @@ impl<'a> Composer<'a> {
                     return;
                 }
                 let selected = self.state.sender.as_deref();
-                let label =
-                    selected.and_then(|email| self.identities.iter().find(|identity| identity.email.eq_ignore_ascii_case(email))).map_or_else(
-                        || format!("{} <{}>", self.account.name, self.account.email),
-                        |identity| format!("{} <{}>", identity.name, identity.email),
-                    );
+                let selected_identity = selected.and_then(|email| self.identities.iter().find(|identity| identity.email.eq_ignore_ascii_case(email)));
+                let stale = selected.is_some() && selected_identity.is_none();
+                let label = selected_identity.map_or_else(
+                    || {
+                        if let Some(sender) = selected.filter(|_| stale) {
+                            format!("{sender} · mittente non disponibile")
+                        } else {
+                            format!("{} <{}>", self.account.name, self.account.email)
+                        }
+                    },
+                    |identity| format!("{} <{}>", identity.name, identity.email),
+                );
                 let mut chosen = None;
                 let combo = egui::ComboBox::from_id_salt(("composer-from", self.state.session))
                     .selected_text(label)
                     .width((ui.available_width() - 8.0).max(160.0))
                     .show_ui(ui, |ui| {
+                        if stale && let Some(sender) = selected {
+                            ui.label(typography::text(Role::Caption, format!("{sender} non è più configurato"), t.text_faint));
+                            ui.separator();
+                        }
                         if ui.selectable_label(selected.is_none(), format!("{} <{}>", self.account.name, self.account.email)).clicked() {
                             chosen = Some(None);
                         }
@@ -542,6 +553,8 @@ impl<'a> Composer<'a> {
             let new_prefix = postino_core::new_message_body(&new_signature);
             if !old_prefix.is_empty() && self.state.body.starts_with(&old_prefix) {
                 self.state.body.replace_range(0..old_prefix.len(), &new_prefix);
+            } else if old_prefix.is_empty() && !new_prefix.is_empty() {
+                self.state.body = format!("{new_prefix}{}", self.state.body);
             } else if self.state.body.is_empty() {
                 self.state.body = new_prefix;
             }
@@ -1061,6 +1074,33 @@ mod tests {
     #[test]
     fn quote_prefixes_every_line() {
         assert_eq!(postino_core::quote_body("Ciao\n\nGiulia"), "> Ciao\n>\n> Giulia");
+    }
+
+    #[test]
+    fn choosing_an_identity_adds_its_signature_to_a_reply_with_no_account_signature() {
+        let account = Account {
+            id: "acc".to_owned(),
+            name: "Ada".to_owned(),
+            email: "ada@example.com".to_owned(),
+            provider: "custom".to_owned(),
+            signature: String::new(),
+        };
+        let identity = Identity {
+            id: "idn_1".to_owned(),
+            account_id: "acc".to_owned(),
+            name: "Laboratorio".to_owned(),
+            email: "lab@example.com".to_owned(),
+            signature: "Laboratorio".to_owned(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let mut state = ComposerState::new(ComposeMode::Reply);
+        state.body = "> Ciao Ada".to_owned();
+        let mut composer = Composer::new(&mut state, &account).identities(std::slice::from_ref(&identity));
+        composer.change_sender(Some("lab@example.com".to_owned()), 1.0);
+        assert_eq!(state.sender.as_deref(), Some("lab@example.com"));
+        assert_eq!(state.body, "-- \nLaboratorio\n\n> Ciao Ada");
+        assert!(state.dirty);
     }
 
     #[test]

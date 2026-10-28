@@ -9957,7 +9957,7 @@ impl PostinoApp {
                             .icon(icons::PLUS)
                             .size(ButtonSize::Sm)
                             .enabled(!self.demo)
-                            .disabled_reason("La modalit�� demo non ha un archivio locale su cui salvare i mittenti")
+                            .disabled_reason("La modalità demo non ha un archivio locale su cui salvare i mittenti")
                             .show(ui)
                             .clicked()
                         {
@@ -21099,6 +21099,10 @@ mod tests {
         assert_eq!(app.composer.sender.as_deref(), Some("ada@example.com"));
         assert!(app.composer.body.starts_with("-- \nLaboratorio\n\n"), "the identity signature replaces the account one: {:?}", app.composer.body);
         assert!(app.composer.dirty, "choosing a sender is part of the draft");
+
+        app.composer.sender = Some("gone@example.com".to_owned());
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "gone@example.com · mittente non disponibile");
     }
 
     #[test]

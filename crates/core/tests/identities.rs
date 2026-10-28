@@ -70,11 +70,34 @@ fn identities_are_scoped_to_one_account() {
         seed_account_with_smtp(&store, &vault, id, 1, 1, &[("inbox", "Inbox", FolderKind::Inbox), ("drafts", "Drafts", FolderKind::Drafts)]);
     }
     let mut engine = Engine::open(store).expect("engine");
-    engine.call("identity_create", json!({ "account": "acc_a", "name": "Ada", "email": "ada@example.com" })).expect("create for A");
+    let id = engine.call("identity_create", json!({ "account": "acc_a", "name": "Ada", "email": "ada@example.com" })).expect("create for A")["id"]
+        .as_str()
+        .expect("identity id")
+        .to_owned();
     assert_eq!(engine.call("identities_list", json!({ "account": "acc_a" })).expect("A").as_array().map(Vec::len), Some(1));
     assert_eq!(engine.call("identities_list", json!({ "account": "acc_b" })).expect("B"), json!([]));
     let missing_account = engine.call("identities_list", json!({})).expect_err("two accounts need an explicit account");
     assert!(missing_account.to_string().contains("account"), "{missing_account}");
+
+    let foreign_update =
+        engine.call("identity_update", json!({ "account": "acc_b", "id": id, "name": "Intruso" })).expect_err("an identity never crosses accounts");
+    assert!(foreign_update.to_string().contains("unknown identity"), "{foreign_update}");
+    let foreign_delete =
+        engine.call("identity_delete", json!({ "account": "acc_b", "id": id })).expect_err("an identity cannot be deleted from another account");
+    assert!(foreign_delete.to_string().contains("unknown identity"), "{foreign_delete}");
+    let foreign_sender = engine
+        .call(
+            "draft_save",
+            json!({
+                "account": "acc_b",
+                "from": id,
+                "to": [{ "name": "Grace", "email": "grace@example.com" }],
+                "subject": "Intrusione",
+                "body_text": "no"
+            }),
+        )
+        .expect_err("a draft cannot borrow another account's sender");
+    assert!(foreign_sender.to_string().contains("unknown sender"), "{foreign_sender}");
 }
 
 #[test]
@@ -116,6 +139,31 @@ fn a_draft_keeps_the_selected_sender_and_send_resolves_it() {
     assert!(unknown_from.to_string().contains("unknown sender"), "{unknown_from}");
     let no_fallback = engine.call("send_dry_run", json!({ "draft": stale_id })).expect_err("a deleted sender never falls back to the account");
     assert!(no_fallback.to_string().contains("neither the account address nor a configured identity"), "{no_fallback}");
+}
+
+#[test]
+fn identity_ids_never_overwrite_an_existing_row() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    let store = harness.open();
+    seed_account_with_smtp(&store, &vault, ACCOUNT_ID, 1, 1, &[("inbox", "Inbox", FolderKind::Inbox), ("drafts", "Drafts", FolderKind::Drafts)]);
+    store.set_meta("identity:idn_1", "{\"id\":\"idn_1\"}").expect("an older identity row");
+    let mut engine = Engine::open(store).expect("engine");
+    let created = create(&mut engine, "Ada", "ada@example.com");
+    assert_eq!(created["id"], "idn_2", "a missing sequence must skip the row that already exists");
+}
+
+#[test]
+fn a_damaged_identity_row_fails_the_duplicate_check_instead_of_being_ignored() {
+    let harness = Harness::new();
+    let vault = MemoryVault::new();
+    let store = harness.open();
+    seed_account_with_smtp(&store, &vault, ACCOUNT_ID, 1, 1, &[("inbox", "Inbox", FolderKind::Inbox), ("drafts", "Drafts", FolderKind::Drafts)]);
+    store.set_meta(&format!("identities.index:{ACCOUNT_ID}"), "[\"idn_bad\"]").expect("the index");
+    store.set_meta("identity:idn_bad", "{not json").expect("a damaged row");
+    let mut engine = Engine::open(store).expect("engine");
+    let error = engine.call("identity_create", json!({ "name": "Ada", "email": "ada@example.com" })).expect_err("a damaged row cannot be skipped");
+    assert!(error.to_string().contains("damaged"), "{error}");
 }
 
 #[test]

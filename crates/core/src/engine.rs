@@ -217,12 +217,30 @@ fn encode_identity(identity: &Identity) -> Result<String, OpError> {
     serde_json::to_string(identity).map_err(|_| OpError::Failed("the identity could not be encoded".to_owned()))
 }
 
+fn identity_email_taken(store: &Store, account_id: &str, index: &[String], email: &str, except: Option<&str>) -> Result<bool, OpError> {
+    for id in index {
+        if except == Some(id.as_str()) {
+            continue;
+        }
+        if read_identity(store, account_id, id)?.is_some_and(|row| row.email.eq_ignore_ascii_case(email)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn allocate_identity_id(store: &Store) -> Result<String, OpError> {
     const KEY: &str = "identity_seq";
     let stored = store.get_meta(KEY).map_err(store_map::read_error)?.and_then(|raw| raw.parse::<i64>().ok()).unwrap_or(0);
-    let next = stored.saturating_add(1);
-    store.set_meta(KEY, &next.to_string()).map_err(store_map::write_error)?;
-    Ok(format!("idn_{next}"))
+    let mut next = stored.max(0).saturating_add(1);
+    loop {
+        let id = format!("idn_{next}");
+        if store.get_meta(&identity_key(&id)).map_err(store_map::read_error)?.is_none() {
+            store.set_meta(KEY, &next.to_string()).map_err(store_map::write_error)?;
+            return Ok(id);
+        }
+        next = next.checked_add(1).ok_or_else(|| OpError::Failed("the identity counter is exhausted; inspect the local store".to_owned()))?;
+    }
 }
 
 fn validate_template_name(name: &str) -> Result<String, OpError> {
@@ -1070,7 +1088,7 @@ impl Engine {
         if email.eq_ignore_ascii_case(&account.email) {
             return Err(OpError::InvalidArgs(format!("{email:?} is the account address; the base sender is always available and needs no identity")));
         }
-        if index.iter().any(|id| read_identity(store, &account.id, id).ok().flatten().is_some_and(|row| row.email.eq_ignore_ascii_case(&email))) {
+        if identity_email_taken(store, &account.id, &index, &email, None)? {
             return Err(OpError::InvalidArgs(format!("an identity for {email:?} already exists")));
         }
         let signature = signature.unwrap_or_default();
@@ -1119,10 +1137,7 @@ impl Engine {
                 )));
             }
             let index = read_identity_index(store, &account.id)?;
-            let duplicate = index.iter().any(|other| {
-                other != id && read_identity(store, &account.id, other).ok().flatten().is_some_and(|row| row.email.eq_ignore_ascii_case(&email))
-            });
-            if duplicate {
+            if identity_email_taken(store, &account.id, &index, &email, Some(id))? {
                 return Err(OpError::InvalidArgs(format!("an identity for {email:?} already exists")));
             }
             identity.email = email;

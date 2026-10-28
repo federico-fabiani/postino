@@ -134,7 +134,7 @@ agent can read the message and recover.
 | `identities_list` | yes | Alternative From senders for one account, sorted by display name; the account address is implicit and never repeated |
 | `identity_create` | no | Add one local sender name/address/signature (≤ 10 per account); the provider must already authorise the address |
 | `identity_update` | no | Change name, address and/or signature; id and creation time stay stable |
-| `identity_delete` | no | Delete one sender; existing drafts keep their From but must be re-saved before they can send |
+| `identity_delete` | no | Delete one sender; existing drafts keep their From but must be re-saved with a current `from` before they can send |
 
 ## Sending over MCP
 
