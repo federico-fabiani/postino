@@ -1,0 +1,25 @@
+name: Renderer corpus
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  newsletters:
+    name: Newsletter corpus (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: newsletter-${{ matrix.os }}
+      - name: Render the twenty-body corpus
+        run: cargo test -p postino-mime --test newsletters

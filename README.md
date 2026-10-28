@@ -330,7 +330,10 @@ MCP      ─┘
 - Headless rendering tests of the shell, gallery, composer, label and search flows (980×600
   light/dark, including the parse error), the reading pane's link/attachment/settings paths with
   injected opener/saver recorders, operation-schema tests, MCP protocol tests, store round-trip tests
-  at both the repository and engine level, and the FTS5 migration/query/performance suites.
+  at both the repository and engine level, the FTS5 migration/query/performance suites, and a
+  twenty-newsletter HTML corpus that must keep its text, drop scripts/forms/iframes and never retain
+  a remote image source. The corpus is wired into the cross-platform renderer workflow for Windows,
+  Linux and macOS.
 
 ![Postino composer: recipients, subject, Markdown formatting bar, body and attachment, with the draft save state in the footer](docs/images/postino-u04-compose.png)
 

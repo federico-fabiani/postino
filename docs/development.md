@@ -229,9 +229,10 @@ they have a reason to exist.
 - **Crypto:** HKDF subkeys, seal/open round trip, tampered values, wrong key and AAD, nonce
   uniqueness, redacted `Debug`. `cargo test -p postino-crypto`.
 - **MIME:** ten synthetic fixtures (plain, alternative, HTML newsletter, nested mixed, RFC 2047,
-  RFC 2231, quoted-printable, XSS, malformed, injection), the allowlist scheme/attribute rules,
-  serializer round trip and injection rejection, Bcc absence, deterministic bytes, bounds and a
-  mutation corpus that must not panic. `cargo test -p postino-mime`.
+  RFC 2231, quoted-printable, XSS, malformed, injection), the allowlist scheme/attribute rules, a
+  twenty-newsletter corpus wired into the Windows/Linux/macOS renderer workflow with no retained
+  remote images, serializer round trip and injection rejection, Bcc absence, deterministic bytes,
+  bounds and a mutation corpus that must not panic. `cargo test -p postino-mime`.
 - **Engine on the store:** a demo-shaped fixture written to a temp store and reopened (accounts,
   folders, counts, messages, recipients, labels, attachments, flags), mutations surviving a reopen
   (draft revision, send, label apply/remove, move, read/star), a repository failure surfacing as

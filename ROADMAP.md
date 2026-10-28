@@ -214,7 +214,8 @@ interaction model before real mail makes them expensive to change. Full spec:
       signatures, a composer picker, and a send-time check against the current list.
 - [ ] Dark theme polish, accessibility pass, Italian/English catalogs.
 - [ ] Verify: render a 20-newsletter corpus on Windows/macOS/Linux; sanitizer tests; no remote
-      request in the default profile.
+      request in the default profile. The corpus and the three-OS renderer workflow exist; Windows
+      passes locally, the first remote Linux/macOS run is still pending.
 
 ## M6 — ship and automate
 
