@@ -97,8 +97,8 @@ Status: `todo` · `active` · `review` · `done`.
 | P12b | M6 ship | ManageSieve client and script activation | deferred (no confirmed provider) |
 | P12c1 | M6 ship | PGP key store v8, key ops, CLI | done |
 | P12c2a | M6 ship | v9 raw retention for signed/encrypted mail, GC | done |
-| P12c2b | M6 ship | PGP/MIME verify/decrypt/sign/encrypt, ops/CLI | active |
-| P12c2c | M6 ship | PGP reading badges, composer toggles, key manager | todo |
+| P12c2b | M6 ship | PGP/MIME verify/decrypt/sign/encrypt, ops/CLI | done |
+| P12c2c | M6 ship | PGP reading badges, composer toggles, key manager | active |
 | P12d | M6 ship | iCalendar invites, RSVP drafts | done |
 | P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | done |
 | P12f | M6 ship | standalone fuzz targets and security CI | todo |
@@ -150,9 +150,9 @@ activation/quit. M4 is complete at `2dcd612`.
 **P11a1** merged the bounded sanitized block model in `crates/mime`; **P11a2** maps the blocks to
 egui in the reading pane, keeps the link sheet/text fallback and the 980×600 budget. The full CI is
 green on the merged tree. P11b (optional sandboxed WebView2) remains after P11a2.
-M6 is split. **P12a** Gmail OAuth, **P12e** Windows packaging, **P12d** iCalendar invites and
-**P12c1** PGP key storage and **P12c2a** v9 raw retention are merged and CI-green; **P12c2b**
-MIME/ops/CLI is active and **P12c2c** app UI follows. **P12b** ManageSieve is deferred
+M6 is split. **P12a** Gmail OAuth, **P12e** Windows packaging, **P12d** iCalendar invites,
+**P12c1** PGP key storage, **P12c2a** v9 raw retention and **P12c2b** PGP/MIME MIME/ops/CLI are merged
+and CI-green; **P12c2c** app UI is active. **P12b** ManageSieve is deferred
 until a provider with a real ManageSieve endpoint is confirmed (Gmail has none); **P12f** fuzz
 remains infrastructure. The audit keeps the vertical packages serial because they touch core/store/app.
 
