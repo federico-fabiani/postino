@@ -294,6 +294,38 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
+            "templates_list",
+            "List compose templates",
+            "Every local compose template, by name ignoring case. A template holds a name, a subject and a plain-text body; it never leaves the encrypted store and no provider-side template is read. Read-only and offline.",
+            TemplatesListArgs,
+            true,
+            false
+        ),
+        def!(
+            "template_create",
+            "Create a compose template",
+            "Store one local compose template. Names are 1-64 characters, subjects at most 998 bytes without control characters, bodies at most 16 KiB of plain text (newlines and tabs allowed); a mailbox holds at most 20 templates. Returns the new template with its id and timestamps. This writes local metadata only and never contacts a server.",
+            TemplateCreateArgs,
+            false,
+            false
+        ),
+        def!(
+            "template_update",
+            "Update a compose template",
+            "Change the name, subject and/or body of one template. At least one field is required; the id and creation instant never change. The same bounds as template_create apply. Returns the updated template.",
+            TemplateUpdateArgs,
+            false,
+            false
+        ),
+        def!(
+            "template_delete",
+            "Delete a compose template",
+            "Delete one local template. This removes local metadata only, never a draft or a message. Returns whether the row existed.",
+            TemplateDeleteArgs,
+            false,
+            true
+        ),
+        def!(
             "pgp_keys_list",
             "List PGP keys",
             "Metadata of the OpenPGP keys stored for one account: id, fingerprint, key id, primary user id, whether the row holds a private key and whether it is passphrase-protected. Never returns key material; use pgp_key_export_public for the public certificate. Keys live only in the encrypted store, there is no keyserver lookup and nothing leaves the machine. Read-only and offline.",
@@ -966,6 +998,47 @@ pub struct PgpKeyExportPublicArgs {
     pub id: String,
     /// Account that owns the key. Required when the mailbox has several accounts.
     pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TemplatesListArgs {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateCreateArgs {
+    /// Display name, 1-64 characters, no control characters.
+    pub name: String,
+    /// Default subject, at most 998 bytes, no control characters.
+    pub subject: String,
+    /// Plain-text body, at most 16 KiB; newlines and tabs are allowed.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateUpdateArgs {
+    /// Template id returned by templates_list.
+    pub id: String,
+    /// New display name. Omit to keep the current one.
+    pub name: Option<String>,
+    /// New default subject. Omit to keep the current one.
+    pub subject: Option<String>,
+    /// New plain-text body. Omit to keep the current one.
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateDeleteArgs {
+    /// Template id returned by templates_list.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateDeleteResult {
+    pub id: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1774,6 +1847,23 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let account = engine.requested_account_id(args.account.as_deref(), "saved_search_recent_clear")?;
             let cleared = engine.clear_recent_searches(Some(&account))?;
             value(SavedSearchRecentClearResult { account, cleared })
+        }
+        "templates_list" => {
+            let _args: TemplatesListArgs = parse(args)?;
+            value(engine.templates()?)
+        }
+        "template_create" => {
+            let args: TemplateCreateArgs = parse(args)?;
+            value(engine.create_template(&args.name, &args.subject, &args.body)?)
+        }
+        "template_update" => {
+            let args: TemplateUpdateArgs = parse(args)?;
+            value(engine.update_template(&args.id, args.name.as_deref(), args.subject.as_deref(), args.body.as_deref())?)
+        }
+        "template_delete" => {
+            let args: TemplateDeleteArgs = parse(args)?;
+            let deleted = engine.delete_template(&args.id)?;
+            value(TemplateDeleteResult { id: args.id, deleted })
         }
         "pgp_keys_list" => {
             let args: PgpKeysListArgs = parse(args)?;

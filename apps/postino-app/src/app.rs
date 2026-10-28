@@ -15,9 +15,9 @@ use eframe::egui::{
 };
 use postino_core::{
     Account, Address, Attachment, AttachmentGet, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor,
-    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView,
-    PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued,
-    SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
+    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessageTemplate, MessagesList, OutboxList, OutboxRunReport,
+    OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult,
+    SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
@@ -45,11 +45,10 @@ use crate::ui::icons;
 use crate::ui::tokens;
 use crate::ui::tokens::{inset, radius, size as ui_size, space, type_size};
 use crate::ui::typography::{self, Role};
-#[cfg(test)]
-use crate::ui::widgets::ComposerFocus;
 use crate::ui::widgets::{
-    AUTOSAVE_DELAY, Badge, BadgeKind, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerState, DEMO_SEND_REASON, Dialog, EmptyState,
-    IconButton, IconButtonSize, ListRow, Menu, MenuItem, NO_SMTP_SEND_REASON, SearchField, SectionHeader, TextField, Toast, ToastKind, ToastResult,
+    AUTOSAVE_DELAY, Badge, BadgeKind, Button, ButtonSize, Chip, ComposeMode, Composer, ComposerFocus, ComposerState, DEMO_SEND_REASON, Dialog,
+    EmptyState, IconButton, IconButtonSize, ListRow, Menu, MenuItem, NO_SMTP_SEND_REASON, SearchField, SectionHeader, TextField, Toast, ToastKind,
+    ToastResult,
 };
 
 /// Which view the command line asked for. Only the tray passes `Outbox`; a desktop launch keeps
@@ -508,6 +507,13 @@ pub struct PostinoApp {
     pgp_delete: Option<PgpDeleteState>,
     /// A one-line result under the PGP settings section.
     pgp_notice: Option<String>,
+    /// Local compose templates. Global to the profile, loaded once for the composer and Settings.
+    templates: Vec<MessageTemplate>,
+    templates_loaded: bool,
+    /// The create/edit template sheet. `id: None` creates a new row.
+    template_editor: Option<TemplateEditorState>,
+    /// The template waiting for the delete confirmation.
+    template_delete: Option<MessageTemplate>,
     /// The sidebar account row, used to return focus when settings closes.
     account_switcher_id: Option<Id>,
     /// The widget to restore when the settings dialog closes.
@@ -1192,6 +1198,10 @@ impl PostinoApp {
             pgp_import: None,
             pgp_delete: None,
             pgp_notice: None,
+            templates: Vec::new(),
+            templates_loaded: false,
+            template_editor: None,
+            template_delete: None,
             account_switcher_id: None,
             settings_return_focus: None,
             settings_focus_pending: false,
@@ -4758,6 +4768,8 @@ impl PostinoApp {
             || self.pgp_prompt.is_some()
             || self.pgp_import.is_some()
             || self.pgp_delete.is_some()
+            || self.template_editor.is_some()
+            || self.template_delete.is_some()
             || self.rules_page.is_some()
         {
             return;
@@ -8996,6 +9008,7 @@ impl PostinoApp {
         if !self.pgp_keys_loaded && !self.demo {
             self.refresh_pgp_keys();
         }
+        self.refresh_templates();
         // Escape closes the signature editor first; only a second Escape leaves Settings. Consuming
         // the key here keeps the modal's own close rule from seeing it.
         if self.signature_editor.is_some()
@@ -9024,6 +9037,9 @@ impl PostinoApp {
         let mut pgp_import = false;
         let mut pgp_delete: Option<PgpKey> = None;
         let mut pgp_export: Option<String> = None;
+        let mut template_new = false;
+        let mut template_edit: Option<MessageTemplate> = None;
+        let mut template_delete: Option<MessageTemplate> = None;
         let focus_close = self.settings_focus_pending;
         self.settings_focus_pending = false;
         let window = ui.ctx().content_rect();
@@ -9395,6 +9411,63 @@ impl PostinoApp {
                         {
                             pgp_import = true;
                         }
+
+                        ui.add_space(space::MD);
+                        let _templates = ui.label(typography::strong(Role::BodySmall, "MODELLI", t.text_faint));
+                        #[cfg(test)]
+                        probe::settings_section(ui, "MODELLI", _templates.rect);
+                        ui.add_space(space::XS);
+                        ui.label(typography::text(
+                            Role::Meta,
+                            "Testi pronti per il composer. Restano in questo archivio cifrato e non vengono inviati a un server finché non li usi in una bozza.",
+                            t.text_faint,
+                        ));
+                        if self.templates.is_empty() {
+                            ui.label(typography::text(Role::BodySmall, "Nessun modello salvato.", t.text_muted));
+                        }
+                        for template in &self.templates {
+                            Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::XS)).show(
+                                ui,
+                                |ui| {
+                                    Sides::new().show(
+                                        ui,
+                                        |ui| {
+                                            ui.vertical(|ui| {
+                                                ui.spacing_mut().item_spacing.y = 1.0;
+                                                ui.label(typography::text(Role::BodySmall, template.name.as_str(), t.text));
+                                                ui.add(
+                                                    egui::Label::new(typography::text(
+                                                        Role::Caption,
+                                                        if template.subject.is_empty() { "Senza oggetto" } else { template.subject.as_str() },
+                                                        t.text_faint,
+                                                    ))
+                                                    .truncate(),
+                                                );
+                                            });
+                                        },
+                                        |ui| {
+                                            if Button::ghost("Modifica").size(ButtonSize::Sm).show(ui).clicked() {
+                                                template_edit = Some(template.clone());
+                                            }
+                                            if Button::danger("Elimina").size(ButtonSize::Sm).show(ui).clicked() {
+                                                template_delete = Some(template.clone());
+                                            }
+                                        },
+                                    );
+                                },
+                            );
+                            ui.add_space(space::XS);
+                        }
+                        if Button::new("Nuovo modello")
+                            .icon(icons::PLUS)
+                            .size(ButtonSize::Sm)
+                            .enabled(!self.demo)
+                            .disabled_reason("La modalità demo non ha un archivio locale su cui salvare i modelli")
+                            .show(ui)
+                            .clicked()
+                        {
+                            template_new = true;
+                        }
                     });
                 #[cfg(test)]
                 probe::settings_scroll(ui, _settings_scroll.inner_rect, _settings_scroll.content_size, _settings_scroll.state.offset);
@@ -9436,6 +9509,15 @@ impl PostinoApp {
         }
         if pgp_import {
             self.open_pgp_import();
+        }
+        if template_new {
+            self.open_template_editor(None);
+        }
+        if let Some(template) = template_edit {
+            self.open_template_editor(Some(&template));
+        }
+        if let Some(template) = template_delete {
+            self.template_delete = Some(template);
         }
         if let Some(account_id) = signature_open {
             let text =
@@ -9544,6 +9626,94 @@ impl PostinoApp {
         if close || response.should_close() {
             self.close_licences(ui.ctx());
         }
+    }
+
+    /// Load the local compose templates once. A failure leaves the composer without a template menu,
+    /// never with a dead entry; the CLI and MCP can still create one.
+    fn refresh_templates(&mut self) {
+        if self.templates_loaded {
+            return;
+        }
+        self.reload_templates();
+    }
+
+    fn reload_templates(&mut self) {
+        self.templates_loaded = true;
+        match self.op("templates_list", json!({})) {
+            Ok(value) => {
+                if let Ok(templates) = serde_json::from_value::<Vec<MessageTemplate>>(value) {
+                    self.templates = templates;
+                }
+            }
+            Err(_) => self.templates.clear(),
+        }
+    }
+
+    fn open_template_editor(&mut self, template: Option<&MessageTemplate>) {
+        self.template_editor = Some(match template {
+            Some(template) => TemplateEditorState {
+                id: Some(template.id.clone()),
+                name: template.name.clone(),
+                subject: template.subject.clone(),
+                body: template.body.clone(),
+                focus_name: true,
+                error: None,
+            },
+            None => TemplateEditorState { id: None, name: String::new(), subject: String::new(), body: String::new(), focus_name: true, error: None },
+        });
+    }
+
+    fn submit_template_editor(&mut self) {
+        let Some(editor) = self.template_editor.clone() else { return };
+        let result = match editor.id.as_deref() {
+            Some(id) => self.op("template_update", json!({ "id": id, "name": editor.name, "subject": editor.subject, "body": editor.body })),
+            None => self.op("template_create", json!({ "name": editor.name, "subject": editor.subject, "body": editor.body })),
+        };
+        match result {
+            Ok(_) => {
+                let name = editor.name.trim().to_owned();
+                self.template_editor = None;
+                self.reload_templates();
+                self.push_info_toast(format!("Modello salvato: {name}"), ToastKind::Info);
+            }
+            Err(error) => {
+                if let Some(editor) = self.template_editor.as_mut() {
+                    editor.error = Some(format!("Il modello non è stato salvato: {error}"));
+                }
+            }
+        }
+    }
+
+    fn delete_template(&mut self, template: &MessageTemplate) {
+        match self.op("template_delete", json!({ "id": template.id })) {
+            Ok(_) => {
+                self.reload_templates();
+                self.push_info_toast(format!("Modello eliminato: {}", template.name), ToastKind::Info);
+            }
+            Err(error) => self.push_info_toast(format!("Il modello non è stato eliminato: {error}"), ToastKind::Error),
+        }
+    }
+
+    /// Insert a local template without discarding what the person already wrote: an empty subject
+    /// takes the template subject, an empty body takes the template body, otherwise the body is
+    /// appended after a blank line. Insertion is undoable through the composer's own text undo.
+    fn insert_template(&mut self, id: &str) {
+        let Some(template) = self.templates.iter().find(|template| template.id == id).cloned() else {
+            self.push_info_toast("Il modello non è più disponibile.", ToastKind::Error);
+            return;
+        };
+        if self.composer.subject.trim().is_empty() {
+            self.composer.subject = template.subject.clone();
+        }
+        if self.composer.body.trim().is_empty() {
+            self.composer.body = template.body.clone();
+        } else {
+            self.composer.body.push_str("\n\n");
+            self.composer.body.push_str(&template.body);
+        }
+        self.composer.focus = Some(ComposerFocus::Body);
+        self.composer.touch(self.now);
+        self.push_info_toast(format!("Modello inserito: {}", template.name), ToastKind::Info);
     }
 
     /// Read the account's key rows once. A failure becomes a sentence in Settings; it never hides
@@ -9807,6 +9977,71 @@ impl PostinoApp {
         }
     }
 
+    fn template_editor_dialog(&mut self, ui: &mut Ui) {
+        let Some(state) = self.template_editor.as_mut() else { return };
+        let t = theme::tokens(self.dark);
+        let mut submit = false;
+        let mut cancel = false;
+        let focus_name = state.focus_name;
+        state.focus_name = false;
+        let title = if state.id.is_some() { "Modifica modello" } else { "Nuovo modello" };
+        let response = egui::Modal::new(Id::new("postino-template-editor"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(520.0);
+                ui.label(typography::strong(Role::Emphasis, title, t.text));
+                ui.add_space(space::SM);
+                ui.label(typography::text(
+                    Role::Secondary,
+                    "Il modello è testo locale: viene inserito nel composer e non viene inviato finché non salvi o invii una bozza.",
+                    t.text_muted,
+                ));
+                ui.add_space(space::MD);
+                TextField::new(&mut state.name, "Nome del modello").label("NOME").width(ui.available_width()).focus(focus_name).show(ui);
+                ui.add_space(space::SM);
+                TextField::new(&mut state.subject, "Oggetto predefinito").label("OGGETTO").width(ui.available_width()).show(ui);
+                ui.add_space(space::SM);
+                TextField::new(&mut state.body, "Testo del modello").label("TESTO").multiline(5).width(ui.available_width()).show(ui);
+                if let Some(error) = state.error.as_deref() {
+                    ui.label(typography::text(Role::Meta, error, t.danger));
+                }
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let save = Button::primary("Salva").enabled(!state.name.trim().is_empty());
+                    submit = save.show(ui).clicked();
+                    cancel = Button::ghost("Annulla").show(ui).clicked();
+                });
+            });
+        if submit {
+            self.submit_template_editor();
+        } else if cancel || response.should_close() {
+            self.template_editor = None;
+        }
+    }
+
+    fn template_delete_dialog(&mut self, ui: &mut Ui) {
+        let Some(template) = self.template_delete.clone() else { return };
+        let body = format!(
+            "Eliminare il modello �?o{}�?? Il testo viene rimosso da questo archivio cifrato. Le bozze che lo hanno già usato non cambiano.",
+            template.name
+        );
+        let mut confirm = false;
+        let mut cancel = false;
+        let response =
+            egui::Modal::new(Id::new("postino-template-delete")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
+                let response = Dialog::new("Eliminare il modello?", body.as_str(), "Elimina").secondary("Annulla").danger(true).width(480.0).show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            });
+        if confirm {
+            self.template_delete = None;
+            self.delete_template(&template);
+        } else if cancel || response.should_close() {
+            self.template_delete = None;
+        }
+    }
+
     fn account_remove_dialog(&mut self, ui: &mut Ui) {
         let Some(state) = self.account_remove.clone() else {
             return;
@@ -10012,6 +10247,7 @@ impl PostinoApp {
         if !self.pgp_keys_loaded && !self.demo {
             self.refresh_pgp_keys();
         }
+        self.refresh_templates();
         let Some(account) = self.account().cloned() else {
             self.composer = ComposerState::closed();
             return;
@@ -10044,6 +10280,7 @@ impl PostinoApp {
                     .demo(self.demo)
                     .attachments_available(attachments_available)
                     .pgp_keys(&self.pgp_keys)
+                    .templates(&self.templates)
                     .show(ui)
             })
             .inner
@@ -10061,6 +10298,9 @@ impl PostinoApp {
         }
         if let Some(attachment) = action.remove_attachment.clone() {
             self.remove_composer_attachment(&attachment);
+        }
+        if let Some(id) = action.insert_template.clone() {
+            self.insert_template(&id);
         }
         if action.pick_files {
             self.pick_composer_files();
@@ -10800,6 +11040,8 @@ impl PostinoApp {
         self.account_remove_dialog(ui);
         self.pgp_import_dialog(ui);
         self.pgp_delete_dialog(ui);
+        self.template_editor_dialog(ui);
+        self.template_delete_dialog(ui);
         self.link_confirmation(ui);
         self.attachment_warning_dialog(ui);
         self.attachment_overwrite_dialog(ui);
@@ -11184,6 +11426,18 @@ struct PgpImportState {
 struct PgpDeleteState {
     key: PgpKey,
     focus_cancel: bool,
+}
+
+/// The create/edit sheet for one local template. The body is plain text and never leaves the
+/// encrypted store except inside a draft the person explicitly saves or sends.
+#[derive(Clone)]
+struct TemplateEditorState {
+    id: Option<String>,
+    name: String,
+    subject: String,
+    body: String,
+    focus_name: bool,
+    error: Option<String>,
 }
 
 /// An attachment whose bytes are already read from the blob store and whose destination is being
@@ -20000,6 +20254,31 @@ mod tests {
     }
 
     #[test]
+    fn settings_lists_local_templates_with_edit_and_delete() {
+        let (ctx, mut app) = ready_app();
+        app.templates_loaded = true;
+        app.templates = vec![MessageTemplate {
+            id: "tpl_1".to_owned(),
+            name: "Preventivo".to_owned(),
+            subject: "Il tuo preventivo".to_owned(),
+            body: "Ciao".to_owned(),
+            created_at: 1,
+            updated_at: 1,
+        }];
+        app.open_settings(&ctx, None);
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        if let Some(scroll) = probe::settings_scroll_view(&ctx) {
+            frame_at(&ctx, &mut app, size, wheel(scroll.center(), 120));
+        }
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "MODELLI");
+        painted_visible(&runs, "Preventivo");
+        painted_visible(&runs, "Modifica");
+        painted_visible(&runs, "Nuovo modello");
+    }
+
+    #[test]
     fn settings_lists_pgp_keys_with_export_and_delete() {
         let (ctx, mut app) = ready_app();
         app.pgp_keys_loaded = true;
@@ -20015,6 +20294,35 @@ mod tests {
         painted_visible(&runs, "Ada Lovelace");
         painted_visible(&runs, "Copia pubblica");
         painted_visible(&runs, "Elimina");
+    }
+
+    #[test]
+    fn the_composer_offers_local_templates_and_never_discards_an_existing_body() {
+        let (ctx, mut app) = ready_app();
+        app.templates_loaded = true;
+        app.templates = vec![MessageTemplate {
+            id: "tpl_1".to_owned(),
+            name: "Preventivo".to_owned(),
+            subject: "Il tuo preventivo".to_owned(),
+            body: "Ciao,\n\nil preventivo è in allegato.".to_owned(),
+            created_at: 1,
+            updated_at: 1,
+        }];
+        app.compose_new();
+        app.composer.body.clear();
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Modelli");
+
+        app.insert_template("tpl_1");
+        assert_eq!(app.composer.subject, "Il tuo preventivo");
+        assert_eq!(app.composer.body, "Ciao,\n\nil preventivo è in allegato.");
+        assert_eq!(app.composer.focus, Some(ComposerFocus::Body));
+
+        app.composer.body = "Testo già scritto".to_owned();
+        app.insert_template("tpl_1");
+        assert_eq!(app.composer.body, "Testo già scritto\n\nCiao,\n\nil preventivo è in allegato.");
+        app.insert_template("tpl_missing");
+        assert_eq!(app.composer.body, "Testo già scritto\n\nCiao,\n\nil preventivo è in allegato.");
     }
 
     #[test]

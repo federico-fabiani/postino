@@ -32,8 +32,8 @@ pub use engine::{
 };
 pub use model::{
     Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
-    MailTls, Message, MessageSummary, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect, RulePreviewRow, RuleRun,
-    RuleRunScope, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
+    MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleEffectStatus, RulePreviewEffect,
+    RulePreviewRow, RuleRun, RuleRunScope, SavedSearch, ServerSettings, SmtpSettings, ThreadSummary,
 };
 pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{
@@ -42,7 +42,7 @@ pub use ops::{
     OutboxAction, OutboxListResult, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult,
     RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchHit,
     SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView,
-    ThreadFlagOutput, ThreadGetResult, ThreadsListResult, op_defs,
+    TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, op_defs,
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
 pub use pgp_mime::{

@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::model::{
     Account, AccountView, Address, Attachment, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor, LabelSummary,
-    MailTls, Message, MessageSummary, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
+    MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary, snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::outbox::{
@@ -104,6 +104,52 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 /// A signature is plain text and small: 4 KiB is already a long signature.
 pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
+const TEMPLATE_INDEX_KEY: &str = "templates.index";
+const TEMPLATE_KEY_PREFIX: &str = "template:";
+const MAX_TEMPLATES: usize = 20;
+const MAX_TEMPLATE_NAME_CHARS: usize = 64;
+const MAX_TEMPLATE_SUBJECT_BYTES: usize = 998;
+const MAX_TEMPLATE_BODY_BYTES: usize = 16 * 1024;
+
+fn template_key(id: &str) -> String {
+    format!("{TEMPLATE_KEY_PREFIX}{id}")
+}
+
+fn validate_template_name(name: &str) -> Result<String, OpError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(OpError::InvalidArgs("a template name must not be empty".to_owned()));
+    }
+    if name.chars().count() > MAX_TEMPLATE_NAME_CHARS {
+        return Err(OpError::InvalidArgs(format!("a template name is limited to {MAX_TEMPLATE_NAME_CHARS} characters")));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(OpError::InvalidArgs("a template name must not contain control characters".to_owned()));
+    }
+    Ok(name.to_owned())
+}
+
+fn validate_template_subject(subject: &str) -> Result<String, OpError> {
+    if subject.len() > MAX_TEMPLATE_SUBJECT_BYTES {
+        return Err(OpError::InvalidArgs(format!("a template subject is limited to {MAX_TEMPLATE_SUBJECT_BYTES} bytes")));
+    }
+    if subject.chars().any(|character| character.is_control()) {
+        return Err(OpError::InvalidArgs("a template subject must not contain control characters".to_owned()));
+    }
+    Ok(subject.to_owned())
+}
+
+fn validate_template_body(body: &str) -> Result<String, OpError> {
+    if body.len() > MAX_TEMPLATE_BODY_BYTES {
+        return Err(OpError::InvalidArgs(format!("a template body is limited to {MAX_TEMPLATE_BODY_BYTES} bytes")));
+    }
+    let normalised = body.replace("\r\n", "\n");
+    if normalised.chars().any(|character| character != '\n' && character != '\t' && character.is_control()) {
+        return Err(OpError::InvalidArgs("a template body allows newlines and tabs only among control characters".to_owned()));
+    }
+    Ok(normalised)
+}
+
 const MAX_LABEL_NAME_CHARS: usize = 48;
 const MAX_LABEL_MESSAGES: usize = 500;
 /// `thread_flag` changes at most this many messages in one call.
@@ -745,12 +791,137 @@ impl Engine {
         if key.is_empty() || key.chars().count() > 128 {
             return Err(OpError::InvalidArgs("an internal meta key must be 1-128 characters".to_owned()));
         }
-        if value.chars().count() > 16 * 1024 {
+        if value.chars().count() > 64 * 1024 {
             return Err(OpError::InvalidArgs("an internal meta value is too long".to_owned()));
         }
         match &self.store {
             Some(store) => store.set_meta(key, value).map_err(store_map::write_error),
             None => Ok(()),
+        }
+    }
+
+    /// Remove one internal `meta` value. The demo engine has no store and reports `false`.
+    pub fn meta_delete(&mut self, key: &str) -> Result<bool, OpError> {
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(OpError::InvalidArgs("an internal meta key must be 1-128 characters".to_owned()));
+        }
+        match &self.store {
+            Some(store) => store.delete_meta(key).map_err(store_map::write_error),
+            None => Ok(false),
+        }
+    }
+
+    /// Local compose templates, ordered by name. The demo engine has no writable template store and
+    /// answers with an empty list, exactly like a mailbox that never saved one.
+    pub fn templates(&self) -> Result<Vec<MessageTemplate>, OpError> {
+        let index = self.template_index()?;
+        let mut templates = Vec::with_capacity(index.len());
+        for id in index {
+            let key = template_key(&id);
+            let Some(raw) = self.meta_get(&key)? else { continue };
+            let template: MessageTemplate = serde_json::from_str(&raw)
+                .map_err(|_| OpError::Failed(format!("the stored template {id:?} is damaged; delete it with templates_delete")))?;
+            templates.push(template);
+        }
+        templates.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()).then_with(|| left.id.cmp(&right.id)));
+        Ok(templates)
+    }
+
+    pub fn create_template(&mut self, name: &str, subject: &str, body: &str) -> Result<MessageTemplate, OpError> {
+        self.require_template_store("template_create")?;
+        let index = self.template_index()?;
+        if index.len() >= MAX_TEMPLATES {
+            return Err(OpError::InvalidArgs(format!("at most {MAX_TEMPLATES} templates are allowed; delete one first")));
+        }
+        let name = validate_template_name(name)?;
+        let subject = validate_template_subject(subject)?;
+        let body = validate_template_body(body)?;
+        let id = self.next_template_id()?;
+        let now = Utc::now().timestamp_millis();
+        let template = MessageTemplate { id: id.clone(), name, subject, body, created_at: now, updated_at: now };
+        self.write_template(&template)?;
+        let mut index = index;
+        index.push(id);
+        self.write_template_index(&index)?;
+        Ok(template)
+    }
+
+    /// Change the editable fields. `None` keeps the current value; the id and creation instant never
+    /// change. An update with no field is refused rather than rewriting `updated_at` for nothing.
+    pub fn update_template(&mut self, id: &str, name: Option<&str>, subject: Option<&str>, body: Option<&str>) -> Result<MessageTemplate, OpError> {
+        self.require_template_store("template_update")?;
+        if name.is_none() && subject.is_none() && body.is_none() {
+            return Err(OpError::InvalidArgs("template_update needs at least one of name, subject or body".to_owned()));
+        }
+        let Some(mut template) = self.template(id)? else {
+            return Err(OpError::InvalidArgs(format!("unknown template {id:?}; use an id returned by templates_list")));
+        };
+        if let Some(name) = name {
+            template.name = validate_template_name(name)?;
+        }
+        if let Some(subject) = subject {
+            template.subject = validate_template_subject(subject)?;
+        }
+        if let Some(body) = body {
+            template.body = validate_template_body(body)?;
+        }
+        template.updated_at = Utc::now().timestamp_millis();
+        self.write_template(&template)?;
+        Ok(template)
+    }
+
+    pub fn delete_template(&mut self, id: &str) -> Result<bool, OpError> {
+        self.require_template_store("template_delete")?;
+        let Some(_template) = self.template(id)? else {
+            return Err(OpError::InvalidArgs(format!("unknown template {id:?}; use an id returned by templates_list")));
+        };
+        self.meta_delete(&template_key(id))?;
+        let mut index = self.template_index()?;
+        index.retain(|entry| entry != id);
+        self.write_template_index(&index)?;
+        Ok(true)
+    }
+
+    fn template(&self, id: &str) -> Result<Option<MessageTemplate>, OpError> {
+        let Some(raw) = self.meta_get(&template_key(id))? else { return Ok(None) };
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|_| OpError::Failed(format!("the stored template {id:?} is damaged; delete it with templates_delete")))
+    }
+
+    fn template_index(&self) -> Result<Vec<String>, OpError> {
+        let Some(raw) = self.meta_get(TEMPLATE_INDEX_KEY)? else { return Ok(Vec::new()) };
+        let index: Vec<String> = serde_json::from_str(&raw)
+            .map_err(|_| OpError::Failed("the template index is damaged; inspect the local store before adding templates".to_owned()))?;
+        if index.len() > MAX_TEMPLATES {
+            return Err(OpError::Failed("the template index is larger than the allowed bound".to_owned()));
+        }
+        Ok(index)
+    }
+
+    fn write_template_index(&mut self, index: &[String]) -> Result<(), OpError> {
+        let encoded = serde_json::to_string(index).map_err(|_| OpError::Failed("the template index could not be encoded".to_owned()))?;
+        self.meta_set(TEMPLATE_INDEX_KEY, &encoded)
+    }
+
+    fn write_template(&mut self, template: &MessageTemplate) -> Result<(), OpError> {
+        let encoded = serde_json::to_string(template).map_err(|_| OpError::Failed("the template could not be encoded".to_owned()))?;
+        self.meta_set(&template_key(&template.id), &encoded)
+    }
+
+    fn next_template_id(&mut self) -> Result<String, OpError> {
+        const KEY: &str = "template_seq";
+        let stored = self.meta_get(KEY)?.and_then(|raw| raw.parse::<i64>().ok()).unwrap_or(0);
+        let next = stored.saturating_add(1);
+        self.meta_set(KEY, &next.to_string())?;
+        Ok(format!("tpl_{next}"))
+    }
+
+    fn require_template_store(&self, operation: &str) -> Result<(), OpError> {
+        if self.is_persistent() {
+            Ok(())
+        } else {
+            Err(OpError::Failed(format!("{operation} needs a local store; the demo mailbox has no writable template list")))
         }
     }
     /// True for the synthetic demo mailbox. Data written by a store-backed engine is real local

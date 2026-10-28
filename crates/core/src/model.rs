@@ -389,6 +389,18 @@ pub struct SavedSearch {
     pub index_pending: bool,
 }
 
+/// One local compose template. Templates never leave the encrypted store and are inserted into a
+/// draft as plain text; they are not provider-side templates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageTemplate {
+    pub id: String,
+    pub name: String,
+    pub subject: String,
+    pub body: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// The public half of a stored key, returned by an explicit export. It never contains secret
 /// material, even when the row also holds a private key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

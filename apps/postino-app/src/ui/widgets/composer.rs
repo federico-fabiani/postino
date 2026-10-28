@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eframe::egui::containers::Sides;
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{self, Align, FontFamily, FontId, Frame, Layout, Margin, Rect, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2, pos2};
-use postino_core::{Account, Address, Attachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS, PgpKey};
+use postino_core::{Account, Address, Attachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS, MessageTemplate, PgpKey};
 
 use crate::theme::Tokens;
 use crate::ui::icons;
@@ -268,6 +268,8 @@ pub struct ComposerResponse {
     pub dropped_files: Vec<PathBuf>,
     /// Ask the screen to remove one attachment row through the operation registry.
     pub remove_attachment: Option<String>,
+    /// Ask the screen to insert one local template. The component never edits the body itself.
+    pub insert_template: Option<String>,
 }
 
 pub struct Composer<'a> {
@@ -277,12 +279,20 @@ pub struct Composer<'a> {
     demo: bool,
     attachments_available: bool,
     pgp_keys: &'a [PgpKey],
+    templates: &'a [MessageTemplate],
 }
 
 impl<'a> Composer<'a> {
     #[must_use]
     pub fn new(state: &'a mut ComposerState, account: &'a Account) -> Self {
-        Self { state, account, send_available: true, demo: true, attachments_available: false, pgp_keys: &[] }
+        Self { state, account, send_available: true, demo: true, attachments_available: false, pgp_keys: &[], templates: &[] }
+    }
+
+    /// Local compose templates. The screen owns loading and insertion; an empty list hides the menu.
+    #[must_use]
+    pub fn templates(mut self, templates: &'a [MessageTemplate]) -> Self {
+        self.templates = templates;
+        self
     }
 
     /// The account's stored PGP keys. The screen loads them through the registry; the component
@@ -382,7 +392,7 @@ impl<'a> Composer<'a> {
                     changed |= subject.changed();
                     ui.add_space(space::SM);
 
-                    self.formatting_bar(ui, &t, now);
+                    self.formatting_bar(ui, &t, now, &mut response);
                     changed |= self.body_field(ui, &t);
                     // A little tail so the last line of the body breathes at the scroll edge.
                     ui.add_space(space::SM);
@@ -559,7 +569,7 @@ impl<'a> Composer<'a> {
         crate::app::probe::composer_pgp(ui, _row.response.rect);
     }
 
-    fn formatting_bar(&mut self, ui: &mut Ui, t: &Tokens, now: f64) {
+    fn formatting_bar(&mut self, ui: &mut Ui, t: &Tokens, now: f64, response: &mut ComposerResponse) {
         let mut action = None;
         Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::XS, inset::XS)).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -580,6 +590,18 @@ impl<'a> Composer<'a> {
                     action = Some(FormatAction::Link);
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if !self.templates.is_empty() {
+                        ui.menu_button(format!("{} Modelli", icons::TEMPLATE), |ui| {
+                            for template in self.templates {
+                                if ui.button(&template.name).clicked() {
+                                    response.insert_template = Some(template.id.clone());
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Inserisci un modello locale");
+                    }
                     ui.label(typography::text(Role::Caption, "Markdown", t.text_faint));
                 });
             });

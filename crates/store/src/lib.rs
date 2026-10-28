@@ -868,6 +868,11 @@ impl Store {
     pub fn get_meta(&self, name: &str) -> Result<Option<String>, StoreError> {
         Ok(self.conn.query_row("SELECT value FROM meta WHERE key = ?1", [name], |row| row.get(0)).optional()?)
     }
+
+    /// Remove one internal `meta` value. Returns whether a row existed.
+    pub fn delete_meta(&self, name: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute("DELETE FROM meta WHERE key = ?1", [name])? == 1)
+    }
 }
 
 /// Add the P9c `origin` column to a v7 file written before P9c. A fresh v7 migration already has it.

@@ -27,11 +27,12 @@ use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     AttachmentGet, CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate,
-    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OAuthGrant, OpDef, OpError,
-    OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult,
-    PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult,
-    RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued,
-    SmtpSetup, SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
+    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessageTemplate, MessagesList, OAuthGrant,
+    OpDef, OpError, OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions,
+    PgpVerifyResult, PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
+    RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult,
+    SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult,
+    ThreadsListResult, VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -216,6 +217,33 @@ enum SavedCommand {
         #[arg(long)]
         account: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum TemplateCommand {
+    /// List local compose templates.
+    List,
+    /// Create a local compose template.
+    Create {
+        name: String,
+        #[arg(long, default_value = "")]
+        subject: String,
+        /// Plain-text body. Newlines are allowed when the shell passes them quoted.
+        #[arg(long, default_value = "")]
+        body: String,
+    },
+    /// Change the name, subject and/or body of a template.
+    Update {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Delete a local compose template.
+    Delete { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -749,6 +777,11 @@ enum Command {
     Saved {
         #[command(subcommand)]
         command: SavedCommand,
+    },
+    /// List, create, update or delete local compose templates.
+    Templates {
+        #[command(subcommand)]
+        command: TemplateCommand,
     },
     /// List, preview, run and undo local rules.
     Rules {
@@ -1627,6 +1660,7 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Threads { .. } => true,
         Command::Thread { command } => matches!(command, ThreadCommand::Get { .. }),
         Command::Saved { command } => matches!(command, SavedCommand::List { .. }),
+        Command::Templates { command } => matches!(command, TemplateCommand::List),
         Command::Rules { command } => matches!(command, RuleCommand::List { .. } | RuleCommand::Preview { .. } | RuleCommand::Runs { .. }),
         Command::Outbox { command } => matches!(command, OutboxCommand::List { .. }),
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
@@ -2592,6 +2626,50 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     print_json(&result)?;
                 } else {
                     say(if result.cleared { "Ricerche recenti cancellate.\n" } else { "Nessuna ricerca recente da cancellare.\n" })?;
+                }
+            }
+        },
+        Command::Templates { command } => match command {
+            TemplateCommand::List => {
+                let templates: Vec<MessageTemplate> = decode(call(engine, "templates_list", json!({}))?)?;
+                if json_output {
+                    print_json(&templates)?;
+                } else {
+                    let mut text = String::new();
+                    for template in &templates {
+                        text.push_str(&format!("{}  {}  {}\n", template.id, template.name, template.subject));
+                    }
+                    if templates.is_empty() {
+                        text.push_str("Nessun modello salvato.\n");
+                    }
+                    say(text)?;
+                }
+            }
+            TemplateCommand::Create { name, subject, body } => {
+                let template: MessageTemplate = decode(call(engine, "template_create", json!({ "name": name, "subject": subject, "body": body }))?)?;
+                if json_output {
+                    print_json(&template)?;
+                } else {
+                    say(format!("{}  {}  {}\n", template.id, template.name, template.subject))?;
+                }
+            }
+            TemplateCommand::Update { id, name, subject, body } => {
+                let template: MessageTemplate =
+                    decode(call(engine, "template_update", json!({ "id": id, "name": name, "subject": subject, "body": body }))?)?;
+                if json_output {
+                    print_json(&template)?;
+                } else {
+                    say(format!("{}  {}  {}\n", template.id, template.name, template.subject))?;
+                }
+            }
+            TemplateCommand::Delete { id } => {
+                let result: TemplateDeleteResult = decode(call(engine, "template_delete", json!({ "id": id }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else if result.deleted {
+                    say(format!("Modello eliminato: {}\n", result.id))?;
+                } else {
+                    say(format!("Nessun modello con id {}.\n", result.id))?;
                 }
             }
         },
@@ -3890,6 +3968,33 @@ mod tests {
         assert!(cleared.summary.to.is_empty(), "an explicitly empty --to did not clear the recipients");
         assert_eq!(cleared.summary.subject, "");
         assert_eq!(cleared.body_text, "Solo il corpo", "an omitted body was cleared");
+    }
+
+    #[test]
+    fn cli_templates_create_update_and_delete_a_local_row() {
+        let fixture = TempStore::new();
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        run(
+            cli(Command::Templates {
+                command: TemplateCommand::Create { name: "Preventivo".to_owned(), subject: "Il preventivo".to_owned(), body: "Ciao".to_owned() },
+            }),
+            &mut engine,
+        )
+        .expect("template create");
+        let templates = engine.templates().expect("templates");
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].name, "Preventivo");
+        let id = templates[0].id.clone();
+        run(
+            cli(Command::Templates {
+                command: TemplateCommand::Update { id: id.clone(), name: None, subject: Some("Nuovo oggetto".to_owned()), body: None },
+            }),
+            &mut engine,
+        )
+        .expect("template update");
+        assert_eq!(engine.templates().expect("templates")[0].subject, "Nuovo oggetto");
+        run(cli(Command::Templates { command: TemplateCommand::Delete { id } }), &mut engine).expect("template delete");
+        assert!(engine.templates().expect("templates").is_empty());
     }
 
     #[test]

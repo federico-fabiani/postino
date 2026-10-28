@@ -95,7 +95,7 @@ MCP      ─┘
   reading width), data (store and blob paths with a copy action, open the blob folder) and version,
   licences and shortcuts; every section fits 980×600 and returns focus to the account switcher on
   `Esc`.
-- Forty-eight typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
+- Typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
   `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_flag`, `message_move`,
   `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
@@ -104,7 +104,8 @@ MCP      ─┘
   `saved_searches_list`, `saved_search_create`, `saved_search_update`, `saved_search_delete`,
   `saved_search_recent_clear`, `rules_list`, `rules_create`, `rules_update`, `rules_delete`,
   `rules_preview`, `rules_run`, `rules_undo`, `rules_runs`, `labels_list`, `label_create`,
-  `label_update`, `label_delete`, `label_apply`.
+  `label_update`, `label_delete`, `label_apply`, `templates_list`, `template_create`,
+  `template_update`, `template_delete`.
 - **Conversations (P9b).** Thread ids come from the message's reference chain: an incoming
   `References`/`In-Reply-To` is normalised, bounded and resolved against the cached conversations; an
   unresolved reference becomes a phantom root waiting for its parent, two resolved threads merge into
@@ -127,6 +128,12 @@ MCP      ─┘
   search field is focused and empty; “Cancella ricerche recenti” clears them. Rename, edit and delete
   are undoable, and `saved_searches_list` plus the four CRUD/recent operations expose the same surface
   to agents.
+- **Local templates (P13c).** Up to 20 named compose templates live in the encrypted `meta` table, so
+  no schema migration is needed. Settings → **MODELLI** creates, edits and deletes them, and the
+  composer's **Modelli** menu inserts a subject only when it is empty and appends the body after any
+  text already written, never discarding it. `templates_list`, `template_create`, `template_update`
+  and `template_delete` are the same registry surface for the CLI and MCP; the demo mailbox has no
+  local store, so its template list is empty and the create button is disabled with a reason.
 - **Local rules (P9c).** The Rules page (Settings → **Regole locali**, or the palette commands
   **Regole locali**/**Nuova regola**) stores up to 100 rules per account on the encrypted v7 tables.
   A rule is a validated search query plus 1–5 actions: move to a folder, add a label, read/unread,

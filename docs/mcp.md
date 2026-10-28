@@ -122,6 +122,10 @@ agent can read the message and recover.
 | `label_update` | no | Rename and/or recolour a label; the id is stable |
 | `label_delete` | no | Delete a label, detach it from every message, return the affected count |
 | `label_apply` | no | Apply or remove one label on 1–500 messages; idempotent |
+| `templates_list` | yes | Local compose templates (≤ 20) sorted by name; demo returns an empty list |
+| `template_create` | no | Create a local template with a validated name, subject and plain-text body in the encrypted store |
+| `template_update` | no | Change the name, subject and/or body of a stored template; id and creation time stay stable |
+| `template_delete` | no | Delete one stored template; drafts that already used it do not change |
 
 ## Sending over MCP
 
