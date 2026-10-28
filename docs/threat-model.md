@@ -1,8 +1,7 @@
 # Postino threat model
 
-> **Status:** M0 + M1 MIME parser (P4a) + encrypted attachment blobs (P4b) + IMAP sync into the store
-> (P5b) + SMTP submission and the outbox (P7) + compose attachment bytes, signatures and reply headers
-> (P8) · **Last updated:** 2026-10-26 · **Review:** before every
+> **Status:** M0–M6 surfaces: MIME/HTML, encrypted blobs, IMAP/SMTP/outbox, OAuth, daemon/MCP,
+> PGP/MIME and calendar invites · **Last updated:** 2026-10-28 · **Review:** before every
 > release that touches networking, storage, HTML rendering or MCP.
 
 ## 1. What we protect

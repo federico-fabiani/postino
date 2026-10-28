@@ -226,7 +226,7 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] Windows per-user packaging source: MSI/ZIP, manifest, external signing (P12e).
 - [ ] Signing/clean-VM verification and DMG/AppImage/deb/rpm.
 - [x] Standalone fuzz targets for MIME/HTML/PGP/calendar and `cargo-deny` security CI (P12f).
-- [ ] Full security review against `docs/threat-model.md`; clean-VM install and restore.
+- [x] Full security review against `docs/threat-model.md` (two read-only audits, no blocker).
 - [ ] Verify: clean install on a fresh VM; agent sends a dry-run and a real message; offline
       restore from backup.
 
