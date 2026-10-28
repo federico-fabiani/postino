@@ -2901,7 +2901,16 @@ impl Engine {
             match existing.state {
                 OutboxState::Queued => {
                     // The same queue operation was retried before the undo window expired: return
-                    // the existing row instead of inserting a duplicate submission.
+                    // the existing row instead of inserting a duplicate submission. Only bytes that
+                    // hash to the row's blob are the same submission: a plaintext row must never be
+                    // returned for a signed or encrypted request, which would deliver cleartext.
+                    let outgoing_hash = blake3::hash(&serialized.raw).to_hex().to_string();
+                    if existing.raw_blob_hash != outgoing_hash {
+                        return Err(OpError::InvalidArgs(format!(
+                            "draft {draft_id:?} is already queued with different content or PGP protection; cancel that row with `postino outbox cancel {}` before sending it again",
+                            existing.id
+                        )));
+                    }
                     let (view, _warning) = view(&existing);
                     return Ok(SendQueued { outbox: view, undo_until: Some(existing.send_at) });
                 }

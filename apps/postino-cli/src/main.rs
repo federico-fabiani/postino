@@ -2700,6 +2700,7 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 )));
             }
             let object = parse_run_args(args, params)?;
+            refuse_run_pgp_passphrase(&op, &object)?;
             let result = call(engine, &op, object)?;
             print_json(&result)?;
         }
@@ -3553,6 +3554,24 @@ fn parse_run_args(args: Option<String>, params: Vec<String>) -> Result<Value> {
         map.insert(key.to_owned(), value);
     }
     Ok(object)
+}
+
+/// `postino run` must never accept a PGP passphrase: it would land in argv and shell history.
+///
+/// The send operations are not sensitive (they do not need a credential), but their optional `pgp`
+/// object carries a signing secret. The typed commands read it from stdin or a no-echo prompt; a
+/// generic JSON argument has no such path.
+fn refuse_run_pgp_passphrase(op: &str, args: &Value) -> Result<()> {
+    if !matches!(op, "message_send" | "send_schedule" | "send_dry_run") {
+        return Ok(());
+    }
+    let passphrase = args.get("pgp").and_then(Value::as_object).and_then(|pgp| pgp.get("passphrase")).and_then(Value::as_str).unwrap_or_default();
+    if passphrase.is_empty() {
+        return Ok(());
+    }
+    Err(usage(
+        "a PGP passphrase is never accepted by `postino run`: use `postino send --sign <key> --passphrase-stdin`, or sign from the desktop app",
+    ))
 }
 
 fn call<B: CliBackend>(engine: &mut B, name: &str, args: Value) -> Result<Value> {
@@ -5131,5 +5150,17 @@ mod tests {
         assert_eq!(request["sign"], json!("pgp_2"));
         assert_eq!(request["passphrase"], json!("segreto"), "the real send request must carry the passphrase the CLI read from stdin");
         assert!(!format!("{signed:?}").contains("segreto"), "Debug must redact the passphrase");
+    }
+
+    #[test]
+    fn run_refuses_a_pgp_passphrase_from_argv() {
+        let leaky = json!({ "draft": "d", "pgp": { "sign": "pgp_1", "passphrase": "segreto" } });
+        let error = refuse_run_pgp_passphrase("message_send", &leaky).expect_err("the generic run must refuse an argv secret");
+        assert!(error.to_string().contains("--passphrase-stdin"), "the error must point at the safe path: {error}");
+        assert!(refuse_run_pgp_passphrase("send_schedule", &leaky).is_err());
+        assert!(refuse_run_pgp_passphrase("send_dry_run", &leaky).is_err());
+        assert!(refuse_run_pgp_passphrase("message_send", &json!({ "draft": "d" })).is_ok());
+        assert!(refuse_run_pgp_passphrase("message_send", &json!({ "draft": "d", "pgp": { "encrypt": ["pgp_1"] } })).is_ok());
+        assert!(refuse_run_pgp_passphrase("messages_list", &leaky).is_ok(), "only the send operations carry PGP options");
     }
 }

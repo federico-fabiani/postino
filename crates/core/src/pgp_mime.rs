@@ -11,9 +11,10 @@
 
 use std::io::Read;
 
-use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, Message, MessageBuilder, SignedPublicKey, SignedSecretKey};
+use pgp::composed::{ArmorOptions, Deserializable, DetachedSignature, Message, MessageBuilder, SignedPublicKey, SignedPublicSubKey, SignedSecretKey};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
+use pgp::packet::{KeyFlags, Signature, SignatureType};
 use pgp::types::{KeyDetails, Password};
 use rand::rngs::OsRng;
 use schemars::JsonSchema;
@@ -108,8 +109,10 @@ pub struct PgpSendOptions {
     #[serde(default)]
     pub encrypt: Vec<String>,
     /// Signing-key passphrase. Never accepted in argv, environment, logs or MCP arguments, and
-    /// never serialized back out.
+    /// never serialized back out. It is also kept out of the published schema: a generic client
+    /// must prompt for it through the CLI or the app, never through `postino run` or MCP.
     #[serde(default, skip_serializing)]
+    #[schemars(skip)]
     pub passphrase: String,
 }
 
@@ -147,6 +150,7 @@ pub enum PgpSendError {
     WrongPassphrase,
     RevokedKey,
     ExpiredKey,
+    NoEncryptionKey,
     MalformedKey,
     MalformedMessage,
     TooManyRecipients,
@@ -164,6 +168,7 @@ impl PgpSendError {
             Self::WrongPassphrase => "the passphrase does not unlock the signing key; nothing was queued",
             Self::RevokedKey => "a recipient key is revoked; the message was not queued and no cleartext was sent",
             Self::ExpiredKey => "a recipient key is expired; the message was not queued and no cleartext was sent",
+            Self::NoEncryptionKey => "a recipient key has no usable encryption key; ask for a certificate with an encryption-capable key or subkey",
             Self::MalformedKey => "a stored PGP key could not be read; export and import it again",
             Self::MalformedMessage => "the outgoing message has no MIME entity to protect",
             Self::TooManyRecipients => "an encrypted send addresses more than 100 keys",
@@ -195,7 +200,7 @@ pub fn verify(store: &Store, account_id: &str, raw: &[u8]) -> Result<PgpVerifyRe
         let Some(armor) = store.get_pgp_public_armor(account_id, &summary.id).map_err(crate::store_map::read_error)? else { continue };
         let Ok(key) = crate::pgp::parse_public_key(&armor) else { continue };
         readable = readable.saturating_add(1);
-        if signature.verify(&key, &entity).is_ok() {
+        if signature_matches(&signature, &key, &entity) {
             return Ok(PgpVerifyResult {
                 state: PgpVerifyState::Verified,
                 key_id: Some(summary.id.clone()),
@@ -311,16 +316,21 @@ pub fn apply_send(store: &Store, account: &Account, raw: Vec<u8>, options: &PgpS
     let parts = pgp_mime::split_outgoing(&raw).map_err(|_| send_error(PgpSendError::MalformedMessage))?;
     let mut entity = parts.entity;
     if let Some((key, password)) = signing {
-        let signed_bytes = entity.strip_suffix(b"\r\n").unwrap_or(&entity);
-        let signature = DetachedSignature::sign_binary_data(OsRng, &key.primary_key, &password, HashAlgorithm::Sha256, signed_bytes)
+        let signature = DetachedSignature::sign_binary_data(OsRng, &key.primary_key, &password, HashAlgorithm::Sha256, entity.as_slice())
             .map_err(|_| send_error(PgpSendError::MalformedKey))?;
         let armor = signature.to_armored_string(ArmorOptions::default()).map_err(|_| send_error(PgpSendError::MalformedKey))?;
-        entity = pgp_mime::serialize_signed(signed_bytes, &armor, MICALG_SHA256).map_err(|_| send_error(PgpSendError::MalformedMessage))?;
+        entity = pgp_mime::serialize_signed(&entity, &armor, MICALG_SHA256).map_err(|_| send_error(PgpSendError::MalformedMessage))?;
     }
     if !recipients.is_empty() {
         let mut builder = MessageBuilder::from_bytes("message", entity).seipd_v1(OsRng, SymmetricKeyAlgorithm::AES256);
         for key in &recipients {
-            builder.encrypt_to_key(OsRng, key).map_err(|_| send_error(PgpSendError::MalformedKey))?;
+            if let Some(subkey) = encryption_subkey(key, now) {
+                builder.encrypt_to_key(OsRng, subkey).map_err(|_| send_error(PgpSendError::MalformedKey))?;
+            } else if primary_can_encrypt(key, now) {
+                builder.encrypt_to_key(OsRng, key).map_err(|_| send_error(PgpSendError::MalformedKey))?;
+            } else {
+                return Err(send_error(PgpSendError::NoEncryptionKey));
+            }
         }
         let armor = builder.to_armored_string(OsRng, ArmorOptions::default()).map_err(|_| send_error(PgpSendError::MalformedKey))?;
         entity = pgp_mime::serialize_encrypted(&armor).map_err(|_| send_error(PgpSendError::MalformedMessage))?;
@@ -387,6 +397,65 @@ fn key_is_expired(key: &SignedPublicKey, now: i64) -> bool {
     };
     let seconds = i64::from(expiry);
     seconds > 0 && now > created.saturating_add(seconds)
+}
+
+/// The newest binding signature decides a subkey's key flags and expiry.
+fn newest_binding(signatures: &[Signature]) -> Option<&Signature> {
+    signatures
+        .iter()
+        .filter(|signature| signature.typ() == Some(SignatureType::SubkeyBinding))
+        .max_by_key(|signature| signature.created().map(|created| created.as_secs()))
+}
+
+/// The newest non-revoked, unexpired encryption-capable subkey, if the certificate has one.
+fn encryption_subkey(key: &SignedPublicKey, now: i64) -> Option<&SignedPublicSubKey> {
+    key.public_subkeys
+        .iter()
+        .filter_map(|subkey| {
+            let binding = newest_binding(&subkey.signatures)?;
+            let flags = binding.key_flags();
+            if !(flags.encrypt_comms() || flags.encrypt_storage()) {
+                return None;
+            }
+            if subkey.signatures.iter().any(|signature| signature.typ() == Some(SignatureType::SubkeyRevocation)) {
+                return None;
+            }
+            let created = i64::from(subkey.key.created_at().as_secs());
+            if binding.key_expiration_time().is_some_and(|expiry| {
+                let seconds = i64::from(expiry.as_secs());
+                seconds > 0 && now > created.saturating_add(seconds)
+            }) {
+                return None;
+            }
+            Some((subkey, created))
+        })
+        .max_by_key(|(_, created)| *created)
+        .map(|(subkey, _)| subkey)
+}
+
+/// Whether the primary key itself may encrypt. Most modern keys delegate encryption to a subkey.
+fn primary_can_encrypt(key: &SignedPublicKey, now: i64) -> bool {
+    let flags = primary_key_flags(key).unwrap_or_default();
+    (flags.encrypt_comms() || flags.encrypt_storage()) && key.details.revocation_signatures.is_empty() && !key_is_expired(key, now)
+}
+
+/// The key flags from the newest self-signature or direct signature.
+fn primary_key_flags(key: &SignedPublicKey) -> Option<KeyFlags> {
+    key.details
+        .users
+        .iter()
+        .flat_map(|user| user.signatures.iter())
+        .chain(key.details.direct_signatures.iter())
+        .max_by_key(|signature| signature.created().map(|created| created.as_secs()))
+        .map(Signature::key_flags)
+}
+
+/// A detached signature may have been made by the primary key or by a signing subkey.
+fn signature_matches(signature: &DetachedSignature, key: &SignedPublicKey, entity: &[u8]) -> bool {
+    if signature.verify(&key.primary_key, entity).is_ok() {
+        return true;
+    }
+    key.public_subkeys.iter().any(|subkey| signature.verify(&subkey.key, entity).is_ok())
 }
 
 fn decrypt_payload(payload: &[u8], password: &Password, key: &SignedSecretKey) -> Option<Vec<u8>> {

@@ -181,13 +181,14 @@ passphrase: MCP has no no-echo prompt and must not receive a secret in an argume
 entries remain available to the CLI (`postino account add|update|remove`, `postino pgp ...`), whose
 password path is a no-echo prompt or one `--password-stdin` / `--passphrase-stdin` line; there is
 deliberately no `--password` or `--passphrase` argv flag, and `postino run` refuses sensitive
-operations so generic JSON arguments cannot carry a password into shell history. `account_test` is
-not sensitive because it never receives a password: it uses the credential already in the OS keyring.
+operations and any send that carries a `pgp.passphrase`, so generic JSON arguments cannot carry a
+secret into shell history. `account_test` is not sensitive because it never receives a password: it
+uses the credential already in the OS keyring.
 
 `message_send`, `send_schedule` and `send_dry_run` accept an optional `pgp` object to sign and/or
-encrypt. A request that carries a `pgp.passphrase` is refused over MCP before dispatch, because the
-server never accepts a signing secret; an agent can still ask for encryption by key id, or prepare a
-draft and leave signing to the CLI or the desktop app.
+encrypt. A request that carries a `pgp.passphrase` is refused over MCP before dispatch and by
+`postino run` after parsing, because neither path has a no-echo prompt; an agent can still ask for
+encryption by key id, or prepare a draft and leave signing to the CLI or the desktop app.
 
 Annotations:
 

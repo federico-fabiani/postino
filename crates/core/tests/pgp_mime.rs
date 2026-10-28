@@ -7,7 +7,7 @@ mod support;
 
 use pgp::composed::{
     ArmorOptions, Deserializable, DetachedSignature, EncryptionCaps, KeyType, Message, MessageBuilder, SecretKeyParamsBuilder, SignedPublicKey,
-    SignedSecretKey,
+    SignedSecretKey, SubkeyParamsBuilder,
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
@@ -36,6 +36,33 @@ fn keypair() -> Keypair {
         .can_encrypt(EncryptionCaps::All)
         .primary_user_id("Postino PGP Test <pgp@example.com>".into())
         .passphrase(Some(PASSPHRASE.to_owned()))
+        .build()
+        .expect("key params")
+        .generate(OsRng)
+        .expect("generate a test key");
+    Keypair {
+        secret_armor: key.to_armored_string(ArmorOptions::default()).expect("secret armor"),
+        public_armor: key.to_public_key().to_armored_string(ArmorOptions::default()).expect("public armor"),
+        fingerprint: key.fingerprint().to_string().to_uppercase(),
+    }
+}
+
+/// A certificate whose primary key signs/certifies and whose subkey carries encryption or signing.
+fn keypair_with_subkey(signing_subkey: bool) -> Keypair {
+    let mut subkey = SubkeyParamsBuilder::default();
+    subkey.key_type(KeyType::Rsa(2048)).passphrase(Some(PASSPHRASE.to_owned()));
+    if signing_subkey {
+        subkey.can_sign(true);
+    } else {
+        subkey.can_encrypt(EncryptionCaps::All);
+    }
+    let key = SecretKeyParamsBuilder::default()
+        .key_type(KeyType::Rsa(2048))
+        .can_certify(true)
+        .can_sign(true)
+        .primary_user_id("Postino PGP Subkey <pgp-subkey@example.com>".into())
+        .passphrase(Some(PASSPHRASE.to_owned()))
+        .subkeys(vec![subkey.build().expect("subkey params")])
         .build()
         .expect("key params")
         .generate(OsRng)
@@ -79,6 +106,14 @@ fn signed_raw(message_headers: &str, entity: &[u8], secret_armor: &str) -> Vec<u
     let signature = sign(entity, secret_armor);
     let part =
         postino_sync::mime::pgp_mime::serialize_signed(signed, &signature, postino_sync::mime::pgp_mime::MICALG_SHA256).expect("signed entity");
+    let mut raw = message_headers.as_bytes().to_vec();
+    raw.extend_from_slice(&part);
+    raw
+}
+
+fn signed_raw_with_signature(message_headers: &str, entity: &[u8], signature_armor: &str) -> Vec<u8> {
+    let part =
+        postino_sync::mime::pgp_mime::serialize_signed(entity, signature_armor, postino_sync::mime::pgp_mime::MICALG_SHA256).expect("signed entity");
     let mut raw = message_headers.as_bytes().to_vec();
     raw.extend_from_slice(&part);
     raw
@@ -310,6 +345,55 @@ fn sign_dry_run_and_encrypt_send_keep_exact_outbox_bytes() {
         postino_sync::mime::pgp_mime::detect(&inner, &postino_sync::mime::Limits::default()).expect("detect inner"),
         Some(postino_sync::mime::pgp_mime::PgpMimeEntity::Signed { .. })
     ));
+}
+
+#[test]
+fn encryption_uses_the_encryption_subkey_when_the_primary_cannot_encrypt() {
+    let (harness, mut engine, fixture_key) = send_fixture();
+    let key = keypair_with_subkey(false);
+    let imported =
+        engine.call("pgp_key_import", json!({ "armored_key": key.secret_armor, "passphrase": PASSPHRASE })).expect("import the subkey certificate");
+    let encryption_id = imported["id"].as_str().expect("id").to_owned();
+    assert_ne!(key_id(&mut engine, &fixture_key.fingerprint), encryption_id, "the two certificates must be distinct");
+
+    let draft = new_draft(&mut engine, &format!("Solo chiave di cifratura\r\n{PLAINTEXT_MARKER}"));
+    engine.call("message_send", json!({ "draft": draft, "pgp": { "encrypt": [encryption_id] } })).expect("encrypt to the encryption subkey");
+    let inner = decrypt_blob(&harness, &draft, &key);
+    assert!(String::from_utf8_lossy(&inner).contains(PLAINTEXT_MARKER), "the queued body was not encrypted to the subkey");
+}
+
+#[test]
+fn verification_accepts_a_signature_made_by_a_signing_subkey() {
+    let key = keypair_with_subkey(true);
+    let entity = entity(BODY);
+    let (secret, _) = SignedSecretKey::from_string(&key.secret_armor).expect("secret key");
+    let password = Password::from(PASSPHRASE);
+    let Some(subkey) = secret.secret_subkeys.first() else { panic!("the fixture must have a signing subkey") };
+    assert!(matches!(subkey.key.unlock(&password, |_, _| Ok(())), Ok(Ok(()))), "the signing subkey must unlock");
+    let signature =
+        DetachedSignature::sign_binary_data(OsRng, &subkey.key, &password, HashAlgorithm::Sha256, entity.as_slice()).expect("sign with the subkey");
+    let armor = signature.to_armored_string(ArmorOptions::default()).expect("signature armor");
+    let raw = signed_raw_with_signature(&headers("subkey"), &entity, &armor);
+
+    let (_harness, mut engine) = received_fixture(&raw, Some(&key));
+    let verified = engine.call("message_pgp_verify", json!({ "id": "msg_pgp" })).expect("verify");
+    assert_eq!(verified["state"], json!(PgpVerifyState::Verified), "a valid signing-subkey signature must not be reported bad: {verified}");
+}
+
+#[test]
+fn a_queued_plaintext_row_cannot_be_reused_for_a_protected_send() {
+    let (harness, mut engine, fixture_key) = send_fixture();
+    let encryption_id = key_id(&mut engine, &fixture_key.fingerprint);
+    let draft = new_draft(&mut engine, "Mai in chiaro\r\n");
+    engine.call("message_send", json!({ "draft": draft })).expect("plain queue");
+    let before = harness.open().active_outbox_for_draft(&draft).expect("lookup").expect("queued row");
+
+    let error = engine
+        .call("message_send", json!({ "draft": draft, "pgp": { "encrypt": [encryption_id] } }))
+        .expect_err("a protected send must not reuse a plaintext row");
+    assert!(error.to_string().contains("already queued"), "{error}");
+    let after = harness.open().active_outbox_for_draft(&draft).expect("lookup").expect("queued row");
+    assert_eq!(before.raw_blob_hash, after.raw_blob_hash, "the queued bytes must not change");
 }
 
 #[test]

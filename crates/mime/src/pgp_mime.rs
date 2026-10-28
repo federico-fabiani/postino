@@ -186,17 +186,12 @@ pub fn split_outgoing(raw: &[u8]) -> Result<OutgoingParts, MimeError> {
 
 /// Wrap an exact MIME entity and an armored detached signature in `multipart/signed`.
 ///
-/// `entity` must already end with CRLF: the boundary line break is not covered by the signature.
-/// The armor is copied verbatim apart from line-ending normalization, so the caller must sign the
-/// same entity it passes here.
+/// The signature must cover `entity` exactly as passed. The serializer writes one CRLF before the
+/// first boundary; extraction strips that one separator, so an entity that itself ends with CRLF
+/// still round-trips byte for byte.
 pub fn serialize_signed(entity: &[u8], signature_armor: &str, micalg: &str) -> Result<Vec<u8>, MimeError> {
     if entity.is_empty() {
         return Err(MimeError::Encode { reason: "the signed entity is empty" });
-    }
-    if entity.ends_with(b"\r\n") {
-        // The CRLF before a boundary belongs to the boundary, not to the signed entity. A caller
-        // that wants a trailing newline in the signed canonical form must not pass it here.
-        return Err(MimeError::Encode { reason: "the signed entity must not end with CRLF" });
     }
     if !is_token(micalg) || micalg.len() > 32 {
         return Err(MimeError::Encode { reason: "micalg must be a short token such as pgp-sha256" });
@@ -523,15 +518,19 @@ mod tests {
 
     #[test]
     fn serialization_round_trips_the_entity_byte_for_byte() {
-        let entity = b"Content-Type: text/plain\r\n\r\nCiao\r\n";
-        let signed_entity = entity.strip_suffix(b"\r\n").unwrap_or(entity);
         let armor = "-----BEGIN PGP SIGNATURE-----\r\nYWJj\r\n-----END PGP SIGNATURE-----";
-        let raw = serialize_signed(signed_entity, armor, MICALG_SHA256).expect("serialize");
-        let PgpMimeEntity::Signed { entity: signed, signature, .. } = detect(&raw, &Limits::default()).expect("detect").expect("pgp") else {
-            panic!("signed")
-        };
-        assert_eq!(signed, signed_entity);
-        assert_eq!(signature, armor.as_bytes());
+        for entity in [
+            b"Content-Type: text/plain\r\n\r\nCiao".as_slice(),
+            b"Content-Type: text/plain\r\n\r\nCiao\r\n".as_slice(),
+            b"Content-Type: text/plain\r\n\r\nCiao\r\n\r\n".as_slice(),
+        ] {
+            let raw = serialize_signed(entity, armor, MICALG_SHA256).expect("serialize");
+            let PgpMimeEntity::Signed { entity: signed, signature, .. } = detect(&raw, &Limits::default()).expect("detect").expect("pgp") else {
+                panic!("signed")
+            };
+            assert_eq!(signed, entity, "the signed entity changed across serialization");
+            assert_eq!(signature, armor.as_bytes());
+        }
     }
 
     #[test]

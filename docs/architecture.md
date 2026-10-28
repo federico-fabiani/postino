@@ -1577,24 +1577,29 @@ usual MIME limits apply before parsing: body size, header size, part size, exact
 `message_pgp_verify` (read-only, offline) reports `verified` with key id, fingerprint and signer,
 `bad` on a mismatch, `no_key` when the account has no stored public key, `unknown` when the entity or
 the stored key cannot be read, and `not_stored` for rows that predate v9; it never fakes a result
-from the parsed body. `message_pgp_decrypt` is `sensitive`: the per-use passphrase comes from stdin
-or a no-echo prompt, is zeroised, and never appears in argv, the environment, a log or a result. The
-decrypted payload is decompressed through a bounded reader and re-parsed under the normal MIME
-limits; HTML goes through the existing sanitizer, and the text/html are returned to the caller only.
-They never overwrite `body_text`/`body_html` and never enter FTS, so `message_get` and `search` keep
-seeing the encrypted row.
+from the parsed body. A detached signature is checked against the primary key and every signing
+subkey, so a certificate that signs with a subkey is not reported as `bad`. `message_pgp_decrypt` is
+`sensitive`: the per-use passphrase comes from stdin or a no-echo prompt, is zeroised, and never
+appears in argv, the environment, a log or a result. The decrypted payload is decompressed through a
+bounded reader and re-parsed under the normal MIME limits; HTML goes through the existing sanitizer,
+and the text/html are returned to the caller only. They never overwrite `body_text`/`body_html` and
+never enter FTS, so `message_get` and `search` keep seeing the encrypted row.
 
 `PgpSendOptions { sign, encrypt, passphrase }` is an optional field of `message_send`,
 `send_schedule` and `send_dry_run`, not a separate draft operation: the draft is serialized once and
 the same bytes are protected, hashed and journaled, so there is no window in which the draft can
 change between "protect" and "send". Signing wraps the MIME entity in `multipart/signed` with a
-SHA-256 detached signature; encryption wraps the signed entity in `multipart/encrypted`; the outer
-RFC 5322 headers are copied unchanged. A missing, unreadable, revoked or expired recipient key, a
-locked or wrongly unlocked signing key, or a demo store (no encrypted key material) aborts before a
-blob or an outbox row is written: there is no cleartext fallback. A send addresses at most 100 keys.
-The passphrase is skipped by `Serialize`, redacted by `Debug` and zeroised on drop; MCP refuses any
-send request that carries one, and never lists or dispatches `message_pgp_decrypt` or
-`pgp_key_import`. The CLI adds `postino pgp message verify|decrypt`, `postino pgp keys ...` and
+SHA-256 detached signature; encryption wraps the signed entity in `multipart/encrypted` and targets
+the newest non-revoked, unexpired encryption-capable subkey (falling back to a primary key that
+carries an encryption flag); the outer RFC 5322 headers are copied unchanged. A retry that finds an
+existing queued row returns it only when the newly serialized bytes have the same BLAKE3 hash as the
+row's blob: a plaintext row can never satisfy a signed or encrypted request. A missing, unreadable,
+revoked or expired recipient key, a locked or wrongly unlocked signing key, or a demo store (no
+encrypted key material) aborts before a blob or an outbox row is written: there is no cleartext
+fallback. A send addresses at most 100 keys. The passphrase is skipped by `Serialize`, redacted by
+`Debug` and zeroised on drop; MCP and `postino run` refuse any send request that carries one, and MCP
+never lists or dispatches `message_pgp_decrypt` or `pgp_key_import`. The CLI adds
+`postino pgp message verify|decrypt`, `postino pgp keys ...` and
 `postino send --sign <id> --encrypt <id>... [--passphrase-stdin]`.
 
 Limits: keys are local only, with no discovery or revocation fetch; verification does not consult
