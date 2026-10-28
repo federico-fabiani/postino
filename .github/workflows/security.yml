@@ -55,3 +55,48 @@ jobs:
           name: fuzz-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+
+  fuzz-windows:
+    name: fuzz windows ${{ matrix.target }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - mime_parse
+          - html_sanitize
+          - pgp_mime_detect
+          - calendar_parse
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly MSVC and rust-src
+        shell: pwsh
+        run: |
+          rustup toolchain install nightly-x86_64-pc-windows-msvc --profile minimal
+          rustup component add rust-src --toolchain nightly-x86_64-pc-windows-msvc
+      - name: Install cargo-fuzz
+        shell: pwsh
+        run: cargo install cargo-fuzz --locked
+      - name: Seed the corpus
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force fuzz/corpus/mime_parse, fuzz/corpus/pgp_mime_detect, fuzz/corpus/html_sanitize, fuzz/corpus/calendar_parse | Out-Null
+          Copy-Item crates/mime/tests/fixtures/*.eml fuzz/corpus/mime_parse/
+          Copy-Item crates/mime/tests/fixtures/*.eml fuzz/corpus/pgp_mime_detect/
+          Copy-Item fuzz/seeds/html.html fuzz/corpus/html_sanitize/seed.html
+          Copy-Item fuzz/seeds/calendar.ics fuzz/corpus/calendar_parse/seed.ics
+      - name: Build and run with MSVC AddressSanitizer
+        shell: cmd
+        env:
+          RUSTUP_TOOLCHAIN: nightly-x86_64-pc-windows-msvc
+          CARGO_TARGET_DIR: ${{ github.workspace }}\target\fuzz-msvc
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          cargo fuzz run --target x86_64-pc-windows-msvc ${{ matrix.target }} -- -runs=5000 -rss_limit_mb=2048 -timeout=10
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-windows-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

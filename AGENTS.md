@@ -153,8 +153,9 @@ cargo test --workspace
 ```
 
 Without `MAKEFLAGS`, `openssl-src` builds serially on Windows (~14 min cold instead of ~4.5 min).
-The MSVC toolchain is installed but lacks `link.exe`; do not switch to it without installing Visual
-Studio Build Tools. `cargo xtask ci` prints a clear error when `dlltool`, `make` or `perl` is missing.
+The VS 2022 BuildTools instance has the C++ workload, Windows SDK and AddressSanitizer for native
+fuzzing (`fuzz/run-windows.ps1`); product builds stay on GNU, so do not switch the default toolchain
+casually. `cargo xtask ci` prints a clear error when `dlltool`, `make` or `perl` is missing.
 
 ## 8. Commits
 
@@ -247,3 +248,6 @@ Append one line when significant time is lost to an issue likely to recur. Forma
 - [fs4/Windows] a hard link to a SQLCipher file derives a different `.lock` path for the same inode.
   fix/avoid: refuse a database with more than one link (`GetFileInformationByHandle` on Windows,
   `nlink` on Unix) before taking the lock.
+- [cargo-fuzz/Windows] `cargo fuzz` defaults to the GNU host target; MSVC fuzzing also needs the VC
+  C++/ASAN components, Windows SDK `LIB` paths and the ASan DLL on `PATH`. fix/avoid: run
+  `fuzz/run-windows.ps1`, which calls `vcvars64.bat` and passes `--target x86_64-pc-windows-msvc`.

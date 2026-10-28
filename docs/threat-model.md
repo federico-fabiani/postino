@@ -66,9 +66,8 @@
   warnings. A deterministic mutation corpus runs in `cargo xtask ci`
   (`crates/mime/tests/no_panic.rs`); `fuzz/` adds libFuzzer targets for `parse`, the HTML
   sanitizer/text converter, PGP/MIME structure detection and `.ics` parsing. The security workflow
-  runs each target for 120 s on Linux; Windows cannot host `cargo-fuzz` (no GNU libFuzzer build and
-  no MSVC `link.exe` here), so the local CI keeps the deterministic corpus and the fuzz build stays
-  a Linux gate. A 120 s run is a smoke gate, not a proof.
+  runs each target for 120 s on Linux and as a smoke job on Windows with MSVC AddressSanitizer; local
+  Windows runs use `fuzz/run-windows.ps1`. A 120 s run is a smoke gate, not a proof.
 - HTML (`postino-mime`, P4a): ammonia allowlist, no `<script>`, `<iframe>`, forms, SVG/MathML,
   `style`, `class`/`id` or `on*`; `javascript:`, `vbscript:`, `data:`, `file:`, relative and
   protocol-relative URLs never survive. Remote images are removed and `http`/`https` sources are
@@ -254,7 +253,7 @@ crash-dump entry above.
 ### 4.5 Supply chain
 
 - `Cargo.lock` committed; `cargo deny check` in the security workflow covers licences and RustSec
-  advisories. The workflow also runs the libFuzzer targets; it is a Linux gate.
+  advisories. The workflow also runs the libFuzzer targets on Linux and Windows.
 - Minimal dependency surface; no npm in M0. If a webview renderer arrives, it is an OS component,
   not a bundled browser, and it gets its own sandbox review.
 - Fonts and logos are hashed and attributed; `cargo xtask assets` fails on drift.

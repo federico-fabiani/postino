@@ -156,7 +156,9 @@ and CI-green. **P12c2c** completes the app surface (reading badges, decrypt shee
 sign/encrypt choices, key table with import/public export/delete) and is CI-green. **P12b**
 ManageSieve is deferred until a provider with a real ManageSieve endpoint is confirmed (Gmail has
 none). **P12f** adds standalone libFuzzer targets for MIME, HTML, PGP/MIME structure and calendar
-invites, plus a Linux security workflow with `cargo deny check`; M6 has no active package left. The audit keeps the vertical packages serial because they touch core/store/app.
+invites, plus a security workflow with `cargo deny check`, Linux 120 s runs and a native Windows MSVC
+AddressSanitizer job; M6 has no active package left. The audit keeps the vertical packages serial
+because they touch core/store/app.
 
 ## 5. Delighters backlog
 
@@ -176,7 +178,9 @@ Candidate small features, each cheap but noticeable. Ship only after the milesto
 
 - **No real mailbox in this environment.** IMAP/SMTP are developed against scripted fake servers
   and golden MIME files; a live Aruba/Gmail smoke test stays a manual release step.
-- **Windows GNU toolchain.** Tests need `C:\msys64\mingw64\bin` on `PATH`; MSVC lacks `link.exe`.
+- **Windows GNU toolchain.** Tests need `C:\msys64\mingw64\bin` on `PATH`. MSVC `link.exe` is now
+  installed for native fuzzing; product builds stay on GNU, so do not switch the default toolchain
+  casually.
 - **Screenshot rendering** depends on a GPU surface; if eframe screenshots fail, fall back to
   `egui_kittest` + wgpu before resorting to OS capture.
 - **Scope drift.** The demo engine must not grow features that M1 will throw away; new state goes

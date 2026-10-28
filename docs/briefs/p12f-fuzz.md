@@ -34,6 +34,6 @@ GNU developer loop.
   tight `Limits` pass.
 - `cargo test -p postino-mime` and `cargo xtask ci` stay green; `cargo metadata` does not include
   `postino-fuzz` as a workspace package.
-- The workflow runs `cargo deny check` and every target on Linux, uploads a crash artifact and fails
-  the job on a crash.
-- The threat model names the targets, the CI location and the Windows/nightly limit.
+- The workflow runs `cargo deny check` and every target on Linux and on Windows with MSVC
+  AddressSanitizer, uploads a crash artifact and fails the job on a crash.
+- The threat model names the targets, the CI locations and the native Windows setup path.

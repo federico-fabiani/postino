@@ -474,8 +474,10 @@ verifies every font and logo against `ATTRIBUTION.toml`; `cargo xtask assets --w
 `ATTRIBUTION.md`.
 
 The separate security workflow runs `cargo deny check` and the libFuzzer targets in `fuzz/` on
-Linux (120 s per target). Local CI deliberately does not build them: `cargo-fuzz` needs nightly and
-a sanitizer, and this Windows GNU host cannot link `libfuzzer-sys`. See `fuzz/README.md`.
+Linux (120 s per target) and on Windows with MSVC AddressSanitizer. Local CI deliberately does not
+build them: `cargo-fuzz` needs nightly and a sanitizer. On Windows, `pwsh -File fuzz/run-windows.ps1`
+builds and runs the same targets natively once the VS C++ ASan components are installed. See
+`fuzz/README.md`.
 
 ### Windows note
 
