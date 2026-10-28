@@ -157,8 +157,14 @@ sign/encrypt choices, key table with import/public export/delete) and is CI-gree
 ManageSieve is deferred until a provider with a real ManageSieve endpoint is confirmed (Gmail has
 none). **P12f** adds standalone libFuzzer targets for MIME, HTML, PGP/MIME structure and calendar
 invites, plus a security workflow with `cargo deny check`, Linux 120 s runs and a native Windows MSVC
-AddressSanitizer job; M6 has no active package left. The audit keeps the vertical packages serial
-because they touch core/store/app.
+AddressSanitizer job. The remaining roadmap work continues as P13 vertical packages: **P13a** MCP
+resources/compact/audit, **P13b** attachment preview, **P13c** local templates, **P13d**
+unsubscribe, **P13e** Gmail label mapping and **P13f** `.eml` export/import are merged and
+CI-green. The audit keeps these vertical packages serial because they touch core/store/app.
+
+**P13f** adds `message_export`/`message_import`, `postino export|import`, palette commands and the
+local **Import** folder. Export is byte-exact only when the v9 raw blob was retained; otherwise it
+rebuilds from stored sanitized content. `.mbox` and Thunderbird import remain open.
 
 ## 5. Delighters backlog
 

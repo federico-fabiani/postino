@@ -49,6 +49,7 @@ pub const COMMAND: &str = regular::COMMAND;
 pub const KEYBOARD: &str = regular::KEYBOARD;
 pub const HELP: &str = regular::QUESTION;
 pub const DOWNLOAD: &str = regular::DOWNLOAD_SIMPLE;
+pub const UPLOAD: &str = regular::UPLOAD_SIMPLE;
 pub const SIDEBAR: &str = regular::SIDEBAR_SIMPLE;
 pub const LIST: &str = regular::LIST;
 pub const FILTER: &str = regular::FUNNEL;

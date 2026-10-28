@@ -15,9 +15,10 @@ use eframe::egui::{
 };
 use postino_core::{
     Account, Address, Attachment, AttachmentGet, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor,
-    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessageTemplate, MessagesList, OutboxList, OutboxRunReport,
-    OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult,
-    SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod, UnsubscribeTarget,
+    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, MAX_ATTACHMENT_BYTES, Message, MessageExport, MessageImport, MessageSummary,
+    MessageTemplate, MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey,
+    PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
+    UnsubscribeInfo, UnsubscribeMethod, UnsubscribeTarget,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
@@ -8309,6 +8310,129 @@ impl PostinoApp {
         }
     }
 
+    /// Export the selected message through `message_export` and write the exact returned bytes.
+    /// The native Save dialog owns overwrite confirmation; a cancelled dialog writes nothing.
+    fn export_selected_eml(&mut self) {
+        if self.demo || self.store.is_none() {
+            self.push_info_toast("La modalità demo non esporta .eml: serve un archivio locale.", ToastKind::Error);
+            return;
+        }
+        let Some(id) = self.selected.clone() else {
+            self.status = "Seleziona prima un messaggio".to_owned();
+            return;
+        };
+        let value = match self.op("message_export", json!({ "id": id, "account": self.active_account })) {
+            Ok(value) => value,
+            Err(_) => {
+                self.push_info_toast("Non è stato possibile preparare l'esportazione del messaggio.", ToastKind::Error);
+                return;
+            }
+        };
+        let exported: MessageExport = match serde_json::from_value(value) {
+            Ok(exported) => exported,
+            Err(_) => {
+                self.push_info_toast("La risposta dell'archivio per l'esportazione non è leggibile.", ToastKind::Error);
+                return;
+            }
+        };
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(exported.eml_base64.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.push_info_toast("I byte .eml non sono decodificabili.", ToastKind::Error);
+                return;
+            }
+        };
+        let suggested = reading::safe_filename(&exported.filename);
+        match self.file_saver.choose_path(&suggested) {
+            Ok(Some(path)) => {
+                if path.is_dir() {
+                    self.push_info_toast("La destinazione scelta è una cartella, non un file.", ToastKind::Error);
+                    return;
+                }
+                match self.file_saver.write(&path, &bytes) {
+                    Ok(()) => self.push_info_toast(
+                        if exported.exact {
+                            "Messaggio esportato con i byte originali.".to_owned()
+                        } else {
+                            "Messaggio esportato e ricostruito dai dati salvati.".to_owned()
+                        },
+                        ToastKind::Success,
+                    ),
+                    Err(error) => self.push_info_toast(format!("Non è stato possibile scrivere il file .eml: {error}"), ToastKind::Error),
+                }
+            }
+            Ok(None) => self.status = "Esportazione annullata".to_owned(),
+            Err(error) => self.push_info_toast(format!("Non è stato possibile aprire la finestra di salvataggio: {error}"), ToastKind::Error),
+        }
+    }
+
+    /// Import one chosen `.eml` through `message_import`, then reload the mailbox and open the copy.
+    /// The engine bounds and sanitizes the file exactly as a server fetch would.
+    fn import_eml(&mut self) {
+        if self.demo || self.store.is_none() {
+            self.push_info_toast("La modalità demo non importa .eml: serve un archivio locale.", ToastKind::Error);
+            return;
+        }
+        let path = match self.file_picker.choose_files() {
+            Ok(paths) if paths.is_empty() => return,
+            Ok(paths) if paths.len() == 1 => paths[0].clone(),
+            Ok(_) => {
+                self.push_info_toast("Scegli un solo file .eml per volta.", ToastKind::Info);
+                return;
+            }
+            Err(error) => {
+                self.push_info_toast(format!("Non è stato possibile aprire la scelta dei file: {error}"), ToastKind::Error);
+                return;
+            }
+        };
+        let size = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                self.push_info_toast(format!("Non è stato possibile leggere il file scelto: {error}"), ToastKind::Error);
+                return;
+            }
+        };
+        if size > MAX_ATTACHMENT_BYTES {
+            self.push_info_toast(format!("Il file supera il limite di {} MiB.", MAX_ATTACHMENT_BYTES / (1024 * 1024)), ToastKind::Error);
+            return;
+        }
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.push_info_toast(format!("Non è stato possibile leggere il file scelto: {error}"), ToastKind::Error);
+                return;
+            }
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let value = match self.op("message_import", json!({ "account": self.active_account, "eml_base64": encoded })) {
+            Ok(value) => value,
+            Err(_) => {
+                self.push_info_toast("Il file non è un messaggio RFC 5322 importabile.", ToastKind::Error);
+                return;
+            }
+        };
+        let imported: MessageImport = match serde_json::from_value(value) {
+            Ok(imported) => imported,
+            Err(_) => {
+                self.push_info_toast("La risposta dell'archivio per l'importazione non è leggibile.", ToastKind::Error);
+                return;
+            }
+        };
+        let folder = imported.message.summary.folder_id.clone();
+        let id = imported.message.summary.id.clone();
+        self.reload_engine_after_sync(true);
+        self.select_folder(folder);
+        self.open_message(id);
+        if imported.warnings.is_empty() {
+            self.push_info_toast("Messaggio importato nella cartella Import.", ToastKind::Success);
+        } else {
+            self.push_info_toast(
+                format!("Messaggio importato con {} avvisi MIME: il contenuto sospeso è stato neutralizzato.", imported.warnings.len()),
+                ToastKind::Info,
+            );
+        }
+    }
+
     fn request_attachment_save(&mut self, attachment: &Attachment) {
         if self.demo {
             // A synthetic attachment was never given bytes; the Save button is disabled with the
@@ -10858,6 +10982,7 @@ impl PostinoApp {
             CommandRule::Sync => self.sync_ready(),
             CommandRule::Store => self.can_add_account(),
             CommandRule::Invite => self.reading_open && self.selected.is_some() && self.invite_ready,
+            CommandRule::StoredMessage => self.selected.is_some() && !self.demo && self.store.is_some(),
         }
     }
 
@@ -10893,6 +11018,8 @@ impl PostinoApp {
             "outbox" => {
                 self.open_outbox();
             }
+            "export_eml" => self.export_selected_eml(),
+            "import_eml" => self.import_eml(),
             "open" => {
                 if self.threads_view {
                     if self.reading_open && self.selected_thread.is_some() && self.thread_summary.is_some() {
@@ -11967,6 +12094,8 @@ enum CommandRule {
     Store,
     /// The three replies need a received, valid METHOD:REQUEST that names an organizer.
     Invite,
+    /// Export needs both a selected message and the encrypted store that holds its bytes.
+    StoredMessage,
 }
 
 impl CommandRule {
@@ -11981,6 +12110,7 @@ impl CommandRule {
             Self::Sync => Some("Aggiungi un account per sincronizzare"),
             Self::Store => Some("La modalità demo non ha un archivio locale"),
             Self::Invite => Some("Apri un invito ricevuto per rispondere"),
+            Self::StoredMessage => Some("Seleziona un messaggio in un archivio locale"),
         }
     }
 
@@ -12011,6 +12141,8 @@ const COMMANDS: &[Command] = &[
     Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", rule: CommandRule::Message, in_palette: false },
     Command { id: "send", label: "Invia", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
     Command { id: "outbox", label: "Coda di invio", icon: icons::SEND, shortcut: "Ctrl+Shift+O", rule: CommandRule::Always, in_palette: true },
+    Command { id: "export_eml", label: "Esporta .eml", icon: icons::DOWNLOAD, shortcut: "", rule: CommandRule::StoredMessage, in_palette: true },
+    Command { id: "import_eml", label: "Importa .eml", icon: icons::UPLOAD, shortcut: "", rule: CommandRule::Store, in_palette: true },
     Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", rule: CommandRule::Message, in_palette: true },
     Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", rule: CommandRule::Message, in_palette: true },
     Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", rule: CommandRule::Message, in_palette: true },
@@ -20492,6 +20624,49 @@ mod tests {
         painted_visible(&runs, "Preventivo");
         painted_visible(&runs, "Modifica");
         painted_visible(&runs, "Nuovo modello");
+    }
+
+    #[test]
+    fn eml_import_opens_the_copy_and_export_writes_a_readable_file() {
+        let (mut app, daemon, store_path, _key, _vault) = daemon_app("p13d-eml-import-export", |store| {
+            seed_account_rows(store, "acc_a", "ada@example.com", None);
+        });
+        let dir = store_path.parent().expect("store directory");
+        let source_path = dir.join("import.eml");
+        let source = postino_testkit::synthetic_message_with_attachment(7, "nota.txt", "text/plain", b"allegato import\n");
+        std::fs::write(&source_path, &source.raw).expect("write fixture .eml");
+        let picker = crate::test_support::RecordingFilePicker::new();
+        picker.set_paths(vec![source_path]);
+        app.file_picker = picker.clone();
+
+        app.import_eml();
+
+        assert_eq!(picker.calls(), 1);
+        assert_eq!(app.folder, "fld_import_acc_a");
+        let id = app.selected.clone().expect("the imported message opens");
+        assert!(app.reading_open, "the imported copy is visible in the reading pane");
+        let message = app.engine.message(&id).expect("the engine reloaded the imported row");
+        assert_eq!(message.summary.subject, "Synthetic message with attachment 7");
+        assert_eq!(message.summary.folder_id, "fld_import_acc_a");
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].filename, "nota.txt");
+
+        let out = dir.join("esportato.eml");
+        let saver = RecordingFileSaver::new();
+        saver.set_path(Some(out.clone()));
+        app.file_saver = saver.clone();
+        app.export_selected_eml();
+
+        assert_eq!(saver.choose_calls(), 1);
+        let writes = saver.writes();
+        assert_eq!(writes.len(), 1, "export must write exactly one file");
+        assert_eq!(writes[0].0, out);
+        let raw = String::from_utf8_lossy(&writes[0].1).into_owned();
+        assert!(raw.starts_with("From: "), "{}", &raw[..raw.len().min(80)]);
+        assert!(raw.contains("Subject: Synthetic message with attachment 7"));
+        assert!(raw.contains("nota.txt"));
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.message.contains("ricostruito")));
+        daemon.shutdown().expect("the daemon stops");
     }
 
     #[test]

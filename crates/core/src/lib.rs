@@ -40,9 +40,9 @@ pub use model::{
 pub use oauth::{Authorized, OAuthAccess, OAuthGrant, authorize};
 pub use ops::{
     AccountAdd, AccountRemove, AccountSignature, AccountTest, AccountUpdate, AccountsList, AppInfo, AttachmentGet, DraftAttachmentResult, DraftSave,
-    DryRunResult, FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageFlag, MessageGet, MessagesList, OpDef,
-    OutboxAction, OutboxListResult, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult,
-    RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchHit,
+    DryRunResult, FoldersList, LabelApply, LabelCreate, LabelDelete, LabelUpdate, LabelsList, MessageExport, MessageFlag, MessageGet, MessageImport,
+    MessagesList, OpDef, OutboxAction, OutboxListResult, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
+    RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchHit,
     SearchReindexResult, SearchResult, SearchSort, SearchStatusResult, SendQueued, SyncNow, SyncReport, SyncStatusReport, SyncStatusView,
     TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, op_defs,
 };

@@ -97,7 +97,8 @@ MCP      ─┘
   `Esc`.
 - Typed operations with JSON Schemas: `app_info`, `accounts_list`, `account_add`,
   `account_update`, `account_test`, `account_remove`, `account_signature_set`, `sync_now`,
-  `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_unsubscribe`, `message_flag`, `message_move`,
+  `sync_status`, `folders_list`, `messages_list`, `message_get`, `message_export`, `message_import`,
+  `message_unsubscribe`, `message_flag`, `message_move`,
   `draft_save`, `draft_attachment_add`, `draft_attachment_remove`, `message_send`, `send_schedule`,
   `outbox_list`, `outbox_cancel`, `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`,
   `search_status`, `search_reindex`, `threads_list`, `thread_get`, `thread_flag`,
@@ -150,6 +151,13 @@ MCP      ─┘
   text already written, never discarding it. `templates_list`, `template_create`, `template_update`
   and `template_delete` are the same registry surface for the CLI and MCP; the demo mailbox has no
   local store, so its template list is empty and the create button is disabled with a reason.
+- **`.eml` export/import (P13f).** `message_export` returns an RFC 5322 file: the exact retained v9
+  bytes for signed/encrypted mail, otherwise a reconstruction from the stored sanitized body and
+  attachments. `message_import` runs a chosen file through the same MIME and attachment bounds as a
+  server fetch and stores it in the account's local **Import** folder; importing a copy never moves
+  or overwrites an existing message with the same Message-ID. The reading pane exports the selected
+  message, the palette imports one `.eml`, and `postino export <id> --out` /
+  `postino import <path>` expose the same operations without a window.
 - **Local rules (P9c).** The Rules page (Settings → **Regole locali**, or the palette commands
   **Regole locali**/**Nuova regola**) stores up to 100 rules per account on the encrypted v7 tables.
   A rule is a validated search query plus 1–5 actions: move to a folder, add a label, read/unread,

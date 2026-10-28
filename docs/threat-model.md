@@ -122,6 +122,12 @@
   guess a type, and stores only a content hash and the encrypted blob. A missing or corrupt blob is a
   send-time refusal naming the file, not a silent drop. Removing a row does not delete a blob another
   draft may share; the unreferenced sweep remains P9 work and is documented as such.
+- `.eml` import/export (P13f) bounds the base64 string and decodes at most 25 MiB, then feeds the
+  bytes through the same MIME parser, sanitizer and attachment bounds as a server fetch. Import writes
+  to a per-account local **Import** folder and never treats a duplicate Message-ID as a move, so a
+  hostile file cannot relocate cached mail. Export returns exact retained v9 bytes or a reconstruction
+  from stored sanitized content; the app writes the chosen path through the injected file saver and
+  never opens the result, and no operation executes an imported file.
 
 ### 4.2 Account compromise
 
@@ -282,7 +288,8 @@ crash-dump entry above.
 - Sync resumes without gaps: the per-folder cursor advances only after a message transaction commits,
   so a crash re-fetches one message at most. A `UIDVALIDITY` change discards that folder's cache but
   keeps local drafts, which were never on the server.
-- Backups are the user's responsibility, but export/import is a first-class feature.
+- Backups are the user's responsibility, but `.eml` export/import is a first-class feature. The
+  exported file is plaintext on disk by definition; the user chooses the destination.
 
 ### 4.7 SMTP submission and the outbox (P7)
 

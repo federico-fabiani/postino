@@ -47,6 +47,10 @@ pub(crate) fn unknown_message(id: &str) -> OpError {
     OpError::InvalidArgs(format!("unknown message {id:?}; use an id returned by messages_list"))
 }
 
+fn outgoing_mailbox(address: &postino_store::Address) -> postino_sync::mime::Mailbox {
+    postino_sync::mime::Mailbox { name: (!address.name.is_empty()).then(|| address.name.clone()), address: address.email.clone() }
+}
+
 fn not_stored_verify() -> crate::pgp_mime::PgpVerifyResult {
     crate::pgp_mime::PgpVerifyResult {
         state: crate::pgp_mime::PgpVerifyState::NotStored,
@@ -1461,6 +1465,115 @@ impl Engine {
         let Some(hash) = store.message_raw_blob_hash(message_id).map_err(store_map::read_error)? else { return Ok(not_stored_decrypt()) };
         let raw = store.blobs().get(&hash, crate::pgp_mime::MAX_RAW_MESSAGE_BYTES).map_err(store_map::blob_read_error)?;
         crate::pgp_mime::decrypt(store, &account.id, &raw, passphrase)
+    }
+
+    /// Export one message as RFC 5322 bytes.
+    ///
+    /// A message whose exact raw bytes were retained (a PGP signed/encrypted row, schema v9) is
+    /// returned byte-for-byte. Every other message is rebuilt from the stored headers, sanitized body
+    /// and attachments: the result is valid `.eml`, but it is not the original wire encoding.
+    pub fn message_export(&self, message_id: &str, account: Option<&str>) -> Result<(Vec<u8>, bool), OpError> {
+        let account = self.requested_account(account, "message_export")?;
+        let current = self.message_result(message_id)?.ok_or_else(|| unknown_message(message_id))?;
+        if self.folders.iter().find(|folder| folder.id == current.summary.folder_id).is_none_or(|folder| folder.account_id != account.id) {
+            return Err(OpError::InvalidArgs(format!("message {message_id:?} belongs to another account")));
+        }
+        let store = self.require_store("message_export")?;
+        if let Some(hash) = store.message_raw_blob_hash(message_id).map_err(store_map::read_error)? {
+            let raw = store.blobs().get(&hash, crate::pgp_mime::MAX_RAW_MESSAGE_BYTES).map_err(store_map::blob_read_error)?;
+            return Ok((raw.to_vec(), true));
+        }
+        let (message, attachments) =
+            store.get_message_with_attachments(message_id).map_err(store_map::read_error)?.ok_or_else(|| unknown_message(message_id))?;
+        if message.summary.from.email.is_empty() {
+            return Err(OpError::Failed(format!("message {message_id:?} has no usable From address; it cannot be exported as .eml")));
+        }
+        let mut parts = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let Some(hash) = attachment.blob_hash else {
+                return Err(OpError::Failed(format!(
+                    "attachment {:?} has no stored bytes; the message cannot be exported without inventing them",
+                    attachment.filename
+                )));
+            };
+            let data = store.blobs().get(&hash, attachment.size.saturating_add(1024)).map_err(store_map::blob_read_error)?;
+            parts.push(postino_sync::mime::OutgoingAttachment {
+                filename: attachment.filename,
+                mime: attachment.mime,
+                data: data.to_vec(),
+                content_id: None,
+            });
+        }
+        let date = chrono::DateTime::<Utc>::from_timestamp_millis(message.summary.date)
+            .ok_or_else(|| OpError::Failed(format!("message {message_id:?} has an invalid date and cannot be exported")))?;
+        let outgoing = postino_sync::mime::OutgoingMessage {
+            from: outgoing_mailbox(&message.summary.from),
+            to: message.summary.to.iter().map(outgoing_mailbox).collect(),
+            cc: message.cc.iter().map(outgoing_mailbox).collect(),
+            bcc: message.bcc.iter().map(outgoing_mailbox).collect(),
+            subject: message.summary.subject,
+            date,
+            text: message.body_text,
+            html: message.body_html,
+            attachments: parts,
+            in_reply_to: None,
+            references: Vec::new(),
+            message_id: message.message_id,
+            extra_headers: Vec::new(),
+        };
+        let serialized = postino_sync::mime::serialize(&outgoing)
+            .map_err(|error| OpError::Failed(format!("the stored message could not be serialized as .eml: {error}")))?;
+        Ok((serialized.raw, false))
+    }
+
+    /// Import one `.eml` file into a per-account local `Import` folder.
+    ///
+    /// The same ingest path as a server fetch sanitizes the HTML, stores bounded attachment blobs,
+    /// indexes the body and keeps PGP raw bytes. A matching Message-ID never moves cached mail: the
+    /// import is a separate local copy.
+    pub fn message_import(&mut self, account: Option<&str>, raw: &[u8]) -> Result<(Message, Vec<String>), OpError> {
+        let account = self.requested_account(account, "message_import")?;
+        if raw.is_empty() {
+            return Err(OpError::InvalidArgs("the file is empty; it is not an RFC 5322 message".to_owned()));
+        }
+        let store = self.require_store("message_import")?;
+        let account_row = store.get_account(&account.id).map_err(store_map::read_error)?.ok_or_else(|| unknown_account(&account.id))?;
+        let existing =
+            self.folders.iter().find(|folder| folder.account_id == account.id && folder.kind == FolderKind::Custom && folder.name == "Import");
+        let folder_row = match existing {
+            Some(folder) => postino_store::Folder {
+                id: folder.id.clone(),
+                account_id: folder.account_id.clone(),
+                name: folder.name.clone(),
+                kind: postino_store::FolderKind::Custom,
+                unread: folder.unread,
+                total: folder.total,
+                uid_validity: None,
+                uid_next: None,
+                last_sync_at: None,
+            },
+            None => {
+                let row = postino_store::Folder {
+                    id: format!("fld_import_{}", account.id),
+                    account_id: account.id.clone(),
+                    name: "Import".to_owned(),
+                    kind: postino_store::FolderKind::Custom,
+                    unread: 0,
+                    total: 0,
+                    uid_validity: None,
+                    uid_next: None,
+                    last_sync_at: None,
+                };
+                store.upsert_folder(&row).map_err(store_map::write_error)?;
+                row
+            }
+        };
+        let imported = postino_sync::import_message(store, &account_row, &folder_row, raw, &postino_sync::SyncLimits::default())
+            .map_err(|error| OpError::Failed(format!("the file could not be imported: {error}")))?;
+        self.reload_mailbox()?;
+        let message =
+            self.message_result(&imported.message_id)?.ok_or_else(|| OpError::Failed("the imported message could not be read back".to_owned()))?;
+        Ok((message, imported.warnings))
     }
 
     /// The RFC 2369/8058 choices captured at ingest for one received message.

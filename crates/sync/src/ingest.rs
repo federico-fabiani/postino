@@ -84,7 +84,8 @@ pub(crate) fn ingest(
     };
 
     let normalised = normalise_id(&parsed, envelope, uid, warnings);
-    let Some((id, existing)) = choose_identity(store, folder, index, &account.id, normalised.as_deref(), uid, uid_validity)? else {
+    let seed = IdentitySeed { message_id: normalised.as_deref(), uid, uid_validity, allow_cross_folder_move: context.allow_cross_folder_move };
+    let Some((id, existing)) = choose_identity(store, folder, index, &account.id, seed)? else {
         warnings.push(format!("message UID {uid} was skipped: every stable id candidate is taken by another message"));
         return Ok(None);
     };
@@ -245,15 +246,21 @@ pub(crate) fn ingest(
 /// deleted. Drafts and Trash rows are never adopted: a Sent copy moved back to Drafts is being edited.
 /// `None` means every candidate is taken; the caller skips the message rather than overwrite another
 /// row.
+struct IdentitySeed<'a> {
+    message_id: Option<&'a str>,
+    uid: u32,
+    uid_validity: u32,
+    allow_cross_folder_move: bool,
+}
+
 fn choose_identity(
     store: &store::Store,
     folder: &store::Folder,
     index: &FolderIndex,
     account_id: &str,
-    message_id: Option<&str>,
-    uid: u32,
-    uid_validity: u32,
+    seed: IdentitySeed<'_>,
 ) -> Result<Option<(String, Option<Existing>)>, SyncError> {
+    let IdentitySeed { message_id, uid, uid_validity, allow_cross_folder_move } = seed;
     let Some(message_id) = message_id else {
         let id = ids::message_id(account_id, &folder.id, uid_validity, uid, None);
         let existing = index.cached.get(&id).map(|row| Existing { unread: row.unread, starred: row.starred });
@@ -288,7 +295,7 @@ fn choose_identity(
             continue;
         }
         if let Some(existing) = store.message_flags(variant)? {
-            if position == 0 && existing.folder_id != folder.id {
+            if position == 0 && existing.folder_id != folder.id && allow_cross_folder_move {
                 // The same Message-ID in another folder is a move: keep the row and its labels.
                 return Ok(Some((variant.clone(), Some(Existing { unread: existing.unread, starred: existing.starred }))));
             }

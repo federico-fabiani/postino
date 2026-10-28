@@ -27,12 +27,12 @@ use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     AttachmentGet, CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate,
-    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessageTemplate, MessagesList, OAuthGrant,
-    OpDef, OpError, OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions,
-    PgpVerifyResult, PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
-    RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult,
-    SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult,
-    ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod, VaultError,
+    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MAX_ATTACHMENT_BYTES, MailTls, MessageExport, MessageFlag, MessageGet, MessageImport,
+    MessageSummary, MessageTemplate, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult,
+    PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult, PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult,
+    RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult,
+    SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, TemplateDeleteResult,
+    ThreadFlagOutput, ThreadGetResult, ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod, VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -664,6 +664,21 @@ enum Command {
     /// Show the List-Unsubscribe choices captured for one message.
     Unsubscribe {
         id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Import one `.eml` file into the local Import folder.
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Export one message as an `.eml` file, or print its base64 with --json.
+    Export {
+        id: String,
+        /// Write the RFC 5322 bytes here instead of printing base64 JSON.
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[arg(long)]
         account: Option<String>,
     },
@@ -1663,6 +1678,8 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Attachment { .. } => true,
         Command::Read { mark_read, .. } => !mark_read,
         Command::Unsubscribe { .. } => true,
+        Command::Export { .. } => true,
+        Command::Import { .. } => false,
         Command::Label { command } => matches!(command, LabelCommand::List),
         Command::Threads { .. } => true,
         Command::Thread { command } => matches!(command, ThreadCommand::Get { .. }),
@@ -1734,6 +1751,8 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             | Command::Messages { .. }
             | Command::Read { .. }
             | Command::Unsubscribe { .. }
+            | Command::Import { .. }
+            | Command::Export { .. }
             | Command::Search { .. }
             | Command::Flag { .. }
             | Command::Draft { .. }
@@ -2185,6 +2204,51 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 if info.one_click {
                     say("Il mittente dichiara One-Click; Postino non invia richieste in background.")?;
                 }
+            }
+        }
+        Command::Import { path, account } => {
+            let size = std::fs::metadata(&path).with_context(|| format!("lettura di {}", path.display()))?.len();
+            if size > MAX_ATTACHMENT_BYTES {
+                bail!("il file è troppo grande: {size} byte, il limite è {MAX_ATTACHMENT_BYTES}");
+            }
+            let raw = std::fs::read(&path).with_context(|| format!("lettura di {}", path.display()))?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+            let imported: MessageImport = decode(call(engine, "message_import", json!({ "account": account, "eml_base64": encoded }))?)?;
+            if json_output {
+                print_json(&imported)?;
+            } else {
+                say(format!(
+                    "Importato: {}\n{} avvisi MIME.\nUsa `postino export {} --out <file>` per rileggerlo.",
+                    format_summary(&imported.message.summary),
+                    imported.warnings.len(),
+                    imported.message.summary.id
+                ))?;
+            }
+        }
+        Command::Export { id, out, account } => {
+            let exported: MessageExport = decode(call(engine, "message_export", json!({ "id": id, "account": account }))?)?;
+            let raw = base64::engine::general_purpose::STANDARD.decode(exported.eml_base64.as_bytes()).context("decodifica dei byte .eml")?;
+            if let Some(path) = out {
+                std::fs::write(&path, &raw).with_context(|| format!("scrittura di {}", path.display()))?;
+                if json_output {
+                    print_json(&exported)?;
+                } else {
+                    say(format!(
+                        "Esportato: {}\n{} byte ({})",
+                        path.display(),
+                        raw.len(),
+                        if exported.exact { "byte originali conservati" } else { "ricostruito dai dati salvati" }
+                    ))?;
+                }
+            } else if json_output {
+                print_json(&exported)?;
+            } else {
+                say(format!(
+                    "{}: {} byte ({}).\nUsa --out <file> per salvarlo, oppure --json per il base64.",
+                    exported.filename,
+                    raw.len(),
+                    if exported.exact { "byte originali conservati" } else { "ricostruito dai dati salvati" }
+                ))?;
             }
         }
         Command::Search { query, limit, offset, folder, label, account, unread, attachments, sort } => {
@@ -4120,6 +4184,30 @@ mod tests {
         let missing = fixture.path().parent().expect("temp dir").join("manca.pdf");
         let error = run(cli(Command::Draft { command: DraftCommand::Attach { id: draft, path: missing } }), &mut engine).expect_err("missing file");
         assert!(format!("{error:#}").contains("lettura del file"), "{error:#}");
+    }
+
+    #[test]
+    fn cli_import_puts_an_eml_in_the_import_folder_and_export_writes_it_back() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        let store_path = fixture.path();
+        let dir = store_path.parent().expect("temp dir");
+        let source_path = dir.join("messaggio.eml");
+        let source = postino_testkit::synthetic_message_with_attachment(1, "nota.txt", "text/plain", b"allegato cli\n");
+        std::fs::write(&source_path, &source.raw).expect("fixture .eml");
+
+        run(cli(Command::Import { path: source_path, account: Some("acc_cli".to_owned()) }), &mut engine).expect("import");
+        let imported =
+            engine.messages().iter().find(|message| message.subject == "Synthetic message with attachment 1").cloned().expect("imported message");
+        assert_eq!(imported.folder_id, "fld_import_acc_cli");
+        let out = dir.join("riesportato.eml");
+        run(cli(Command::Export { id: imported.id.clone(), out: Some(out.clone()), account: Some("acc_cli".to_owned()) }), &mut engine)
+            .expect("export");
+        let raw = String::from_utf8_lossy(&std::fs::read(&out).expect("exported file")).into_owned();
+        assert!(raw.starts_with("From: "), "{}", &raw[..raw.len().min(80)]);
+        assert!(raw.contains("Subject: Synthetic message with attachment 1"));
+        assert!(raw.contains("nota.txt"));
     }
 
     #[test]

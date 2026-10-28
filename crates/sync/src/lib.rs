@@ -52,6 +52,7 @@
 
 mod folder;
 mod ids;
+mod importing;
 mod ingest;
 mod labels;
 mod status;
@@ -67,6 +68,7 @@ use postino_store as store;
 use thiserror::Error;
 
 pub use folder::{PlannedFolder, plan_folders};
+pub use importing::{Imported, import_message};
 /// The MIME crate this bridge parses and serializes through. The engine reads PGP/MIME structure
 /// through this re-export because the layer rule lets core depend on sync, not on the foundation
 /// crate directly.
@@ -217,6 +219,9 @@ pub(crate) struct Context<'a> {
     pub(crate) cancel: &'a AtomicBool,
     /// The server advertised Gmail's `X-GM-EXT-1`; labels are present and meaningful.
     pub(crate) gmail_labels: bool,
+    /// A server sync treats the same Message-ID in another folder as a move. A local import must not
+    /// move cached mail just because the file has the same Message-ID.
+    pub(crate) allow_cross_folder_move: bool,
 }
 
 /// Mutable state shared by every folder of one run.
@@ -371,7 +376,7 @@ async fn run_session(
     log::info!("sync: account {}: {} folders to reconcile", account.id, outcome.folders);
 
     let gmail_labels = session.capabilities().x_gm_ext();
-    let context = Context { store, account, limits, cancel, gmail_labels };
+    let context = Context { store, account, limits, cancel, gmail_labels, allow_cross_folder_move: true };
     let mut progress = RunProgress { remaining: limits.max_messages, seen: HashSet::new(), drifted: HashSet::new() };
     let mut exhausted = false;
     let mut done = 0u32;

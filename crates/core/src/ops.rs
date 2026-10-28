@@ -94,6 +94,22 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
+            "message_export",
+            "Export a message",
+            "Return one message as RFC 5322 bytes, base64-encoded. A PGP signed/encrypted row with retained v9 raw bytes is exact; any other row is rebuilt from stored headers, sanitized body and attachments, so its wire encoding is valid but not byte-identical to the original. Read-only and offline; `postino export` writes the same bytes to a file.",
+            MessageExportArgs,
+            true,
+            false
+        ),
+        def!(
+            "message_import",
+            "Import a message",
+            "Import one `.eml` file (RFC 5322 bytes, base64, at most 25 MiB) into a per-account local `Import` folder. The same MIME sanitizer and attachment limits as a server fetch apply, bodies are indexed and PGP raw bytes are retained. A matching Message-ID never moves cached mail: the import is a separate local copy. Returns the stored message and bounded MIME warnings.",
+            MessageImportArgs,
+            false,
+            false
+        ),
+        def!(
             "message_invite",
             "Read a calendar invite",
             "Parse the first text/calendar attachment of one message into an invite card: METHOD, summary, organizer, attendees, start/end, location, recurrence and timezone flags, validity and warnings. The part is capped at 256 KiB, 1000 components and 2000 attendees; malformed or hostile input returns `invite: null` and the file stays a normal attachment. Read-only and offline: nothing is stored, expanded or added to a calendar.",
@@ -604,6 +620,24 @@ pub struct MessageGetArgs {
 pub struct AttachmentGetArgs {
     /// Attachment id returned by message_get or draft_save.
     pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessageExportArgs {
+    /// Message id returned by messages_list.
+    pub id: String,
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessageImportArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Standard base64 of the `.eml` bytes. At most 25 MiB before encoding.
+    pub eml_base64: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1406,6 +1440,23 @@ pub struct AttachmentGet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageExport {
+    pub message_id: String,
+    pub filename: String,
+    /// Standard base64 of the RFC 5322 bytes.
+    pub eml_base64: String,
+    /// True only when retained v9 raw bytes were returned without reconstruction.
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageImport {
+    pub message: Message,
+    /// MIME sanitization and attachment warnings, bounded by the ingest layer.
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageFlag {
     pub message: MessageSummary,
 }
@@ -1734,6 +1785,14 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "attachment_get" => {
             let args: AttachmentGetArgs = parse(args)?;
             attachment(engine, args)
+        }
+        "message_export" => {
+            let args: MessageExportArgs = parse(args)?;
+            export(engine, args)
+        }
+        "message_import" => {
+            let args: MessageImportArgs = parse(args)?;
+            import(engine, args)
         }
         "message_invite" => {
             let args: MessageInviteArgs = parse(args)?;
@@ -2244,6 +2303,30 @@ fn attachment(engine: &Engine, args: AttachmentGetArgs) -> Result<Value, OpError
     let bytes = engine.attachment_bytes(&args.id)?;
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     value(AttachmentGet { attachment, data_base64 })
+}
+
+fn export(engine: &Engine, args: MessageExportArgs) -> Result<Value, OpError> {
+    let (raw, exact) = engine.message_export(&args.id, args.account.as_deref())?;
+    value(MessageExport {
+        message_id: args.id.clone(),
+        filename: format!("{}.eml", args.id),
+        eml_base64: base64::engine::general_purpose::STANDARD.encode(raw),
+        exact,
+    })
+}
+
+fn import(engine: &mut Engine, args: MessageImportArgs) -> Result<Value, OpError> {
+    if args.eml_base64.len() > MAX_ATTACHMENT_BASE64_CHARS {
+        return Err(OpError::InvalidArgs(format!(
+            "the `.eml` payload is too large; the decoded file must be at most {} bytes",
+            crate::engine::MAX_ATTACHMENT_BYTES
+        )));
+    }
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(args.eml_base64.as_bytes())
+        .map_err(|_| OpError::InvalidArgs("the `.eml` payload is not valid base64".to_owned()))?;
+    let (message, warnings) = engine.message_import(args.account.as_deref(), &raw)?;
+    value(MessageImport { message, warnings })
 }
 
 fn flag(engine: &mut Engine, args: MessageFlagArgs) -> Result<Value, OpError> {
