@@ -162,9 +162,10 @@ resources/compact/audit, **P13b** attachment preview, **P13c** local templates, 
 unsubscribe, **P13e** Gmail label mapping and **P13f** `.eml` export/import are merged and
 CI-green. The audit keeps these vertical packages serial because they touch core/store/app.
 
-**P13f** adds `message_export`/`message_import`, `postino export|import`, palette commands and the
-local **Import** folder. Export is byte-exact only when the v9 raw blob was retained; otherwise it
-rebuilds from stored sanitized content. `.mbox` and Thunderbird import remain open.
+**P13f** adds `message_export`/`message_import`, `postino export|import`, palette and reading-pane
+actions and the local **Import** folder. Export is byte-exact only when the v9 raw blob was retained;
+otherwise it rebuilds from stored sanitized content and threading headers. Both directions cap the
+file at 10 MiB so base64 fits the daemon frame. `.mbox` and Thunderbird import remain open.
 
 ## 5. Delighters backlog
 

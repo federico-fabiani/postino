@@ -199,6 +199,13 @@ pub struct Message {
     pub size: Option<u64>,
 }
 
+/// The threading headers stored with one message, ready for a `.eml` reconstruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageThreading {
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
+}
+
 /// Why a message row exists. This is provenance, not its current folder: a Sent copy moved to
 /// Archive is still `Sent`, and a received message moved to Sent is still `Received`. Rules only
 /// consider `Received`, so moving a message afterwards cannot turn it into rule mail.

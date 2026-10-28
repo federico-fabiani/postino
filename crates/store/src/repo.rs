@@ -12,7 +12,7 @@ use rusqlite::{ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavi
 use crate::model::{
     Account, AccountServer, AccountTls, Address, Attachment, Draft, DraftMeta, DraftUpdate, FlagUpdate, Folder, FolderKind, FolderMessageFlags,
     Label, LabelCount, MAX_REMOTE_IMAGES, Message, MessageCounts, MessageFilter, MessageFlags, MessageOrigin, MessagePage, MessageSummary,
-    OutboxEntry, OutboxState, SyncState, UidEntry,
+    MessageThreading, OutboxEntry, OutboxState, SyncState, UidEntry,
 };
 use crate::threads;
 use crate::{REMOTE_LABELS_KEY_PREFIX, REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError, UNSUBSCRIBE_KEY_PREFIX};
@@ -666,6 +666,26 @@ impl Store {
     /// One message with its labels **and** attachment metadata. This is the owned read behind
     /// `Engine::message(id)`: the mailbox list holds summaries, so a body and its attachment rows
     /// are read only when somebody opens the message.
+    /// The threading headers stored with a message: its parent `Message-ID` and the bounded
+    /// reference chain, both as they appeared on the wire.
+    pub fn message_threading(&self, id: &str) -> Result<Option<MessageThreading>, StoreError> {
+        let row = self
+            .conn
+            .query_row("SELECT in_reply_to, references_json FROM messages WHERE id = ?1", [id], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .optional()
+            .map_err(|error| corrupt_on_decode("messages", error))?;
+        let Some((in_reply_to, references_json)) = row else { return Ok(None) };
+        let references = match references_json {
+            Some(raw) => {
+                serde_json::from_str(&raw).map_err(|error| StoreError::Corrupt { table: "messages.references_json", detail: error.to_string() })?
+            }
+            None => Vec::new(),
+        };
+        Ok(Some(MessageThreading { in_reply_to, references }))
+    }
+
     pub fn get_message_with_attachments(&self, id: &str) -> Result<Option<(Message, Vec<Attachment>)>, StoreError> {
         let Some(message) = self.get_message(id)? else { return Ok(None) };
         let attachments = self.attachments(id)?;

@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     AttachmentGet, CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate,
-    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MAX_ATTACHMENT_BYTES, MailTls, MessageExport, MessageFlag, MessageGet, MessageImport,
+    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MAX_EML_BYTES, MailTls, MessageExport, MessageFlag, MessageGet, MessageImport,
     MessageSummary, MessageTemplate, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult,
     PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult, PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult,
     RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult,
@@ -679,6 +679,9 @@ enum Command {
         /// Write the RFC 5322 bytes here instead of printing base64 JSON.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Overwrite an existing output file. Without it the export refuses to truncate.
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         account: Option<String>,
     },
@@ -2208,10 +2211,15 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
         }
         Command::Import { path, account } => {
             let size = std::fs::metadata(&path).with_context(|| format!("lettura di {}", path.display()))?.len();
-            if size > MAX_ATTACHMENT_BYTES {
-                bail!("il file è troppo grande: {size} byte, il limite è {MAX_ATTACHMENT_BYTES}");
+            if size > MAX_EML_BYTES {
+                bail!("il file è troppo grande: {size} byte, il limite è {MAX_EML_BYTES}");
             }
-            let raw = std::fs::read(&path).with_context(|| format!("lettura di {}", path.display()))?;
+            let file = std::fs::File::open(&path).with_context(|| format!("lettura di {}", path.display()))?;
+            let mut raw = Vec::new();
+            file.take(MAX_EML_BYTES.saturating_add(1)).read_to_end(&mut raw).with_context(|| format!("lettura di {}", path.display()))?;
+            if raw.len() as u64 > MAX_EML_BYTES {
+                bail!("il file è troppo grande: il limite è {MAX_EML_BYTES} byte");
+            }
             let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
             let imported: MessageImport = decode(call(engine, "message_import", json!({ "account": account, "eml_base64": encoded }))?)?;
             if json_output {
@@ -2225,11 +2233,21 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 ))?;
             }
         }
-        Command::Export { id, out, account } => {
+        Command::Export { id, out, force, account } => {
             let exported: MessageExport = decode(call(engine, "message_export", json!({ "id": id, "account": account }))?)?;
             let raw = base64::engine::general_purpose::STANDARD.decode(exported.eml_base64.as_bytes()).context("decodifica dei byte .eml")?;
             if let Some(path) = out {
-                std::fs::write(&path, &raw).with_context(|| format!("scrittura di {}", path.display()))?;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true);
+                if force {
+                    options.create(true).truncate(true);
+                } else {
+                    options.create_new(true);
+                }
+                let mut file = options
+                    .open(&path)
+                    .with_context(|| format!("scrittura di {} (il file esiste già? usa --force per sovrascriverlo)", path.display()))?;
+                file.write_all(&raw).with_context(|| format!("scrittura di {}", path.display()))?;
                 if json_output {
                     print_json(&exported)?;
                 } else {
@@ -4202,8 +4220,16 @@ mod tests {
             engine.messages().iter().find(|message| message.subject == "Synthetic message with attachment 1").cloned().expect("imported message");
         assert_eq!(imported.folder_id, "fld_import_acc_cli");
         let out = dir.join("riesportato.eml");
-        run(cli(Command::Export { id: imported.id.clone(), out: Some(out.clone()), account: Some("acc_cli".to_owned()) }), &mut engine)
+        run(cli(Command::Export { id: imported.id.clone(), out: Some(out.clone()), force: false, account: Some("acc_cli".to_owned()) }), &mut engine)
             .expect("export");
+        let error = run(
+            cli(Command::Export { id: imported.id.clone(), out: Some(out.clone()), force: false, account: Some("acc_cli".to_owned()) }),
+            &mut engine,
+        )
+        .expect_err("an existing file must not be truncated");
+        assert!(format!("{error:#}").contains("--force"), "{error:#}");
+        run(cli(Command::Export { id: imported.id.clone(), out: Some(out.clone()), force: true, account: Some("acc_cli".to_owned()) }), &mut engine)
+            .expect("forced export");
         let raw = String::from_utf8_lossy(&std::fs::read(&out).expect("exported file")).into_owned();
         assert!(raw.starts_with("From: "), "{}", &raw[..raw.len().min(80)]);
         assert!(raw.contains("Subject: Synthetic message with attachment 1"));

@@ -153,10 +153,11 @@ MCP      ─┘
   local store, so its template list is empty and the create button is disabled with a reason.
 - **`.eml` export/import (P13f).** `message_export` returns an RFC 5322 file: the exact retained v9
   bytes for signed/encrypted mail, otherwise a reconstruction from the stored sanitized body and
-  attachments. `message_import` runs a chosen file through the same MIME and attachment bounds as a
-  server fetch and stores it in the account's local **Import** folder; importing a copy never moves
-  or overwrites an existing message with the same Message-ID. The reading pane exports the selected
-  message, the palette imports one `.eml`, and `postino export <id> --out` /
+  attachments and threading headers. `message_import` runs a chosen file through the same MIME and
+  attachment bounds as a server fetch and stores it read in the account's local **Import** folder;
+  importing a copy never moves or overwrites an existing message with the same Message-ID. Files are
+  capped at 10 MiB each way so the base64 stays inside the daemon frame. The reading pane exports the
+  selected message, the palette imports one `.eml`, and `postino export <id> --out` /
   `postino import <path>` expose the same operations without a window.
 - **Local rules (P9c).** The Rules page (Settings → **Regole locali**, or the palette commands
   **Regole locali**/**Nuova regola**) stores up to 100 rules per account on the encrypted v7 tables.

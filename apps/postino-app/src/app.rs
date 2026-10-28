@@ -2,6 +2,7 @@
 //! Every action goes through `Engine::call`, the same operation registry the CLI and MCP expose.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,10 +16,10 @@ use eframe::egui::{
 };
 use postino_core::{
     Account, Address, Attachment, AttachmentGet, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor,
-    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, MAX_ATTACHMENT_BYTES, Message, MessageExport, MessageImport, MessageSummary,
-    MessageTemplate, MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey,
-    PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
-    UnsubscribeInfo, UnsubscribeMethod, UnsubscribeTarget,
+    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, MAX_EML_BYTES, Message, MessageExport, MessageImport, MessageSummary, MessageTemplate,
+    MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult,
+    PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult, UnsubscribeInfo,
+    UnsubscribeMethod, UnsubscribeTarget,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
@@ -7959,6 +7960,16 @@ impl PostinoApp {
                     if IconButton::new(command_icon("forward", icons::FORWARD), command_label("forward", "Inoltra")).show(ui).clicked() {
                         action = Some(ReadingAction::Forward);
                     }
+                    if !self.demo
+                        && self.store.is_some()
+                        && IconButton::new(command_icon("export_eml", icons::DOWNLOAD), command_label("export_eml", "Esporta .eml"))
+                            .show(ui)
+                            .clicked()
+                    {
+                        action = Some(ReadingAction::ExportEml);
+                    }
+                    #[cfg(test)]
+                    probe::action(ui, "export_eml");
                     if has_unsubscribe && IconButton::new(icons::EYE_OFF, "Disiscriviti").show(ui).on_hover_text("Opzioni di disiscrizione").clicked()
                     {
                         action = Some(ReadingAction::Unsubscribe);
@@ -8184,6 +8195,7 @@ impl PostinoApp {
                 let id = message.summary.id.clone();
                 self.reply_to(&id, ComposeMode::ReplyAll);
             }
+            Some(ReadingAction::ExportEml) => self.export_selected_eml(),
             Some(ReadingAction::Forward) => {
                 let id = message.summary.id.clone();
                 self.reply_to(&id, ComposeMode::Forward);
@@ -8392,17 +8404,26 @@ impl PostinoApp {
                 return;
             }
         };
-        if size > MAX_ATTACHMENT_BYTES {
-            self.push_info_toast(format!("Il file supera il limite di {} MiB.", MAX_ATTACHMENT_BYTES / (1024 * 1024)), ToastKind::Error);
+        if size > MAX_EML_BYTES {
+            self.push_info_toast(format!("Il file .eml supera il limite di {} MiB.", MAX_EML_BYTES / (1024 * 1024)), ToastKind::Error);
             return;
         }
-        let raw = match std::fs::read(&path) {
-            Ok(raw) => raw,
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
             Err(error) => {
                 self.push_info_toast(format!("Non è stato possibile leggere il file scelto: {error}"), ToastKind::Error);
                 return;
             }
         };
+        let mut raw = Vec::new();
+        if let Err(error) = file.take(MAX_EML_BYTES.saturating_add(1)).read_to_end(&mut raw) {
+            self.push_info_toast(format!("Non è stato possibile leggere il file scelto: {error}"), ToastKind::Error);
+            return;
+        }
+        if raw.len() as u64 > MAX_EML_BYTES {
+            self.push_info_toast(format!("Il file .eml supera il limite di {} MiB.", MAX_EML_BYTES / (1024 * 1024)), ToastKind::Error);
+            return;
+        }
         let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
         let value = match self.op("message_import", json!({ "account": self.active_account, "eml_base64": encoded })) {
             Ok(value) => value,
@@ -11421,6 +11442,7 @@ enum ReadingAction {
     Reply,
     ReplyAll,
     Forward,
+    ExportEml,
     EditDraft,
     Star,
     Read,

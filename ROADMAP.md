@@ -226,8 +226,9 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] `.ics` invite parsing and organizer-only reply drafts (P12d).
 - [x] Unsubscribe (P13d): bounded `List-Unsubscribe` capture, explicit mailto draft or web confirmation,
       no background request and no automatic send.
-- [x] Export/import `.eml` (P13f): exact retained v9 bytes or a sanitized reconstruction, local
-      **Import** folder through the same ingest bounds, CLI/app/MCP parity.
+- [x] Export/import `.eml` (P13f): exact retained v9 bytes or a sanitized reconstruction with
+      threading headers, local **Import** folder through the same ingest bounds, a 10 MiB transport
+      cap and CLI/app/MCP parity.
 - [ ] `.mbox` export/import, Thunderbird import.
 - [x] MCP compact mode, resources, send guardrails, audit log (P13a): `--compact`,
       `--audit-log`, read-only mailbox/message resources, a rolling 300-call guard, and a

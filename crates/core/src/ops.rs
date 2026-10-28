@@ -24,6 +24,7 @@ use crate::store_map;
 /// before allocating the decoded buffer: a hostile caller cannot make the engine allocate 25 MiB
 /// from a one-line "payload" that claims to be enormous.
 const MAX_ATTACHMENT_BASE64_CHARS: usize = ((crate::engine::MAX_ATTACHMENT_BYTES as usize).saturating_add(2) / 3).saturating_mul(4);
+const MAX_EML_BASE64_CHARS: usize = ((crate::engine::MAX_EML_BYTES as usize).saturating_add(2) / 3).saturating_mul(4);
 
 /// One operation as the CLI and MCP see it.
 #[derive(Debug, Clone, Serialize)]
@@ -96,7 +97,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "message_export",
             "Export a message",
-            "Return one message as RFC 5322 bytes, base64-encoded. A PGP signed/encrypted row with retained v9 raw bytes is exact; any other row is rebuilt from stored headers, sanitized body and attachments, so its wire encoding is valid but not byte-identical to the original. Read-only and offline; `postino export` writes the same bytes to a file.",
+            "Return one message as RFC 5322 bytes, base64-encoded, at most 10 MiB. A PGP signed/encrypted row with retained v9 raw bytes is exact; any other row is rebuilt from stored headers, threading references, sanitized body and attachments, so its wire encoding is valid but not byte-identical to the original. Read-only and offline; `postino export` writes the same bytes to a file without overwriting unless `--force`.",
             MessageExportArgs,
             true,
             false
@@ -104,7 +105,7 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "message_import",
             "Import a message",
-            "Import one `.eml` file (RFC 5322 bytes, base64, at most 25 MiB) into a per-account local `Import` folder. The same MIME sanitizer and attachment limits as a server fetch apply, bodies are indexed and PGP raw bytes are retained. A matching Message-ID never moves cached mail: the import is a separate local copy. Returns the stored message and bounded MIME warnings.",
+            "Import one `.eml` file (RFC 5322 bytes, base64, at most 10 MiB) into a per-account local `Import` folder. The same MIME sanitizer and attachment limits as a server fetch apply, bodies are indexed and PGP raw bytes are retained; the copy is marked read so imports do not inflate the unread count. A matching Message-ID never moves cached mail: the import is a separate local copy. Returns the stored message and bounded MIME warnings.",
             MessageImportArgs,
             false,
             false
@@ -2305,21 +2306,33 @@ fn attachment(engine: &Engine, args: AttachmentGetArgs) -> Result<Value, OpError
     value(AttachmentGet { attachment, data_base64 })
 }
 
+fn export_filename(engine: &Engine, id: &str) -> String {
+    let Ok(Some(message)) = engine.message_result(id) else { return format!("{id}.eml") };
+    let mut slug = String::new();
+    for character in message.summary.subject.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let date = message.summary.date.format("%Y-%m-%d").to_string();
+    let short_id: String = id.chars().take(16).collect();
+    if slug.is_empty() { format!("{date}-{short_id}.eml") } else { format!("{date}-{}-{short_id}.eml", &slug[..slug.len().min(60)]) }
+}
+
 fn export(engine: &Engine, args: MessageExportArgs) -> Result<Value, OpError> {
+    let filename = export_filename(engine, &args.id);
     let (raw, exact) = engine.message_export(&args.id, args.account.as_deref())?;
-    value(MessageExport {
-        message_id: args.id.clone(),
-        filename: format!("{}.eml", args.id),
-        eml_base64: base64::engine::general_purpose::STANDARD.encode(raw),
-        exact,
-    })
+    value(MessageExport { message_id: args.id.clone(), filename, eml_base64: base64::engine::general_purpose::STANDARD.encode(raw), exact })
 }
 
 fn import(engine: &mut Engine, args: MessageImportArgs) -> Result<Value, OpError> {
-    if args.eml_base64.len() > MAX_ATTACHMENT_BASE64_CHARS {
+    if args.eml_base64.len() > MAX_EML_BASE64_CHARS {
         return Err(OpError::InvalidArgs(format!(
             "the `.eml` payload is too large; the decoded file must be at most {} bytes",
-            crate::engine::MAX_ATTACHMENT_BYTES
+            crate::engine::MAX_EML_BYTES
         )));
     }
     let raw = base64::engine::general_purpose::STANDARD

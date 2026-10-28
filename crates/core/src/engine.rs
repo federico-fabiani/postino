@@ -51,6 +51,15 @@ fn outgoing_mailbox(address: &postino_store::Address) -> postino_sync::mime::Mai
     postino_sync::mime::Mailbox { name: (!address.name.is_empty()).then(|| address.name.clone()), address: address.email.clone() }
 }
 
+fn ensure_eml_size(size: usize) -> Result<(), OpError> {
+    if size as u64 > MAX_EML_BYTES {
+        return Err(OpError::InvalidArgs(format!(
+            "the RFC 5322 file is {size} bytes; message_import and message_export move at most {MAX_EML_BYTES} bytes so the base64 stays inside the 16 MiB daemon frame"
+        )));
+    }
+    Ok(())
+}
+
 fn not_stored_verify() -> crate::pgp_mime::PgpVerifyResult {
     crate::pgp_mime::PgpVerifyResult {
         state: crate::pgp_mime::PgpVerifyState::NotStored,
@@ -106,6 +115,12 @@ const MAX_RECIPIENTS_PER_FIELD: usize = 100;
 /// The composer caps from P8: at most 20 files, 25 MiB each and 25 MiB in total.
 pub const MAX_DRAFT_ATTACHMENTS: usize = 20;
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Largest RFC 5322 file moved through `message_import` / `message_export`, base64 included.
+///
+/// The daemon JSON-RPC frame is 16 MiB in each direction. A 10 MiB file becomes ~13.4 MiB of
+/// standard base64, leaving room for the envelope while keeping CLI, MCP and desktop on one bound.
+pub const MAX_EML_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 /// A signature is plain text and small: 4 KiB is already a long signature.
 pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
@@ -1481,6 +1496,7 @@ impl Engine {
         let store = self.require_store("message_export")?;
         if let Some(hash) = store.message_raw_blob_hash(message_id).map_err(store_map::read_error)? {
             let raw = store.blobs().get(&hash, crate::pgp_mime::MAX_RAW_MESSAGE_BYTES).map_err(store_map::blob_read_error)?;
+            ensure_eml_size(raw.len())?;
             return Ok((raw.to_vec(), true));
         }
         let (message, attachments) =
@@ -1506,6 +1522,7 @@ impl Engine {
         }
         let date = chrono::DateTime::<Utc>::from_timestamp_millis(message.summary.date)
             .ok_or_else(|| OpError::Failed(format!("message {message_id:?} has an invalid date and cannot be exported")))?;
+        let threading = store.message_threading(message_id).map_err(store_map::read_error)?.ok_or_else(|| unknown_message(message_id))?;
         let outgoing = postino_sync::mime::OutgoingMessage {
             from: outgoing_mailbox(&message.summary.from),
             to: message.summary.to.iter().map(outgoing_mailbox).collect(),
@@ -1516,13 +1533,14 @@ impl Engine {
             text: message.body_text,
             html: message.body_html,
             attachments: parts,
-            in_reply_to: None,
-            references: Vec::new(),
+            in_reply_to: threading.in_reply_to,
+            references: threading.references,
             message_id: message.message_id,
             extra_headers: Vec::new(),
         };
         let serialized = postino_sync::mime::serialize(&outgoing)
             .map_err(|error| OpError::Failed(format!("the stored message could not be serialized as .eml: {error}")))?;
+        ensure_eml_size(serialized.raw.len())?;
         Ok((serialized.raw, false))
     }
 
@@ -1536,25 +1554,22 @@ impl Engine {
         if raw.is_empty() {
             return Err(OpError::InvalidArgs("the file is empty; it is not an RFC 5322 message".to_owned()));
         }
+        ensure_eml_size(raw.len())?;
         let store = self.require_store("message_import")?;
         let account_row = store.get_account(&account.id).map_err(store_map::read_error)?.ok_or_else(|| unknown_account(&account.id))?;
-        let existing =
-            self.folders.iter().find(|folder| folder.account_id == account.id && folder.kind == FolderKind::Custom && folder.name == "Import");
-        let folder_row = match existing {
-            Some(folder) => postino_store::Folder {
-                id: folder.id.clone(),
-                account_id: folder.account_id.clone(),
-                name: folder.name.clone(),
-                kind: postino_store::FolderKind::Custom,
-                unread: folder.unread,
-                total: folder.total,
-                uid_validity: None,
-                uid_next: None,
-                last_sync_at: None,
-            },
+        let folder_id = format!("fld_import_{}", account.id);
+        let folder_row = match store.get_folder(&folder_id).map_err(store_map::read_error)? {
+            Some(folder) => {
+                if folder.account_id != account.id || folder.kind != postino_store::FolderKind::Custom || folder.uid_validity.is_some() {
+                    return Err(OpError::Failed(format!(
+                        "the reserved local Import folder id {folder_id:?} is already used by a server folder; rename that folder or import into a different store"
+                    )));
+                }
+                folder
+            }
             None => {
                 let row = postino_store::Folder {
-                    id: format!("fld_import_{}", account.id),
+                    id: folder_id,
                     account_id: account.id.clone(),
                     name: "Import".to_owned(),
                     kind: postino_store::FolderKind::Custom,

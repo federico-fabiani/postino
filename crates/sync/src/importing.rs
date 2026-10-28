@@ -48,6 +48,8 @@ pub fn import_message(
     // file whose headers are missing or unusable.
     let envelope = Envelope {
         uid,
+        // Import is an archive action, not a new delivery: keep the copy read so importing a backup
+        // does not inflate the unread count. The body and MIME warnings are untouched.
         flags: vec![Flag::Seen],
         internal_date: None,
         size: u32::try_from(raw.len()).unwrap_or(u32::MAX),

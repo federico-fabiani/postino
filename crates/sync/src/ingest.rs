@@ -302,11 +302,14 @@ fn choose_identity(
             continue;
         }
         if position == 0
+            && allow_cross_folder_move
             && let Some(local) = &local
             && let Some(flags) = store.message_flags(local)?
         {
             // The local row is the same message as this server copy: give it the UID (and, through
-            // the upsert, the folder it arrived in) instead of inserting a duplicate.
+            // the upsert, the folder it arrived in) instead of inserting a duplicate. An offline
+            // import must never take this path: a uid-less Sent copy with the same Message-ID has
+            // to stay exactly where it is.
             return Ok(Some((local.clone(), Some(Existing { unread: flags.unread, starred: flags.starred }))));
         }
         return Ok(Some((variant.clone(), None)));
