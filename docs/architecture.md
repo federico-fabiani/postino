@@ -226,8 +226,9 @@ sync_state(account, folder, uidvalidity, last_uid, modseq)
 - P8 added no migration on this store: the draft reply link is the shipped `drafts.in_reply_to`, the
   account signature is the shipped `accounts.signature`, and a received `Reply-To` is cached under
   `meta` key `reply_to:<message_id>`. P9a's v7 now also stores the incoming `In-Reply-To` and
-  `References` chain for P9b; `Reply-To` still rides `meta`. The target schema above shows the eventual
-  `signature` table for multiple identities and HTML signatures, which M2 does not implement.
+  `References` chain for P9b; `Reply-To` still rides `meta`. The future `signature` table for HTML
+  signatures remains unimplemented; P13i instead stores up to 10 alternative From senders per account
+  as encrypted `meta` rows, so no migration was needed.
 
 - The **server is the source of truth**. The local database is a cache plus an operation log.
 - Attachment bytes are content-addressed blobs: BLAKE3 of the plaintext names the file, zstd
@@ -1753,3 +1754,4 @@ mutation corpus so `cargo xtask ci` stays fast.
 | 2026-10-28 | minor | P13f: `message_export` returns the exact retained v9 raw bytes or rebuilds a sanitized `.eml`, `message_import` runs a chosen file through the ordinary ingest path into a local **Import** folder without treating a duplicate Message-ID as a move, and the CLI/app/MCP share the same 10 MiB bound so base64 stays inside the 16 MiB daemon frame |
 | 2026-10-28 | minor | P13g: `folder_export_mbox`/`folder_import_mbox` add bounded Thunderbird-style mbox transfer; the splitter validates every separator against the following header before any folder is created, removes one mboxrd quote layer, imports into a named local folder through the ordinary ingest path, reports skip counts and keeps the same 10 MiB daemon-frame bound |
 | 2026-10-28 | minor | P13h: `draft_save.body_format` compiles the Markdown-like source into table-based HTML with inline CSS and a matching text alternative; the composer toggles plain/HTML and previews the exact output, the engine recompiles compiler-owned drafts at send time, raw HTML is never accepted and the source is capped at 1 MiB |
+| 2026-10-28 | minor | P13i: up to 10 alternative From senders per account live in encrypted `meta` (index + row per identity, no schema migration); `identities_list`/`identity_create`/`identity_update`/`identity_delete`, `draft_save.from`, a composer **Da** picker with signature swap, Settings management, and a send-time check that the draft From is the account or a current identity |

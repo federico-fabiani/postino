@@ -105,7 +105,8 @@ MCP      ─┘
   `saved_search_recent_clear`, `rules_list`, `rules_create`, `rules_update`, `rules_delete`,
   `rules_preview`, `rules_run`, `rules_undo`, `rules_runs`, `labels_list`, `label_create`,
   `label_update`, `label_delete`, `label_apply`, `templates_list`, `template_create`,
-  `template_update`, `template_delete`.
+  `template_update`, `template_delete`, `identities_list`, `identity_create`, `identity_update`,
+  `identity_delete`.
 - **Conversations (P9b).** Thread ids come from the message's reference chain: an incoming
   `References`/`In-Reply-To` is normalised, bounded and resolved against the cached conversations; an
   unresolved reference becomes a phantom root waiting for its parent, two resolved threads merge into
@@ -150,6 +151,15 @@ MCP      ─┘
   text already written, never discarding it. `templates_list`, `template_create`, `template_update`
   and `template_delete` are the same registry surface for the CLI and MCP; the demo mailbox has no
   local store, so its template list is empty and the create button is disabled with a reason.
+- **Multiple senders (P13i).** Up to 10 alternative From addresses per account live in the encrypted
+  `meta` table, never in the schema and never on a server. Settings → **MITTENTI** creates, edits and
+  deletes them; the composer's **Da** picker switches the sender and swaps its signature without
+  touching unrelated text. `draft_save.from` accepts an identity id or address (omit to keep the
+  stored sender), and each draft stores its chosen From. At send time the engine resolves that
+  address against the account or a current identity and fails loudly instead of silently falling
+  back; the provider still decides whether the alias may submit, and an SMTP rejection stays
+  visible. The operations are `identities_list`, `identity_create`, `identity_update` and
+  `identity_delete`.
 - **Email-safe HTML composition (P13h).** The composer's **Testo/HTML** toggle compiles the same
   Markdown-like source into a table-based HTML part with inline CSS and a matching plain-text
   alternative; raw HTML is never accepted from the UI, CLI or MCP. In HTML mode the eye button opens
@@ -574,7 +584,7 @@ The GNU toolchain plus MSYS2 is the path documented here.
   inline images or HTML: the caps are 20 files, 25 MiB each and 25 MiB total, unknown extensions are
   labeled `application/octet-stream`, and the composer generates no thumbnail. The reading pane has
   a bounded text/image preview sheet; other types explain that only Save is available. The signature is plain
-  text (no HTML, images or tracking), belongs to one identity, is not a separate MIME part, and a
+  text (no HTML, images or tracking), belongs to the account or one alternate sender, is not a separate MIME part, and a
   provider-side signature is neither read nor synchronized. In `--demo` the synthetic attachments have
   no bytes and Save/attach/preview is disabled with that reason. A link reaches the system browser or
   mail client only after the confirmation sheet, and Save writes attachment bytes to the chosen path

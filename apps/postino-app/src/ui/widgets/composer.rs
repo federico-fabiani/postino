@@ -8,7 +8,8 @@ use eframe::egui::containers::Sides;
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{self, Align, FontFamily, FontId, Frame, Layout, Margin, Rect, ScrollArea, Stroke, TextEdit, Ui, UiBuilder, Vec2, pos2};
 use postino_core::{
-    Account, Address, Attachment, BodyFormat, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS, MessageTemplate, PgpKey,
+    Account, Address, Attachment, BodyFormat, Identity, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES, MAX_DRAFT_ATTACHMENTS, MessageTemplate,
+    PgpKey,
 };
 
 use crate::theme::Tokens;
@@ -82,6 +83,9 @@ pub struct ComposerState {
     pub open: bool,
     pub mode: ComposeMode,
     pub draft_id: Option<String>,
+    /// Selected From address when it is not the account address. The engine validates it against
+    /// the stored identities at save and send time.
+    pub sender: Option<String>,
     pub to: String,
     pub cc: String,
     pub bcc: String,
@@ -128,6 +132,7 @@ impl ComposerState {
             open: true,
             mode,
             draft_id: None,
+            sender: None,
             to: String::new(),
             cc: String::new(),
             bcc: String::new(),
@@ -292,12 +297,20 @@ pub struct Composer<'a> {
     attachments_available: bool,
     pgp_keys: &'a [PgpKey],
     templates: &'a [MessageTemplate],
+    identities: &'a [Identity],
 }
 
 impl<'a> Composer<'a> {
     #[must_use]
     pub fn new(state: &'a mut ComposerState, account: &'a Account) -> Self {
-        Self { state, account, send_available: true, demo: true, attachments_available: false, pgp_keys: &[], templates: &[] }
+        Self { state, account, send_available: true, demo: true, attachments_available: false, pgp_keys: &[], templates: &[], identities: &[] }
+    }
+
+    /// Alternate senders for the account. An empty list keeps the From row read-only.
+    #[must_use]
+    pub fn identities(mut self, identities: &'a [Identity]) -> Self {
+        self.identities = identities;
+        self
     }
 
     /// Local compose templates. The screen owns loading and insertion; an empty list hides the menu.
@@ -471,12 +484,79 @@ impl<'a> Composer<'a> {
         ui.scope_builder(UiBuilder::new().max_rect(account_rect), |ui| {
             ui.horizontal(|ui| {
                 ui.add_sized([24.0, ui_size::COMPOSER_ACCOUNT_ROW], egui::Label::new(typography::text(Role::Meta, "Da", t.text_faint)));
-                ui.add(
-                    egui::Label::new(typography::text(Role::Meta, format!("{} <{}>", self.account.name, self.account.email), t.text_muted))
-                        .truncate(),
-                );
+                if self.identities.is_empty() {
+                    ui.add(
+                        egui::Label::new(typography::text(Role::Meta, format!("{} <{}>", self.account.name, self.account.email), t.text_muted))
+                            .truncate(),
+                    );
+                    return;
+                }
+                let selected = self.state.sender.as_deref();
+                let label =
+                    selected.and_then(|email| self.identities.iter().find(|identity| identity.email.eq_ignore_ascii_case(email))).map_or_else(
+                        || format!("{} <{}>", self.account.name, self.account.email),
+                        |identity| format!("{} <{}>", identity.name, identity.email),
+                    );
+                let mut chosen = None;
+                let combo = egui::ComboBox::from_id_salt(("composer-from", self.state.session))
+                    .selected_text(label)
+                    .width((ui.available_width() - 8.0).max(160.0))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(selected.is_none(), format!("{} <{}>", self.account.name, self.account.email)).clicked() {
+                            chosen = Some(None);
+                        }
+                        for identity in self.identities {
+                            if ui
+                                .selectable_label(
+                                    selected.is_some_and(|email| email.eq_ignore_ascii_case(&identity.email)),
+                                    format!("{} <{}>", identity.name, identity.email),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(Some(identity.email.clone()));
+                            }
+                        }
+                    });
+                #[cfg(test)]
+                crate::app::probe::composer_from(ui, combo.response.rect);
+                #[cfg(not(test))]
+                let _ = combo;
+                if let Some(chosen) = chosen
+                    && chosen.as_deref() != selected
+                {
+                    let now = ui.input(|input| input.time);
+                    self.change_sender(chosen, now);
+                }
             });
         });
+    }
+
+    /// Switch the From address and carry the conventional signature with it. Text after the old
+    /// signature is preserved; a body the person already edited without a matching signature is
+    /// never rewritten.
+    fn change_sender(&mut self, sender: Option<String>, now: f64) {
+        let old_signature = self.sender_signature(self.state.sender.as_deref()).to_owned();
+        let new_signature = self.sender_signature(sender.as_deref()).to_owned();
+        if old_signature != new_signature {
+            let old_prefix = postino_core::new_message_body(&old_signature);
+            let new_prefix = postino_core::new_message_body(&new_signature);
+            if !old_prefix.is_empty() && self.state.body.starts_with(&old_prefix) {
+                self.state.body.replace_range(0..old_prefix.len(), &new_prefix);
+            } else if self.state.body.is_empty() {
+                self.state.body = new_prefix;
+            }
+        }
+        self.state.sender = sender;
+        self.state.touch(now);
+    }
+
+    fn sender_signature(&self, email: Option<&str>) -> &str {
+        match email {
+            Some(email) => {
+                self.identities.iter().find(|identity| identity.email.eq_ignore_ascii_case(email)).map_or("", |identity| identity.signature.as_str())
+            }
+            None => self.account.signature.as_str(),
+        }
     }
 
     fn recipient_field(&mut self, ui: &mut Ui, t: &Tokens, label: &str, field: ComposerFocus, icon: &'static str) -> bool {

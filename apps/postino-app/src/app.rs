@@ -15,7 +15,7 @@ use eframe::egui::{
     RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
-    Account, Address, Attachment, AttachmentGet, BodyFormat, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply,
+    Account, Address, Attachment, AttachmentGet, BodyFormat, CalendarInviteView, DraftSave, Engine, FolderKind, Identity, InviteResponse, LabelApply,
     LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, MAX_EML_BYTES, Message, MessageExport, MessageImport, MessageSummary,
     MessageTemplate, MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey,
     PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
@@ -519,6 +519,16 @@ pub struct PostinoApp {
     template_editor: Option<TemplateEditorState>,
     /// The template waiting for the delete confirmation.
     template_delete: Option<MessageTemplate>,
+    /// Alternate senders for the active account, loaded once for the composer and Settings.
+    identities: Vec<Identity>,
+    identities_loaded: bool,
+    identities_retry_at: f64,
+    /// The create/edit identity sheet. `id: None` creates a new row.
+    identity_editor: Option<IdentityEditorState>,
+    /// The identity waiting for the delete confirmation.
+    identity_delete: Option<Identity>,
+    /// A one-line result under the identities settings section.
+    identities_notice: Option<String>,
     /// The unsubscribe choices for the open message. Empty means the header was absent or invalid.
     unsubscribe_info: Option<UnsubscribeInfo>,
     /// The message whose headers were already checked; a negative result is cached too.
@@ -1214,6 +1224,12 @@ impl PostinoApp {
             templates_loaded: false,
             template_editor: None,
             template_delete: None,
+            identities: Vec::new(),
+            identities_loaded: false,
+            identities_retry_at: 0.0,
+            identity_editor: None,
+            identity_delete: None,
+            identities_notice: None,
             unsubscribe_info: None,
             unsubscribe_checked: None,
             show_unsubscribe: false,
@@ -4803,6 +4819,8 @@ impl PostinoApp {
             || self.pgp_delete.is_some()
             || self.template_editor.is_some()
             || self.template_delete.is_some()
+            || self.identity_editor.is_some()
+            || self.identity_delete.is_some()
             || self.show_unsubscribe
             || self.rules_page.is_some()
         {
@@ -5178,6 +5196,9 @@ impl PostinoApp {
         if message.body_html.is_some() {
             state.body_format = BodyFormat::Html;
         }
+        if self.account().is_none_or(|account| !account.email.eq_ignore_ascii_case(&message.summary.from.email)) {
+            state.sender = Some(message.summary.from.email.clone());
+        }
         state.attachments = message.attachments.clone();
         state.in_reply_to = self.engine.draft_reply_link(&message.summary.id).map(str::to_owned);
         state.saved_at = Some(format_time(message.summary.date));
@@ -5237,6 +5258,11 @@ impl PostinoApp {
             && let Some(object) = args.as_object_mut()
         {
             object.insert("body_format".to_owned(), json!(self.composer.body_format));
+        }
+        if let Some(from) = self.composer.sender.as_deref().or_else(|| self.account().map(|account| account.email.as_str()))
+            && let Some(object) = args.as_object_mut()
+        {
+            object.insert("from".to_owned(), json!(from));
         }
         if let Some(link) = &self.composer.in_reply_to
             && let Some(object) = args.as_object_mut()
@@ -7850,6 +7876,9 @@ impl PostinoApp {
                     if draft.body_html.is_some() {
                         state.body_format = BodyFormat::Html;
                     }
+                    if self.account().is_none_or(|account| !account.email.eq_ignore_ascii_case(&draft.summary.from.email)) {
+                        state.sender = Some(draft.summary.from.email.clone());
+                    }
                     state.attachments = draft.attachments.clone();
                     state.in_reply_to = parent;
                     state.saved_at = Some(format_time(draft.summary.date));
@@ -9408,6 +9437,7 @@ impl PostinoApp {
             self.refresh_pgp_keys();
         }
         self.refresh_templates();
+        self.refresh_identities();
         // Escape closes the signature editor first; only a second Escape leaves Settings. Consuming
         // the key here keeps the modal's own close rule from seeing it.
         if self.signature_editor.is_some()
@@ -9439,6 +9469,9 @@ impl PostinoApp {
         let mut template_new = false;
         let mut template_edit: Option<MessageTemplate> = None;
         let mut template_delete: Option<MessageTemplate> = None;
+        let mut identity_new = false;
+        let mut identity_edit: Option<Identity> = None;
+        let mut identity_delete: Option<Identity> = None;
         let focus_close = self.settings_focus_pending;
         self.settings_focus_pending = false;
         let window = ui.ctx().content_rect();
@@ -9867,6 +9900,69 @@ impl PostinoApp {
                         {
                             template_new = true;
                         }
+
+                        ui.add_space(space::MD);
+                        let _identities = ui.label(typography::strong(Role::BodySmall, "MITTENTI", t.text_faint));
+                        #[cfg(test)]
+                        probe::settings_section(ui, "MITTENTI", _identities.rect);
+                        ui.add_space(space::XS);
+                        ui.label(typography::text(
+                            Role::Meta,
+                            "Indirizzi alternativi per il campo Da. Il provider deve autorizzarli per l'invio; il client non cambia nulla sul server.",
+                            t.text_faint,
+                        ));
+                        if !self.demo
+                            && !self.identities_loaded
+                            && let Some(notice) = &self.identities_notice
+                        {
+                            ui.label(typography::text(Role::Caption, notice.as_str(), t.danger));
+                        }
+                        if self.identities.is_empty() {
+                            ui.label(typography::text(Role::BodySmall, "Nessun mittente alternativo.", t.text_muted));
+                        }
+                        for identity in &self.identities {
+                            Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::XS)).show(
+                                ui,
+                                |ui| {
+                                    Sides::new().show(
+                                        ui,
+                                        |ui| {
+                                            ui.vertical(|ui| {
+                                                ui.spacing_mut().item_spacing.y = 1.0;
+                                                ui.label(typography::text(Role::BodySmall, format!("{} <{}>", identity.name, identity.email), t.text));
+                                                ui.add(
+                                                    egui::Label::new(typography::text(
+                                                        Role::Caption,
+                                                        if identity.signature.trim().is_empty() { "Senza firma" } else { "Firma impostata" },
+                                                        t.text_faint,
+                                                    ))
+                                                    .truncate(),
+                                                );
+                                            });
+                                        },
+                                        |ui| {
+                                            if Button::ghost("Modifica").size(ButtonSize::Sm).show(ui).clicked() {
+                                                identity_edit = Some(identity.clone());
+                                            }
+                                            if Button::danger("Elimina").size(ButtonSize::Sm).show(ui).clicked() {
+                                                identity_delete = Some(identity.clone());
+                                            }
+                                        },
+                                    );
+                                },
+                            );
+                            ui.add_space(space::XS);
+                        }
+                        if Button::new("Nuovo mittente")
+                            .icon(icons::PLUS)
+                            .size(ButtonSize::Sm)
+                            .enabled(!self.demo)
+                            .disabled_reason("La modalit�� demo non ha un archivio locale su cui salvare i mittenti")
+                            .show(ui)
+                            .clicked()
+                        {
+                            identity_new = true;
+                        }
                     });
                 #[cfg(test)]
                 probe::settings_scroll(ui, _settings_scroll.inner_rect, _settings_scroll.content_size, _settings_scroll.state.offset);
@@ -9917,6 +10013,15 @@ impl PostinoApp {
         }
         if let Some(template) = template_delete {
             self.template_delete = Some(template);
+        }
+        if identity_new {
+            self.open_identity_editor(None);
+        }
+        if let Some(identity) = identity_edit {
+            self.open_identity_editor(Some(&identity));
+        }
+        if let Some(identity) = identity_delete {
+            self.identity_delete = Some(identity);
         }
         if let Some(account_id) = signature_open {
             let text =
@@ -10093,6 +10198,102 @@ impl PostinoApp {
         }
     }
 
+    fn refresh_identities(&mut self) {
+        if self.identities_loaded || self.demo || self.now < self.identities_retry_at {
+            return;
+        }
+        self.reload_identities();
+    }
+
+    fn reload_identities(&mut self) {
+        if self.demo {
+            self.identities.clear();
+            self.identities_loaded = true;
+            return;
+        }
+        let mut args = json!({});
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        match self.op("identities_list", args) {
+            Ok(value) => match serde_json::from_value::<Vec<Identity>>(value) {
+                Ok(identities) => {
+                    self.identities = identities;
+                    self.identities_loaded = true;
+                    self.identities_retry_at = 0.0;
+                    self.identities_notice = None;
+                }
+                Err(_) => {
+                    self.identities_retry_at = self.now + 5.0;
+                    self.identities_notice = Some("L'elenco dei mittenti non è leggibile.".to_owned());
+                }
+            },
+            Err(error) => {
+                self.identities_retry_at = self.now + 5.0;
+                self.identities_notice = Some(format!("Mittenti non disponibili: {error}"));
+            }
+        }
+    }
+
+    fn open_identity_editor(&mut self, identity: Option<&Identity>) {
+        self.identity_editor = Some(match identity {
+            Some(identity) => IdentityEditorState {
+                id: Some(identity.id.clone()),
+                name: identity.name.clone(),
+                email: identity.email.clone(),
+                signature: identity.signature.clone(),
+                focus_name: true,
+                error: None,
+            },
+            None => {
+                IdentityEditorState { id: None, name: String::new(), email: String::new(), signature: String::new(), focus_name: true, error: None }
+            }
+        });
+    }
+
+    fn submit_identity_editor(&mut self) {
+        let Some(editor) = self.identity_editor.clone() else { return };
+        let mut args = match editor.id.as_deref() {
+            Some(id) => json!({ "id": id, "name": editor.name, "email": editor.email, "signature": editor.signature }),
+            None => json!({ "name": editor.name, "email": editor.email, "signature": editor.signature }),
+        };
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        let result = match editor.id.as_deref() {
+            Some(_) => self.op("identity_update", args),
+            None => self.op("identity_create", args),
+        };
+        match result {
+            Ok(_) => {
+                let name = editor.name.trim().to_owned();
+                self.identity_editor = None;
+                self.reload_identities();
+                self.push_info_toast(format!("Mittente salvato: {name}"), ToastKind::Info);
+            }
+            Err(error) => {
+                if let Some(editor) = self.identity_editor.as_mut() {
+                    editor.error = Some(format!("Il mittente non è stato salvato: {error}"));
+                }
+            }
+        }
+    }
+
+    fn delete_identity(&mut self, identity: &Identity) {
+        let mut args = json!({ "id": identity.id });
+        if let Some(account) = &self.active_account {
+            args["account"] = json!(account);
+        }
+        match self.op("identity_delete", args) {
+            Ok(_) => {
+                self.identity_delete = None;
+                self.reload_identities();
+                self.push_info_toast(format!("Mittente eliminato: {}", identity.name), ToastKind::Info);
+            }
+            Err(error) => self.push_info_toast(format!("Il mittente non è stato eliminato: {error}"), ToastKind::Error),
+        }
+    }
+
     /// Insert a local template without discarding what the person already wrote: an empty subject
     /// takes the template subject, an empty body takes the template body, otherwise the body is
     /// appended after a blank line. Insertion is undoable through the composer's own text undo.
@@ -10131,6 +10332,12 @@ impl PostinoApp {
         self.unsubscribe_info = None;
         self.unsubscribe_checked = None;
         self.show_unsubscribe = false;
+        self.identities.clear();
+        self.identities_loaded = false;
+        self.identities_retry_at = 0.0;
+        self.identity_editor = None;
+        self.identity_delete = None;
+        self.identities_notice = None;
     }
 
     fn refresh_pgp_keys(&mut self) {
@@ -10444,6 +10651,71 @@ impl PostinoApp {
         }
     }
 
+    fn identity_editor_dialog(&mut self, ui: &mut Ui) {
+        let Some(state) = self.identity_editor.as_mut() else { return };
+        let t = theme::tokens(self.dark);
+        let mut submit = false;
+        let mut cancel = false;
+        let focus_name = state.focus_name;
+        state.focus_name = false;
+        let title = if state.id.is_some() { "Modifica mittente" } else { "Nuovo mittente" };
+        let response = egui::Modal::new(Id::new("postino-identity-editor"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(520.0);
+                ui.label(typography::strong(Role::Emphasis, title, t.text));
+                ui.add_space(space::SM);
+                ui.label(typography::text(
+                    Role::Secondary,
+                    "Il mittente resta in questo archivio cifrato. Il provider deve gia accettare l'indirizzo per l'invio: Postino non crea alias sul server.",
+                    t.text_muted,
+                ));
+                ui.add_space(space::MD);
+                TextField::new(&mut state.name, "Nome mostrato").label("NOME").width(ui.available_width()).focus(focus_name).show(ui);
+                ui.add_space(space::SM);
+                TextField::new(&mut state.email, "nome@esempio.it").label("INDIRIZZO").width(ui.available_width()).show(ui);
+                ui.add_space(space::SM);
+                TextField::new(&mut state.signature, "Firma per i messaggi scritti da questo indirizzo").label("FIRMA").multiline(4).width(ui.available_width()).show(ui);
+                if let Some(error) = state.error.as_deref() {
+                    ui.label(typography::text(Role::Meta, error, t.danger));
+                }
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let save = Button::primary("Salva").enabled(!state.name.trim().is_empty() && !state.email.trim().is_empty());
+                    submit = save.show(ui).clicked();
+                    cancel = Button::ghost("Annulla").show(ui).clicked();
+                });
+            });
+        if submit {
+            self.submit_identity_editor();
+        } else if cancel || response.should_close() {
+            self.identity_editor = None;
+        }
+    }
+
+    fn identity_delete_dialog(&mut self, ui: &mut Ui) {
+        let Some(identity) = self.identity_delete.clone() else { return };
+        let body = format!(
+            "Eliminare {} <{}>? Le bozze gia scritte da questo indirizzo non cambiano, ma non potranno essere inviate finche non scegli un mittente valido.",
+            identity.name, identity.email
+        );
+        let mut confirm = false;
+        let mut cancel = false;
+        let response =
+            egui::Modal::new(Id::new("postino-identity-delete")).backdrop_color(theme::scrim(self.dark)).frame(Frame::NONE).show(ui.ctx(), |ui| {
+                let response =
+                    Dialog::new("Eliminare il mittente?", body.as_str(), "Elimina").secondary("Annulla").danger(true).width(480.0).show(ui);
+                confirm = response.primary;
+                cancel = response.secondary;
+            });
+        if confirm {
+            self.delete_identity(&identity);
+        } else if cancel || response.should_close() {
+            self.identity_delete = None;
+        }
+    }
+
     fn account_remove_dialog(&mut self, ui: &mut Ui) {
         let Some(state) = self.account_remove.clone() else {
             return;
@@ -10650,6 +10922,7 @@ impl PostinoApp {
             self.refresh_pgp_keys();
         }
         self.refresh_templates();
+        self.refresh_identities();
         let Some(account) = self.account().cloned() else {
             self.composer_preview = false;
             self.composer = ComposerState::closed();
@@ -10684,6 +10957,7 @@ impl PostinoApp {
                     .attachments_available(attachments_available)
                     .pgp_keys(&self.pgp_keys)
                     .templates(&self.templates)
+                    .identities(&self.identities)
                     .show(ui)
             })
             .inner
@@ -11451,6 +11725,8 @@ impl PostinoApp {
         self.pgp_delete_dialog(ui);
         self.template_editor_dialog(ui);
         self.template_delete_dialog(ui);
+        self.identity_editor_dialog(ui);
+        self.identity_delete_dialog(ui);
         self.unsubscribe_sheet(ui);
         self.link_confirmation(ui);
         self.attachment_warning_dialog(ui);
@@ -11849,6 +12125,18 @@ struct TemplateEditorState {
     name: String,
     subject: String,
     body: String,
+    focus_name: bool,
+    error: Option<String>,
+}
+
+/// The create/edit sheet for one alternate sender. The signature is plain text and the address
+/// must already be authorised by the provider for submission.
+#[derive(Clone)]
+struct IdentityEditorState {
+    id: Option<String>,
+    name: String,
+    email: String,
+    signature: String,
     focus_name: bool,
     error: Option<String>,
 }
@@ -14227,6 +14515,14 @@ pub(crate) mod probe {
 
     pub fn composer_pgp_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("composer-pgp")))
+    }
+
+    pub fn composer_from(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("composer-from"), rect));
+    }
+
+    pub fn composer_from_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("composer-from")))
     }
 
     pub fn settings_pgp_export(ui: &Ui, key_id: &str, rect: Rect) {
@@ -20760,6 +21056,84 @@ mod tests {
         painted_visible(&runs, "Preventivo");
         painted_visible(&runs, "Modifica");
         painted_visible(&runs, "Nuovo modello");
+    }
+
+    #[test]
+    fn settings_lists_local_identities_with_edit_and_delete() {
+        let (ctx, mut app) = ready_app();
+        app.identities_loaded = true;
+        app.identities = vec![identity("idn_1", "Ada", "ada@example.com", "Laboratorio")];
+        app.open_settings(&ctx, None);
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
+        if let Some(scroll) = probe::settings_scroll_view(&ctx) {
+            frame_at(&ctx, &mut app, size, wheel(scroll.center(), 160));
+        }
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "MITTENTI");
+        painted_visible(&runs, "Ada <ada@example.com>");
+        painted_visible(&runs, "Firma impostata");
+        painted_visible(&runs, "Modifica");
+        painted_visible(&runs, "Nuovo mittente");
+    }
+
+    #[test]
+    fn the_composer_picker_switches_the_sender_and_its_signature() {
+        let (ctx, mut app) = ready_app();
+        app.identities_loaded = true;
+        app.identities = vec![identity("idn_1", "Ada", "ada@example.com", "Laboratorio")];
+        app.compose_new();
+        let account_email = app.account().expect("demo account").email.clone();
+        let size = Vec2::new(980.0, 600.0);
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "Da");
+        painted_visible(&runs, account_email.as_str());
+        let from = probe::composer_from_rect(&ctx).expect("the From picker").center();
+        click_at(&ctx, &mut app, from, size);
+
+        let runs = painted_runs(&ctx, &mut app, size);
+        painted_visible(&runs, "Ada <ada@example.com>");
+        let option = runs.iter().find(|run| run.text.contains("ada@example.com")).expect("the identity option").rect.center();
+        click_at(&ctx, &mut app, option, size);
+
+        assert_eq!(app.composer.sender.as_deref(), Some("ada@example.com"));
+        assert!(app.composer.body.starts_with("-- \nLaboratorio\n\n"), "the identity signature replaces the account one: {:?}", app.composer.body);
+        assert!(app.composer.dirty, "choosing a sender is part of the draft");
+    }
+
+    #[test]
+    fn saving_from_an_identity_keeps_the_chosen_sender() {
+        let (mut app, daemon, _store_path, _key, _vault) = daemon_app("p14-identities-draft", |store| {
+            seed_account_rows(store, "acc_a", "ada@example.com", None);
+        });
+        let created = app
+            .op("identity_create", json!({ "account": "acc_a", "name": "Laboratorio", "email": "lab@example.com", "signature": "Lab" }))
+            .expect("create the identity");
+        assert_eq!(created["email"], "lab@example.com");
+        app.refresh_identities();
+        assert_eq!(app.identities.len(), 1, "the settings cache sees the new sender");
+        app.compose_new();
+        app.composer.to = "grace@example.com".to_owned();
+        app.composer.subject = "Dal laboratorio".to_owned();
+        app.composer.sender = Some("lab@example.com".to_owned());
+        app.composer.dirty = true;
+        assert!(app.save_composer(true), "the draft saves through the registry");
+        let draft = app.engine.messages().iter().find(|message| message.subject == "Dal laboratorio").cloned().expect("the saved draft");
+        let full = app.engine.message(&draft.id).expect("draft body");
+        assert_eq!(full.summary.from.email, "lab@example.com");
+        daemon.shutdown().expect("the daemon stops");
+    }
+
+    fn identity(id: &str, name: &str, email: &str, signature: &str) -> Identity {
+        Identity {
+            id: id.to_owned(),
+            account_id: "acc_demo".to_owned(),
+            name: name.to_owned(),
+            email: email.to_owned(),
+            signature: signature.to_owned(),
+            created_at: 1,
+            updated_at: 1,
+        }
     }
 
     #[test]

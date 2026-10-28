@@ -27,13 +27,13 @@ use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     AttachmentGet, CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FolderExportMbox, FolderImportMbox, FoldersList,
-    LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MAX_EML_BYTES, MAX_MBOX_BYTES, MailTls, MessageExport,
-    MessageFlag, MessageGet, MessageImport, MessageSummary, MessageTemplate, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction,
-    OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult, PgpVerifyState,
-    Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult,
-    SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow,
-    SyncReport, SyncStatusReport, TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod,
-    VaultError,
+    Identity, IdentityDeleteResult, LabelApply, LabelColor, LabelCreate, LabelDelete, LabelSummary, LabelUpdate, LabelsList, MAX_EML_BYTES,
+    MAX_MBOX_BYTES, MailTls, MessageExport, MessageFlag, MessageGet, MessageImport, MessageSummary, MessageTemplate, MessagesList, OAuthGrant, OpDef,
+    OpError, OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions,
+    PgpVerifyResult, PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult,
+    RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult,
+    SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, TemplateDeleteResult, ThreadFlagOutput, ThreadGetResult,
+    ThreadsListResult, UnsubscribeInfo, UnsubscribeMethod, VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -87,6 +87,10 @@ enum DraftCommand {
         /// Subject. Omit to keep it on update; pass --subject "" to clear it.
         #[arg(long)]
         subject: Option<String>,
+        /// Sender: identity id from `postino identities list`, its address, or the account address.
+        /// Omit on update to keep the stored sender; omit on create to use the account.
+        #[arg(long)]
+        from: Option<String>,
         /// Body text. Omit to keep it on update; pass --body "" to clear it.
         #[arg(long)]
         body: Option<String>,
@@ -253,6 +257,44 @@ enum TemplateCommand {
     },
     /// Delete a local compose template.
     Delete { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    /// List alternate senders for an account.
+    List {
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Add an alternate From address. The provider must still authorise it for submission.
+    Create {
+        name: String,
+        email: String,
+        #[arg(long)]
+        account: Option<String>,
+        /// Plain-text signature applied to new messages written from this identity.
+        #[arg(long, default_value = "")]
+        signature: String,
+    },
+    /// Change an alternate sender's name, address or signature.
+    Update {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        email: Option<String>,
+        /// New plain-text signature; pass --signature "" to remove it.
+        #[arg(long)]
+        signature: Option<String>,
+    },
+    /// Delete an alternate sender. Drafts already written from it must be re-saved.
+    Delete {
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -837,6 +879,11 @@ enum Command {
     Templates {
         #[command(subcommand)]
         command: TemplateCommand,
+    },
+    /// List, create, update or delete alternate senders.
+    Identities {
+        #[command(subcommand)]
+        command: IdentityCommand,
     },
     /// List, preview, run and undo local rules.
     Rules {
@@ -1719,6 +1766,7 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Thread { command } => matches!(command, ThreadCommand::Get { .. }),
         Command::Saved { command } => matches!(command, SavedCommand::List { .. }),
         Command::Templates { command } => matches!(command, TemplateCommand::List),
+        Command::Identities { command } => matches!(command, IdentityCommand::List { .. }),
         Command::Rules { command } => matches!(command, RuleCommand::List { .. } | RuleCommand::Preview { .. } | RuleCommand::Runs { .. }),
         Command::Outbox { command } => matches!(command, OutboxCommand::List { .. }),
         // An unknown operation stays read-only so a typo cannot create a store; a sensitive
@@ -2454,7 +2502,7 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             }
         }
         Command::Draft { command } => match command {
-            DraftCommand::Save { id, account, to, cc, bcc, subject, body, html, plain, send, in_reply_to } => {
+            DraftCommand::Save { id, account, to, cc, bcc, subject, from, body, html, plain, send, in_reply_to } => {
                 let body_format = if html {
                     Some(postino_core::BodyFormat::Html)
                 } else if plain {
@@ -2462,7 +2510,7 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 } else {
                     None
                 };
-                let args = draft_save_args(id, account, to, cc, bcc, subject, body, body_format, in_reply_to)?;
+                let args = draft_save_args(id, account, to, cc, bcc, subject, from, body, body_format, in_reply_to)?;
                 let saved: DraftSave = decode(call(engine, "draft_save", args)?)?;
                 let draft_id = saved.draft.summary.id.clone();
                 if send {
@@ -2874,6 +2922,52 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     say(format!("Modello eliminato: {}\n", result.id))?;
                 } else {
                     say(format!("Nessun modello con id {}.\n", result.id))?;
+                }
+            }
+        },
+        Command::Identities { command } => match command {
+            IdentityCommand::List { account } => {
+                let identities: Vec<Identity> = decode(call(engine, "identities_list", json!({ "account": account }))?)?;
+                if json_output {
+                    print_json(&identities)?;
+                } else {
+                    let mut text = String::new();
+                    for identity in &identities {
+                        text.push_str(&format!("{}  {} <{}>\n", identity.id, identity.name, identity.email));
+                    }
+                    if identities.is_empty() {
+                        text.push_str("Nessun mittente alternativo.\n");
+                    }
+                    say(text)?;
+                }
+            }
+            IdentityCommand::Create { name, email, account, signature } => {
+                let identity: Identity =
+                    decode(call(engine, "identity_create", json!({ "name": name, "email": email, "account": account, "signature": signature }))?)?;
+                if json_output {
+                    print_json(&identity)?;
+                } else {
+                    say(format!("{}  {} <{}>\n", identity.id, identity.name, identity.email))?;
+                }
+            }
+            IdentityCommand::Update { id, account, name, email, signature } => {
+                let identity: Identity = decode(call(
+                    engine,
+                    "identity_update",
+                    json!({ "id": id, "account": account, "name": name, "email": email, "signature": signature }),
+                )?)?;
+                if json_output {
+                    print_json(&identity)?;
+                } else {
+                    say(format!("{}  {} <{}>\n", identity.id, identity.name, identity.email))?;
+                }
+            }
+            IdentityCommand::Delete { id, account } => {
+                let result: IdentityDeleteResult = decode(call(engine, "identity_delete", json!({ "id": id, "account": account }))?)?;
+                if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!("Mittente eliminato: {} <{}>\n", result.identity.name, result.identity.email))?;
                 }
             }
         },
@@ -3839,6 +3933,7 @@ fn draft_save_args(
     cc: Option<Vec<String>>,
     bcc: Option<Vec<String>>,
     subject: Option<String>,
+    from: Option<String>,
     body: Option<String>,
     body_format: Option<postino_core::BodyFormat>,
     in_reply_to: Option<String>,
@@ -3861,6 +3956,9 @@ fn draft_save_args(
     }
     if let Some(subject) = subject {
         args.insert("subject".to_owned(), json!(subject));
+    }
+    if let Some(from) = from {
+        args.insert("from".to_owned(), json!(from));
     }
     if let Some(body) = body {
         args.insert("body_text".to_owned(), json!(body));
@@ -4145,6 +4243,7 @@ mod tests {
                     plain: false,
                     send: false,
                     in_reply_to: None,
+                    from: None,
                 },
             }),
             &mut engine,
@@ -4166,6 +4265,7 @@ mod tests {
                     plain: false,
                     send: false,
                     in_reply_to: None,
+                    from: None,
                 },
             }),
             &mut engine,
@@ -4191,6 +4291,7 @@ mod tests {
                     plain: false,
                     send: false,
                     in_reply_to: None,
+                    from: None,
                 },
             }),
             &mut engine,
@@ -4210,6 +4311,7 @@ mod tests {
                     plain: false,
                     send: false,
                     in_reply_to: None,
+                    from: None,
                 },
             }),
             &mut engine,
@@ -4246,6 +4348,65 @@ mod tests {
         assert_eq!(engine.templates().expect("templates")[0].subject, "Nuovo oggetto");
         run(cli(Command::Templates { command: TemplateCommand::Delete { id } }), &mut engine).expect("template delete");
         assert!(engine.templates().expect("templates").is_empty());
+    }
+
+    #[test]
+    fn cli_identities_round_trip_and_a_draft_keeps_the_chosen_sender() {
+        let fixture = TempStore::new();
+        fixture.seed();
+        let mut engine = Engine::open(fixture.open()).expect("engine");
+        run(
+            cli(Command::Identities {
+                command: IdentityCommand::Create {
+                    name: "Ada".to_owned(),
+                    email: "ada@example.com".to_owned(),
+                    account: None,
+                    signature: "Laboratorio".to_owned(),
+                },
+            }),
+            &mut engine,
+        )
+        .expect("create an identity");
+        let identities = engine.identities(None).expect("list identities");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].email, "ada@example.com");
+        let id = identities[0].id.clone();
+
+        run(
+            cli(Command::Draft {
+                command: DraftCommand::Save {
+                    id: None,
+                    account: None,
+                    to: Some(vec!["grace@example.com".to_owned()]),
+                    cc: None,
+                    bcc: None,
+                    subject: Some("Dal CLI".to_owned()),
+                    body: Some("Ciao".to_owned()),
+                    html: false,
+                    plain: false,
+                    send: false,
+                    in_reply_to: None,
+                    from: Some(id.clone()),
+                },
+            }),
+            &mut engine,
+        )
+        .expect("save from the identity");
+        let draft = engine.messages().iter().find(|message| message.subject == "Dal CLI").cloned().expect("draft");
+        let full = engine.message(&draft.id).expect("draft body");
+        assert_eq!(full.summary.from.email, "ada@example.com");
+
+        run(
+            cli(Command::Identities {
+                command: IdentityCommand::Update { id: id.clone(), account: None, name: Some("Ada L.".to_owned()), email: None, signature: None },
+            }),
+            &mut engine,
+        )
+        .expect("update the identity");
+        assert_eq!(engine.identities(None).expect("list")[0].name, "Ada L.");
+
+        run(cli(Command::Identities { command: IdentityCommand::Delete { id, account: None } }), &mut engine).expect("delete the identity");
+        assert!(engine.identities(None).expect("list").is_empty());
     }
 
     #[test]
@@ -4311,6 +4472,7 @@ mod tests {
                     plain: false,
                     send: false,
                     in_reply_to: None,
+                    from: None,
                 },
             }),
             &mut engine,
@@ -4458,13 +4620,13 @@ mod tests {
 
     #[test]
     fn draft_save_args_omit_unset_flags_and_keep_an_explicit_account() {
-        let args = draft_save_args(None, Some("acc_b".to_owned()), None, None, None, None, Some("Corpo".to_owned()), None, None).expect("args");
+        let args = draft_save_args(None, Some("acc_b".to_owned()), None, None, None, None, None, Some("Corpo".to_owned()), None, None).expect("args");
         assert_eq!(args["account"], "acc_b");
         assert_eq!(args["body_text"], "Corpo");
         assert!(args.get("to").is_none(), "an omitted --to must stay absent for patch semantics");
         assert!(args.get("subject").is_none(), "an omitted --subject must stay absent for patch semantics");
 
-        let empty = draft_save_args(None, None, Some(Vec::new()), None, None, Some(String::new()), None, None, None).expect("empty args");
+        let empty = draft_save_args(None, None, Some(Vec::new()), None, None, Some(String::new()), None, None, None, None).expect("empty args");
         assert_eq!(empty["to"], json!([]));
         assert_eq!(empty["subject"], "");
     }
@@ -4486,6 +4648,7 @@ mod tests {
                     plain: false,
                     send: false,
                     in_reply_to: None,
+                    from: None,
                 },
             }),
             &mut engine,
@@ -4512,6 +4675,7 @@ mod tests {
                     plain: true,
                     send: false,
                     in_reply_to: None,
+                    from: None,
                 },
             }),
             &mut engine,
@@ -4846,6 +5010,7 @@ mod tests {
                         plain: false,
                         send: false,
                         in_reply_to: None,
+                        from: None,
                     },
                 }),
                 &mut engine,
@@ -4867,6 +5032,7 @@ mod tests {
                         plain: false,
                         send: false,
                         in_reply_to: None,
+                        from: None,
                     },
                 }),
                 &mut engine,
@@ -4913,6 +5079,7 @@ mod tests {
                         plain: false,
                         send: false,
                         in_reply_to: None,
+                        from: None,
                     },
                 }),
                 &mut engine,

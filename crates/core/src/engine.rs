@@ -15,15 +15,15 @@ use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
 use postino_net::{CertificateDer, NetError, SmtpEnvelope, SmtpError, SmtpLimits};
-use postino_store::{FlagUpdate, OutboxEntry, OutboxState, PgpKeyInsert, Store};
+use postino_store::{FlagUpdate, IDENTITY_INDEX_KEY_PREFIX, IDENTITY_KEY_PREFIX, OutboxEntry, OutboxState, PgpKeyInsert, Store};
 use postino_sync::SyncError;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::model::{
-    Account, AccountView, Address, Attachment, BodyFormat, CalendarInviteView, DraftContent, Folder, FolderKind, InviteResponse, Label, LabelColor,
-    LabelSummary, MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings, ThreadSummary,
-    UnsubscribeInfo, snippet,
+    Account, AccountView, Address, Attachment, BodyFormat, CalendarInviteView, DraftContent, Folder, FolderKind, Identity, InviteResponse, Label,
+    LabelColor, LabelSummary, MailTls, Message, MessageSummary, MessageTemplate, PgpKey, PgpPublicKey, Provider, SavedSearch, SmtpSettings,
+    ThreadSummary, UnsubscribeInfo, snippet,
 };
 use crate::ops::{self, OpDef};
 use crate::outbox::{
@@ -165,9 +165,64 @@ const MAX_TEMPLATES: usize = 20;
 const MAX_TEMPLATE_NAME_CHARS: usize = 64;
 const MAX_TEMPLATE_SUBJECT_BYTES: usize = 998;
 const MAX_TEMPLATE_BODY_BYTES: usize = 16 * 1024;
+const MAX_IDENTITIES: usize = 10;
+const MAX_IDENTITY_NAME_CHARS: usize = 64;
 
 fn template_key(id: &str) -> String {
     format!("{TEMPLATE_KEY_PREFIX}{id}")
+}
+
+fn identity_key(id: &str) -> String {
+    format!("{IDENTITY_KEY_PREFIX}{id}")
+}
+
+fn validate_identity_name(name: &str) -> Result<String, OpError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(OpError::InvalidArgs("an identity name must not be empty".to_owned()));
+    }
+    if name.chars().count() > MAX_IDENTITY_NAME_CHARS {
+        return Err(OpError::InvalidArgs(format!("an identity name is limited to {MAX_IDENTITY_NAME_CHARS} characters")));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(OpError::InvalidArgs("an identity name must not contain control characters".to_owned()));
+    }
+    Ok(name.to_owned())
+}
+
+fn read_identity_index(store: &Store, account_id: &str) -> Result<Vec<String>, OpError> {
+    let key = format!("{IDENTITY_INDEX_KEY_PREFIX}{account_id}");
+    let Some(raw) = store.get_meta(&key).map_err(store_map::read_error)? else { return Ok(Vec::new()) };
+    let index: Vec<String> = serde_json::from_str(&raw)
+        .map_err(|_| OpError::Failed("the identity index is damaged; inspect the local store before adding identities".to_owned()))?;
+    if index.len() > MAX_IDENTITIES {
+        return Err(OpError::Failed("the identity index is larger than the allowed bound".to_owned()));
+    }
+    Ok(index)
+}
+
+fn write_identity_index(store: &Store, account_id: &str, index: &[String]) -> Result<(), OpError> {
+    let encoded = serde_json::to_string(index).map_err(|_| OpError::Failed("the identity index could not be encoded".to_owned()))?;
+    store.set_meta(&format!("{IDENTITY_INDEX_KEY_PREFIX}{account_id}"), &encoded).map_err(store_map::write_error)
+}
+
+fn read_identity(store: &Store, account_id: &str, id: &str) -> Result<Option<Identity>, OpError> {
+    let Some(raw) = store.get_meta(&identity_key(id)).map_err(store_map::read_error)? else { return Ok(None) };
+    let identity: Identity =
+        serde_json::from_str(&raw).map_err(|_| OpError::Failed(format!("the stored identity {id:?} is damaged; delete it with identity_delete")))?;
+    Ok((identity.account_id == account_id).then_some(identity))
+}
+
+fn encode_identity(identity: &Identity) -> Result<String, OpError> {
+    serde_json::to_string(identity).map_err(|_| OpError::Failed("the identity could not be encoded".to_owned()))
+}
+
+fn allocate_identity_id(store: &Store) -> Result<String, OpError> {
+    const KEY: &str = "identity_seq";
+    let stored = store.get_meta(KEY).map_err(store_map::read_error)?.and_then(|raw| raw.parse::<i64>().ok()).unwrap_or(0);
+    let next = stored.saturating_add(1);
+    store.set_meta(KEY, &next.to_string()).map_err(store_map::write_error)?;
+    Ok(format!("idn_{next}"))
 }
 
 fn validate_template_name(name: &str) -> Result<String, OpError> {
@@ -979,6 +1034,124 @@ impl Engine {
             Err(OpError::Failed(format!("{operation} needs a local store; the demo mailbox has no writable template list")))
         }
     }
+
+    /// Alternate senders configured for one account, by display name. The base account address is
+    /// implicit and is never repeated here.
+    pub fn identities(&self, account: Option<&str>) -> Result<Vec<Identity>, OpError> {
+        let account = self.requested_account(account, "identities_list")?;
+        if !self.is_persistent() {
+            return Ok(Vec::new());
+        }
+        let store = self.require_store("identities_list")?;
+        let mut identities = Vec::new();
+        for id in read_identity_index(store, &account.id)? {
+            if let Some(identity) = read_identity(store, &account.id, &id)? {
+                identities.push(identity);
+            }
+        }
+        identities.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()).then_with(|| left.id.cmp(&right.id)));
+        Ok(identities)
+    }
+
+    /// Add one alternate sender. It must be an address the provider lets this account submit; the
+    /// engine never claims the alias is authorised, and SMTP rejection stays visible.
+    pub fn create_identity(&mut self, account: Option<&str>, name: &str, email: &str, signature: Option<&str>) -> Result<Identity, OpError> {
+        let account = self.requested_account(account, "identity_create")?;
+        let store = self.require_store("identity_create")?;
+        if !self.is_persistent() {
+            return Err(OpError::Failed("identity_create needs a local store".to_owned()));
+        }
+        let index = read_identity_index(store, &account.id)?;
+        if index.len() >= MAX_IDENTITIES {
+            return Err(OpError::InvalidArgs(format!("at most {MAX_IDENTITIES} identities per account are allowed; delete one first")));
+        }
+        let name = validate_identity_name(name)?;
+        let email = validate_account_email(email)?;
+        if email.eq_ignore_ascii_case(&account.email) {
+            return Err(OpError::InvalidArgs(format!("{email:?} is the account address; the base sender is always available and needs no identity")));
+        }
+        if index.iter().any(|id| read_identity(store, &account.id, id).ok().flatten().is_some_and(|row| row.email.eq_ignore_ascii_case(&email))) {
+            return Err(OpError::InvalidArgs(format!("an identity for {email:?} already exists")));
+        }
+        let signature = signature.unwrap_or_default();
+        validate_signature(signature)?;
+        let signature = signature.trim_end().to_owned();
+        let id = allocate_identity_id(store)?;
+        let now = Utc::now().timestamp_millis();
+        let identity = Identity { id: id.clone(), account_id: account.id.clone(), name, email, signature, created_at: now, updated_at: now };
+        let encoded = encode_identity(&identity)?;
+        store.set_meta(&identity_key(&id), &encoded).map_err(store_map::write_error)?;
+        let mut next_index = index;
+        next_index.push(id);
+        if let Err(error) = write_identity_index(store, &account.id, &next_index) {
+            let _ = store.delete_meta(&identity_key(&identity.id));
+            return Err(error);
+        }
+        Ok(identity)
+    }
+
+    /// Change the display name, address or signature of one identity. At least one field is
+    /// required; the id, account and creation instant never change.
+    pub fn update_identity(
+        &mut self,
+        account: Option<&str>,
+        id: &str,
+        name: Option<&str>,
+        email: Option<&str>,
+        signature: Option<&str>,
+    ) -> Result<Identity, OpError> {
+        let account = self.requested_account(account, "identity_update")?;
+        if name.is_none() && email.is_none() && signature.is_none() {
+            return Err(OpError::InvalidArgs("identity_update needs at least one of name, email or signature".to_owned()));
+        }
+        let store = self.require_store("identity_update")?;
+        let Some(mut identity) = read_identity(store, &account.id, id)? else {
+            return Err(OpError::InvalidArgs(format!("unknown identity {id:?}; use an id returned by identities_list")));
+        };
+        if let Some(name) = name {
+            identity.name = validate_identity_name(name)?;
+        }
+        if let Some(email) = email {
+            let email = validate_account_email(email)?;
+            if email.eq_ignore_ascii_case(&account.email) {
+                return Err(OpError::InvalidArgs(format!(
+                    "{email:?} is the account address; remove this identity instead of duplicating the base sender"
+                )));
+            }
+            let index = read_identity_index(store, &account.id)?;
+            let duplicate = index.iter().any(|other| {
+                other != id && read_identity(store, &account.id, other).ok().flatten().is_some_and(|row| row.email.eq_ignore_ascii_case(&email))
+            });
+            if duplicate {
+                return Err(OpError::InvalidArgs(format!("an identity for {email:?} already exists")));
+            }
+            identity.email = email;
+        }
+        if let Some(signature) = signature {
+            validate_signature(signature)?;
+            identity.signature = signature.trim_end().to_owned();
+        }
+        identity.updated_at = Utc::now().timestamp_millis();
+        let encoded = encode_identity(&identity)?;
+        store.set_meta(&identity_key(&identity.id), &encoded).map_err(store_map::write_error)?;
+        Ok(identity)
+    }
+
+    /// Delete one alternate sender. Drafts already written from it keep their `From`; sending one
+    /// fails until they are re-saved with a current identity, rather than silently changing sender.
+    pub fn delete_identity(&mut self, account: Option<&str>, id: &str) -> Result<Identity, OpError> {
+        let account = self.requested_account(account, "identity_delete")?;
+        let store = self.require_store("identity_delete")?;
+        let Some(identity) = read_identity(store, &account.id, id)? else {
+            return Err(OpError::InvalidArgs(format!("unknown identity {id:?}; use an id returned by identities_list")));
+        };
+        let mut index = read_identity_index(store, &account.id)?;
+        index.retain(|entry| entry != id);
+        write_identity_index(store, &account.id, &index)?;
+        store.delete_meta(&identity_key(id)).map_err(store_map::write_error)?;
+        Ok(identity)
+    }
+
     /// True for the synthetic demo mailbox. Data written by a store-backed engine is real local
     /// data even while no server is connected.
     pub fn is_demo(&self) -> bool {
@@ -3155,6 +3328,19 @@ impl Engine {
         draft: DraftContent,
         body_format: Option<BodyFormat>,
     ) -> Result<Message, OpError> {
+        self.save_draft_with_sender(account, id, draft, body_format, None)
+    }
+
+    /// Save a draft and choose its From. `sender` is an identity id, an identity address or the
+    /// account address; `None` keeps the stored sender on update and uses the account on create.
+    pub fn save_draft_with_sender(
+        &mut self,
+        account: Option<&str>,
+        id: Option<&str>,
+        draft: DraftContent,
+        body_format: Option<BodyFormat>,
+        sender: Option<&str>,
+    ) -> Result<Message, OpError> {
         let draft = normalize_draft_attachment_names(draft);
         validate_draft(&draft)?;
         let requested_html = match body_format {
@@ -3301,7 +3487,12 @@ impl Engine {
                 id: message_id.clone(),
                 thread_id,
                 folder_id: draft_folder,
-                from: Address::new(account.name.clone(), account.email.clone()),
+                from: match sender {
+                    Some(token) => self.identity_address(&account, token)?,
+                    None => current_full
+                        .as_ref()
+                        .map_or_else(|| Address::new(account.name.clone(), account.email.clone()), |message| message.summary.from.clone()),
+                },
                 to: draft.to,
                 subject: draft.subject,
                 snippet: summary_snippet,
@@ -3613,6 +3804,47 @@ impl Engine {
     /// the queued blob and a resend after a cancel all serialize the same draft state the same way.
     /// The Message-ID is derived from that digest, so it is stable too. A scheduled message therefore
     /// carries the instant it was last edited; the header dates the message, not the queue.
+    /// Resolve a draft sender token to the account address or one configured identity. An identity
+    /// is named by id or by its exact address; the account address always means the base sender.
+    fn identity_address(&self, account: &Account, token: &str) -> Result<Address, OpError> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(OpError::InvalidArgs("from must name an identity or the account address".to_owned()));
+        }
+        if token.eq_ignore_ascii_case(&account.email) {
+            return Ok(Address::new(account.name.clone(), account.email.clone()));
+        }
+        let store = self.require_store("choosing a draft sender")?;
+        for id in read_identity_index(store, &account.id)? {
+            if let Some(identity) = read_identity(store, &account.id, &id)?
+                && (identity.id == token || identity.email.eq_ignore_ascii_case(token))
+            {
+                return Ok(identity.address());
+            }
+        }
+        Err(OpError::InvalidArgs(format!("unknown sender {token:?}; use the account address or an id/address returned by identities_list")))
+    }
+
+    /// Resolve the From of a draft to the account address or one configured identity. Never falls
+    /// back to the account silently: a draft saved with a stale or foreign sender must fail loudly.
+    fn submission_sender(&self, account: &Account, from: &Address) -> Result<postino_sync::SubmissionMailbox, OpError> {
+        if from.email.eq_ignore_ascii_case(&account.email) {
+            return Ok(postino_sync::SubmissionMailbox { name: Some(account.name.clone()), address: account.email.clone() });
+        }
+        let store = self.require_store("sending from an alternate identity")?;
+        for id in read_identity_index(store, &account.id)? {
+            if let Some(identity) = read_identity(store, &account.id, &id)?
+                && identity.email.eq_ignore_ascii_case(&from.email)
+            {
+                return Ok(postino_sync::SubmissionMailbox { name: Some(identity.name), address: identity.email });
+            }
+        }
+        Err(OpError::InvalidArgs(format!(
+            "draft sender {:?} is neither the account address nor a configured identity; edit the draft and choose a current sender before sending",
+            from.email
+        )))
+    }
+
     fn submission_for_draft(
         &self,
         draft_id: &str,
@@ -3653,7 +3885,7 @@ impl Engine {
             });
         }
         let submission = postino_sync::Submission {
-            from: postino_sync::SubmissionMailbox { name: Some(account.name.clone()), address: account.email.clone() },
+            from: self.submission_sender(&account, &current.summary.from)?,
             to: current.summary.to.iter().map(mailbox).collect(),
             cc: current.cc.iter().map(mailbox).collect(),
             bcc: current.bcc.iter().map(mailbox).collect(),

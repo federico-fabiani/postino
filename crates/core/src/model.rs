@@ -160,6 +160,30 @@ pub struct Account {
     pub signature: String,
 }
 
+/// One alternate sender of an account. The address is what the composer puts in `From`; the
+/// provider must authorise it for SMTP, because Postino never rewrites the envelope behind the
+/// user's back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Identity {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    pub email: String,
+    /// Plain-text signature applied to a new message written from this identity.
+    #[serde(default)]
+    pub signature: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl Identity {
+    #[must_use]
+    pub fn address(&self) -> Address {
+        Address::new(self.name.clone(), self.email.clone())
+    }
+}
+
 /// The closed autodiscovery table. `Custom` requires the caller to supply host, port and TLS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]

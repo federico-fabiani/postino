@@ -210,7 +210,8 @@ interaction model before real mail makes them expensive to change. Full spec:
 - [x] Email-safe HTML compiler (P13h): tables and inline CSS, matching plain-text alternative, source
       capped at 1 MiB, no raw HTML from UI/CLI/MCP, live preview over the composer.
 - [x] Templates, per-account signatures, remote-content policy and tracking-pixel stripping.
-- [ ] Multiple identities per account.
+- [x] Multiple identities per account (P13i): up to 10 local alternative From senders with their own
+      signatures, a composer picker, and a send-time check against the current list.
 - [ ] Dark theme polish, accessibility pass, Italian/English catalogs.
 - [ ] Verify: render a 20-newsletter corpus on Windows/macOS/Linux; sanitizer tests; no remote
       request in the default profile.

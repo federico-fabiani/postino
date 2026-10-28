@@ -160,8 +160,8 @@ invites, plus a security workflow with `cargo deny check`, Linux 120 s runs and 
 AddressSanitizer job. The remaining roadmap work continues as P13 vertical packages: **P13a** MCP
 resources/compact/audit, **P13b** attachment preview, **P13c** local templates, **P13d**
 unsubscribe, **P13e** Gmail label mapping, **P13f** `.eml` export/import, **P13g** `.mbox`
-export/import are merged and CI-green. The audit keeps these vertical packages serial because they
-touch core/store/app.
+export/import, **P13h** email-safe HTML composition and **P13i** multiple senders are merged and
+CI-green. The audit keeps these vertical packages serial because they touch core/store/app.
 
 **P13f** adds `message_export`/`message_import`, `postino export|import`, palette and reading-pane
 actions and the local **Import** folder. Export is byte-exact only when the v9 raw blob was retained;
@@ -180,6 +180,12 @@ into inline-CSS tables and a matching text alternative; the composer toggles pla
 the exact output, and the engine recompiles compiler-owned drafts at send time. The CLI mirrors the
 flag with `--html`/`--plain`; raw HTML is never accepted and the source is capped at 1 MiB. The block
 editor and Tailwind mode remain open.
+
+**P13i** adds multiple senders per account: up to 10 alternative From identities in encrypted
+`meta`, `identities_list`/`identity_create`/`identity_update`/`identity_delete`, `draft_save.from`
+and a composer **Da** picker that swaps the signature. Drafts store their chosen From; send resolves
+it against the account or a current identity and fails instead of silently using the account. The
+provider must authorise the alias, and Settings manages the list. No schema migration was needed.
 
 ## 5. Delighters backlog
 

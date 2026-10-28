@@ -15,7 +15,7 @@ use postino_sync::SyncStatus;
 
 use crate::engine::{AccountSetup, Engine, OpError, unknown_account, unknown_folder, unknown_label, unknown_message};
 use crate::model::{
-    AccountView, Address, Attachment, BodyFormat, DraftContent, Folder, FolderKind, Label, LabelColor, LabelSummary, MailTls, Message,
+    AccountView, Address, Attachment, BodyFormat, DraftContent, Folder, FolderKind, Identity, Label, LabelColor, LabelSummary, MailTls, Message,
     MessageSummary, Provider, RuleAction, RuleRunScope,
 };
 use crate::store_map;
@@ -355,6 +355,38 @@ pub fn op_defs() -> Vec<OpDef> {
             "Delete a compose template",
             "Delete one local template. This removes local metadata only, never a draft or a message. Returns whether the row existed.",
             TemplateDeleteArgs,
+            false,
+            true
+        ),
+        def!(
+            "identities_list",
+            "List alternate senders",
+            "Every alternate sender configured for one account, by display name. The account's own name and address are the implicit default and are not repeated. Each row carries a display name, an address and an optional plain-text signature; addresses live only in the encrypted store. This does not prove the provider accepts the alias: SMTP rejection stays visible when a message is sent. Read-only and offline.",
+            IdentitiesListArgs,
+            true,
+            false
+        ),
+        def!(
+            "identity_create",
+            "Create an alternate sender",
+            "Add one alternate From address to an account. Names are 1-64 characters, addresses at most 320 bytes with one @ and no control characters, signatures at most 4 KiB; one account holds at most 10 identities and the account's own address cannot be duplicated. This writes local metadata only and never contacts a provider. The provider must still authorise the alias for submission.",
+            IdentityCreateArgs,
+            false,
+            false
+        ),
+        def!(
+            "identity_update",
+            "Update an alternate sender",
+            "Change the display name, address and/or signature of one identity. At least one field is required; the id, account and creation instant never change. Drafts already written from the old address keep their From and must be re-saved to use the new one.",
+            IdentityUpdateArgs,
+            false,
+            false
+        ),
+        def!(
+            "identity_delete",
+            "Delete an alternate sender",
+            "Delete one alternate sender from local metadata. Drafts already written from it keep their From and sending fails until they are re-saved, so a message is never silently sent from a different address.",
+            IdentityDeleteArgs,
             false,
             true
         ),
@@ -732,6 +764,9 @@ pub struct DraftSaveArgs {
     pub bcc: Option<Vec<Address>>,
     /// Subject. Omit to keep the current subject on update; an empty string clears it.
     pub subject: Option<String>,
+    /// From identity: an id from identities_list, an identity address, or the account address for
+    /// the base sender. Omit on update to keep the stored sender; omit on create to use the account.
+    pub from: Option<String>,
     /// Body source. Omit to keep the current body on update; an empty string clears it. In HTML
     /// mode this same source is compiled into the HTML part and its plain-text alternative.
     pub body_text: Option<String>,
@@ -1132,6 +1167,55 @@ pub struct TemplateDeleteArgs {
 pub struct TemplateDeleteResult {
     pub id: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdentitiesListArgs {
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityCreateArgs {
+    /// Account that owns the identity. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Display name, 1-64 characters, no control characters.
+    pub name: String,
+    /// Alternate From address, at most 320 bytes, one @, no whitespace or control characters.
+    pub email: String,
+    /// Optional plain-text signature applied to new messages written from this identity.
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityUpdateArgs {
+    /// Identity id returned by identities_list.
+    pub id: String,
+    /// Account that owns the identity. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// New display name. Omit to keep the current one.
+    pub name: Option<String>,
+    /// New alternate address. Omit to keep the current one.
+    pub email: Option<String>,
+    /// New plain-text signature; an empty string removes it. Omit to keep the current one.
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityDeleteArgs {
+    /// Identity id returned by identities_list.
+    pub id: String,
+    /// Account that owns the identity. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityDeleteResult {
+    pub identity: Identity,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -2015,6 +2099,29 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let deleted = engine.delete_template(&args.id)?;
             value(TemplateDeleteResult { id: args.id, deleted })
         }
+        "identities_list" => {
+            let args: IdentitiesListArgs = parse(args)?;
+            value(engine.identities(args.account.as_deref())?)
+        }
+        "identity_create" => {
+            let args: IdentityCreateArgs = parse(args)?;
+            value(engine.create_identity(args.account.as_deref(), &args.name, &args.email, args.signature.as_deref())?)
+        }
+        "identity_update" => {
+            let args: IdentityUpdateArgs = parse(args)?;
+            value(engine.update_identity(
+                args.account.as_deref(),
+                &args.id,
+                args.name.as_deref(),
+                args.email.as_deref(),
+                args.signature.as_deref(),
+            )?)
+        }
+        "identity_delete" => {
+            let args: IdentityDeleteArgs = parse(args)?;
+            let identity = engine.delete_identity(args.account.as_deref(), &args.id)?;
+            value(IdentityDeleteResult { identity })
+        }
         "pgp_keys_list" => {
             let args: PgpKeysListArgs = parse(args)?;
             value(engine.pgp_keys_list(args.account.as_deref())?)
@@ -2195,7 +2302,7 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
 /// Merge a `draft_save` request into full draft content. On create absent fields are empty; on
 /// update absent fields keep the current value and present fields (including empty ones) replace it.
 fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, OpError> {
-    let DraftSaveArgs { id, account, to, cc, bcc, subject, body_text, body_format, attachments, in_reply_to } = args;
+    let DraftSaveArgs { id, account, to, cc, bcc, subject, from, body_text, body_format, attachments, in_reply_to } = args;
     let content = match &id {
         Some(id) => {
             let current = engine.message(id).ok_or_else(|| OpError::InvalidArgs(format!("unknown draft {id:?}; omit id to create a draft")))?;
@@ -2222,7 +2329,7 @@ fn draft_content(engine: &mut Engine, args: DraftSaveArgs) -> Result<Message, Op
             in_reply_to,
         },
     };
-    engine.save_draft_with_format(account.as_deref(), id.as_deref(), content, body_format)
+    engine.save_draft_with_sender(account.as_deref(), id.as_deref(), content, body_format, from.as_deref())
 }
 
 fn draft_attachments(attachments: Vec<DraftAttachment>) -> Vec<Attachment> {

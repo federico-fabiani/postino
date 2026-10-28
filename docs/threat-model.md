@@ -127,6 +127,12 @@
   remote image or web font, and allows only absolute `http`/`https`/`mailto` links. The same blocks
   produce the plain-text alternative; parser limits, the 1 MiB body cap and the sanitizer still
   apply when the message comes back through IMAP.
+- Multiple senders (P13i) are local metadata, not credentials: at most 10 per account in encrypted
+  `meta`, with a validated display name, address and ≤ 4 KiB signature. The account address is
+  reserved, duplicate addresses are refused, and deleting an identity never rewrites existing drafts.
+  At send time the draft's From must equal the account or a current identity; the engine fails closed
+  instead of substituting the account address. The provider still authorises aliases, so a local entry
+  never bypasses SMTP policy and a rejection is shown to the user.
 - `.eml` import/export (P13f) bounds the base64 string and decodes at most 10 MiB (so the encoded
   file stays inside the 16 MiB daemon frame), then feeds the
   bytes through the same MIME parser, sanitizer and attachment bounds as a server fetch. Import writes

@@ -15,7 +15,10 @@ use crate::model::{
     MessageThreading, OutboxEntry, OutboxState, SyncState, UidEntry,
 };
 use crate::threads;
-use crate::{REMOTE_LABELS_KEY_PREFIX, REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError, UNSUBSCRIBE_KEY_PREFIX};
+use crate::{
+    IDENTITY_INDEX_KEY_PREFIX, IDENTITY_KEY_PREFIX, REMOTE_LABELS_KEY_PREFIX, REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError,
+    UNSUBSCRIBE_KEY_PREFIX,
+};
 
 /// Largest page a caller can request. A mailbox list never needs more, and the cap bounds memory.
 const MAX_PAGE: u32 = 500;
@@ -164,6 +167,29 @@ impl Store {
         tx.execute("DELETE FROM meta WHERE key = ?1", [status_key])?;
         let recent_key = format!("{}{account_id}", crate::RECENT_SEARCHES_KEY_PREFIX);
         tx.execute("DELETE FROM meta WHERE key = ?1", [recent_key])?;
+        // Alternate senders live in `meta`, not in a FK-owned table. Remove every row whose JSON
+        // names this account, not only the ids the index happens to list: a damaged or missing index
+        // must not leave an encrypted identity behind after its account is gone.
+        let identity_index_key = format!("{IDENTITY_INDEX_KEY_PREFIX}{account_id}");
+        let identity_keys = {
+            let mut statement = tx.prepare("SELECT key, value FROM meta WHERE key LIKE ?1")?;
+            let rows = statement.query_map([format!("{IDENTITY_KEY_PREFIX}%")], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            let mut keys = Vec::new();
+            for row in rows {
+                let (key, raw) = row?;
+                let owner = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|value| value.get("account_id").and_then(serde_json::Value::as_str).map(str::to_owned));
+                if owner.as_deref() == Some(account_id) {
+                    keys.push(key);
+                }
+            }
+            keys
+        };
+        for key in identity_keys {
+            tx.execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        }
+        tx.execute("DELETE FROM meta WHERE key = ?1", [identity_index_key])?;
         tx.execute("DELETE FROM accounts WHERE id = ?1", [account_id])?;
         tx.commit()?;
         Ok(true)

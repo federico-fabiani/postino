@@ -192,6 +192,11 @@ fn delete_account_removes_its_cache_and_keeps_labels_and_other_accounts() {
     let label = Label { id: "lbl_global".to_owned(), account_id: None, name: "Cliente".to_owned(), color: "gold".to_owned() };
     store.create_label(&label).expect("label");
     store.apply_label(&label.id, &[format!("msg_{ACCOUNT_A}"), format!("msg_{ACCOUNT_B}")]).expect("assignments");
+    store.set_meta(&format!("identities.index:{ACCOUNT_A}"), "[\"idn_a\"]").expect("identity index");
+    store.set_meta("identity:idn_a", "{\"id\":\"idn_a\",\"account_id\":\"acc_a\"}").expect("identity row");
+    store.set_meta("identity:idn_orphan", "{\"id\":\"idn_orphan\",\"account_id\":\"acc_a\"}").expect("unindexed identity row");
+    store.set_meta(&format!("identities.index:{ACCOUNT_B}"), "[\"idn_b\"]").expect("other identity index");
+    store.set_meta("identity:idn_b", "{\"id\":\"idn_b\",\"account_id\":\"acc_b\"}").expect("other identity row");
 
     assert!(store.delete_account(ACCOUNT_A).expect("delete"));
 
@@ -202,6 +207,11 @@ fn delete_account_removes_its_cache_and_keeps_labels_and_other_accounts() {
     assert!(!store.list_all_attachments().expect("attachments").contains_key(&format!("msg_{ACCOUNT_A}")));
     assert!(store.get_draft(&format!("drf_{ACCOUNT_A}")).expect("draft").is_none());
     assert_eq!(store.get_meta(&format!("sync_status:{ACCOUNT_A}")).expect("status"), None);
+    assert_eq!(store.get_meta(&format!("identities.index:{ACCOUNT_A}")).expect("identity index"), None);
+    assert_eq!(store.get_meta("identity:idn_a").expect("identity row"), None);
+    assert_eq!(store.get_meta("identity:idn_orphan").expect("unindexed identity row"), None);
+    assert_eq!(store.get_meta(&format!("identities.index:{ACCOUNT_B}")).expect("other identity index").as_deref(), Some("[\"idn_b\"]"));
+    assert!(store.get_meta("identity:idn_b").expect("other identity row").is_some());
 
     // The other account is untouched, and the mailbox-wide label survives with both its counts and
     // its one remaining assignment.
