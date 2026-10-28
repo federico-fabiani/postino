@@ -319,6 +319,23 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
+            "message_pgp_verify",
+            "Verify a PGP/MIME message",
+            "Verify the retained PGP/MIME signature of one received message. The exact bytes captured at ingest (schema v9) are checked against the account's stored public keys, so header folding and CRLF are preserved. States: `verified` with key id, fingerprint and signer, `bad` when the signature does not match, `unknown` when the message is not PGP/MIME or the stored key material cannot be read, `no_key` when the account has no stored public key, and `not_stored` for rows that predate raw retention. A pre-v9 row is never given a fake result: refresh it explicitly. Read-only and offline; there is no key discovery or revocation fetch.",
+            MessagePgpVerifyArgs,
+            true,
+            false
+        ),
+        def!(
+            "message_pgp_decrypt",
+            "Decrypt a PGP/MIME message",
+            "Sensitive: decrypt one retained PGP/MIME message with a per-use passphrase and return the plaintext body without storing it. The output is re-parsed under the normal MIME bounds and HTML is sanitized; it never overwrites `body_text`/`body_html` and never enters the search index. States: `decrypted`, `locked`, `wrong_passphrase`, `no_key`, `unknown` and `not_stored` for pre-v9 rows. The passphrase must come from stdin or a no-echo prompt, is zeroised after use and is never accepted on argv, in the environment or in logs. MCP never lists or dispatches this operation.",
+            MessagePgpDecryptArgs,
+            true,
+            false,
+            true
+        ),
+        def!(
             "rules_list",
             "List rules",
             "Local rules of one account in execution order (`priority ASC, id ASC`), with their validated query, 1-5 actions, stop/enabled flags and a computed `valid`/`error`. A rule whose target folder or label was deleted stays visible as stale; it fails with a readable error at run time. Read-only and offline.",
@@ -648,6 +665,9 @@ pub struct AccountSignatureArgs {
 pub struct MessageSendArgs {
     /// Draft id returned by draft_save.
     pub draft: String,
+    /// Optional PGP sign/encrypt options. A missing, revoked or expired recipient key aborts the
+    /// send; there is no cleartext fallback. The passphrase must not come from argv.
+    pub pgp: Option<crate::pgp_mime::PgpSendOptions>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -657,6 +677,8 @@ pub struct SendScheduleArgs {
     pub draft: String,
     /// RFC 3339 instant with a timezone, for example `2026-10-26T18:30:00+01:00`.
     pub send_at: String,
+    /// Optional PGP sign/encrypt options, applied when the queue row is built.
+    pub pgp: Option<crate::pgp_mime::PgpSendOptions>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -702,6 +724,9 @@ pub struct OutboxMarkSentArgs {
 pub struct SendDryRunArgs {
     /// Draft id returned by draft_save.
     pub draft: String,
+    /// Optional PGP sign/encrypt options. The dry run performs the same signing and encryption as a
+    /// real send, so the returned bytes prove what would leave the machine.
+    pub pgp: Option<crate::pgp_mime::PgpSendOptions>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -850,6 +875,39 @@ pub struct SavedSearchRecentClearArgs {
 pub struct PgpKeysListArgs {
     /// Account id. Required when the mailbox has several accounts.
     pub account: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessagePgpVerifyArgs {
+    /// Message id returned by messages_list.
+    pub id: String,
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MessagePgpDecryptArgs {
+    /// Message id returned by messages_list.
+    pub id: String,
+    /// Account id. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Passphrase of the matching private key, at most 256 bytes. Never stored, logged or returned,
+    /// and never accepted on a command line.
+    #[serde(default)]
+    pub passphrase: String,
+}
+
+impl std::fmt::Debug for MessagePgpDecryptArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MessagePgpDecryptArgs")
+            .field("id", &self.id)
+            .field("account", &self.account)
+            .field("passphrase", &if self.passphrase.is_empty() { "[empty]" } else { "[redacted]" })
+            .finish()
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1605,14 +1663,16 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "message_send" => {
             let args: MessageSendArgs = parse(args)?;
-            value(SendQueued { queued: engine.message_send(&args.draft)? })
+            let pgp = args.pgp.unwrap_or_default();
+            value(SendQueued { queued: engine.message_send_with_pgp(&args.draft, &pgp)? })
         }
         "send_schedule" => {
             let args: SendScheduleArgs = parse(args)?;
+            let pgp = args.pgp.unwrap_or_default();
             let send_at = chrono::DateTime::parse_from_rfc3339(args.send_at.trim())
                 .map_err(|error| OpError::InvalidArgs(format!("send_at is not an RFC 3339 instant: {error}")))?
                 .with_timezone(&chrono::Utc);
-            value(SendQueued { queued: engine.send_schedule(&args.draft, send_at)? })
+            value(SendQueued { queued: engine.send_schedule_with_pgp(&args.draft, send_at, &pgp)? })
         }
         "outbox_list" => {
             let args: OutboxListArgs = parse(args)?;
@@ -1632,7 +1692,8 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         }
         "send_dry_run" => {
             let args: SendDryRunArgs = parse(args)?;
-            value(DryRunResult { dry_run: engine.send_dry_run(&args.draft)? })
+            let pgp = args.pgp.unwrap_or_default();
+            value(DryRunResult { dry_run: engine.send_dry_run_with_pgp(&args.draft, &pgp)? })
         }
         "search" => {
             let args: SearchArgs = parse(args)?;
@@ -1705,6 +1766,15 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "pgp_key_export_public" => {
             let args: PgpKeyExportPublicArgs = parse(args)?;
             value(engine.pgp_key_export_public(args.account.as_deref(), &args.id)?)
+        }
+        "message_pgp_verify" => {
+            let args: MessagePgpVerifyArgs = parse(args)?;
+            value(engine.message_pgp_verify(&args.id, args.account.as_deref())?)
+        }
+        "message_pgp_decrypt" => {
+            let args: MessagePgpDecryptArgs = parse(args)?;
+            let passphrase = Zeroizing::new(args.passphrase);
+            value(engine.message_pgp_decrypt(&args.id, args.account.as_deref(), passphrase.as_bytes())?)
         }
         "rules_list" => {
             let args: RulesListArgs = parse(args)?;

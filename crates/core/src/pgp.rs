@@ -87,20 +87,36 @@ pub fn parse_import(armored: &str, passphrase: &[u8]) -> Result<ParsedPgpKey, Pg
 }
 
 fn parse_public(armored: &str) -> Result<ParsedPgpKey, PgpImportError> {
-    let block = single_armor_block(armored, PUBLIC_ARMOR, PUBLIC_END)?;
-    let (keys, _headers) = SignedPublicKey::from_string_many(block).map_err(|_| PgpImportError::Malformed)?;
-    let key = one_key(keys)?;
+    let key = parse_public_key(armored)?;
     let (public_armor, fingerprint, key_id, user_id) = describe_public(&key)?;
     Ok(ParsedPgpKey { fingerprint, key_id, user_id, public_armor, secret_armor: None, protected: false })
+}
+
+/// Parse one armored public key, bounded and with no trailing block or text.
+pub(crate) fn parse_public_key(armored: &str) -> Result<SignedPublicKey, PgpImportError> {
+    if armored.len() > MAX_PGP_KEY_BYTES {
+        return Err(PgpImportError::TooLarge);
+    }
+    let block = single_armor_block(armored, PUBLIC_ARMOR, PUBLIC_END)?;
+    let (keys, _headers) = SignedPublicKey::from_string_many(block).map_err(|_| PgpImportError::Malformed)?;
+    one_key(keys)
+}
+
+/// Parse one armored secret key without unlocking it. The passphrase is checked by the caller.
+pub(crate) fn parse_secret_key(armored: &str) -> Result<SignedSecretKey, PgpImportError> {
+    if armored.len() > MAX_PGP_KEY_BYTES {
+        return Err(PgpImportError::TooLarge);
+    }
+    let block = single_armor_block(armored, PRIVATE_ARMOR, PRIVATE_END)?;
+    let (keys, _headers) = SignedSecretKey::from_string_many(block).map_err(|_| PgpImportError::Malformed)?;
+    one_key(keys)
 }
 
 fn parse_private(armored: &str, passphrase: &[u8]) -> Result<ParsedPgpKey, PgpImportError> {
     if passphrase.is_empty() {
         return Err(PgpImportError::PassphraseRequired);
     }
-    let block = single_armor_block(armored, PRIVATE_ARMOR, PRIVATE_END)?;
-    let (keys, _headers) = SignedSecretKey::from_string_many(block).map_err(|_| PgpImportError::Malformed)?;
-    let key = one_key(keys)?;
+    let key = parse_secret_key(armored)?;
     if !key.primary_key.secret_params().is_encrypted() || key.secret_subkeys.iter().any(|subkey| !subkey.key.secret_params().is_encrypted()) {
         return Err(PgpImportError::NotProtected);
     }

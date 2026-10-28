@@ -220,6 +220,11 @@ fn tools_call<B: McpBackend + ?Sized>(backend: &mut B, params: &Value, allow_sen
     if backend.tools().into_iter().any(|def| def.name == name && def.sensitive) {
         return Ok(sensitive_refusal(name));
     }
+    // A signing passphrase is never accepted over MCP, not even with --allow-send. The CLI and the
+    // desktop app take it from a no-echo prompt; an agent must not hold it.
+    if matches!(name, "message_send" | "send_schedule" | "send_dry_run") && requests_pgp_passphrase(&arguments) {
+        return Ok(pgp_passphrase_refusal(name));
+    }
     if SEND_GATED.contains(&name) && !allow_send {
         return Ok(send_disabled_refusal(name));
     }
@@ -289,6 +294,26 @@ fn send_disabled_refusal(name: &str) -> Value {
     })
 }
 
+/// True when a send request carries a non-empty PGP signing passphrase.
+fn requests_pgp_passphrase(arguments: &Value) -> bool {
+    arguments
+        .get("pgp")
+        .and_then(Value::as_object)
+        .and_then(|pgp| pgp.get("passphrase"))
+        .and_then(Value::as_str)
+        .is_some_and(|passphrase| !passphrase.is_empty())
+}
+
+fn pgp_passphrase_refusal(name: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!("operation {name:?} is refused: a PGP passphrase is never accepted over MCP; sign from the CLI or the desktop app with a no-echo prompt")
+        }],
+        "isError": true
+    })
+}
+
 /// A readable refusal that does not repeat the arguments (which may contain a password).
 fn sensitive_refusal(name: &str) -> Value {
     json!({
@@ -343,6 +368,8 @@ mod tests {
         assert!(tools.iter().all(|tool| tool["inputSchema"].is_object()));
         assert!(tools.iter().all(|tool| tool["name"] != "account_add" && tool["name"] != "account_remove"), "sensitive tools are never listed");
         assert!(tools.iter().all(|tool| tool["name"] != "pgp_key_import"), "the passphrase-handling import is never listed");
+        assert!(tools.iter().all(|tool| tool["name"] != "message_pgp_decrypt"), "the passphrase-handling decrypt is never listed");
+        assert!(tools.iter().any(|tool| tool["name"] == "message_pgp_verify"), "verification takes no secret and stays available");
 
         for name in ["pgp_keys_list", "pgp_key_delete", "pgp_key_export_public"] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap_or_else(|| panic!("{name} is missing"));

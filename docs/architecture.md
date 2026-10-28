@@ -1564,6 +1564,44 @@ and a failed v9 keeps `user_version = 8`; an older binary refuses a v9 file as t
 no crypto, no operation, no CLI/UI surface and no way to verify a message from a body that was
 re-parsed locally.
 
+### 4.16 Implemented in P12c2b: PGP/MIME verification, decryption and protected sends
+
+`postino-mime::pgp_mime` is structure only: it recognizes RFC 3156 `multipart/signed` and
+`multipart/encrypted` with a PGP protocol, keeps the exact first part of a signed message (the byte
+string the signature covers, not a re-serialized body), transfer-decodes the detached signature or
+the encrypted payload, and serializes outgoing entities with a boundary and CRLF contract that keeps
+the signed bytes stable. It never parses OpenPGP and never decides whether a signature is good. The
+usual MIME limits apply before parsing: body size, header size, part size, exactly two parts.
+
+`postino-core::pgp_mime` owns the OpenPGP calls and reads received bytes from the v9 raw blob.
+`message_pgp_verify` (read-only, offline) reports `verified` with key id, fingerprint and signer,
+`bad` on a mismatch, `no_key` when the account has no stored public key, `unknown` when the entity or
+the stored key cannot be read, and `not_stored` for rows that predate v9; it never fakes a result
+from the parsed body. `message_pgp_decrypt` is `sensitive`: the per-use passphrase comes from stdin
+or a no-echo prompt, is zeroised, and never appears in argv, the environment, a log or a result. The
+decrypted payload is decompressed through a bounded reader and re-parsed under the normal MIME
+limits; HTML goes through the existing sanitizer, and the text/html are returned to the caller only.
+They never overwrite `body_text`/`body_html` and never enter FTS, so `message_get` and `search` keep
+seeing the encrypted row.
+
+`PgpSendOptions { sign, encrypt, passphrase }` is an optional field of `message_send`,
+`send_schedule` and `send_dry_run`, not a separate draft operation: the draft is serialized once and
+the same bytes are protected, hashed and journaled, so there is no window in which the draft can
+change between "protect" and "send". Signing wraps the MIME entity in `multipart/signed` with a
+SHA-256 detached signature; encryption wraps the signed entity in `multipart/encrypted`; the outer
+RFC 5322 headers are copied unchanged. A missing, unreadable, revoked or expired recipient key, a
+locked or wrongly unlocked signing key, or a demo store (no encrypted key material) aborts before a
+blob or an outbox row is written: there is no cleartext fallback. A send addresses at most 100 keys.
+The passphrase is skipped by `Serialize`, redacted by `Debug` and zeroised on drop; MCP refuses any
+send request that carries one, and never lists or dispatches `message_pgp_decrypt` or
+`pgp_key_import`. The CLI adds `postino pgp message verify|decrypt`, `postino pgp keys ...` and
+`postino send --sign <id> --encrypt <id>... [--passphrase-stdin]`.
+
+Limits: keys are local only, with no discovery or revocation fetch; verification does not consult
+revocation or expiry (the send path does, because it chooses a key), and there is no S/MIME, no HTML
+signing and no key UX beyond the settings table. Received mail cached before v9 has no raw bytes and
+reports `not_stored` until it is refreshed.
+
 ## 5. Synchronization
 
 

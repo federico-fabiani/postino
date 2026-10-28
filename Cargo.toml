@@ -28,6 +28,7 @@ mail-parser = { version = "=1.0.0", features = ["full_encoding"] }
 # OpenPGP key parsing and passphrase checks (P12c1). Pure Rust, MIT OR Apache-2.0; the bzip2
 # default feature is off because Postino never decompresses OpenPGP compressed data.
 pgp = { version = "=0.21.0", default-features = false }
+rand = "0.8.6"
 ammonia = "=4.2.4"
 # Parse-only calendar support for received invites (P12d). The parser feature is the only one
 # enabled: no recurrence expansion and no timezone database, both deliberate product limits.

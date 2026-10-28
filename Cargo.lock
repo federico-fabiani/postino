@@ -4189,6 +4189,7 @@ dependencies = [
  "postino-store",
  "postino-sync",
  "postino-testkit",
+ "rand 0.8.8",
  "rusqlite",
  "schemars",
  "serde",
@@ -4259,6 +4260,7 @@ name = "postino-mime"
 version = "0.1.0"
 dependencies = [
  "ammonia",
+ "base64",
  "chrono",
  "icalendar",
  "mail-parser",

@@ -66,6 +66,10 @@ use postino_store as store;
 use thiserror::Error;
 
 pub use folder::{PlannedFolder, plan_folders};
+/// The MIME crate this bridge parses and serializes through. The engine reads PGP/MIME structure
+/// through this re-export because the layer rule lets core depend on sync, not on the foundation
+/// crate directly.
+pub use postino_mime as mime;
 pub use postino_mime::{
     CalendarInvite, InviteError, InviteWarning, Limits, MAX_CALENDAR_BYTES, MAX_CALENDAR_COMPONENTS, MAX_INVITE_ATTENDEES, MAX_INVITE_FIELD_CHARS,
     parse, parse_invite, reply_calendar,

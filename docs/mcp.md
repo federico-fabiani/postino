@@ -68,6 +68,10 @@ agent can read the message and recover.
 | `folders_list` | yes | Folders with unread and total counts |
 | `messages_list` | yes | Message summaries, paginated; `label` alone spans every folder, `folder` narrows it |
 | `message_get` | yes | One message with body and attachments |
+| `message_pgp_verify` | yes | Verify a received PGP/MIME signature against the stored public keys using the exact v9 bytes; `verified`/`bad`/`no_key`/`unknown`/`not_stored` |
+| `pgp_keys_list` | yes | Stored key metadata: id, fingerprint, key id, primary user id, secret presence and protection; never key material |
+| `pgp_key_export_public` | yes | One stored public certificate as ASCII armor |
+| `pgp_key_delete` | no | Delete one stored key, public or private; no key discovery or fetch |
 | `message_invite` | yes | Parse the first `text/calendar` attachment (≤ 256 KiB, 1 000 components, 2 000 attendees, 64-character organizer/attendee lines); `invite` is `null` for malformed or hostile input and the file stays an attachment |
 | `invite_reply_draft` | no | Draft accept/tentative/decline to the organizer only, with `text/calendar` METHOD:REPLY; only a received REQUEST is answerable, a Sent copy is informational; never sends and never updates a calendar |
 | `message_flag` | no | Set read/unread and/or starred |
@@ -168,22 +172,31 @@ is accepted for the row but `message_send` refuses it with the filename before w
 
 ## Sensitive operations
 
-`account_add`, `account_update` and `account_remove` are marked `sensitive` in the operation registry.
-They are **not** in `tools/list`, and `tools/call` refuses them before it parses the arguments, with
-a readable `isError` result that never repeats the arguments. The reason is structural, not a policy:
-MCP cannot see or set a password, and it cannot create, reconfigure or remove an account. The same
-registry entries remain available to the CLI (`postino account add|update|remove`), whose password
-path is a no-echo prompt or one `--password-stdin` / `--smtp-password-stdin` line; there is
-deliberately no `--password` argv flag, and `postino run` refuses sensitive operations so generic JSON
-arguments cannot carry a password into shell history. `account_test` is not sensitive because it never
-receives a password: it uses the credential already in the OS keyring.
+`account_add`, `account_update`, `account_remove`, `pgp_key_import` and `message_pgp_decrypt` are
+marked `sensitive` in the operation registry. They are **not** in `tools/list`, and `tools/call`
+refuses them before it parses the arguments, with a readable `isError` result that never repeats the
+arguments. For the account operations the reason is structural: MCP cannot see or set a password, and
+it cannot create, reconfigure or remove an account. For the two PGP operations it is the per-use
+passphrase: MCP has no no-echo prompt and must not receive a secret in an argument. The same registry
+entries remain available to the CLI (`postino account add|update|remove`, `postino pgp ...`), whose
+password path is a no-echo prompt or one `--password-stdin` / `--passphrase-stdin` line; there is
+deliberately no `--password` or `--passphrase` argv flag, and `postino run` refuses sensitive
+operations so generic JSON arguments cannot carry a password into shell history. `account_test` is
+not sensitive because it never receives a password: it uses the credential already in the OS keyring.
+
+`message_send`, `send_schedule` and `send_dry_run` accept an optional `pgp` object to sign and/or
+encrypt. A request that carries a `pgp.passphrase` is refused over MCP before dispatch, because the
+server never accepts a signing secret; an agent can still ask for encryption by key id, or prepare a
+draft and leave signing to the CLI or the desktop app.
 
 Annotations:
 
 - `readOnlyHint`: true for `accounts_list`, `account_test`, `sync_status`, `outbox_list`,
-  `send_dry_run`, `rules_list`, `rules_preview`, `rules_runs` and every read.
+  `send_dry_run`, `rules_list`, `rules_preview`, `rules_runs`, `message_pgp_verify`,
+  `pgp_keys_list`, `pgp_key_export_public` and every read.
 - `destructiveHint`: true for `account_remove` (it deletes the local cache for one account),
-  `rules_run` (it changes local mail and may queue a submission), `rules_undo` (it moves, flags and
+  `pgp_key_delete` (it deletes stored key material), `rules_run` (it changes local mail and may queue
+  a submission), `rules_undo` (it moves, flags and
   labels mail and is one-way, with no redo) and `rules_delete` (rule metadata only). Sending and
   message deletion are not marked destructive: `message_send` is the product's purpose and
   `outbox_cancel` discards a queued submission, not mail.

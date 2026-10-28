@@ -19,6 +19,7 @@ pub mod oauth;
 pub mod ops;
 pub mod outbox;
 pub mod pgp;
+pub mod pgp_mime;
 mod reply;
 mod rules;
 pub mod search;
@@ -44,6 +45,9 @@ pub use ops::{
     ThreadsListResult, op_defs,
 };
 pub use outbox::{OutboxHalt, OutboxList, OutboxRunReport, OutboxView, SendDryRun, SendEnvelope};
+pub use pgp_mime::{
+    MAX_PGP_RECIPIENTS, MAX_RAW_MESSAGE_BYTES, PgpDecryptResult, PgpDecryptState, PgpSendError, PgpSendOptions, PgpVerifyResult, PgpVerifyState,
+};
 pub use postino_sync::{SyncPhase, SyncStatus};
 pub use reply::{ReplyMode, ReplyPrefill, compose_reply, forward_subject, new_message_body, quote_body, reply_subject, signature_block};
 pub use rules::{

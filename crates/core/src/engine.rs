@@ -46,6 +46,27 @@ pub(crate) fn unknown_message(id: &str) -> OpError {
     OpError::InvalidArgs(format!("unknown message {id:?}; use an id returned by messages_list"))
 }
 
+fn not_stored_verify() -> crate::pgp_mime::PgpVerifyResult {
+    crate::pgp_mime::PgpVerifyResult {
+        state: crate::pgp_mime::PgpVerifyState::NotStored,
+        key_id: None,
+        fingerprint: None,
+        signer: None,
+        reason: Some("the raw message was not retained; refresh the message explicitly before verifying it".to_owned()),
+    }
+}
+
+fn not_stored_decrypt() -> crate::pgp_mime::PgpDecryptResult {
+    crate::pgp_mime::PgpDecryptResult {
+        state: crate::pgp_mime::PgpDecryptState::NotStored,
+        key_id: None,
+        fingerprint: None,
+        text: None,
+        html: None,
+        reason: Some("the raw message was not retained; refresh the message explicitly before decrypting it".to_owned()),
+    }
+}
+
 pub(crate) fn unknown_thread(id: &str) -> OpError {
     OpError::InvalidArgs(format!("unknown thread {id:?}; use an id returned by threads_list"))
 }
@@ -1230,6 +1251,43 @@ impl Engine {
             .map_err(store_map::read_error)?
             .ok_or_else(|| OpError::InvalidArgs(format!("unknown PGP key {id:?}; use an id returned by pgp_keys_list")))?;
         Ok(PgpPublicKey { fingerprint: public.fingerprint, key_id: public.key_id, public_armor: public.public_armor, user_id: key.user_id })
+    }
+
+    /// Verify one retained PGP/MIME message against the account's stored keys.
+    ///
+    /// The bytes come from the schema v9 raw blob, never from a re-serialized body. A pre-v9 row
+    /// reports `not_stored`: there is nothing to verify and this operation never fakes a result.
+    pub fn message_pgp_verify(&self, message_id: &str, account: Option<&str>) -> Result<crate::pgp_mime::PgpVerifyResult, OpError> {
+        let account = self.requested_account(account, "message_pgp_verify")?;
+        let current = self.message_result(message_id)?.ok_or_else(|| unknown_message(message_id))?;
+        if self.folders.iter().find(|folder| folder.id == current.summary.folder_id).is_none_or(|folder| folder.account_id != account.id) {
+            return Err(OpError::InvalidArgs(format!("message {message_id:?} belongs to another account")));
+        }
+        let Some(store) = self.store.as_ref() else { return Ok(not_stored_verify()) };
+        let Some(hash) = store.message_raw_blob_hash(message_id).map_err(store_map::read_error)? else { return Ok(not_stored_verify()) };
+        let raw = store.blobs().get(&hash, crate::pgp_mime::MAX_RAW_MESSAGE_BYTES).map_err(store_map::blob_read_error)?;
+        crate::pgp_mime::verify(store, &account.id, &raw)
+    }
+
+    /// Decrypt one retained PGP/MIME message with a per-use passphrase.
+    ///
+    /// The decrypted body is returned to this caller only. It never overwrites `body_text` or
+    /// `body_html` and is never indexed: a later `message_get` still sees the encrypted body.
+    pub fn message_pgp_decrypt(
+        &self,
+        message_id: &str,
+        account: Option<&str>,
+        passphrase: &[u8],
+    ) -> Result<crate::pgp_mime::PgpDecryptResult, OpError> {
+        let account = self.requested_account(account, "message_pgp_decrypt")?;
+        let current = self.message_result(message_id)?.ok_or_else(|| unknown_message(message_id))?;
+        if self.folders.iter().find(|folder| folder.id == current.summary.folder_id).is_none_or(|folder| folder.account_id != account.id) {
+            return Err(OpError::InvalidArgs(format!("message {message_id:?} belongs to another account")));
+        }
+        let Some(store) = self.store.as_ref() else { return Ok(not_stored_decrypt()) };
+        let Some(hash) = store.message_raw_blob_hash(message_id).map_err(store_map::read_error)? else { return Ok(not_stored_decrypt()) };
+        let raw = store.blobs().get(&hash, crate::pgp_mime::MAX_RAW_MESSAGE_BYTES).map_err(store_map::blob_read_error)?;
+        crate::pgp_mime::decrypt(store, &account.id, &raw, passphrase)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2762,14 +2820,32 @@ impl Engine {
     /// cancellation rather than a restore; a queued draft cannot be edited or moved until it is
     /// cancelled or resolved.
     pub fn message_send(&mut self, draft_id: &str) -> Result<SendQueued, OpError> {
+        self.message_send_with_pgp(draft_id, &crate::pgp_mime::PgpSendOptions::default())
+    }
+
+    /// Queue a draft with explicit PGP sign/encrypt options.
+    ///
+    /// Any PGP failure aborts before a blob or an outbox row is written: there is no plaintext
+    /// fallback.
+    pub fn message_send_with_pgp(&mut self, draft_id: &str, pgp: &crate::pgp_mime::PgpSendOptions) -> Result<SendQueued, OpError> {
         let now = Utc::now().timestamp_millis();
-        self.queue_send(draft_id, now.saturating_add(UNDO_MS), now)
+        self.queue_send(draft_id, pgp, now.saturating_add(UNDO_MS), now)
     }
 
     /// Queue a draft at an explicit instant. A time in the past is treated as "now".
     pub fn send_schedule(&mut self, draft_id: &str, send_at: chrono::DateTime<Utc>) -> Result<SendQueued, OpError> {
+        self.send_schedule_with_pgp(draft_id, send_at, &crate::pgp_mime::PgpSendOptions::default())
+    }
+
+    /// Schedule a draft with explicit PGP sign/encrypt options.
+    pub fn send_schedule_with_pgp(
+        &mut self,
+        draft_id: &str,
+        send_at: chrono::DateTime<Utc>,
+        pgp: &crate::pgp_mime::PgpSendOptions,
+    ) -> Result<SendQueued, OpError> {
         let now = Utc::now().timestamp_millis();
-        self.queue_send(draft_id, send_at.timestamp_millis().max(now), now)
+        self.queue_send(draft_id, pgp, send_at.timestamp_millis().max(now), now)
     }
 
     /// Serialize a draft and return the exact bytes without touching the outbox.
@@ -2777,7 +2853,12 @@ impl Engine {
     /// The same builder as a real send, so a dry run proves what would leave the machine. No network
     /// call and no row.
     pub fn send_dry_run(&self, draft_id: &str) -> Result<SendDryRun, OpError> {
-        let (serialized, _account, _message) = self.submission_for_draft(draft_id)?;
+        self.send_dry_run_with_pgp(draft_id, &crate::pgp_mime::PgpSendOptions::default())
+    }
+
+    /// Dry run with explicit PGP sign/encrypt options.
+    pub fn send_dry_run_with_pgp(&self, draft_id: &str, pgp: &crate::pgp_mime::PgpSendOptions) -> Result<SendDryRun, OpError> {
+        let (serialized, _account, _message) = self.submission_for_draft(draft_id, pgp)?;
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &serialized.raw);
         Ok(SendDryRun {
             raw_base64: encoded,
@@ -2788,7 +2869,7 @@ impl Engine {
         })
     }
 
-    fn queue_send(&mut self, draft_id: &str, send_at: i64, now: i64) -> Result<SendQueued, OpError> {
+    fn queue_send(&mut self, draft_id: &str, pgp: &crate::pgp_mime::PgpSendOptions, send_at: i64, now: i64) -> Result<SendQueued, OpError> {
         let store = self.require_store("message_send")?;
         let draft_row = store.get_draft(draft_id).map_err(store_map::read_error)?;
         let revision = draft_row.as_ref().map(|draft| draft.revision);
@@ -2797,7 +2878,7 @@ impl Engine {
         {
             return Err(OpError::InvalidArgs(format!("draft {draft_id:?} changed in another session; refresh the mailbox before sending it")));
         }
-        let (serialized, account, _message) = self.submission_for_draft(draft_id)?;
+        let (serialized, account, _message) = self.submission_for_draft(draft_id, pgp)?;
         // Re-check after the body read: another process may have saved between the snapshot check and
         // serialization. The revision is store-owned and changes on every save.
         if let Some(revision) = revision
@@ -2925,7 +3006,11 @@ impl Engine {
     /// the queued blob and a resend after a cancel all serialize the same draft state the same way.
     /// The Message-ID is derived from that digest, so it is stable too. A scheduled message therefore
     /// carries the instant it was last edited; the header dates the message, not the queue.
-    fn submission_for_draft(&self, draft_id: &str) -> Result<(postino_sync::SerializedSubmission, Account, Message), OpError> {
+    fn submission_for_draft(
+        &self,
+        draft_id: &str,
+        pgp: &crate::pgp_mime::PgpSendOptions,
+    ) -> Result<(postino_sync::SerializedSubmission, Account, Message), OpError> {
         let current = self.message_result(draft_id)?.ok_or_else(|| unknown_message(draft_id))?;
         let folder = self
             .folders
@@ -2979,6 +3064,14 @@ impl Engine {
         };
         let serialized = postino_sync::serialize_submission(&submission)
             .map_err(|error| OpError::InvalidArgs(format!("the message cannot be serialized: {error}")))?;
+        let mut serialized = serialized;
+        if !pgp.is_plain() {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| OpError::Failed("the in-memory demo has no encrypted store, so it cannot sign or encrypt mail".to_owned()))?;
+            serialized.raw = crate::pgp_mime::apply_send(store, &account, serialized.raw, pgp)?;
+        }
         if serialized.raw.len() as u64 > MAX_SUBMISSION_BYTES {
             return Err(OpError::InvalidArgs(format!(
                 "the message is {} bytes; this build submits at most {MAX_SUBMISSION_BYTES} bytes",

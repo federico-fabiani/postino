@@ -31,6 +31,7 @@ mod html_text;
 mod limits;
 mod model;
 mod parse;
+pub mod pgp_mime;
 mod sanitize;
 mod serialize;
 mod util;

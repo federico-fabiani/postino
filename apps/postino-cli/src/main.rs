@@ -28,10 +28,10 @@ use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
     CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
     LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction,
-    OutboxListResult, OutboxRunReport, PgpKey, PgpPublicKey, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult,
-    RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult,
-    SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult,
-    ThreadsListResult, VaultError,
+    OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult, PgpVerifyState,
+    Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult,
+    SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow,
+    SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -407,6 +407,33 @@ enum PgpCommand {
         #[command(subcommand)]
         command: PgpKeysCommand,
     },
+    /// Verify or decrypt a received PGP/MIME message.
+    Message {
+        #[command(subcommand)]
+        command: PgpMessageCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PgpMessageCommand {
+    /// Verify the retained signature against the account's stored public keys.
+    Verify {
+        /// Message id returned by `postino read` or `postino messages`.
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Decrypt a retained message with a per-use passphrase and print the body.
+    Decrypt {
+        /// Message id returned by `postino read` or `postino messages`.
+        id: String,
+        #[arg(long)]
+        account: Option<String>,
+        /// Read the passphrase from one stdin line. There is deliberately no --passphrase argument:
+        /// a passphrase must not appear in argv or shell history.
+        #[arg(long)]
+        passphrase_stdin: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -651,6 +678,16 @@ enum Command {
         /// Return the exact RFC 822 bytes and envelope without queueing or connecting.
         #[arg(long)]
         dry_run: bool,
+        /// Sign with this stored private key id.
+        #[arg(long)]
+        sign: Option<String>,
+        /// Encrypt to this stored public key id. Repeat for each recipient.
+        #[arg(long = "encrypt", value_name = "KEY")]
+        encrypt: Vec<String>,
+        /// Read the signing-key passphrase from one stdin line. There is deliberately no
+        /// --passphrase argument: a passphrase must not appear in argv or shell history.
+        #[arg(long)]
+        passphrase_stdin: bool,
     },
     /// Inspect or act on the outbox journal.
     Outbox {
@@ -1539,6 +1576,7 @@ fn command_reads_only(command: &Command) -> bool {
         Command::Account { command } => matches!(command, AccountCommand::List | AccountCommand::Test { .. }),
         Command::Pgp { command } => match command {
             PgpCommand::Keys { command } => matches!(command, PgpKeysCommand::List { .. } | PgpKeysCommand::ExportPublic { .. }),
+            PgpCommand::Message { command } => matches!(command, PgpMessageCommand::Verify { .. }),
         },
         Command::Sync { command } => matches!(command, SyncCommand::Status { .. }),
         Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } | Command::SearchStatus => true,
@@ -1892,6 +1930,36 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             }
         },
         Command::Pgp { command } => match command {
+            PgpCommand::Message { command } => match command {
+                PgpMessageCommand::Verify { id, account } => {
+                    let result: PgpVerifyResult = decode(call(engine, "message_pgp_verify", json!({ "id": id, "account": account }))?)?;
+                    if json_output {
+                        print_json(&result)?;
+                    } else {
+                        say(format_pgp_verify(&result))?;
+                    }
+                }
+                PgpMessageCommand::Decrypt { id, account, passphrase_stdin } => {
+                    let passphrase = if passphrase_stdin {
+                        read_password_stdin(input)?
+                    } else if interactive {
+                        let passphrase = rpassword::prompt_password("Passphrase PGP: ").context("lettura della passphrase PGP dal terminale")?;
+                        Zeroizing::new(passphrase)
+                    } else {
+                        return Err(usage("decrypt needs --passphrase-stdin when stdin is not a terminal; the passphrase is never accepted in argv"));
+                    };
+                    if passphrase.is_empty() {
+                        return Err(usage("the passphrase must not be empty"));
+                    }
+                    let result: PgpDecryptResult =
+                        decode(call(engine, "message_pgp_decrypt", json!({ "id": id, "account": account, "passphrase": passphrase.as_str() }))?)?;
+                    if json_output {
+                        print_json(&result)?;
+                    } else {
+                        say(format_pgp_decrypt(&result))?;
+                    }
+                }
+            },
             PgpCommand::Keys { command } => match command {
                 PgpKeysCommand::List { account } => {
                     let keys: Vec<PgpKey> = decode(call(engine, "pgp_keys_list", json!({ "account": account }))?)?;
@@ -2117,14 +2185,14 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 let saved: DraftSave = decode(call(engine, "draft_save", args)?)?;
                 let draft_id = saved.draft.summary.id.clone();
                 if send {
-                    send_now(engine, &draft_id, None, json_output)?;
+                    send_now(engine, &draft_id, None, &PgpSendOptions::default(), json_output)?;
                 } else if json_output {
                     print_json(&saved)?;
                 } else {
                     say(format!("Bozza salvata: {}\n{}\n{}", draft_id, format_summary(&saved.draft.summary), draft_note(engine)))?;
                 }
             }
-            DraftCommand::Send { id } => send_now(engine, &id, None, json_output)?,
+            DraftCommand::Send { id } => send_now(engine, &id, None, &PgpSendOptions::default(), json_output)?,
             DraftCommand::Attach { id, path } => {
                 let attachment = read_cli_attachment(&path)?;
                 let result: DraftAttachmentResult = decode(call(
@@ -2158,9 +2226,37 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                 }
             }
         },
-        Command::Send { draft, at, dry_run } => {
+        Command::Send { draft, at, dry_run, sign, encrypt, passphrase_stdin } => {
+            let passphrase = if sign.is_some() {
+                let value = if passphrase_stdin {
+                    read_password_stdin(input)?
+                } else if interactive {
+                    Zeroizing::new(
+                        rpassword::prompt_password("Passphrase della chiave PGP: ")
+                            .context("lettura della passphrase della chiave PGP dal terminale")?,
+                    )
+                } else {
+                    return Err(usage(
+                        "a signed send needs --passphrase-stdin when stdin is not a terminal; the passphrase is never accepted in argv",
+                    ));
+                };
+                if value.is_empty() {
+                    return Err(usage("the passphrase of a signing key must not be empty"));
+                }
+                value
+            } else {
+                if passphrase_stdin {
+                    return Err(usage("--passphrase-stdin needs --sign"));
+                }
+                Zeroizing::new(String::new())
+            };
+            let pgp = PgpSendOptions { sign, encrypt, passphrase: passphrase.to_string() };
             if dry_run {
-                let result: DryRunResult = decode(call(engine, "send_dry_run", json!({ "draft": draft }))?)?;
+                let mut args = json!({ "draft": draft });
+                if let Some(options) = pgp_request(&pgp) {
+                    args["pgp"] = options;
+                }
+                let result: DryRunResult = decode(call(engine, "send_dry_run", args)?)?;
                 if json_output {
                     print_json(&result)?;
                 } else {
@@ -2174,7 +2270,7 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     ))?;
                 }
             } else {
-                send_now(engine, &draft, at.as_deref(), json_output)?;
+                send_now(engine, &draft, at.as_deref(), &pgp, json_output)?;
             }
         }
         Command::Outbox { command } => match command {
@@ -2820,6 +2916,50 @@ fn format_pgp_keys(keys: &[PgpKey]) -> String {
     out
 }
 
+fn format_pgp_verify(result: &PgpVerifyResult) -> String {
+    let state = match result.state {
+        PgpVerifyState::Verified => "Firma verificata",
+        PgpVerifyState::Bad => "Firma non valida",
+        PgpVerifyState::Unknown => "Firma sconosciuta",
+        PgpVerifyState::NoKey => "Nessuna chiave pubblica",
+        PgpVerifyState::NotStored => "Byte non conservati",
+    };
+    let mut out = state.to_owned();
+    if let Some(signer) = &result.signer {
+        out.push_str(&format!("\nFirmatario: {signer}"));
+    }
+    if let Some(fingerprint) = &result.fingerprint {
+        out.push_str(&format!("\nImpronta: {fingerprint}"));
+    }
+    if let Some(reason) = &result.reason {
+        out.push_str(&format!("\n{reason}"));
+    }
+    out
+}
+
+fn format_pgp_decrypt(result: &PgpDecryptResult) -> String {
+    let state = match result.state {
+        PgpDecryptState::Decrypted => "Messaggio decifrato",
+        PgpDecryptState::Locked => "Chiave bloccata",
+        PgpDecryptState::WrongPassphrase => "Passphrase errata",
+        PgpDecryptState::NoKey => "Nessuna chiave privata",
+        PgpDecryptState::Unknown => "Contenuto non leggibile",
+        PgpDecryptState::NotStored => "Byte non conservati",
+    };
+    let mut out = state.to_owned();
+    if let Some(reason) = &result.reason {
+        out.push_str(&format!("\n{reason}"));
+    }
+    if let Some(text) = &result.text {
+        out.push_str("\n\n");
+        out.push_str(text);
+    }
+    if result.html.is_some() {
+        out.push_str("\n\n(HTML sanificato disponibile nel JSON con --json.)");
+    }
+    out
+}
+
 fn format_pgp_key_imported(key: &PgpKey) -> String {
     format!("Chiave {} ({}) importata come {}.", key.fingerprint, key.user_id.as_deref().unwrap_or("nessun user id"), key.id)
 }
@@ -3146,16 +3286,36 @@ fn draft_note<B: CliBackend>(engine: &B) -> &'static str {
     }
 }
 
+/// JSON request fragment for a signed or encrypted send.
+///
+/// `PgpSendOptions` skips the passphrase when serialized, because it must never reach a log or an
+/// operation response. The request that needs it therefore adds it here, once; the dry run and the
+/// real send share this helper so neither can silently drop it.
+fn pgp_request(pgp: &PgpSendOptions) -> Option<Value> {
+    if pgp.is_plain() {
+        return None;
+    }
+    let mut options = json!({ "sign": pgp.sign.clone(), "encrypt": pgp.encrypt.clone() });
+    if pgp.sign.is_some() {
+        options["passphrase"] = json!(pgp.passphrase.as_str());
+    }
+    Some(options)
+}
+
 /// Queue a draft and, when it is due now, wait for the undo window and run one outbox pass.
 ///
 /// Only an explicit `--at` in the future leaves the row queued: there is no daemon in this build, so
 /// the CLI says when it will be attempted. A plain `postino send` always waits out the 5-second undo
 /// window and runs the pass; the undo window is not a scheduled time.
-fn send_now<B: CliBackend>(engine: &mut B, draft: &str, at: Option<&str>, json_output: bool) -> Result<()> {
-    let (operation, args) = match at {
-        Some(at) => ("send_schedule", json!({ "draft": draft, "send_at": at })),
-        None => ("message_send", json!({ "draft": draft })),
+fn send_now<B: CliBackend>(engine: &mut B, draft: &str, at: Option<&str>, pgp: &PgpSendOptions, json_output: bool) -> Result<()> {
+    let operation = if at.is_some() { "send_schedule" } else { "message_send" };
+    let mut args = match at {
+        Some(at) => json!({ "draft": draft, "send_at": at }),
+        None => json!({ "draft": draft }),
     };
+    if let Some(options) = pgp_request(pgp) {
+        args["pgp"] = options;
+    }
     let queued: SendQueued = decode(call(engine, operation, args)?)?;
     let row = queued.queued.outbox.clone();
     if !json_output {
@@ -4563,7 +4723,11 @@ mod tests {
         let id = saved.draft.summary.id.clone();
         // The plain command must wait the 5-second undo window and run the pass; the undo window is
         // not a scheduled time.
-        run(cli(Command::Send { draft: id.clone(), at: None, dry_run: false }), &mut engine).expect("postino send without --at");
+        run(
+            cli(Command::Send { draft: id.clone(), at: None, dry_run: false, sign: None, encrypt: Vec::new(), passphrase_stdin: false }),
+            &mut engine,
+        )
+        .expect("postino send without --at");
         smtp_thread.join().expect("SMTP thread");
         assert_eq!(captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(), 1, "a plain postino send left the row queued");
         let rows = engine.outbox_list(None, 500, 0).expect("outbox after send");
@@ -4591,9 +4755,81 @@ mod tests {
         )
         .expect("draft");
         let at = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
-        run(cli(Command::Send { draft: saved.draft.summary.id.clone(), at: Some(at), dry_run: false }), &mut engine).expect("scheduled send");
+        run(
+            cli(Command::Send {
+                draft: saved.draft.summary.id.clone(),
+                at: Some(at),
+                dry_run: false,
+                sign: None,
+                encrypt: Vec::new(),
+                passphrase_stdin: false,
+            }),
+            &mut engine,
+        )
+        .expect("scheduled send");
         let rows = engine.outbox_list(None, 500, 0).expect("outbox");
         assert_eq!(rows.entries[0].state, postino_store::OutboxState::Queued, "a future --at must not submit now");
+    }
+
+    #[test]
+    fn cli_signed_send_carries_the_passphrase_and_queues_a_signed_message() {
+        let fixture = TempStore::new();
+        let vault = crate::test_support::MemoryVault::new();
+        fixture.seed_smtp_account("acc_cli", 1025, &vault);
+        let mut engine = Engine::open_with_vault(fixture.open(), vault).expect("engine");
+        let dir = tempfile::tempdir().expect("key dir");
+        let key_path = dir.path().join("key.asc");
+        std::fs::write(&key_path, PGP_PRIVATE).expect("key file");
+        let mut import = std::io::Cursor::new(format!("{PGP_PRIVATE_PASSPHRASE}\n").into_bytes());
+        run_with_input(
+            pgp_cli(PgpKeysCommand::Import { account: None, armor_file: Some(key_path), passphrase_stdin: true }),
+            &mut engine,
+            &mut import,
+            false,
+        )
+        .expect("import");
+        let listed = call(&mut engine, "pgp_keys_list", json!({})).expect("list");
+        let sign_key = listed.as_array().expect("keys")[0]["id"].as_str().expect("id").to_owned();
+
+        let saved: DraftSave = decode(
+            call(
+                &mut engine,
+                "draft_save",
+                json!({
+                    "to": [{ "name": "Giulia", "email": "giulia.ferri@example.com" }],
+                    "subject": "Firmato",
+                    "body_text": "Ciao"
+                }),
+            )
+            .expect("draft_save"),
+        )
+        .expect("draft");
+        let draft = saved.draft.summary.id.clone();
+        let at = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let mut stdin = std::io::Cursor::new(format!("{PGP_PRIVATE_PASSPHRASE}\n").into_bytes());
+        run_with_input(
+            cli(Command::Send {
+                draft: draft.clone(),
+                at: Some(at),
+                dry_run: false,
+                sign: Some(sign_key),
+                encrypt: Vec::new(),
+                passphrase_stdin: true,
+            }),
+            &mut engine,
+            &mut stdin,
+            false,
+        )
+        .expect("signed scheduled send");
+
+        let rows = engine.outbox_list(None, 500, 0).expect("outbox");
+        assert_eq!(rows.entries[0].state, postino_store::OutboxState::Queued);
+        let store = fixture.open();
+        let queued = store.active_outbox_for_draft(&draft).expect("lookup").expect("queued row");
+        let blob = store.blobs().get(&queued.raw_blob_hash, postino_core::MAX_RAW_MESSAGE_BYTES).expect("queued blob");
+        let raw = String::from_utf8_lossy(&blob);
+        assert!(raw.contains("multipart/signed"), "the queued message is not signed: {raw}");
+        assert!(raw.contains("application/pgp-signature"), "the queued message has no PGP signature part");
     }
 
     #[test]
@@ -4666,7 +4902,11 @@ mod tests {
         assert!(engine.outbox_list(None, 500, 0).expect("outbox").entries.is_empty(), "the dry run queued a row");
 
         let now = Utc::now().to_rfc3339();
-        run(cli(Command::Send { draft: id.clone(), at: Some(now), dry_run: false }), &mut engine).expect("send from the CLI");
+        run(
+            cli(Command::Send { draft: id.clone(), at: Some(now), dry_run: false, sign: None, encrypt: Vec::new(), passphrase_stdin: false }),
+            &mut engine,
+        )
+        .expect("send from the CLI");
         smtp_thread.join().expect("SMTP thread");
         let captured = captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(captured.len(), 1, "the CLI did not submit exactly one message");
@@ -4877,5 +5117,19 @@ mod tests {
         assert!(command_reads_only(&pgp_cli(PgpKeysCommand::ExportPublic { id: "pgp_1".to_owned(), account: None }).command));
         assert!(!command_reads_only(&pgp_cli(PgpKeysCommand::Delete { id: "pgp_1".to_owned(), account: None }).command));
         assert!(!command_reads_only(&pgp_cli(PgpKeysCommand::Import { account: None, armor_file: None, passphrase_stdin: false }).command));
+    }
+
+    #[test]
+    fn pgp_request_adds_the_passphrase_only_for_a_signed_send() {
+        assert!(pgp_request(&PgpSendOptions::default()).is_none(), "a plain send must not send a pgp field");
+        let encrypted = PgpSendOptions { sign: None, encrypt: vec!["pgp_1".to_owned()], passphrase: String::new() };
+        let request = pgp_request(&encrypted).expect("encrypted fragment");
+        assert_eq!(request["encrypt"], json!(["pgp_1"]));
+        assert!(request.get("passphrase").is_none(), "encrypt-only sends take no passphrase");
+        let signed = PgpSendOptions { sign: Some("pgp_2".to_owned()), encrypt: Vec::new(), passphrase: "segreto".to_owned() };
+        let request = pgp_request(&signed).expect("signed fragment");
+        assert_eq!(request["sign"], json!("pgp_2"));
+        assert_eq!(request["passphrase"], json!("segreto"), "the real send request must carry the passphrase the CLI read from stdin");
+        assert!(!format!("{signed:?}").contains("segreto"), "Debug must redact the passphrase");
     }
 }

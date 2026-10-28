@@ -2,13 +2,14 @@
 //!
 //! A row carries the fingerprint, the public armor and, for a private key, the still
 //! passphrase-protected secret armor. Both armors are bounded by the caller before they reach this
-//! module, and the secret armor is only ever written: no read path in this module returns it, so a
-//! list or export can never leak private material into an operation response or a log line.
+//! module. Signing and decryption need the secret armor, so [`Store::get_pgp_secret_armor`] returns
+//! it only to the engine's crypto path; no operation lists, exports or logs it.
 //!
 //! The schema enforces one fingerprint per store and `protected` agreement with the presence of a
 //! secret. The per-account cap is checked inside the same immediate transaction as the insert.
 
 use rusqlite::{OptionalExtension, params};
+use zeroize::Zeroizing;
 
 use crate::model::{PgpKeyInsert, PgpKeySummary, PgpPublicKeyRecord};
 use crate::{Store, StoreError};
@@ -106,6 +107,27 @@ impl Store {
             })
             .optional()
             .map_err(StoreError::from)
+    }
+
+    /// The public armor of one key, for verification and recipient encryption.
+    pub fn get_pgp_public_armor(&self, account_id: &str, id: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row("SELECT public_armor FROM pgp_keys WHERE account_id = ?1 AND id = ?2", params![account_id, id], |row| row.get(0))
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// The still-protected secret armor of one key, for the engine's sign/decrypt path only.
+    ///
+    /// The result is zeroised on drop. Callers must not serialize it, log it or return it from an
+    /// operation: no operation here does.
+    pub fn get_pgp_secret_armor(&self, account_id: &str, id: &str) -> Result<Option<Zeroizing<String>>, StoreError> {
+        let armor: Option<String> = self
+            .conn
+            .query_row("SELECT secret_armor FROM pgp_keys WHERE account_id = ?1 AND id = ?2", params![account_id, id], |row| row.get(0))
+            .optional()
+            .map_err(StoreError::from)?;
+        Ok(armor.map(Zeroizing::new))
     }
 }
 
