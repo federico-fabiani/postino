@@ -496,6 +496,9 @@ pub struct PostinoApp {
     /// The account's public key rows, loaded when Settings or the composer needs them.
     pgp_keys: Vec<PgpKey>,
     pgp_keys_loaded: bool,
+    /// After a key-list failure, wait before retrying so a disconnected daemon is not polled every
+    /// frame. A user import/delete or a send with a missing key forces a new attempt.
+    pgp_keys_retry_at: f64,
     /// The key import sheet. Key material and the passphrase stay in this state only.
     pgp_import: Option<PgpImportState>,
     /// The key waiting for the delete confirmation.
@@ -1181,6 +1184,7 @@ impl PostinoApp {
             pgp_prompt: None,
             pgp_keys: Vec::new(),
             pgp_keys_loaded: false,
+            pgp_keys_retry_at: 0.0,
             pgp_import: None,
             pgp_delete: None,
             pgp_notice: None,
@@ -4744,6 +4748,9 @@ impl PostinoApp {
             || self.pending_link.is_some()
             || self.attachment_warning.is_some()
             || self.attachment_overwrite.is_some()
+            || self.pgp_prompt.is_some()
+            || self.pgp_import.is_some()
+            || self.pgp_delete.is_some()
             || self.rules_page.is_some()
         {
             return;
@@ -5038,6 +5045,7 @@ impl PostinoApp {
         // falls back to the body.
         state.focus = Some(state.first_empty_focus());
         self.composer = state;
+        self.pgp_prompt = None;
         self.composer_focus_pending = true;
         self.show_palette = false;
         self.show_shortcuts = false;
@@ -5325,6 +5333,14 @@ impl PostinoApp {
         };
         let sign = self.composer.pgp_sign.clone();
         let encrypt = self.composer.pgp_encrypt.clone();
+        if let Some(key_id) = sign.as_deref()
+            && !self.pgp_keys.iter().any(|key| key.id == key_id)
+        {
+            // A transient list failure must not turn into "key no longer available": try once more
+            // with a fresh request before telling the user to pick another key.
+            self.pgp_keys_retry_at = 0.0;
+            self.refresh_pgp_keys();
+        }
         if let Some(key_id) = sign.as_deref() {
             let Some(key) = self.pgp_keys.iter().find(|key| key.id == key_id) else {
                 self.composer.mark_failed("La chiave PGP scelta non è più disponibile: scegline un'altra.", self.now);
@@ -5358,8 +5374,14 @@ impl PostinoApp {
                 Err(_) => self.composer.mark_failed("Non è stato possibile leggere la coda di invio.", self.now),
             },
             Err(error) => {
-                let message = send_error_message(&error.to_string(), self.demo);
-                self.composer.mark_failed(message, self.now);
+                let raw = error.to_string();
+                let message = send_error_message(&raw, self.demo);
+                self.composer.mark_failed(message.clone(), self.now);
+                if passphrase.is_some() && (raw.contains("passphrase does not unlock") || raw.contains("signing key is passphrase-protected")) {
+                    let mut prompt = PgpPromptState::new(PgpPromptPurpose::Send);
+                    prompt.error = Some("La passphrase non apre la chiave. Riprova.".to_owned());
+                    self.pgp_prompt = Some(prompt);
+                }
             }
         }
     }
@@ -5502,6 +5524,7 @@ impl PostinoApp {
         if self.composer.dirty && !self.save_composer(true) {
             return;
         }
+        self.pgp_prompt = None;
         self.composer = ComposerState::closed();
     }
 
@@ -5521,6 +5544,7 @@ impl PostinoApp {
             match self.op("message_move", json!({ "id": id, "folder": trash })) {
                 Ok(_) => {
                     self.composer = ComposerState::closed();
+                    self.pgp_prompt = None;
                     self.status = "Bozza spostata nel cestino".to_owned();
                     self.push_toast("Bozza scartata", UndoAction::Move(vec![(id, previous)]));
                 }
@@ -7485,8 +7509,8 @@ impl PostinoApp {
                     None
                 }
             },
-            Err(error) => {
-                self.push_info_toast(format!("Decifratura non riuscita: {error}"), ToastKind::Error);
+            Err(_) => {
+                self.push_info_toast("Decifratura non riuscita: la chiave o il messaggio non sono leggibili.", ToastKind::Error);
                 None
             }
         }
@@ -7514,35 +7538,34 @@ impl PostinoApp {
         let Some(state) = self.pgp_reading.as_ref().filter(|state| state.message_id == message_id) else { return };
         ui.add_space(space::XS);
         let mut decrypt = false;
-        let mut tooltip = String::new();
-        let (label, kind) = if let Some(result) = state.decrypt.as_ref() {
-            tooltip = result.reason.clone().unwrap_or_default();
-            match result.state {
-                PgpDecryptState::Decrypted => ("Decifrato · solo in questa vista", BadgeKind::Accent),
-                PgpDecryptState::Locked => ("Chiave bloccata", BadgeKind::Neutral),
-                PgpDecryptState::WrongPassphrase => ("Passphrase errata", BadgeKind::Danger),
-                PgpDecryptState::NoKey => ("Nessuna chiave privata", BadgeKind::Neutral),
-                PgpDecryptState::Unknown => ("Decifratura non riuscita", BadgeKind::Danger),
-                PgpDecryptState::NotStored => ("PGP non disponibile", BadgeKind::Neutral),
-            }
+        let mut hide = false;
+        let ((label, kind), tooltip) = if let Some(result) = state.decrypt.as_ref() {
+            (
+                match result.state {
+                    PgpDecryptState::Decrypted => ("Decifrato · solo in questa vista", BadgeKind::Accent),
+                    PgpDecryptState::Locked => ("Chiave bloccata", BadgeKind::Neutral),
+                    PgpDecryptState::WrongPassphrase => ("Passphrase errata", BadgeKind::Danger),
+                    PgpDecryptState::NoKey => ("Nessuna chiave privata", BadgeKind::Neutral),
+                    PgpDecryptState::Unknown => ("Decifratura non riuscita", BadgeKind::Danger),
+                    PgpDecryptState::NotStored => ("PGP non disponibile", BadgeKind::Neutral),
+                },
+                pgp_decrypt_tooltip(result),
+            )
         } else if state.kind == PgpMimeKind::Encrypted {
-            tooltip = state.verify.as_ref().and_then(|result| result.reason.clone()).unwrap_or_default();
-            ("Crittografato", BadgeKind::Neutral)
+            (("Crittografato", BadgeKind::Neutral), "Messaggio cifrato: decifralo per leggerlo.".to_owned())
         } else if let Some(result) = state.verify.as_ref() {
-            tooltip = result.reason.clone().unwrap_or_else(|| {
-                let signer = result.signer.as_deref().unwrap_or("firma");
-                let fingerprint = result.fingerprint.as_deref().unwrap_or("");
-                if fingerprint.is_empty() { format!("Firmato da {signer}") } else { format!("Firmato da {signer} · {fingerprint}") }
-            });
-            match result.state {
-                PgpVerifyState::Verified => ("Firma verificata", BadgeKind::Accent),
-                PgpVerifyState::Bad => ("Firma non valida", BadgeKind::Danger),
-                PgpVerifyState::NoKey => ("Firma: chiave assente", BadgeKind::Neutral),
-                PgpVerifyState::Unknown => ("PGP: stato sconosciuto", BadgeKind::Neutral),
-                PgpVerifyState::NotStored => ("PGP non disponibile", BadgeKind::Neutral),
-            }
+            (
+                match result.state {
+                    PgpVerifyState::Verified => ("Firma verificata", BadgeKind::Accent),
+                    PgpVerifyState::Bad => ("Firma non valida", BadgeKind::Danger),
+                    PgpVerifyState::NoKey => ("Firma: chiave assente", BadgeKind::Neutral),
+                    PgpVerifyState::Unknown => ("PGP: stato sconosciuto", BadgeKind::Neutral),
+                    PgpVerifyState::NotStored => ("PGP non disponibile", BadgeKind::Neutral),
+                },
+                pgp_verify_tooltip(result),
+            )
         } else {
-            ("PGP: stato sconosciuto", BadgeKind::Neutral)
+            (("PGP: stato sconosciuto", BadgeKind::Neutral), "Stato PGP non disponibile.".to_owned())
         };
         let _row = ui.horizontal_wrapped(|ui| {
             let badge = Badge::new(label).kind(kind).show(ui);
@@ -7557,10 +7580,20 @@ impl PostinoApp {
             }
             if state.decrypt.as_ref().is_some_and(|result| result.state == PgpDecryptState::Decrypted) {
                 ui.label(typography::text(Role::Caption, "Il testo decifrato non viene salvato né indicizzato.", t.text_faint));
+                if Button::ghost("Nascondi").size(ButtonSize::Sm).show(ui).clicked() {
+                    hide = true;
+                }
             }
         });
         #[cfg(test)]
         probe::reading_pgp(ui, _row.response.rect);
+        if hide
+            && let Some(state) = self.pgp_reading.as_mut()
+            && state.message_id == message_id
+        {
+            state.decrypt = None;
+            state.view = None;
+        }
         if decrypt {
             self.begin_pgp_decrypt();
         }
@@ -9381,6 +9414,7 @@ impl PostinoApp {
     fn reset_pgp_account_state(&mut self) {
         self.pgp_keys.clear();
         self.pgp_keys_loaded = false;
+        self.pgp_keys_retry_at = 0.0;
         self.pgp_reading = None;
         self.pgp_checked = None;
         self.pgp_prompt = None;
@@ -9389,6 +9423,9 @@ impl PostinoApp {
     }
 
     fn refresh_pgp_keys(&mut self) {
+        if self.pgp_keys_loaded || self.now < self.pgp_keys_retry_at {
+            return;
+        }
         let mut args = json!({});
         if let Some(account) = &self.active_account {
             args["account"] = json!(account);
@@ -9397,13 +9434,20 @@ impl PostinoApp {
             Ok(value) => match serde_json::from_value::<Vec<PgpKey>>(value) {
                 Ok(keys) => {
                     self.pgp_keys = keys;
+                    self.pgp_keys_loaded = true;
+                    self.pgp_keys_retry_at = 0.0;
                     self.pgp_notice = None;
                 }
-                Err(_) => self.pgp_notice = Some("L'elenco delle chiavi non è leggibile.".to_owned()),
+                Err(_) => {
+                    self.pgp_keys_retry_at = self.now + 5.0;
+                    self.pgp_notice = Some("L'elenco delle chiavi non è leggibile.".to_owned());
+                }
             },
-            Err(error) => self.pgp_notice = Some(format!("Chiavi PGP non disponibili: {error}")),
+            Err(error) => {
+                self.pgp_keys_retry_at = self.now + 5.0;
+                self.pgp_notice = Some(format!("Chiavi PGP non disponibili: {error}"));
+            }
         }
-        self.pgp_keys_loaded = true;
     }
 
     fn open_pgp_import(&mut self) {
@@ -9428,6 +9472,9 @@ impl PostinoApp {
             Ok(_) => {
                 self.pgp_import = None;
                 self.pgp_keys_loaded = false;
+                self.pgp_keys_retry_at = 0.0;
+                self.pgp_checked = None;
+                self.pgp_reading = None;
                 self.refresh_pgp_keys();
                 self.pgp_notice = Some("Chiave PGP importata in questo archivio cifrato.".to_owned());
             }
@@ -9466,6 +9513,9 @@ impl PostinoApp {
         match self.op("pgp_key_delete", args) {
             Ok(_) => {
                 self.pgp_keys_loaded = false;
+                self.pgp_keys_retry_at = 0.0;
+                self.pgp_checked = None;
+                self.pgp_reading = None;
                 self.refresh_pgp_keys();
                 self.pgp_notice = Some("Chiave PGP eliminata.".to_owned());
             }
@@ -12065,6 +12115,37 @@ fn missing_attachment_name(raw: &str) -> Option<String> {
 /// Translate an engine send failure into Italian copy. The raw sentence never reaches the shell.
 /// The optional `pgp` object on a send. Encryption alone takes no passphrase; a signature adds it
 /// only after the sheet collected it. No key ids means a plain send and no `pgp` field at all.
+/// Translate the verify verdict into the one line a person needs. The engine's `reason` is for
+/// diagnostics and is English; the UI never shows it raw.
+fn pgp_verify_tooltip(result: &PgpVerifyResult) -> String {
+    match result.state {
+        PgpVerifyState::Verified => {
+            let signer = result.signer.as_deref().unwrap_or("chiave salvata");
+            let fingerprint = result.fingerprint.as_deref().unwrap_or("");
+            if fingerprint.is_empty() {
+                format!("Firma valida per i byte originali, da {signer}.")
+            } else {
+                format!("Firma valida per i byte originali, da {signer} · {fingerprint}.")
+            }
+        }
+        PgpVerifyState::Bad => "La firma non corrisponde a nessuna chiave pubblica salvata.".to_owned(),
+        PgpVerifyState::NoKey => "Nessuna chiave pubblica salvata per questo account.".to_owned(),
+        PgpVerifyState::Unknown => "I byte originali non sono leggibili come PGP/MIME firmato.".to_owned(),
+        PgpVerifyState::NotStored => "I byte originali non sono conservati: la firma non è verificabile.".to_owned(),
+    }
+}
+
+fn pgp_decrypt_tooltip(result: &PgpDecryptResult) -> String {
+    match result.state {
+        PgpDecryptState::Decrypted => "Testo decifrato visibile solo in questa finestra.".to_owned(),
+        PgpDecryptState::Locked => "La chiave privata richiede una passphrase.".to_owned(),
+        PgpDecryptState::WrongPassphrase => "La passphrase non apre la chiave privata.".to_owned(),
+        PgpDecryptState::NoKey => "Nessuna chiave privata salvata per questo account.".to_owned(),
+        PgpDecryptState::Unknown => "La decifratura non è riuscita: il messaggio o la chiave non sono leggibili.".to_owned(),
+        PgpDecryptState::NotStored => "I byte originali non sono conservati: il messaggio non è decifrabile.".to_owned(),
+    }
+}
+
 fn pgp_send_request(sign: Option<&str>, encrypt: &[String], passphrase: Option<&str>) -> Option<Value> {
     if sign.is_none() && encrypt.is_empty() {
         return None;
@@ -12092,8 +12173,41 @@ fn send_error_message(raw: &str, demo: bool) -> String {
             None => "Un allegato è mancante o illeggibile: rimuovilo o riattaccalo prima di inviare.".to_owned(),
         };
     }
-    if raw.contains("at least one recipient") {
+    if raw.contains("at least one recipient") && !raw.contains("recipient key") {
         return "Aggiungi almeno un destinatario prima di inviare.".to_owned();
+    }
+    if raw.contains("passphrase does not unlock") {
+        return "La passphrase non apre la chiave PGP: il messaggio non è stato messo in coda.".to_owned();
+    }
+    if raw.contains("signing key is passphrase-protected") {
+        return "La chiave PGP di firma è protetta: inserisci la passphrase per inviare.".to_owned();
+    }
+    if raw.contains("signing key has no stored secret") {
+        return "La chiave PGP scelta non contiene la parte privata: importala di nuovo.".to_owned();
+    }
+    if raw.contains("PGP key id") {
+        return "La chiave PGP scelta non esiste più per questo account: ricarica le chiavi.".to_owned();
+    }
+    if raw.contains("recipient key is revoked") {
+        return "Una chiave PGP del destinatario è revocata: il messaggio non è stato messo in coda.".to_owned();
+    }
+    if raw.contains("recipient key is expired") {
+        return "Una chiave PGP del destinatario è scaduta: il messaggio non è stato messo in coda.".to_owned();
+    }
+    if raw.contains("no usable encryption key") {
+        return "Una chiave PGP del destinatario non può cifrare: chiedine una con una sottochiave di cifratura.".to_owned();
+    }
+    if raw.contains("stored PGP key could not be read") {
+        return "Una chiave PGP salvata non è leggibile: esportala e importala di nuovo.".to_owned();
+    }
+    if raw.contains("encrypted send addresses more than 100") {
+        return "Un invio cifrato può avere al massimo 100 chiavi.".to_owned();
+    }
+    if raw.contains("encrypted send needs at least one recipient key") {
+        return "Scegli almeno una chiave PGP per cifrare il messaggio.".to_owned();
+    }
+    if raw.contains("outgoing message has no MIME entity") {
+        return "Il messaggio non ha un contenuto MIME da firmare o cifrare.".to_owned();
     }
     if raw.contains("100") && raw.contains("recipients") {
         return "Il messaggio ha troppi destinatari: il limite è 100.".to_owned();
@@ -19526,11 +19640,67 @@ mod tests {
         app.dark = false;
         theme::apply(&ctx, false);
 
+        app.pgp_reading.as_mut().expect("the encrypted state").decrypt = Some(PgpDecryptResult {
+            state: PgpDecryptState::Decrypted,
+            key_id: Some("key_ada".to_owned()),
+            fingerprint: None,
+            text: Some("Testo decifrato".to_owned()),
+            html: None,
+            reason: None,
+        });
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Decifrato · solo in questa vista");
+        painted_visible(&runs, "Nascondi");
+
         app.pgp_prompt = Some(PgpPromptState::new(PgpPromptPurpose::Decrypt));
         let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
         painted_visible(&runs, "Passphrase della chiave PGP");
         painted_visible(&runs, "Decifra");
         assert!(app.pgp_prompt.is_some(), "Escape was not pressed: the sheet stays open");
+    }
+
+    #[test]
+    fn escape_while_the_pgp_sheet_is_open_keeps_the_composer_and_closes_only_the_sheet() {
+        let (ctx, mut app) = ready_app();
+        app.pgp_keys_loaded = true;
+        app.pgp_keys = vec![pgp_key("key_ada")];
+        app.compose_new();
+        app.pgp_prompt = Some(PgpPromptState::new(PgpPromptPurpose::Send));
+        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        painted_visible(&runs, "Firma con la chiave PGP");
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(app.pgp_prompt.is_none(), "Escape closes the sheet");
+        assert!(app.composer.open, "Escape in the sheet must not close the composer behind it");
+    }
+
+    #[test]
+    fn pgp_send_errors_never_claim_a_queued_message() {
+        let wrong = send_error_message("invalid arguments: the passphrase does not unlock the signing key; nothing was queued", false);
+        assert!(wrong.contains("passphrase") && !wrong.contains("già in coda"), "wrong passphrase copy: {wrong}");
+        let revoked = send_error_message("invalid arguments: a recipient key is revoked; the message was not queued", false);
+        assert!(revoked.contains("revocata") && !revoked.contains("già in coda"), "revoked-key copy: {revoked}");
+        let expired =
+            send_error_message("invalid arguments: a recipient key is expired; the message was not queued and no cleartext was sent", false);
+        assert!(expired.contains("scaduta") && !expired.contains("già in coda"), "expired-key copy: {expired}");
+        let missing_key = send_error_message("invalid arguments: an encrypted send needs at least one recipient key", false);
+        assert!(missing_key.contains("chiave PGP"), "missing encryption key copy: {missing_key}");
+    }
+
+    #[test]
+    fn a_non_pgp_message_is_verified_once_and_never_gets_a_badge() {
+        let (mut app, daemon, _path, _key, _vault) =
+            daemon_app("p12c2c-plain-check", |store| seed_account_rows(store, "acc_a", "save@example.com", None));
+        let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a seeded message");
+        app.open_message(id.clone());
+        app.pgp_checked = None;
+        app.pgp_reading = None;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+        assert_eq!(app.pgp_checked.as_deref(), Some(id.as_str()), "the pane checks a normal message once");
+        assert!(app.pgp_reading.is_none(), "a non-PGP message must not get a PGP badge");
+        daemon.shutdown().expect("the daemon stops");
     }
 
     #[test]
@@ -19555,11 +19725,12 @@ mod tests {
         app.pgp_keys_loaded = true;
         app.pgp_keys = vec![pgp_key("key_ada")];
         app.open_settings(&ctx, None);
-        frame_at(&ctx, &mut app, Vec2::new(1200.0, 900.0), vec![]);
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(&ctx, &mut app, size, vec![]);
         if let Some(scroll) = probe::settings_scroll_view(&ctx) {
-            frame_at(&ctx, &mut app, Vec2::new(1200.0, 900.0), wheel(scroll.center(), 80));
+            frame_at(&ctx, &mut app, size, wheel(scroll.center(), 80));
         }
-        let runs = painted_runs(&ctx, &mut app, Vec2::new(1200.0, 900.0));
+        let runs = painted_runs(&ctx, &mut app, size);
         painted_visible(&runs, "Importa chiave PGP");
         painted_visible(&runs, "Ada Lovelace");
         painted_visible(&runs, "Copia pubblica");
@@ -19606,6 +19777,14 @@ mod tests {
         let copied = copied_text(&output).unwrap_or_default();
         assert!(copied.contains("BEGIN PGP PUBLIC KEY BLOCK"), "the export must put the public armor on the clipboard");
         assert!(app.pgp_notice.as_deref().is_some_and(|notice| notice.contains("copiata")), "the export must report its result");
+
+        app.pgp_checked = Some("msg_open".to_owned());
+        app.pgp_reading =
+            Some(PgpReadingState { message_id: "msg_open".to_owned(), kind: PgpMimeKind::Signed, verify: None, decrypt: None, view: None });
+        app.delete_pgp_key(key_id.as_str());
+        assert!(app.pgp_keys.is_empty(), "the deleted key leaves the list");
+        assert!(app.pgp_checked.is_none(), "the deleted key must invalidate the open message verdict");
+        assert!(app.pgp_reading.is_none(), "the stale badge must not survive a key deletion");
         daemon.shutdown().expect("the daemon stops");
     }
 

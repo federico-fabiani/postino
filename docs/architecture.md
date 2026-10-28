@@ -1610,7 +1610,9 @@ state, and an encrypted message each have a distinct badge, with the signer and 
 tooltip. "Decifra" first tries an unprotected key, then opens the one passphrase sheet; a `locked` or
 `wrong_passphrase` result stays visible and the sheet can be retried. The decrypted text/html is
 parsed by the same sanitizer and the same `SubsetBodyRenderer` as stored mail, cached only in memory
-for the open message, and never written to the row or FTS. The composer has a per-send sign choice
+for the open message, and never written to the row or FTS. A "Nascondi" action drops that plaintext
+again, and importing or deleting a key invalidates the open verdict instead of leaving a stale badge.
+The composer has a per-send sign choice
 over secret keys and a multi-select encryption menu over stored keys; the protected signing key opens
 the same sheet and the passphrase is inserted only into that `message_send` call. Settings lists the
 account's keys with import, public-armor copy and delete; import accepts public or passphrase-protected
