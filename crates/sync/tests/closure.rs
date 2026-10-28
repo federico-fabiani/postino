@@ -256,6 +256,7 @@ fn many_parts_message(uid: u32, parts: usize) -> TestMessage {
         from_mailbox: format!("many{uid}"),
         from_host: "example.test".to_owned(),
         message_id: Some(message_id),
+        labels: Vec::new(),
     }
 }
 

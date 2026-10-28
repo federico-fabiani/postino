@@ -196,6 +196,11 @@ pub(crate) fn ingest(
     // explicit refresh may fetch the entity again, but nothing here re-derives it from the body.
     store.set_message_raw_blob_hash(&id, raw_blob_hash.as_deref()).map_err(SyncError::Store)?;
     store.set_message_reply_to(&id, &reply_to).map_err(SyncError::Store)?;
+    // Gmail labels are display metadata, not folders. On a Gmail session an empty list still
+    // reconciles, so a label removed on the server also disappears locally.
+    if context.gmail_labels {
+        crate::labels::apply(store, &account.id, &id, &envelope.labels)?;
+    }
     // RFC 2369/8058 unsubscribe targets are header-only. They live beside the reply-to override in
     // encrypted `meta`, within the same small bound as a header value, so no schema migration is
     // needed and a later message can be deleted without leaving them behind.

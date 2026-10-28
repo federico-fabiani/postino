@@ -53,6 +53,7 @@
 mod folder;
 mod ids;
 mod ingest;
+mod labels;
 mod status;
 mod submit;
 mod warnings;
@@ -214,6 +215,8 @@ pub(crate) struct Context<'a> {
     pub(crate) account: &'a store::Account,
     pub(crate) limits: &'a SyncLimits,
     pub(crate) cancel: &'a AtomicBool,
+    /// The server advertised Gmail's `X-GM-EXT-1`; labels are present and meaningful.
+    pub(crate) gmail_labels: bool,
 }
 
 /// Mutable state shared by every folder of one run.
@@ -367,7 +370,8 @@ async fn run_session(
     status::write_status(store, account, state)?;
     log::info!("sync: account {}: {} folders to reconcile", account.id, outcome.folders);
 
-    let context = Context { store, account, limits, cancel };
+    let gmail_labels = session.capabilities().x_gm_ext();
+    let context = Context { store, account, limits, cancel, gmail_labels };
     let mut progress = RunProgress { remaining: limits.max_messages, seen: HashSet::new(), drifted: HashSet::new() };
     let mut exhausted = false;
     let mut done = 0u32;

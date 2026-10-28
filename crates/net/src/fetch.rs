@@ -9,6 +9,9 @@ use crate::parser::Cursor;
 const MAX_ADDRESSES: usize = 256;
 /// Deepest number of flags accepted in one list.
 const MAX_FLAGS: usize = 256;
+/// Gmail returns a label list per message; a hostile server must not grow it without bound.
+const MAX_GMAIL_LABELS: usize = 256;
+const MAX_GMAIL_LABEL_CHARS: usize = 1024;
 
 /// One `* n FETCH (...)` response, before it is mapped to a public [`crate::Envelope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +21,7 @@ pub(crate) struct FetchData {
     pub(crate) internal_date: Option<DateTime<FixedOffset>>,
     pub(crate) size: Option<u32>,
     pub(crate) envelope: Option<RawEnvelope>,
+    pub(crate) labels: Vec<String>,
     pub(crate) body: Option<Vec<u8>>,
 }
 
@@ -40,7 +44,7 @@ pub(crate) struct RawEnvelope {
 
 /// Parse the contents of a `FETCH` list. The opening `(` has already been consumed.
 pub(crate) fn parse_fetch(cursor: &mut Cursor<'_>) -> Result<FetchData, NetError> {
-    let mut data = FetchData { uid: None, flags: Vec::new(), internal_date: None, size: None, envelope: None, body: None };
+    let mut data = FetchData { uid: None, flags: Vec::new(), internal_date: None, size: None, envelope: None, labels: Vec::new(), body: None };
     loop {
         cursor.skip_ws();
         if cursor.peek() == Some(b')') {
@@ -56,6 +60,7 @@ pub(crate) fn parse_fetch(cursor: &mut Cursor<'_>) -> Result<FetchData, NetError
             "INTERNALDATE" => data.internal_date = parse_internal_date(cursor.text_string()?.as_deref())?,
             "RFC822.SIZE" => data.size = Some(cursor.u32_value()?),
             "ENVELOPE" => data.envelope = Some(parse_envelope(cursor)?),
+            "X-GM-LABELS" => data.labels = parse_gmail_labels(cursor)?,
             // A server answers BODY.PEEK[] with BODY[]; RFC822 is the ancient spelling of the same
             // thing and is accepted defensively.
             "BODY[]" | "BODY" | "RFC822" => {
@@ -138,6 +143,43 @@ pub(crate) fn parse_flag_list(cursor: &mut Cursor<'_>) -> Result<Vec<Flag>, NetE
     }
     cursor.list_close()?;
     Ok(flags)
+}
+
+/// Parse `X-GM-LABELS ("\\Inbox" "Label with spaces")`.
+///
+/// The labels are UTF-8 astrings: quoted strings, literals and NIL are accepted by the shared
+/// cursor. Names are display data, so invalid UTF-8 is replaced instead of failing the whole sync.
+fn parse_gmail_labels(cursor: &mut Cursor<'_>) -> Result<Vec<String>, NetError> {
+    if !cursor.list_open()? {
+        return Err(protocol("X-GM-LABELS requires a list"));
+    }
+    let mut labels = Vec::new();
+    loop {
+        cursor.skip_ws();
+        if cursor.peek() == Some(b')') {
+            break;
+        }
+        if !cursor.has_value() {
+            return Err(protocol("unterminated X-GM-LABELS list"));
+        }
+        let Some(raw) = cursor.string()? else {
+            // NIL is an empty item; Gmail does not send it for a label list.
+            cursor.skip_value()?;
+            continue;
+        };
+        let label = String::from_utf8_lossy(&raw).trim().to_owned();
+        if label.is_empty() || label.chars().count() > MAX_GMAIL_LABEL_CHARS {
+            continue;
+        }
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+        if labels.len() > MAX_GMAIL_LABELS {
+            return Err(protocol("too many Gmail labels"));
+        }
+    }
+    cursor.list_close()?;
+    Ok(labels)
 }
 
 fn parse_envelope(cursor: &mut Cursor<'_>) -> Result<RawEnvelope, NetError> {
@@ -229,6 +271,12 @@ mod tests {
         assert_eq!(data.flags, vec![Flag::Seen, Flag::Keyword("$Forwarded".to_owned())]);
         assert_eq!(data.size, Some(1234));
         assert!(data.internal_date.is_some());
+    }
+
+    #[test]
+    fn parses_gmail_labels_with_spaces_and_system_names() {
+        let data = fetch(r#"(UID 7 X-GM-LABELS ("\\Inbox" "Clienti" "Progetto verde"))"#).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(data.labels, vec!["\\Inbox", "Clienti", "Progetto verde"]);
     }
 
     #[test]

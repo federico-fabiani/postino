@@ -128,6 +128,14 @@ MCP      ─┘
   search field is focused and empty; “Cancella ricerche recenti” clears them. Rename, edit and delete
   are undoable, and `saved_searches_list` plus the four CRUD/recent operations expose the same surface
   to agents.
+- **Gmail labels (P13e).** When the IMAP server advertises `X-GM-EXT-1`, sync reads
+  `X-GM-LABELS` with each envelope. Gmail system labels (`\Inbox`, `\Sent`, …) stay folders; each
+  custom label becomes an account-scoped local label shown as a chip and filterable with
+  `messages_list --label`. The mapping is one-way and read-only: local create/rename/delete never
+  pushes to Gmail. The sync remembers the ids it applied in encrypted `meta`, so a label removed on
+  the server disappears locally without deleting a label the person applied by hand. Names are
+  bounded to 48 characters and control/bidi characters are rejected; a hostile server cannot create
+  an unbounded label set.
 - **Unsubscribe (P13d).** The IMAP ingest records the sender's bounded RFC 2369/8058
   `List-Unsubscribe` targets, and `message_unsubscribe` classifies up to four `mailto`, `https` or
   `http` choices. The reading pane shows **Disiscriviti** only when a valid target exists: a

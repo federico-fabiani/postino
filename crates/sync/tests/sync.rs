@@ -108,6 +108,40 @@ fn unsubscribe_headers_are_captured_in_encrypted_meta_for_received_mail() {
 }
 
 #[test]
+fn gmail_labels_become_account_labels_and_are_removed_when_the_server_drops_them() {
+    let harness = Harness::new();
+    let store = seeded(&harness);
+    let message = TestMessage::synthetic(synthetic_message(1)).with_labels(&["\\Inbox", "Clienti", "Progetto verde"]);
+    let server = RunningServer::start_with(one_inbox(10, vec![message]), MailboxScript::default().gmail());
+    sync(&store, &server).expect("first Gmail sync");
+    server.finish();
+
+    let row = message_by_header(&store, "synthetic-1@example.test");
+    let labels = store.list_labels(Some(ACCOUNT_ID)).expect("labels");
+    let names = labels.iter().map(|label| label.label.name.as_str()).collect::<Vec<_>>();
+    assert_eq!(names, vec!["Clienti", "Progetto verde"], "system labels are folders, not chips: {names:?}");
+    let clienti = labels.iter().find(|label| label.label.name == "Clienti").expect("Clienti");
+    assert_eq!(clienti.message_count, 1);
+    assert!(row.summary.labels.contains(&clienti.label.id), "the envelope label is on the message row");
+
+    // Re-fetch the same UID with the labels gone. The sync record is the only way to force the
+    // envelope again without changing UIDVALIDITY, which would delete and recreate the row.
+    let inbox = folder(&store, "INBOX");
+    store
+        .set_sync_state(&postino_store::SyncState { folder_id: inbox.id.clone(), uid_next: 1, highest_modseq: None, last_error: None })
+        .expect("rewind the cursor");
+    let plain = TestMessage::synthetic(synthetic_message(1));
+    let server = RunningServer::start_with(one_inbox(10, vec![plain]), MailboxScript::default().gmail());
+    sync(&store, &server).expect("second Gmail sync");
+    server.finish();
+
+    let row = message_by_header(&store, "synthetic-1@example.test");
+    assert!(row.summary.labels.is_empty(), "a label removed on the server is removed locally: {:?}", row.summary.labels);
+    let labels = store.list_labels(Some(ACCOUNT_ID)).expect("labels");
+    assert!(labels.iter().all(|label| label.message_count == 0), "the label rows remain reusable but carry no message");
+}
+
+#[test]
 fn status_is_absent_before_the_first_run() {
     let harness = Harness::new();
     let store = seeded(&harness);

@@ -93,6 +93,8 @@ pub const LABEL_SEQ_KEY: &str = "label_seq";
 pub const REPLY_TO_KEY_PREFIX: &str = "reply_to:";
 /// Per-message `List-Unsubscribe` targets captured at ingest, keyed `unsubscribe:<message id>`.
 pub const UNSUBSCRIBE_KEY_PREFIX: &str = "unsubscribe:";
+/// Local label ids that sync applied from Gmail `X-GM-LABELS`, keyed `remote_labels:<message id>`.
+pub const REMOTE_LABELS_KEY_PREFIX: &str = "remote_labels:";
 
 /// Prefix of the `meta` key that holds one account's persisted sync status. The account id follows.
 /// `postino-sync` writes the JSON value; `Store::delete_account` removes it with the account.

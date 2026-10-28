@@ -215,7 +215,9 @@ interaction model before real mail makes them expensive to change. Full spec:
 ## M6 — ship and automate
 
 - [x] Gmail OAuth with a bring-your-own Desktop client and XOAUTH2 (P12a).
-- [ ] Gmail label mapping.
+- [x] Gmail label mapping (P13e): `X-GM-LABELS` captured only when the server advertises
+      `X-GM-EXT-1`, custom labels become account labels, system labels stay folders, and a label
+      removed on the server is removed locally without touching manual labels.
 - [ ] Sieve/ManageSieve for server-side filters and vacation responder where supported (deferred:
       no confirmed provider; Gmail has none).
 - [x] PGP key storage/import/export with a passphrase-protected v8 store (P12c1).

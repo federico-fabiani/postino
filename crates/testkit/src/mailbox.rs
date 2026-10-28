@@ -38,6 +38,8 @@ pub struct TestMessage {
     pub from_host: String,
     /// `Message-ID`, angle brackets included.
     pub message_id: Option<String>,
+    /// Gmail labels returned with the envelope when the script advertises `X-GM-EXT-1`.
+    pub labels: Vec<String>,
 }
 
 impl TestMessage {
@@ -55,7 +57,15 @@ impl TestMessage {
             from_mailbox: message.from_mailbox,
             from_host: message.from_host.to_owned(),
             message_id: Some(message.message_id),
+            labels: Vec::new(),
         }
+    }
+
+    /// Add Gmail labels to the envelope. The owning script must advertise `X-GM-EXT-1`.
+    #[must_use]
+    pub fn with_labels(mut self, labels: &[&str]) -> Self {
+        self.labels = labels.iter().map(|label| (*label).to_owned()).collect();
+        self
     }
 
     /// Set the wire flags.
@@ -110,7 +120,15 @@ impl TestMessage {
             cc: None,
             message_id: self.message_id.as_deref(),
         };
-        fetch_envelope_line(sequence, &fields)
+        let line = fetch_envelope_line(sequence, &fields);
+        if self.labels.is_empty() {
+            return line;
+        }
+        let labels = self.labels.iter().map(|label| crate::responses::quoted(label)).collect::<Vec<_>>().join(" ");
+        match line.strip_suffix(')') {
+            Some(prefix) => format!("{prefix} X-GM-LABELS ({labels}))"),
+            None => line,
+        }
     }
 }
 
@@ -214,6 +232,8 @@ pub struct MailboxScript {
     pub uid_next_hint: Option<u32>,
     /// Advertise this `EXISTS` instead of the real count, to fake a wrong liveness hint.
     pub exists_hint: Option<u32>,
+    /// Advertise Gmail's `X-GM-EXT-1`, so the client requests and reads `X-GM-LABELS`.
+    pub gmail: bool,
 }
 
 impl MailboxScript {
@@ -259,6 +279,13 @@ impl MailboxScript {
         self
     }
 
+    /// Advertise Gmail's `X-GM-EXT-1`; messages may then carry labels.
+    #[must_use]
+    pub fn gmail(mut self) -> Self {
+        self.gmail = true;
+        self
+    }
+
     /// Advertise a fake `EXISTS`.
     #[must_use]
     pub fn with_exists_hint(mut self, exists: u32) -> Self {
@@ -278,14 +305,17 @@ pub async fn serve_mailbox(conn: Conn, folders: Vec<TestFolder>) -> Conn {
 /// [`serve_mailbox`] with failure and cancellation hooks.
 pub async fn serve_mailbox_with(conn: Conn, folders: Vec<TestFolder>, script: MailboxScript) -> Conn {
     let mut conn = conn;
-    conn.prepare_sasl().await;
+    let extra = if script.gmail { "X-GM-EXT-1" } else { "" };
+    conn.prepare_sasl_with(extra).await;
     serve_mailbox_inner(conn, folders, script).await
 }
 
 /// [`serve_mailbox`] for an account that authenticates with `AUTHENTICATE XOAUTH2`.
 pub async fn serve_mailbox_with_xoauth2(conn: Conn, folders: Vec<TestFolder>, script: MailboxScript, token: &str) -> Conn {
     let mut conn = conn;
-    conn.prepare_xoauth2(&crate::expected_xoauth2(crate::USER, token)).await;
+    let expected = crate::expected_xoauth2(crate::USER, token);
+    let extra = if script.gmail { "X-GM-EXT-1" } else { "" };
+    conn.prepare_xoauth2_with(&expected, extra).await;
     serve_mailbox_inner(conn, folders, script).await
 }
 
@@ -308,7 +338,8 @@ async fn serve_mailbox_inner(mut conn: Conn, folders: Vec<TestFolder>, script: M
                 return conn;
             }
             "CAPABILITY" => {
-                conn.send_line("* CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE").await;
+                let extra = if script.gmail { " X-GM-EXT-1" } else { "" };
+                conn.send_line(&format!("* CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE{extra}")).await;
                 conn.send_line(&format!("{tag} OK done")).await;
             }
             "NOOP" => conn.send_line(&format!("{tag} OK done")).await,

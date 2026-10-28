@@ -177,14 +177,16 @@ impl Session {
     /// message, and storing it would corrupt the folder.
     pub async fn fetch_envelopes(&mut self, uids: UidSet) -> Result<Vec<Envelope>, NetError> {
         let set = uids.to_wire()?;
-        let arguments = format!("{set} (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)");
+        let gmail = self.capabilities.x_gm_ext();
+        let fields = if gmail { "UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE X-GM-LABELS" } else { "UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE" };
+        let arguments = format!("{set} ({fields})");
         let outcome = self.execute("fetch", "UID FETCH", Some(&arguments)).await?;
         let mut envelopes = Vec::new();
         for item in outcome.untagged {
             let Untagged::Fetch(data) = item else {
                 continue;
             };
-            let FetchData { uid: Some(uid), envelope: Some(envelope), flags, internal_date, size, .. } = *data else {
+            let FetchData { uid: Some(uid), envelope: Some(envelope), flags, internal_date, size, labels, .. } = *data else {
                 continue;
             };
             if !uids.contains(uid) {
@@ -203,6 +205,7 @@ impl Session {
                 reply_to: envelope.reply_to,
                 message_id: envelope.message_id,
                 in_reply_to: envelope.in_reply_to,
+                labels: if gmail { labels } else { Vec::new() },
                 references: Vec::new(),
                 list_id: None,
             });

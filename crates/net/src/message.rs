@@ -158,6 +158,8 @@ pub struct Envelope {
     pub message_id: Option<String>,
     /// `In-Reply-To`.
     pub in_reply_to: Option<String>,
+    /// `X-GM-LABELS`, returned only when the server advertised `X-GM-EXT-1`. Empty elsewhere.
+    pub labels: Vec<String>,
     /// Empty at this layer; see the type documentation.
     pub references: Vec<String>,
     /// Empty at this layer; see the type documentation.

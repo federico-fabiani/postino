@@ -239,28 +239,40 @@ impl Conn {
 
     /// Greeting, CAPABILITY with `AUTH=PLAIN`, the full SASL exchange, and the post-login state.
     pub async fn prepare_sasl(&mut self) {
+        self.prepare_sasl_with("").await;
+    }
+
+    /// [`Conn::prepare_sasl`] with one extra capability such as `X-GM-EXT-1`.
+    pub async fn prepare_sasl_with(&mut self, extra: &str) {
+        let extra = if extra.is_empty() { String::new() } else { format!(" {extra}") };
         self.send_line("* OK fake IMAP ready").await;
         self.expect("A0001 CAPABILITY").await;
-        self.send_line("* CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE").await;
+        self.send_line(&format!("* CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE{extra}")).await;
         self.send_line("A0001 OK done").await;
         self.expect("A0002 AUTHENTICATE PLAIN").await;
         self.send_line("+ ").await;
         let payload = self.read_line().await;
         assert_eq!(payload, expected_sasl());
-        self.send_line("A0002 OK [CAPABILITY IMAP4rev1 IDLE] logged in").await;
+        self.send_line(&format!("A0002 OK [CAPABILITY IMAP4rev1 IDLE{extra}] logged in")).await;
     }
 
     /// Greeting, CAPABILITY with `AUTH=XOAUTH2`, and the full XOAUTH2 exchange.
     pub async fn prepare_xoauth2(&mut self, expected: &str) {
+        self.prepare_xoauth2_with(expected, "").await;
+    }
+
+    /// [`Conn::prepare_xoauth2`] with one extra capability such as `X-GM-EXT-1`.
+    pub async fn prepare_xoauth2_with(&mut self, expected: &str, extra: &str) {
+        let extra = if extra.is_empty() { String::new() } else { format!(" {extra}") };
         self.send_line("* OK fake IMAP ready").await;
         self.expect("A0001 CAPABILITY").await;
-        self.send_line("* CAPABILITY IMAP4rev1 AUTH=XOAUTH2 IDLE").await;
+        self.send_line(&format!("* CAPABILITY IMAP4rev1 AUTH=XOAUTH2 IDLE{extra}")).await;
         self.send_line("A0001 OK done").await;
         self.expect("A0002 AUTHENTICATE XOAUTH2").await;
         self.send_line("+ ").await;
         let payload = self.read_line().await;
         assert_eq!(payload, expected);
-        self.send_line("A0002 OK [CAPABILITY IMAP4rev1 IDLE] logged in").await;
+        self.send_line(&format!("A0002 OK [CAPABILITY IMAP4rev1 IDLE{extra}] logged in")).await;
     }
 }
 

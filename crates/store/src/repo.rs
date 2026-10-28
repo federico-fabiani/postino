@@ -15,7 +15,7 @@ use crate::model::{
     OutboxEntry, OutboxState, SyncState, UidEntry,
 };
 use crate::threads;
-use crate::{REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError, UNSUBSCRIBE_KEY_PREFIX};
+use crate::{REMOTE_LABELS_KEY_PREFIX, REPLY_TO_KEY_PREFIX, SYNC_STATUS_KEY_PREFIX, Store, StoreError, UNSUBSCRIBE_KEY_PREFIX};
 
 /// Largest page a caller can request. A mailbox list never needs more, and the cap bounds memory.
 const MAX_PAGE: u32 = 500;
@@ -148,6 +148,7 @@ impl Store {
         )?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'reply_to:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'unsubscribe:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
+        tx.execute("DELETE FROM meta WHERE key IN (SELECT 'remote_labels:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key IN (SELECT 'rule_guard:' || id FROM messages WHERE account_id = ?1)", [account_id])?;
         tx.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("rule_guard:{account_id}:%")])?;
         tx.execute("DELETE FROM meta WHERE key LIKE ?1", [format!("rule_forward:{account_id}:%")])?;
@@ -925,6 +926,7 @@ impl Store {
         tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
         tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
         tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{UNSUBSCRIBE_KEY_PREFIX}{id}")])?;
+        tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REMOTE_LABELS_KEY_PREFIX}{id}")])?;
         if let Some((_, _, account)) = &row {
             tx.execute("DELETE FROM meta WHERE key = ?1", [format!("rule_guard:{account}:{id}")])?;
         }
@@ -1156,6 +1158,7 @@ impl Store {
             if deleted > 0 {
                 tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
                 tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{UNSUBSCRIBE_KEY_PREFIX}{id}")])?;
+                tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REMOTE_LABELS_KEY_PREFIX}{id}")])?;
                 tx.execute("DELETE FROM meta WHERE key IN (?1, ?2)", params![format!("rule_guard:{account}:{id}"), format!("rule_guard:{id}")])?;
                 if let Some(thread) = thread {
                     touched_threads.push(thread);
@@ -1203,6 +1206,13 @@ impl Store {
         tx.execute(
             "DELETE FROM meta WHERE key IN (
                  SELECT 'unsubscribe:' || id FROM messages
+                 WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
+             )",
+            [folder_id],
+        )?;
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (
+                 SELECT 'remote_labels:' || id FROM messages
                  WHERE folder_id = ?1 AND uid IS NOT NULL AND id NOT IN (SELECT id FROM drafts)
              )",
             [folder_id],
@@ -1318,6 +1328,36 @@ impl Store {
 
     pub fn get_label(&self, id: &str) -> Result<Option<Label>, StoreError> {
         get_label(&self.conn, id)
+    }
+
+    /// Find one account label by its display name, the identity Gmail's `X-GM-LABELS` carries.
+    pub fn label_named(&self, account_id: &str, name: &str) -> Result<Option<Label>, StoreError> {
+        self.conn
+            .query_row(
+                &format!("SELECT {LABEL_COLUMNS} FROM labels l WHERE l.account_id = ?1 AND l.name = ?2"),
+                params![account_id, name],
+                row_to_label,
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)
+    }
+
+    /// Return the account label called `name`, creating it with a deterministic provider id when a
+    /// sync sees it for the first time. The id is not numeric, so it can never collide with the
+    /// `lbl_<n>` sequence the user-facing create path allocates.
+    pub fn ensure_account_label(&self, account_id: &str, name: &str, color: &str) -> Result<Label, StoreError> {
+        if let Some(label) = self.label_named(account_id, name)? {
+            return Ok(label);
+        }
+        let digest = blake3::hash(format!("{account_id}\u{0}{name}").as_bytes()).to_hex().to_string();
+        let id = format!("lbl_g_{}", &digest[..24]);
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO labels(id, account_id, name, color) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS(SELECT 1 FROM accounts WHERE id = ?2)",
+                params![id, account_id, name, color],
+            )
+            .map_err(StoreError::Sqlite)?;
+        self.label_named(account_id, name)?.ok_or_else(|| StoreError::NotFound { entity: "account", id: account_id.to_owned() })
     }
 
     /// Labels visible to an account: mailbox-wide labels plus that account's own labels. Counts are
@@ -1620,6 +1660,7 @@ impl Store {
             tx.execute("DELETE FROM messages WHERE id = ?1", [duplicate])?;
             tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{duplicate}")])?;
             tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{UNSUBSCRIBE_KEY_PREFIX}{duplicate}")])?;
+            tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REMOTE_LABELS_KEY_PREFIX}{duplicate}")])?;
         }
         refresh_folder_counts(&tx, &message.summary.folder_id)?;
         threads::refresh_threads_in_tx(&tx, &message.summary.account_id, touched_threads)?;

@@ -88,6 +88,12 @@ impl Capabilities {
     pub fn special_use(&self) -> bool {
         self.has("SPECIAL-USE")
     }
+
+    /// Gmail's `X-GM-EXT-1`: `X-GM-LABELS` may be fetched and is meaningful.
+    #[must_use]
+    pub fn x_gm_ext(&self) -> bool {
+        self.has("X-GM-EXT-1")
+    }
 }
 
 /// Bytes allowed inside a capability token: a printable atom.
