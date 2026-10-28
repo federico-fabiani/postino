@@ -213,27 +213,31 @@ impl Session {
         Ok(envelopes)
     }
 
-    /// `UID FETCH <set> (UID FLAGS)`: the UID and flags of every message in the set.
+    /// `UID FETCH <set> (UID FLAGS)` (plus `X-GM-LABELS` on Gmail): UID, flags and labels.
     ///
     /// This is the folder liveness scan: no envelope and no body, so one response per message stays
-    /// small and a whole folder fits in bounded windows. A response without a UID (an unsolicited
-    /// update) is skipped; a UID outside the requested set is refused, exactly as for envelopes.
+    /// small and a whole folder fits in bounded windows. On Gmail the same scan carries the labels,
+    /// so a label removed from an existing message is observed without a second request. A response
+    /// without a UID (an unsolicited update) is skipped; a UID outside the requested set is refused,
+    /// exactly as for envelopes.
     pub async fn fetch_uid_flags(&mut self, uids: UidSet) -> Result<Vec<UidFlags>, NetError> {
         let set = uids.to_wire()?;
-        let arguments = format!("{set} (UID FLAGS)");
+        let gmail = self.capabilities.x_gm_ext();
+        let fields = if gmail { "UID FLAGS X-GM-LABELS" } else { "UID FLAGS" };
+        let arguments = format!("{set} ({fields})");
         let outcome = self.execute("fetch flags", "UID FETCH", Some(&arguments)).await?;
         let mut entries = Vec::new();
         for item in outcome.untagged {
             let Untagged::Fetch(data) = item else {
                 continue;
             };
-            let FetchData { uid: Some(uid), flags, .. } = *data else {
+            let FetchData { uid: Some(uid), flags, labels, .. } = *data else {
                 continue;
             };
             if !uids.contains(uid) {
                 return Err(protocol(format!("the server returned UID {uid}, outside the requested set")));
             }
-            entries.push(UidFlags { uid, flags });
+            entries.push(UidFlags { uid, flags, labels: if gmail { labels } else { Vec::new() } });
         }
         Ok(entries)
     }

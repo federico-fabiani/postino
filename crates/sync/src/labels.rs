@@ -10,16 +10,24 @@ use postino_store as store;
 use crate::SyncError;
 
 const MAX_REMOTE_LABELS: usize = 64;
+const MAX_TOTAL_LABELS: usize = 200;
 const MAX_LABEL_NAME_CHARS: usize = 48;
 const LABEL_COLOR: &str = "muted";
 
 /// Apply the remote labels to one message and remember the auto-applied ids.
 pub(crate) fn apply(store: &store::Store, account_id: &str, message_id: &str, remote: &[String]) -> Result<(), SyncError> {
     let mut desired: Vec<String> = Vec::new();
+    let mut total = store.label_count().map_err(SyncError::Store)?;
     for raw in remote {
         let name = raw.trim();
         if name.starts_with('\\') || !valid_name(name) {
             continue;
+        }
+        if store.label_named(account_id, name).map_err(SyncError::Store)?.is_none() {
+            if total >= MAX_TOTAL_LABELS {
+                continue;
+            }
+            total = total.saturating_add(1);
         }
         let label = store.ensure_account_label(account_id, name, LABEL_COLOR).map_err(SyncError::Store)?;
         if !desired.contains(&label.id) {
@@ -62,7 +70,7 @@ fn valid_name(name: &str) -> bool {
             character.is_control()
                 || matches!(
                     character,
-                    '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+                    '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'
                 )
         })
 }

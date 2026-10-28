@@ -167,6 +167,13 @@ pub fn fetch_uid_flags_line(sequence: u32, uid: u32, flags: &[&str]) -> String {
     format!("* {sequence} FETCH (UID {uid} FLAGS ({}))", flags.join(" "))
 }
 
+/// Build the Gmail liveness line: flags plus the message's `X-GM-LABELS`.
+#[must_use]
+pub fn fetch_uid_flags_labels_line(sequence: u32, uid: u32, flags: &[&str], labels: &[String]) -> String {
+    let labels = labels.iter().map(|label| quoted(label)).collect::<Vec<_>>().join(" ");
+    format!("* {sequence} FETCH (UID {uid} FLAGS ({}) X-GM-LABELS ({labels}))", flags.join(" "))
+}
+
 /// Build an IDLE continuation line.
 #[must_use]
 pub fn idle_continuation(text: &str) -> String {

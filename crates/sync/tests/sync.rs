@@ -124,21 +124,44 @@ fn gmail_labels_become_account_labels_and_are_removed_when_the_server_drops_them
     assert_eq!(clienti.message_count, 1);
     assert!(row.summary.labels.contains(&clienti.label.id), "the envelope label is on the message row");
 
-    // Re-fetch the same UID with the labels gone. The sync record is the only way to force the
-    // envelope again without changing UIDVALIDITY, which would delete and recreate the row.
-    let inbox = folder(&store, "INBOX");
+    // A label the person applied by hand is not one the sync owns, so a remote drop must leave it.
     store
-        .set_sync_state(&postino_store::SyncState { folder_id: inbox.id.clone(), uid_next: 1, highest_modseq: None, last_error: None })
-        .expect("rewind the cursor");
-    let plain = TestMessage::synthetic(synthetic_message(1));
-    let server = RunningServer::start_with(one_inbox(10, vec![plain]), MailboxScript::default().gmail());
+        .create_label(&postino_store::Label {
+            id: "lbl_manual".to_owned(),
+            account_id: None,
+            name: "Importanti".to_owned(),
+            color: "gold".to_owned(),
+        })
+        .expect("manual label");
+    store.apply_label("lbl_manual", std::slice::from_ref(&row.summary.id)).expect("manual assignment");
+
+    // A second plain sync above the cursor must observe both the retained and the dropped label
+    // through the liveness scan, without a body re-fetch or a UIDVALIDITY reset.
+    let partial = TestMessage::synthetic(synthetic_message(1)).with_labels(&["Clienti"]);
+    let server = RunningServer::start_with(one_inbox(10, vec![partial]), MailboxScript::default().gmail());
     sync(&store, &server).expect("second Gmail sync");
     server.finish();
 
-    let row = message_by_header(&store, "synthetic-1@example.test");
-    assert!(row.summary.labels.is_empty(), "a label removed on the server is removed locally: {:?}", row.summary.labels);
     let labels = store.list_labels(Some(ACCOUNT_ID)).expect("labels");
-    assert!(labels.iter().all(|label| label.message_count == 0), "the label rows remain reusable but carry no message");
+    let id_of = |name: &str| labels.iter().find(|label| label.label.name == name).expect(name).label.id.clone();
+    let row = message_by_header(&store, "synthetic-1@example.test");
+    assert!(row.summary.labels.contains(&id_of("Clienti")), "the retained label stays: {:?}", row.summary.labels);
+    assert!(!row.summary.labels.contains(&id_of("Progetto verde")), "the dropped label is removed: {:?}", row.summary.labels);
+    assert!(row.summary.labels.iter().any(|id| id == "lbl_manual"), "the manual label survives: {:?}", row.summary.labels);
+
+    // A third sync with no labels removes the last remote chip and still keeps the manual one.
+    let plain = TestMessage::synthetic(synthetic_message(1));
+    let server = RunningServer::start_with(one_inbox(10, vec![plain]), MailboxScript::default().gmail());
+    sync(&store, &server).expect("third Gmail sync");
+    server.finish();
+
+    let row = message_by_header(&store, "synthetic-1@example.test");
+    assert_eq!(row.summary.labels, vec!["lbl_manual".to_owned()], "only the remote label is removed: {:?}", row.summary.labels);
+    let labels = store.list_labels(Some(ACCOUNT_ID)).expect("labels");
+    assert!(
+        labels.iter().filter(|label| label.label.id != "lbl_manual").all(|label| label.message_count == 0),
+        "the remote label rows remain reusable but carry no message"
+    );
 }
 
 #[test]

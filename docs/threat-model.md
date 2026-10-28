@@ -74,9 +74,9 @@
   counted; `cid:` images survive. CSS is unsupported, not partially sanitized.
 - Links: show the destination, warn on punycode/IDN homographs, never auto-open.
 - Gmail labels: `X-GM-LABELS` is read only when `X-GM-EXT-1` is advertised, at most 256 labels per
-  envelope and 64 mapped labels per message. System `\` labels never become chips, names are capped
-  at 48 characters and reject control/bidi characters, and local label edits are never pushed to the
-  provider.
+  envelope, 64 mapped labels per message and 200 label rows in total. System `\` labels never become
+  chips, names are capped at 48 characters and reject control/bidi characters, and local label edits
+  are never pushed to the provider.
 - Unsubscribe: only complete `<mailto:>` and `<http(s):>` targets from a bounded `List-Unsubscribe`
   header are stored, in encrypted per-message `meta` deleted with the message. Reading the choices
   sends and opens nothing; a `mailto:` choice becomes an ordinary draft, a web choice uses the link

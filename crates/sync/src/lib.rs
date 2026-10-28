@@ -62,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use postino_net::{Flag, ImapConfig, NetError, Session, UidSet};
+use postino_net::{Flag, ImapConfig, NetError, Session, UidFlags, UidSet};
 use postino_store as store;
 use thiserror::Error;
 
@@ -632,11 +632,16 @@ async fn sync_folder(
             continue;
         };
         match live.get(&uid) {
-            Some(flags) => {
-                let unread = !flags.contains(&Flag::Seen);
-                let starred = flags.contains(&Flag::Flagged);
+            Some(entry) => {
+                let unread = !entry.flags.contains(&Flag::Seen);
+                let starred = entry.flags.contains(&Flag::Flagged);
                 if cached.unread != unread || cached.starred != starred {
                     progress.drifted.insert(cached.message_id.clone());
+                }
+                // The liveness scan already carries X-GM-LABELS on Gmail, so a label dropped from
+                // an existing message is reconciled without re-fetching its body.
+                if context.gmail_labels {
+                    labels::apply(store, &context.account.id, &cached.message_id, &entry.labels)?;
                 }
             }
             None => missing.push(cached.message_id.clone()),
@@ -663,8 +668,8 @@ async fn sync_folder(
 }
 
 /// Fetch every server UID and its flags in bounded windows, aborting between windows on cancel.
-async fn scan_flags(session: &mut Session, cancel: &AtomicBool, max_uid: u32) -> Result<HashMap<u32, Vec<Flag>>, SyncError> {
-    let mut live: HashMap<u32, Vec<Flag>> = HashMap::new();
+async fn scan_flags(session: &mut Session, cancel: &AtomicBool, max_uid: u32) -> Result<HashMap<u32, UidFlags>, SyncError> {
+    let mut live: HashMap<u32, UidFlags> = HashMap::new();
     if max_uid == 0 {
         return Ok(live);
     }
@@ -676,7 +681,7 @@ async fn scan_flags(session: &mut Session, cancel: &AtomicBool, max_uid: u32) ->
         let end = start.saturating_add(FLAG_SCAN_BATCH.saturating_sub(1)).min(max_uid);
         let set = UidSet::range(start, end).map_err(SyncError::from)?;
         for entry in session.fetch_uid_flags(set).await.map_err(SyncError::from)? {
-            live.insert(entry.uid, entry.flags);
+            live.insert(entry.uid, entry);
         }
         if end == u32::MAX {
             break;

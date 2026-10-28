@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::responses::{
-    EnvelopeAddress, EnvelopeFields, SelectStatus, fetch_body_response, fetch_envelope_line, fetch_uid_flags_line, idle_continuation, list_line,
-    select_lines,
+    EnvelopeAddress, EnvelopeFields, SelectStatus, fetch_body_response, fetch_envelope_line, fetch_uid_flags_labels_line, fetch_uid_flags_line,
+    idle_continuation, list_line, select_lines,
 };
 use crate::server::Conn;
 use crate::synthetic::SyntheticMessage;
@@ -101,6 +101,13 @@ impl TestMessage {
     pub fn flags_line(&self, sequence: u32) -> String {
         let flags = self.flags.iter().map(String::as_str).collect::<Vec<_>>();
         fetch_uid_flags_line(sequence, self.uid, &flags)
+    }
+
+    /// The `FETCH` line for a Gmail liveness scan, including `X-GM-LABELS`.
+    #[must_use]
+    pub fn flags_labels_line(&self, sequence: u32) -> String {
+        let flags = self.flags.iter().map(String::as_str).collect::<Vec<_>>();
+        fetch_uid_flags_labels_line(sequence, self.uid, &flags, &self.labels)
     }
 
     /// The `FETCH` line this message answers with.
@@ -420,7 +427,7 @@ async fn serve_mailbox_inner(mut conn: Conn, folders: Vec<TestFolder>, script: M
                     conn.send_line(&format!("{tag} OK done")).await;
                     continue;
                 }
-                if items.trim() == "(UID FLAGS)" {
+                if matches!(items.trim(), "(UID FLAGS)" | "(UID FLAGS X-GM-LABELS)") {
                     flags_fetches = flags_fetches.saturating_add(1);
                     if script.fail == Some(FailPoint::OnFlagsFetch(flags_fetches)) {
                         return conn;
@@ -440,7 +447,11 @@ async fn serve_mailbox_inner(mut conn: Conn, folders: Vec<TestFolder>, script: M
                             continue;
                         }
                         let sequence = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
-                        conn.send_line(&message.flags_line(sequence)).await;
+                        if items.trim() == "(UID FLAGS X-GM-LABELS)" {
+                            conn.send_line(&message.flags_labels_line(sequence)).await;
+                        } else {
+                            conn.send_line(&message.flags_line(sequence)).await;
+                        }
                     }
                     conn.send_line(&format!("{tag} OK done")).await;
                     continue;

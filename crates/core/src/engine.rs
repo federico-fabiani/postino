@@ -2515,9 +2515,15 @@ impl Engine {
         let drafts = store.list_draft_metadata().map_err(store_map::read_error)?;
         let reply_links =
             drafts.iter().filter_map(|draft| draft.in_reply_to.clone().map(|parent| (draft.id.clone(), parent))).collect::<HashMap<_, _>>();
+        // Sync can insert Gmail labels while this engine is alive. Rehydrate them or `label_apply`
+        // would reject an id that `labels_list` just returned.
+        let labels = store.list_labels(None).map_err(store_map::read_error)?.into_iter().map(store_map::label).collect::<Result<Vec<_>, _>>()?;
+        let next_label_seq = if store.is_read_only() { self.next_label_seq } else { repair_label_seq(store, &labels)? };
         self.draft_snapshots = drafts.into_iter().map(|draft| (draft.id, draft.revision)).collect::<HashMap<_, _>>();
         self.folders = folders;
         self.messages = messages;
+        self.labels = labels;
+        self.next_label_seq = next_label_seq;
         self.rebuild_message_index();
         self.blob_hashes = blob_hashes;
         self.reply_links = reply_links;
@@ -5168,6 +5174,29 @@ mod tests {
         assert_eq!(summary.unread, !was_unread);
         let after = engine.folders().iter().find(|f| f.id == "inbox").map_or(0, |f| f.unread);
         assert_eq!(after, if was_unread { before.saturating_sub(1) } else { before.saturating_add(1) });
+    }
+
+    #[test]
+    fn reload_mailbox_hydrates_a_label_another_writer_added() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("mail.db");
+        let key = postino_store::StoreKey::from_bytes([0x31; 32]);
+        let mut engine = Engine::open(postino_store::Store::open(&path, &key).expect("store")).expect("engine");
+        {
+            let writer = postino_store::Store::open(&path, &key).expect("second writer");
+            writer
+                .create_label(&postino_store::Label {
+                    id: "lbl_late".to_owned(),
+                    account_id: None,
+                    name: "Arrivata dopo".to_owned(),
+                    color: "muted".to_owned(),
+                })
+                .expect("label row");
+        }
+        assert!(engine.label("lbl_late").is_none(), "the engine snapshot is intentionally stale before reload");
+        engine.reload_mailbox().expect("reload");
+        let label = engine.label("lbl_late").expect("the reload must hydrate the label");
+        assert_eq!(label.name, "Arrivata dopo");
     }
 
     #[test]

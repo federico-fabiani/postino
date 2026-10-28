@@ -323,7 +323,10 @@ async fn a_uid_flags_fetch_returns_pairs_without_envelopes() {
     let entries = session.fetch_uid_flags(UidSet::parse("1:2").expect("uid set")).await.expect("fetch flags");
     assert_eq!(
         entries,
-        vec![UidFlags { uid: 1, flags: vec![Flag::Seen] }, UidFlags { uid: 2, flags: vec![Flag::Flagged, Flag::Keyword("$Forwarded".to_owned())] },]
+        vec![
+            UidFlags { uid: 1, flags: vec![Flag::Seen], labels: Vec::new() },
+            UidFlags { uid: 2, flags: vec![Flag::Flagged, Flag::Keyword("$Forwarded".to_owned())], labels: Vec::new() },
+        ]
     );
     session.logout().await.expect("logout");
     server.finish().await;

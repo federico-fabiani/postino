@@ -456,6 +456,31 @@ fn deleting_a_label_detaches_it_and_keeps_mail() {
 }
 
 #[test]
+fn a_synced_label_reuses_a_matching_local_label_instead_of_duplicating_it() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    seed(&store);
+    store
+        .create_label(&Label { id: "lbl_manual".to_owned(), account_id: None, name: "Clienti".to_owned(), color: "forest".to_owned() })
+        .expect("manual label");
+    let reused = store.ensure_account_label(ACCOUNT, "clienti", "muted").expect("reuse by name");
+    assert_eq!(reused.id, "lbl_manual");
+    assert_eq!(reused.color, "forest", "sync must not restyle a label the person created");
+
+    store
+        .create_label(&Label {
+            id: "lbl_legacy".to_owned(),
+            account_id: Some(ACCOUNT.to_owned()),
+            name: "Progetti".to_owned(),
+            color: "gold".to_owned(),
+        })
+        .expect("legacy account label");
+    let legacy = store.ensure_account_label(ACCOUNT, "Progetti", "muted").expect("reuse account label");
+    assert_eq!(legacy.id, "lbl_legacy");
+    assert_eq!(store.label_count().expect("count"), 2, "no duplicate rows");
+}
+
+#[test]
 fn label_batches_are_idempotent_and_atomic() {
     let fixture = Fixture::new();
     let store = fixture.open();

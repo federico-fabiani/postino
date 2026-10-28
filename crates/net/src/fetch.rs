@@ -12,6 +12,8 @@ const MAX_FLAGS: usize = 256;
 /// Gmail returns a label list per message; a hostile server must not grow it without bound.
 const MAX_GMAIL_LABELS: usize = 256;
 const MAX_GMAIL_LABEL_CHARS: usize = 1024;
+/// Cap the total label payload of one message so a full-folder liveness scan stays bounded.
+const MAX_GMAIL_LABEL_BYTES: usize = 32 * 1024;
 
 /// One `* n FETCH (...)` response, before it is mapped to a public [`crate::Envelope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +156,7 @@ fn parse_gmail_labels(cursor: &mut Cursor<'_>) -> Result<Vec<String>, NetError> 
         return Err(protocol("X-GM-LABELS requires a list"));
     }
     let mut labels = Vec::new();
+    let mut bytes = 0usize;
     loop {
         cursor.skip_ws();
         if cursor.peek() == Some(b')') {
@@ -163,10 +166,13 @@ fn parse_gmail_labels(cursor: &mut Cursor<'_>) -> Result<Vec<String>, NetError> 
             return Err(protocol("unterminated X-GM-LABELS list"));
         }
         let Some(raw) = cursor.string()? else {
-            // NIL is an empty item; Gmail does not send it for a label list.
-            cursor.skip_value()?;
+            // `string()` already consumed NIL; skipping again would eat the next label.
             continue;
         };
+        bytes = bytes.saturating_add(raw.len());
+        if bytes > MAX_GMAIL_LABEL_BYTES {
+            return Err(protocol("Gmail label payload over the per-message limit"));
+        }
         let label = String::from_utf8_lossy(&raw).trim().to_owned();
         if label.is_empty() || label.chars().count() > MAX_GMAIL_LABEL_CHARS {
             continue;
@@ -277,6 +283,18 @@ mod tests {
     fn parses_gmail_labels_with_spaces_and_system_names() {
         let data = fetch(r#"(UID 7 X-GM-LABELS ("\\Inbox" "Clienti" "Progetto verde"))"#).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(data.labels, vec!["\\Inbox", "Clienti", "Progetto verde"]);
+    }
+
+    #[test]
+    fn nil_in_a_gmail_label_list_does_not_eat_the_next_label() {
+        let data = fetch(r#"(UID 7 X-GM-LABELS (NIL "Clienti" "" "Progetto verde"))"#).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(data.labels, vec!["Clienti", "Progetto verde"]);
+    }
+
+    #[test]
+    fn refuses_an_unbounded_gmail_label_list() {
+        let many = (0..=MAX_GMAIL_LABELS).map(|index| format!("\"label-{index}\"")).collect::<Vec<_>>().join(" ");
+        assert!(fetch(&format!("(UID 7 X-GM-LABELS ({many}))")).is_err());
     }
 
     #[test]

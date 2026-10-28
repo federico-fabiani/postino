@@ -125,6 +125,8 @@ pub struct UidFlags {
     pub uid: u32,
     /// Flags the server reports.
     pub flags: Vec<Flag>,
+    /// Gmail labels from `X-GM-LABELS`, empty when the server does not advertise `X-GM-EXT-1`.
+    pub labels: Vec<String>,
 }
 
 /// One message's headers as IMAP reports them, with no MIME parsing.

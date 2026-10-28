@@ -1330,11 +1330,18 @@ impl Store {
         get_label(&self.conn, id)
     }
 
-    /// Find one account label by its display name, the identity Gmail's `X-GM-LABELS` carries.
+    /// Find a label by display name, the identity Gmail's `X-GM-LABELS` carries.
+    ///
+    /// Engine-created labels are mailbox-wide (`account_id IS NULL`); a label made by an older
+    /// account-scoped path is still reused before creating a duplicate.
     pub fn label_named(&self, account_id: &str, name: &str) -> Result<Option<Label>, StoreError> {
         self.conn
             .query_row(
-                &format!("SELECT {LABEL_COLUMNS} FROM labels l WHERE l.account_id = ?1 AND l.name = ?2"),
+                &format!(
+                    "SELECT {LABEL_COLUMNS} FROM labels l
+                     WHERE l.name = ?2 COLLATE NOCASE AND (l.account_id IS NULL OR l.account_id = ?1)
+                     ORDER BY l.account_id IS NULL DESC LIMIT 1"
+                ),
                 params![account_id, name],
                 row_to_label,
             )
@@ -1342,22 +1349,29 @@ impl Store {
             .map_err(StoreError::Sqlite)
     }
 
-    /// Return the account label called `name`, creating it with a deterministic provider id when a
-    /// sync sees it for the first time. The id is not numeric, so it can never collide with the
-    /// `lbl_<n>` sequence the user-facing create path allocates.
+    /// Return the mailbox-wide label called `name`, creating it with a deterministic provider id
+    /// when a sync sees it for the first time. The id is not numeric, so it can never collide with
+    /// the `lbl_<n>` sequence the user-facing create path allocates.
     pub fn ensure_account_label(&self, account_id: &str, name: &str, color: &str) -> Result<Label, StoreError> {
         if let Some(label) = self.label_named(account_id, name)? {
             return Ok(label);
         }
-        let digest = blake3::hash(format!("{account_id}\u{0}{name}").as_bytes()).to_hex().to_string();
+        let digest = blake3::hash(name.to_lowercase().as_bytes()).to_hex().to_string();
         let id = format!("lbl_g_{}", &digest[..24]);
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO labels(id, account_id, name, color) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS(SELECT 1 FROM accounts WHERE id = ?2)",
-                params![id, account_id, name, color],
+                "INSERT OR IGNORE INTO labels(id, account_id, name, color) SELECT ?1, NULL, ?2, ?3 WHERE EXISTS(SELECT 1 FROM accounts WHERE id = ?4)",
+                params![id, name, color, account_id],
             )
             .map_err(StoreError::Sqlite)?;
         self.label_named(account_id, name)?.ok_or_else(|| StoreError::NotFound { entity: "account", id: account_id.to_owned() })
+    }
+
+    /// Total number of labels, both mailbox-wide and account-scoped. Sync uses it to bound how many
+    /// labels a hostile provider can mint across many messages.
+    pub fn label_count(&self) -> Result<usize, StoreError> {
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM labels", [], |row| row.get(0))?;
+        usize::try_from(count).map_err(|_| StoreError::Corrupt { table: "labels", detail: "negative label count".to_owned() })
     }
 
     /// Labels visible to an account: mailbox-wide labels plus that account's own labels. Counts are
