@@ -4765,6 +4765,13 @@ impl PostinoApp {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
+        if self.show_unsubscribe {
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.show_unsubscribe = false;
+                ctx.memory_mut(|memory| memory.stop_text_input());
+            }
+            return;
+        }
         // Onboarding and account dialogs own their keyboard. The shell must not steal J/K/Enter
         // while a first-run form or a modal is in front of it.
         if self.boot_failure.is_some()
@@ -7533,13 +7540,14 @@ impl PostinoApp {
         }
         self.unsubscribe_info = None;
         self.show_unsubscribe = false;
-        self.unsubscribe_checked = Some(message.summary.id.clone());
         let mut args = json!({ "id": message.summary.id });
         if let Some(account) = &self.active_account {
             args["account"] = json!(account);
         }
+        // A transient daemon error must not hide the entry point until the message is reopened.
         let Ok(value) = self.op("message_unsubscribe", args) else { return };
         let Ok(info) = serde_json::from_value::<UnsubscribeInfo>(value) else { return };
+        self.unsubscribe_checked = Some(message.summary.id.clone());
         if !info.targets.is_empty() {
             self.unsubscribe_info = Some(info);
         }
@@ -8256,6 +8264,9 @@ impl PostinoApp {
         } else {
             format!("Aprire questo indirizzo nel browser?\n\nHost di destinazione: {}", pending.host)
         };
+        if pending.url.to_ascii_lowercase().starts_with("http://") {
+            body.push_str("\n\nAttenzione: questo indirizzo non usa TLS. Il contenuto della pagina può essere letto o modificato sulla rete.");
+        }
         if pending.backslash {
             body.push_str(
                 "\n\nAttenzione: l'indirizzo contiene una barra rovesciata (\\). Il browser la tratta come separatore di percorso: il sito aperto è quello indicato sopra.",
@@ -20434,13 +20445,22 @@ mod tests {
         assert_eq!(info.targets.len(), 2);
         assert!(info.one_click);
         app.show_unsubscribe = true;
-        let runs = painted_runs(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        let size = Vec2::new(980.0, 600.0);
+        frame_at(
+            &ctx,
+            &mut app,
+            size,
+            vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+        );
+        assert!(!app.show_unsubscribe, "Escape closes the choice sheet without action");
+        app.show_unsubscribe = true;
+        let runs = painted_runs(&ctx, &mut app, size);
         painted_visible(&runs, "Disiscrizione");
         painted_visible(&runs, "Scrivi la disiscrizione");
         painted_visible(&runs, "Apri la pagina");
+        let button = runs.iter().find(|run| run.text.contains("Scrivi la disiscrizione")).expect("the mailto button is painted");
+        click_at(&ctx, &mut app, button.rect.center(), size);
 
-        let mailto = info.targets.iter().find(|target| target.method == UnsubscribeMethod::Mailto).expect("a mailto target").clone();
-        app.unsubscribe_mailto(&mailto);
         assert!(app.composer.open, "the mailto choice opens the ordinary composer");
         assert_eq!(app.composer.to, "leave@example.com");
         assert_eq!(app.composer.subject, "unsubscribe");

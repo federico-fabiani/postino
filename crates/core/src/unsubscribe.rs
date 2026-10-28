@@ -55,13 +55,21 @@ pub(crate) fn parse(values: &[String], one_click_header: bool) -> UnsubscribeInf
 }
 
 fn classify(target: &str) -> Option<UnsubscribeMethod> {
-    if target.chars().any(|character| character.is_control() || character.is_whitespace()) {
+    if target.chars().any(unsafe_header_char) {
         return None;
     }
     let lower = target.to_ascii_lowercase();
     if let Some(rest) = lower.strip_prefix("mailto:") {
         let address = rest.split('?').next().unwrap_or_default();
-        if address.is_empty() || !address.contains('@') || address.starts_with('@') || address.ends_with('@') {
+        let mut parts = address.split('@');
+        let local = parts.next().unwrap_or_default();
+        let domain = parts.next().unwrap_or_default();
+        if parts.next().is_some()
+            || local.is_empty()
+            || domain.is_empty()
+            || address.chars().any(|character| matches!(character, ',' | ';' | '"' | '<' | '>'))
+            || ["%2c", "%3b", "%0a", "%0d", "%3c", "%3e"].iter().any(|encoded| lower.contains(encoded))
+        {
             return None;
         }
         return Some(UnsubscribeMethod::Mailto);
@@ -76,6 +84,17 @@ fn classify(target: &str) -> Option<UnsubscribeMethod> {
         }
     }
     None
+}
+
+/// Control, whitespace and invisible format characters cannot appear in a header-derived target.
+/// Format controls would visually reorder an address or URL in the sheet and draft.
+fn unsafe_header_char(character: char) -> bool {
+    character.is_control()
+        || character.is_whitespace()
+        || matches!(
+            character,
+            '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+        )
 }
 
 #[cfg(test)]
@@ -103,6 +122,12 @@ mod tests {
         assert!(hostile.targets.is_empty());
         let userinfo = parse(&["<https://user:pass@example.com/u>".to_owned()], false);
         assert!(userinfo.targets.is_empty(), "credentials in a target are refused");
+        let two = parse(&["<mailto:a@example.com,c@evil.example>".to_owned()], false);
+        assert!(two.targets.is_empty(), "a mailto target cannot smuggle two recipients");
+        let encoded = parse(&["<mailto:a@example.com%2Cb@evil.example>".to_owned()], false);
+        assert!(encoded.targets.is_empty(), "encoded separators are refused");
+        let bidi = parse(&["<https://example.com/\u{202e}u>".to_owned()], false);
+        assert!(bidi.targets.is_empty(), "format controls are refused");
     }
 
     #[test]

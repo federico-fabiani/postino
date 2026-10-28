@@ -924,6 +924,7 @@ impl Store {
         tx.execute("DELETE FROM drafts WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM draft_seq WHERE message_id = ?1", [id])?;
         tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{REPLY_TO_KEY_PREFIX}{id}")])?;
+        tx.execute("DELETE FROM meta WHERE key = ?1", [&format!("{UNSUBSCRIBE_KEY_PREFIX}{id}")])?;
         if let Some((_, _, account)) = &row {
             tx.execute("DELETE FROM meta WHERE key = ?1", [format!("rule_guard:{account}:{id}")])?;
         }

@@ -201,8 +201,15 @@ pub(crate) fn ingest(
     // needed and a later message can be deleted without leaving them behind.
     let unsubscribe: Vec<&str> = parsed.headers.get_all("List-Unsubscribe").take(4).map(str::trim).filter(|value| !value.is_empty()).collect();
     if !unsubscribe.is_empty() {
-        // RFC 8058 spells the field `List-Unsubscribe=One-Click`; the token is the part after `=`.
-        let one_click = parsed.headers.get("List-Unsubscribe-Post").is_some_and(|value| value.to_ascii_lowercase().contains("one-click"));
+        // RFC 8058 spells the field `List-Unsubscribe=One-Click`; accept that exact token, not a
+        // string that merely contains `one-click` (such as `No-One-Click`).
+        let one_click = parsed.headers.get_all("List-Unsubscribe-Post").any(|value| {
+            value.split(',').any(|part| {
+                part.split_once('=').is_some_and(|(name, token)| {
+                    name.trim().eq_ignore_ascii_case("List-Unsubscribe") && token.trim().eq_ignore_ascii_case("One-Click")
+                })
+            })
+        });
         let value = serde_json::json!({ "targets": unsubscribe, "one_click": one_click }).to_string();
         if value.len() <= 4096 {
             store.set_meta(&format!("{}{id}", store::UNSUBSCRIBE_KEY_PREFIX), &value).map_err(SyncError::Store)?;
