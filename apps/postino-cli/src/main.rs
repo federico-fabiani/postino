@@ -26,12 +26,12 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use postino_core::{
     AccountAdd, AccountRemove, AccountRequest, AccountSignature, AccountTest, AccountUpdate, AccountView, AccountsList, Address, AppInfo,
-    CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate, LabelDelete,
-    LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OAuthGrant, OpDef, OpError, OutboxAction,
-    OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult, PgpVerifyState,
-    Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult, RulesUndoResult,
-    SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued, SmtpSetup, SyncNow,
-    SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
+    AttachmentGet, CredentialVault, DraftAttachmentResult, DraftSave, DryRunResult, Engine, FoldersList, LabelApply, LabelColor, LabelCreate,
+    LabelDelete, LabelSummary, LabelUpdate, LabelsList, MailTls, MessageFlag, MessageGet, MessageSummary, MessagesList, OAuthGrant, OpDef, OpError,
+    OutboxAction, OutboxListResult, OutboxRunReport, PgpDecryptResult, PgpDecryptState, PgpKey, PgpPublicKey, PgpSendOptions, PgpVerifyResult,
+    PgpVerifyState, Provider, Rule, RuleAction, RuleDeleteResult, RuleResult, RulesListResult, RulesPreviewResult, RulesRunResult, RulesRunsResult,
+    RulesUndoResult, SavedSearchDeleteResult, SavedSearchRecentClearResult, SavedSearchResult, SavedSearchesListResult, SearchResult, SendQueued,
+    SmtpSetup, SyncNow, SyncReport, SyncStatusReport, ThreadFlagOutput, ThreadGetResult, ThreadsListResult, VaultError,
 };
 use postino_ipc::client::BlockingClient;
 use postino_ipc::protocol::method;
@@ -112,6 +112,18 @@ enum DraftCommand {
         id: String,
         /// Attachment id or exact filename.
         attachment: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AttachmentCommand {
+    /// Read one attachment's metadata and bytes, optionally writing the bytes to a file.
+    Get {
+        /// Attachment id returned by `postino message show` or `postino draft save`.
+        id: String,
+        /// Write the exact decrypted bytes here instead of printing the base64 JSON.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -666,6 +678,11 @@ enum Command {
     Draft {
         #[command(subcommand)]
         command: DraftCommand,
+    },
+    /// Read or save one attachment from the encrypted store.
+    Attachment {
+        #[command(subcommand)]
+        command: AttachmentCommand,
     },
     /// Queue a draft for real SMTP submission, or show the exact bytes with --dry-run.
     Send {
@@ -1604,6 +1621,7 @@ fn command_reads_only(command: &Command) -> bool {
         },
         Command::Sync { command } => matches!(command, SyncCommand::Status { .. }),
         Command::Folders { .. } | Command::Messages { .. } | Command::Search { .. } | Command::SearchStatus => true,
+        Command::Attachment { .. } => true,
         Command::Read { mark_read, .. } => !mark_read,
         Command::Label { command } => matches!(command, LabelCommand::List),
         Command::Threads { .. } => true,
@@ -1677,6 +1695,7 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
             | Command::Search { .. }
             | Command::Flag { .. }
             | Command::Draft { .. }
+            | Command::Attachment { .. }
             | Command::Send { .. }
             | Command::Outbox { .. }
             | Command::Label { .. }
@@ -2247,6 +2266,31 @@ fn run_with_input<B: CliBackend>(cli: Cli, engine: &mut B, input: &mut dyn BufRe
                     print_json(&result)?;
                 } else {
                     say(format!("Allegato rimosso: {}\n{} allegati nella bozza.", attachment, result.draft.attachments.len()))?;
+                }
+            }
+        },
+        Command::Attachment { command } => match command {
+            AttachmentCommand::Get { id, out } => {
+                let result: AttachmentGet = decode(call(engine, "attachment_get", json!({ "id": id }))?)?;
+                let bytes =
+                    base64::engine::general_purpose::STANDARD.decode(result.data_base64.as_bytes()).context("decodifica dei byte dell'allegato")?;
+                if bytes.len() as u64 != result.attachment.size {
+                    bail!("i byte dell'allegato non corrispondono alla dimensione registrata ({} != {})", bytes.len(), result.attachment.size);
+                }
+                if let Some(path) = out {
+                    std::fs::write(&path, &bytes).with_context(|| format!("scrittura di {}", path.display()))?;
+                    if json_output {
+                        print_json(&result.attachment)?;
+                    } else {
+                        say(format!("Allegato salvato: {}\n{} · {} byte", path.display(), result.attachment.mime, bytes.len()))?;
+                    }
+                } else if json_output {
+                    print_json(&result)?;
+                } else {
+                    say(format!(
+                        "{} ({}, {} byte)\nUsa --out <file> per salvarlo, oppure --json per il base64.",
+                        result.attachment.filename, result.attachment.mime, result.attachment.size
+                    ))?;
                 }
             }
         },
@@ -3879,6 +3923,13 @@ mod tests {
         assert_eq!(saved.attachments.len(), 1);
         assert_eq!(saved.attachments[0].filename, "relazione.pdf");
         assert_eq!(saved.attachments[0].mime, "application/pdf");
+        let out = fixture.path().parent().expect("temp dir").join("relazione-copia.pdf");
+        run(
+            cli(Command::Attachment { command: AttachmentCommand::Get { id: saved.attachments[0].id.clone(), out: Some(out.clone()) } }),
+            &mut engine,
+        )
+        .expect("attachment get");
+        assert_eq!(std::fs::read(&out).expect("copied attachment"), b"%PDF-1.7 byte esatti");
         assert_eq!(engine.attachment_bytes(&saved.attachments[0].id).expect("bytes"), b"%PDF-1.7 byte esatti");
 
         run(cli(Command::Draft { command: DraftCommand::Attach { id: draft.clone(), path: path.clone() } }), &mut engine).expect("second attach");

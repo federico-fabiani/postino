@@ -24,6 +24,7 @@ eframe.workspace = true
 egui_extras.workspace = true
 egui-phosphor.workspace = true
 env_logger.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 log.workspace = true
 png.workspace = true
 rfd = "0.15"

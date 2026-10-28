@@ -86,6 +86,14 @@ pub fn op_defs() -> Vec<OpDef> {
         ),
         def!("message_get", "Get a message", "One message with its body, recipients and attachments.", MessageGetArgs, true, false),
         def!(
+            "attachment_get",
+            "Read an attachment",
+            "One attachment's metadata and exact bytes, base64-encoded. The read is capped at 25 MiB and the encrypted blob store verifies the content hash. Read-only and offline; use the desktop preview or `postino attachment get` rather than putting a large body in an agent context.",
+            AttachmentGetArgs,
+            true,
+            false
+        ),
+        def!(
             "message_invite",
             "Read a calendar invite",
             "Parse the first text/calendar attachment of one message into an invite card: METHOD, summary, organizer, attendees, start/end, location, recurrence and timezone flags, validity and warnings. The part is capped at 256 KiB, 1000 components and 2000 attendees; malformed or hostile input returns `invite: null` and the file stays a normal attachment. Read-only and offline: nothing is stored, expanded or added to a calendar.",
@@ -548,6 +556,13 @@ pub struct MessagesListArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessageGetArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentGetArgs {
+    /// Attachment id returned by message_get or draft_save.
     pub id: String,
 }
 
@@ -1294,6 +1309,13 @@ pub struct MessageGet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentGet {
+    pub attachment: Attachment,
+    /// Standard base64 of the exact decrypted bytes. At most 25 MiB before encoding.
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageFlag {
     pub message: MessageSummary,
 }
@@ -1618,6 +1640,10 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "message_get" => {
             let args: MessageGetArgs = parse(args)?;
             message(engine, args)
+        }
+        "attachment_get" => {
+            let args: AttachmentGetArgs = parse(args)?;
+            attachment(engine, args)
         }
         "message_invite" => {
             let args: MessageInviteArgs = parse(args)?;
@@ -2100,6 +2126,13 @@ fn messages(engine: &Engine, args: MessagesListArgs) -> Result<Value, OpError> {
 fn message(engine: &Engine, args: MessageGetArgs) -> Result<Value, OpError> {
     let message = engine.message_result(&args.id)?.ok_or_else(|| unknown_message(&args.id))?;
     value(MessageGet { message })
+}
+
+fn attachment(engine: &Engine, args: AttachmentGetArgs) -> Result<Value, OpError> {
+    let attachment = engine.attachment_metadata(&args.id)?;
+    let bytes = engine.attachment_bytes(&args.id)?;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    value(AttachmentGet { attachment, data_base64 })
 }
 
 fn flag(engine: &mut Engine, args: MessageFlagArgs) -> Result<Value, OpError> {

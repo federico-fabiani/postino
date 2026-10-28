@@ -465,3 +465,24 @@ fn reply_target_carries_the_parent_id_and_the_persisted_reply_to() {
     assert_eq!(target.parent_message_id.as_deref(), Some("parent@example.com"));
     assert_eq!(target.reply_to, vec![postino_core::Address::new("Segreteria", "segreteria@example.com")]);
 }
+
+#[test]
+fn attachment_get_returns_the_exact_bytes_and_metadata_but_refuses_an_unknown_id() {
+    let harness = Harness::new();
+    let (_vault, store) = seed(&harness);
+    let mut engine = Engine::open(store).expect("engine");
+    let draft = new_draft(&mut engine);
+    let content = b"preview bytes\x00\xff";
+    let added = add(&mut engine, &draft, "nota.txt", Some("text/plain"), content);
+    let attachment = added["draft"]["attachments"][0].clone();
+    let id = attachment["id"].as_str().expect("attachment id");
+
+    let result = engine.call("attachment_get", json!({ "id": id })).expect("attachment_get");
+    assert_eq!(result["attachment"]["filename"], "nota.txt");
+    assert_eq!(result["attachment"]["mime"], "text/plain");
+    assert_eq!(result["attachment"]["size"], content.len());
+    let decoded = base64::engine::general_purpose::STANDARD.decode(result["data_base64"].as_str().expect("base64")).expect("decode");
+    assert_eq!(decoded, content);
+    assert!(engine.call("attachment_get", json!({ "id": "att_missing" })).is_err());
+    assert!(postino_core::op_defs().iter().find(|def| def.name == "attachment_get").is_some_and(|def| def.read_only));
+}

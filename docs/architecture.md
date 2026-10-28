@@ -68,7 +68,7 @@ types, so a handler and its public schema cannot drift.
 
 Current operations: `app_info`, `accounts_list`, `account_add`, `account_update`, `account_test`,
 `account_remove`, `account_signature_set`, `sync_now`, `sync_status`, `folders_list`,
-`messages_list`, `message_get`, `message_invite`, `invite_reply_draft`, `message_flag`, `message_move`, `draft_save`, `draft_attachment_add`,
+`messages_list`, `message_get`, `attachment_get`, `message_invite`, `invite_reply_draft`, `message_flag`, `message_move`, `draft_save`, `draft_attachment_add`,
 `draft_attachment_remove`, `message_send`, `send_schedule`, `outbox_list`, `outbox_cancel`,
 `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `search_status`, `search_reindex`,
 `labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`. They are enough to
@@ -1746,3 +1746,4 @@ mutation corpus so `cargo xtask ci` stays fast.
 | 2026-10-27 | minor | P12d: parse-only `icalendar 0.17.17` behind the MIME bounds (256 KiB, 1 000 components, 2 000 attendees, 64-character organizer/attendee lines), `message_invite` read and organizer-only `invite_reply_draft` with a METHOD:REPLY part that preserves DTSTART/DTEND parameters and SEQUENCE, a reading-pane invite card driven by the shared command table, CLI/MCP parity and one 980 screenshot; only received mail is answerable; the synthetic demo has no calendar part, so the full text+calendar reply is exercised on the encrypted store; no calendar store, RRULE expansion, timezone database, auto-send or schema migration |
 | 2026-10-28 | major | P12f: standalone libFuzzer targets for MIME/HTML/PGP-MIME/calendar outside the workspace, a `security` workflow with `cargo deny check`, 120 s per target on Linux and a native Windows MSVC AddressSanitizer job, `fuzz/run-windows.ps1`, and rustls 0.23.46/tokio 1.53.3 security updates |
 | 2026-10-28 | minor | P13a: MCP read-only resources for mailbox status, folders, recent messages and message/thread templates; `--compact` tool listings; a 300-call rolling rate guardrail and a JSONL audit log with 8 MiB rotation, no arguments or bodies |
+| 2026-10-28 | minor | P13b: `attachment_get` returns bounded exact bytes through the same registry; the reading pane adds a 64 KiB text / 2048 px image preview, hostile controls replaced, image dimensions and allocation capped, and the sheet drops its plaintext when closed |

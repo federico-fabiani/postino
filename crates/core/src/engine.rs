@@ -3757,6 +3757,12 @@ impl Engine {
         ops::dispatch(self, name, args)
     }
 
+    /// Metadata for one attachment, including its sanitized filename and MIME type. The bytes are
+    /// read separately through [`Engine::attachment_bytes`].
+    pub fn attachment_metadata(&self, attachment_id: &str) -> Result<Attachment, OpError> {
+        self.find_attachment(attachment_id)
+    }
+
     /// Read the stored bytes of one attachment through the encrypted blob store.
     ///
     /// The read is capped at the attachment's recorded size plus [`ATTACHMENT_READ_SLACK`], so a

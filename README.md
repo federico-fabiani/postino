@@ -187,7 +187,10 @@ MCP      ─┘
   authenticated dedup that heals a damaged file, bounded reads, atomic writes), and
   `attachments.blob_hash` finally points at something. The engine exposes `attachment_bytes` and
   `store_attachment_bytes`, with tests across a reopen; sync writes the bytes and the P6c reading
-  pane reads them through `attachment_bytes` when a person saves an attachment.
+  pane reads them through `attachment_bytes` when a person saves or previews an attachment.
+  `attachment_get` exposes the same exact bytes to the CLI and MCP; the reading pane previews text
+  and images with bounds (64 KiB text, 2048 px and 32 MiB image decode), while Save always writes the
+  complete file.
 - The M1 network foundation as a crate (`postino-net`, P5a): an IMAP4rev1 client over implicit TLS
   or STARTTLS, with the operating system's certificate verifier and no way to switch verification
   off. It logs in with `AUTHENTICATE PLAIN` or `LOGIN`, lists folders with special-use and modified
@@ -515,12 +518,14 @@ The GNU toolchain plus MSYS2 is the path documented here.
   and counts them; sync stores that count, `message_get` exposes it and the pane names it in Italian,
   never fetching or re-adding a URL. Compose attachments are real files in the encrypted store, not
   inline images or HTML: the caps are 20 files, 25 MiB each and 25 MiB total, unknown extensions are
-  labeled `application/octet-stream`, and no thumbnail or preview is generated. The signature is plain
+  labeled `application/octet-stream`, and the composer generates no thumbnail. The reading pane has
+  a bounded text/image preview sheet; other types explain that only Save is available. The signature is plain
   text (no HTML, images or tracking), belongs to one identity, is not a separate MIME part, and a
   provider-side signature is neither read nor synchronized. In `--demo` the synthetic attachments have
-  no bytes and Save/attach is disabled with that reason. A link reaches the system browser or mail
-  client only after the confirmation sheet, and Save writes attachment bytes to the chosen path
-  without opening the file. The chosen path is a local trust boundary: the app sanitizes the suggested
+  no bytes and Save/attach/preview is disabled with that reason. A link reaches the system browser or
+  mail client only after the confirmation sheet, and Save writes attachment bytes to the chosen path
+  without opening the file. `postino attachment get <id> --out <file>` writes the same bytes from the
+  CLI. The chosen path is a local trust boundary: the app sanitizes the suggested
   filename and re-classifies the chosen name, but does not canonicalize a symlink, reparse point or
   NTFS alternate data stream that the person selects. See
   [docs/product.md](docs/product.md).

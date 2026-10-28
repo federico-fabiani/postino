@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
@@ -13,10 +14,10 @@ use eframe::egui::{
     RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
-    Account, Address, Attachment, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor, LabelCreate,
-    LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView, PgpDecryptResult,
-    PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued, SyncPhase,
-    ThreadGetResult, ThreadSummary, ThreadsListResult,
+    Account, Address, Attachment, AttachmentGet, CalendarInviteView, DraftSave, Engine, FolderKind, InviteResponse, LabelApply, LabelColor,
+    LabelCreate, LabelDelete, LabelSummary, LabelUpdate, Message, MessageSummary, MessagesList, OutboxList, OutboxRunReport, OutboxView,
+    PgpDecryptResult, PgpDecryptState, PgpKey, PgpMimeKind, PgpPublicKey, PgpVerifyResult, PgpVerifyState, SavedSearch, SearchResult, SendQueued,
+    SyncPhase, ThreadGetResult, ThreadSummary, ThreadsListResult,
 };
 use postino_net::CertificateDer;
 use serde_json::Value;
@@ -475,6 +476,8 @@ pub struct PostinoApp {
     attachment_overwrite: Option<PendingAttachment>,
     /// Stable Save-button ids so a headless test can drive the keyboard path.
     attachment_save_ids: BTreeMap<String, Id>,
+    /// A bounded, display-only attachment preview. The bytes are dropped when the sheet closes.
+    attachment_preview: Option<AttachmentPreviewState>,
     /// A message override used only by deterministic screenshots (HTML plus attachment fixtures).
     screenshot_message: Option<Message>,
     /// The invite card shown for [`Self::screenshot_message`], when the scene is an invite.
@@ -1175,6 +1178,7 @@ impl PostinoApp {
             attachment_warning: None,
             attachment_overwrite: None,
             attachment_save_ids: BTreeMap::new(),
+            attachment_preview: None,
             screenshot_message: None,
             screenshot_invite: None,
             invite_cache: None,
@@ -3694,6 +3698,7 @@ impl PostinoApp {
         let same = self.selected.as_deref() == Some(id.as_str());
         if !same {
             self.pending_read = None;
+            self.attachment_preview = None;
         }
         self.select_only(id.clone());
         self.reading_open = true;
@@ -3894,6 +3899,7 @@ impl PostinoApp {
         self.reading_full = false;
         self.pending_read = None;
         self.invite_ready = false;
+        self.attachment_preview = None;
     }
 
     fn move_selected(&mut self, kind: FolderKind, confirmation: &str, plural: &str) {
@@ -4748,6 +4754,7 @@ impl PostinoApp {
             || self.pending_link.is_some()
             || self.attachment_warning.is_some()
             || self.attachment_overwrite.is_some()
+            || self.attachment_preview.is_some()
             || self.pgp_prompt.is_some()
             || self.pgp_import.is_some()
             || self.pgp_delete.is_some()
@@ -7302,7 +7309,7 @@ impl PostinoApp {
 
     /// The pinned attachment strip. It sits below the body scroll and above the status bar so the
     /// attachment row and its Save button are visible at 980×600 even when the body is long.
-    fn reading_attachment_strip(&mut self, ui: &mut Ui, message: &Message, t: &Tokens, height: f32) -> Option<Attachment> {
+    fn reading_attachment_strip(&mut self, ui: &mut Ui, message: &Message, t: &Tokens, height: f32) -> Option<AttachmentStripAction> {
         let mut requested = None;
         let mut save_ids = BTreeMap::new();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
@@ -7328,6 +7335,7 @@ impl PostinoApp {
                 .show(ui, |ui| {
                     for attachment in &message.attachments {
                         let mut save_clicked = false;
+                        let mut preview_clicked = false;
                         let display_name = reading::safe_filename(&attachment.filename);
                         Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::MD)).show(
                             ui,
@@ -7362,12 +7370,24 @@ impl PostinoApp {
                                         if save.clicked() || (save.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
                                             save_clicked = true;
                                         }
+                                        let preview = Button::new("Anteprima")
+                                            .size(ButtonSize::Sm)
+                                            .enabled(!self.demo)
+                                            .disabled_reason("La modalità demo non ha allegati reali")
+                                            .show(ui);
+                                        #[cfg(test)]
+                                        probe::attachment_preview(ui, &attachment.id, preview.rect);
+                                        if preview.clicked() || (preview.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
+                                            preview_clicked = true;
+                                        }
                                     });
                                 });
                             },
                         );
-                        if save_clicked {
-                            requested = Some(attachment.clone());
+                        if preview_clicked {
+                            requested = Some(AttachmentStripAction::Preview(attachment.clone()));
+                        } else if save_clicked {
+                            requested = Some(AttachmentStripAction::Save(attachment.clone()));
                         }
                         ui.add_space(space::SM);
                     }
@@ -7966,13 +7986,16 @@ impl PostinoApp {
         #[cfg(test)]
         probe::reading_body(ui, body_rect);
         if !message.attachments.is_empty()
-            && let Some(attachment) = ui
+            && let Some(action) = ui
                 .scope_builder(UiBuilder::new().max_rect(Rect::from_min_max(pos2(region.left(), strip_top), region.max)), |ui| {
                     self.reading_attachment_strip(ui, &message, t, strip_height)
                 })
                 .inner
         {
-            self.request_attachment_save(&attachment);
+            match action {
+                AttachmentStripAction::Preview(attachment) => self.request_attachment_preview(ui.ctx(), &attachment),
+                AttachmentStripAction::Save(attachment) => self.request_attachment_save(&attachment),
+            }
         }
 
         if let Some(command) = invite_command {
@@ -8142,6 +8165,122 @@ impl PostinoApp {
             self.attachment_warning = Some(pending);
         } else {
             self.choose_attachment_path(pending);
+        }
+    }
+
+    /// Open the bounded, display-only preview for one attachment. The operation is the same
+    /// `attachment_get` the CLI and MCP expose, so the daemon path and the in-process path agree.
+    fn request_attachment_preview(&mut self, ctx: &egui::Context, attachment: &Attachment) {
+        if self.demo {
+            self.push_info_toast("La modalità demo non ha allegati reali.", ToastKind::Info);
+            return;
+        }
+        let value = match self.op("attachment_get", json!({ "id": attachment.id })) {
+            Ok(value) => value,
+            Err(_) => {
+                self.attachment_preview = Some(AttachmentPreviewState {
+                    attachment: attachment.clone(),
+                    text: None,
+                    texture: None,
+                    error: Some("L'allegato non è disponibile nell'archivio locale: il file è mancante o danneggiato.".to_owned()),
+                    truncated: false,
+                });
+                return;
+            }
+        };
+        let result: AttachmentGet = match serde_json::from_value(value) {
+            Ok(result) => result,
+            Err(_) => {
+                self.push_info_toast("La risposta dell'archivio per l'allegato non è leggibile.", ToastKind::Error);
+                return;
+            }
+        };
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(result.data_base64.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.push_info_toast("I byte dell'allegato non sono decodificabili.", ToastKind::Error);
+                return;
+            }
+        };
+        let mut state = AttachmentPreviewState { attachment: result.attachment.clone(), text: None, texture: None, error: None, truncated: false };
+        if bytes.len() as u64 != result.attachment.size {
+            state.error = Some("La dimensione dei byte non corrisponde ai metadati dell'allegato.".to_owned());
+            self.attachment_preview = Some(state);
+            return;
+        }
+        let mime = result.attachment.mime.to_ascii_lowercase();
+        if mime.starts_with("text/") || mime == "application/json" || mime == "application/xml" {
+            let (text, truncated) = preview_text(&bytes);
+            state.text = Some(text);
+            state.truncated = truncated;
+        } else if mime.starts_with("image/") {
+            match preview_image(&bytes) {
+                Ok(color) => {
+                    state.texture =
+                        Some(ctx.load_texture(format!("attachment-preview-{}", result.attachment.id), color, egui::TextureOptions::LINEAR));
+                }
+                Err(error) => state.error = Some(error),
+            }
+        } else {
+            state.error = Some("Anteprima non disponibile per questo tipo di file. Puoi salvarlo e aprirlo con un'altra applicazione.".to_owned());
+        }
+        self.attachment_preview = Some(state);
+    }
+
+    fn attachment_preview_dialog(&mut self, ui: &mut Ui) {
+        let Some(state) = self.attachment_preview.as_mut() else { return };
+        let t = theme::tokens(self.dark);
+        let mut close = false;
+        let mut save = false;
+        let response = egui::Modal::new(Id::new("postino-attachment-preview"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(720.0_f32.min(ui.ctx().content_rect().width() - 40.0));
+                ui.label(typography::strong(Role::Emphasis, "Anteprima allegato", t.text));
+                ui.add_space(space::XS);
+                ui.label(typography::strong(Role::Secondary, reading::safe_filename(&state.attachment.filename), t.text));
+                ui.label(typography::text(
+                    Role::Caption,
+                    format!("{} · {}", state.attachment.mime, format_size(state.attachment.size)),
+                    t.text_faint,
+                ));
+                ui.add_space(space::MD);
+                if let Some(error) = state.error.as_deref() {
+                    ui.label(typography::text(Role::Secondary, error, t.text_muted));
+                } else if let Some(text) = state.text.as_deref() {
+                    ScrollArea::both().max_height(360.0).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(text).family(FontFamily::Monospace).size(type_size::BODY_SMALL).color(t.text))
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    });
+                    if state.truncated {
+                        ui.label(typography::text(
+                            Role::Caption,
+                            "Anteprima limitata ai primi 64 KiB; il file salvato resta completo.",
+                            t.text_faint,
+                        ));
+                    }
+                } else if let Some(texture) = state.texture.as_ref() {
+                    let size = texture.size_vec2();
+                    let scale = (720.0 / size.x).min(360.0 / size.y).min(1.0);
+                    ui.image((texture.id(), size * scale));
+                }
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = Button::primary("Chiudi").show(ui).clicked();
+                    save = Button::new("Salva").icon(icons::DOWNLOAD).size(ButtonSize::Sm).show(ui).clicked();
+                });
+            });
+        #[cfg(test)]
+        probe::attachment_preview_modal(ui, response.response.rect);
+        if save {
+            if let Some(state) = self.attachment_preview.take() {
+                self.request_attachment_save(&state.attachment);
+            }
+        } else if close || response.should_close() {
+            self.attachment_preview = None;
         }
     }
 
@@ -10664,6 +10803,7 @@ impl PostinoApp {
         self.link_confirmation(ui);
         self.attachment_warning_dialog(ui);
         self.attachment_overwrite_dialog(ui);
+        self.attachment_preview_dialog(ui);
         self.licences_dialog(ui);
         // The composer owns the keyboard while it is open. Capture the widget that had it before
         // the composer requests focus, so closing returns the user exactly where they were.
@@ -11049,6 +11189,21 @@ struct PgpDeleteState {
 /// An attachment whose bytes are already read from the blob store and whose destination is being
 /// confirmed. The bytes are kept only for the lifetime of the dialog.
 #[derive(Clone, Debug)]
+enum AttachmentStripAction {
+    Preview(Attachment),
+    Save(Attachment),
+}
+
+/// A display-only preview. The decoded text or texture is bounded and dropped when the sheet closes;
+/// nothing is written back to the store and nothing is added to the search index.
+struct AttachmentPreviewState {
+    attachment: Attachment,
+    text: Option<String>,
+    texture: Option<egui::TextureHandle>,
+    error: Option<String>,
+    truncated: bool,
+}
+
 struct PendingAttachment {
     filename: String,
     bytes: Vec<u8>,
@@ -12628,6 +12783,48 @@ fn format_time(date: DateTime<Utc>) -> String {
     date.with_timezone(&Local).format("%H:%M").to_string()
 }
 
+const MAX_PREVIEW_TEXT: usize = 64 * 1024;
+const MAX_PREVIEW_IMAGE_DIMENSION: u32 = 2048;
+const MAX_PREVIEW_IMAGE_ALLOC: u64 = 32 * 1024 * 1024;
+
+/// Text previews are bounded before decoding and control characters are replaced so a hostile
+/// attachment cannot reorder the interface with bidi controls.
+fn preview_text(bytes: &[u8]) -> (String, bool) {
+    let truncated = bytes.len() > MAX_PREVIEW_TEXT;
+    let slice = &bytes[..bytes.len().min(MAX_PREVIEW_TEXT)];
+    let decoded = String::from_utf8_lossy(slice);
+    let text = decoded
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\t' {
+                character
+            } else if character.is_control() || matches!(character, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
+                '\u{FFFD}'
+            } else {
+                character
+            }
+        })
+        .collect();
+    (text, truncated)
+}
+
+/// Decode an image attachment with strict dimensions and allocation bounds. The full bytes remain
+/// available through Save; the preview is only a scaled texture.
+fn preview_image(bytes: &[u8]) -> Result<egui::ColorImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| "Il formato dell'immagine non è riconoscibile.".to_owned())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PREVIEW_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_PREVIEW_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_PREVIEW_IMAGE_ALLOC);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|_| "L'immagine è troppo grande o non è decodificabile.".to_owned())?;
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok(egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], rgba.as_raw()))
+}
+
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -12826,7 +13023,10 @@ pub(crate) mod probe {
     }
 
     pub fn clear_attachment_saves(ui: &Ui) {
-        ui.ctx().data_mut(|data| data.insert_temp(id("attachment-saves"), BTreeMap::<String, Rect>::new()));
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("attachment-saves"), BTreeMap::<String, Rect>::new());
+            data.insert_temp(id("attachment-previews"), BTreeMap::<String, Rect>::new());
+        });
     }
 
     pub fn clear_invite_actions(ui: &Ui) {
@@ -12874,6 +13074,24 @@ pub(crate) mod probe {
 
     pub fn attachment_save_rect(ctx: &Context, attachment_id: &str) -> Option<Rect> {
         ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("attachment-saves"))).and_then(|rows| rows.get(attachment_id).copied())
+    }
+
+    pub fn attachment_preview(ui: &Ui, attachment_id: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("attachment-previews")).insert(attachment_id.to_owned(), rect);
+        });
+    }
+
+    pub fn attachment_preview_rect(ctx: &Context, attachment_id: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("attachment-previews"))).and_then(|rows| rows.get(attachment_id).copied())
+    }
+
+    pub fn attachment_preview_modal(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("attachment-preview-modal"), rect));
+    }
+
+    pub fn attachment_preview_modal_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("attachment-preview-modal")))
     }
 
     pub fn sidebar_header(ui: &Ui, name: &str, rect: Rect) {
@@ -17064,16 +17282,17 @@ mod tests {
     }
 
     fn seed_attachment(store: &postino_store::Store, message_id: &str, id: &str, filename: &str) {
+        let mime = if filename.to_ascii_lowercase().ends_with(".txt") {
+            "text/plain"
+        } else if filename.to_ascii_lowercase().ends_with(".png") {
+            "image/png"
+        } else {
+            "application/pdf"
+        };
         store
             .replace_attachments(
                 message_id,
-                &[StoreAttachment {
-                    id: id.to_owned(),
-                    filename: filename.to_owned(),
-                    mime: "application/pdf".to_owned(),
-                    size: 11,
-                    blob_hash: None,
-                }],
+                &[StoreAttachment { id: id.to_owned(), filename: filename.to_owned(), mime: mime.to_owned(), size: 11, blob_hash: None }],
             )
             .expect("attachment row");
     }
@@ -17552,6 +17771,67 @@ mod tests {
             app.engine.store_attachment_bytes(&message_id, &attachment.id, bytes).expect("store the test blob");
         }
         (app, message_id, attachment)
+    }
+
+    #[test]
+    fn preview_helpers_bound_text_and_replace_bidi_controls() {
+        let (text, truncated) = preview_text(&vec![b'a'; MAX_PREVIEW_TEXT + 16]);
+        assert!(truncated);
+        assert_eq!(text.len(), MAX_PREVIEW_TEXT);
+        let (hostile, _) = preview_text("titolo \u{202e}eseguito".as_bytes());
+        assert!(hostile.contains('\u{FFFD}'), "bidi controls must not reorder the sheet: {hostile:?}");
+        assert!(!hostile.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn attachment_preview_shows_bounded_text_at_980_in_both_themes_without_saving() {
+        let (mut app, message_id, attachment) = seeded_attachment_app("p6c-preview-text", "nota.txt", Some("riga uno\nriga due".as_bytes()));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        for dark in [false, true] {
+            theme::apply(&ctx, dark);
+            app.open_message(message_id.clone());
+            settle_at(&ctx, &mut app, Vec2::new(980.0, 600.0));
+            let preview = probe::attachment_preview_rect(&ctx, &attachment.id).expect("the Anteprima button");
+            click_at(&ctx, &mut app, preview.center(), Vec2::new(980.0, 600.0));
+            let state = app.attachment_preview.as_ref().expect("the preview sheet");
+            assert_eq!(state.text.as_deref(), Some("riga uno\nriga due"), "dark={dark}");
+            assert!(state.error.is_none(), "dark={dark}: {:?}", state.error);
+            let modal = probe::attachment_preview_modal_rect(&ctx).expect("the preview modal");
+            let content = ctx.content_rect();
+            assert!(content.contains_rect(modal), "dark={dark}: the preview is off-screen: {modal:?} vs {content:?}");
+            app.close_reading();
+            assert!(app.attachment_preview.is_none(), "closing the reading pane must drop the preview");
+        }
+    }
+
+    #[test]
+    fn attachment_preview_decodes_a_small_png_and_explains_an_unsupported_pdf() {
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(&[255, 0, 0, 255]).expect("png data");
+        }
+        let (mut app, message_id, attachment) = seeded_attachment_app("p6c-preview-png", "pixel.png", Some(&png));
+        app.open_message(message_id);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, false);
+        settle_at(&ctx, &mut app, Vec2::new(980.0, 600.0));
+        let preview = probe::attachment_preview_rect(&ctx, &attachment.id).expect("the Anteprima button");
+        click_at(&ctx, &mut app, preview.center(), Vec2::new(980.0, 600.0));
+        assert!(app.attachment_preview.as_ref().and_then(|state| state.texture.as_ref()).is_some(), "the PNG texture");
+
+        let (mut pdf_app, pdf_message, pdf_attachment) = seeded_attachment_app("p6c-preview-pdf", "report.pdf", Some(b"%PDF-1.7"));
+        pdf_app.open_message(pdf_message);
+        settle_at(&ctx, &mut pdf_app, Vec2::new(980.0, 600.0));
+        let preview = probe::attachment_preview_rect(&ctx, &pdf_attachment.id).expect("the PDF preview button");
+        click_at(&ctx, &mut pdf_app, preview.center(), Vec2::new(980.0, 600.0));
+        let state = pdf_app.attachment_preview.as_ref().expect("the PDF preview sheet");
+        assert!(state.error.as_deref().is_some_and(|error| error.contains("Anteprima non disponibile")), "{:?}", state.error);
     }
 
     #[test]
