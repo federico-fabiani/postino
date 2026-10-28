@@ -169,12 +169,16 @@ if (-not (Test-Path -LiteralPath $wxs)) {
             Add-Fail 'data removal custom action is missing'
         }
 
-        $sequence = $xml.SelectSingleNode('//w:Package/w:InstallExecuteSequence/w:CustomAction[@Id="RemovePostinoUserData"]', $ns)
+        $sequence = $xml.SelectSingleNode('//w:Package/w:InstallExecuteSequence/w:Custom[@Action="RemovePostinoUserData"]', $ns)
         if ($sequence) {
             $condition = $sequence.GetAttribute('Condition')
             if ($condition -match 'REMOVEDATA=&quot;1&quot;' -or $condition -match 'REMOVEDATA="1"') {
                 if ($condition -match 'REMOVE=&quot;ALL&quot;' -or $condition -match 'REMOVE="ALL"') {
-                    Add-Pass 'data removal runs only on full uninstall with the checkbox selected'
+                    if ($sequence.GetAttribute('After') -eq 'RemoveFiles') {
+                        Add-Pass 'data removal runs only on full uninstall with the checkbox selected'
+                    } else {
+                        Add-Fail 'data removal is not sequenced after RemoveFiles'
+                    }
                 } else {
                     Add-Fail 'data removal is not limited to a full uninstall'
                 }
@@ -368,7 +372,21 @@ if (Test-Path -LiteralPath $zip) {
     Add-Info 'portable ZIP not present (skip ZIP hash check)'
 }
 
-# 7. Report the optional MSI tool. Never claim an MSI that was not built.
+# 7. MSI checksum, if the MSI was built.
+$msi = Join-Path $DistRoot "Postino-$version-windows-x64.msi"
+if (Test-Path -LiteralPath $msi) {
+    if (Test-Path -LiteralPath $outerManifest) {
+        $expected = (Get-PostinoSha256 $msi)
+        $line = [System.IO.File]::ReadAllLines($outerManifest) | Where-Object { $_ -match [regex]::Escape((Split-Path -Leaf $msi)) } | Select-Object -First 1
+        if ($line -and $line.StartsWith($expected)) { Add-Pass 'MSI hash matches dist/SHA256SUMS.txt' } else { Add-Fail 'MSI is not correctly listed in dist/SHA256SUMS.txt' }
+    } else {
+        Add-Fail 'MSI exists without dist/SHA256SUMS.txt'
+    }
+} else {
+    Add-Info 'MSI not present (skip MSI hash check)'
+}
+
+# 8. Report the optional MSI tool. Never claim an MSI that was not built.
 $wixCommand = Get-Command wix.exe -ErrorAction SilentlyContinue
 if (-not $wixCommand) { $wixCommand = Get-Command wix -ErrorAction SilentlyContinue }
 if ($wixCommand) {

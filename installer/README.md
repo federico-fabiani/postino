@@ -206,7 +206,8 @@ default-off data deletion, shortcut target, generated file list determinism), th
 certificates/secrets/downloads in `installer/`, every payload hash, the provenance gate (a real
 clean commit and the shipped binary hashes), the `x86_64` architecture of every staged PE, and that
 every non-system DLL import resolves inside the payload. It also runs the fixture tests in
-`tests/Test-Resolvers.ps1` and reports whether WiX is installed; it does not build or claim an MSI.
+`tests/Test-Resolvers.ps1`, reports whether WiX is installed, and when an MSI exists checks that its
+hash matches `dist\SHA256SUMS.txt`; it does not build the installer or sign anything.
 
 ## Limits
 
@@ -216,12 +217,9 @@ every non-system DLL import resolves inside the payload. It also runs the fixtur
 
 ### Unverified on this host (do not claim otherwise)
 
-- **WiX was never run.** No `wix.exe`/`dotnet` WiX toolchain is installed here, so the MSI source
-  and the generated fragment have only been static-validated. The first real `wix build` may still
-  report schema or extension errors.
-- **No MSI exists and none was signed.** The staging layout, manifest and checks are verified; the
-  installer itself is not.
+- **The MSI is unsigned.** WiX v4.0.6 built `dist\Postino-0.1.0-windows-x64.msi` from the staged
+  payload; no certificate is installed, so the binary carries no Authenticode signature.
 - **No clean-VM run.** Install, upgrade, uninstall and the data-removal checkbox have not been
   executed on a fresh Windows VM; `smoke-checklist.md` is the manual acceptance list.
-- The portable ZIP and its `SHA256SUMS.txt` are produced by the scripts but were not built in this
-  review round, which had no release binaries to stage.
+- The portable ZIP and its `SHA256SUMS.txt` were built from the release binaries in this round; the
+  MSI hash is included in `dist\SHA256SUMS.txt`.

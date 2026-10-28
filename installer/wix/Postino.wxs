@@ -28,9 +28,10 @@
            UpgradeCode="4A8CC7B9-1C85-4C9C-A47C-C9FDBCC7981B"
            Scope="perUser"
            Compressed="yes"
-           Language="1033"
-           ARPPRODUCTICON="PostinoIcon"
-           ARPCOMMENTS="Uninstalling keeps local mail and settings unless you tick the delete checkbox. Manual installs only; Postino runs no background update service.">
+           Language="1033">
+
+    <Property Id="ARPPRODUCTICON" Value="PostinoIcon" />
+    <Property Id="ARPCOMMENTS" Value="Uninstalling keeps local mail and settings unless you tick the delete checkbox. Manual installs only; Postino runs no background update service." />
 
     <MajorUpgrade DowngradeErrorMessage="A newer Postino is already installed. Uninstall it first." />
     <MediaTemplate EmbedCab="yes" />
@@ -59,15 +60,16 @@
     <Property Id="REMOVEDATA" Value="0" />
 
     <CustomAction Id="RemovePostinoUserData"
-                  ExeCommand="[SystemFolder]cmd.exe /d /c rmdir /s /q &quot;[LocalAppDataFolder]Postino&quot; &amp; rmdir /s /q &quot;[AppDataFolder]Postino&quot;"
+                  Directory="SystemFolder"
+                  ExeCommand="cmd.exe /d /c rmdir /s /q &quot;[LocalAppDataFolder]Postino&quot; &amp; rmdir /s /q &quot;[AppDataFolder]Postino&quot;"
                   Execute="immediate"
                   Impersonate="yes"
                   Return="ignore" />
 
     <InstallExecuteSequence>
-      <CustomAction Id="RemovePostinoUserData"
-                    After="RemoveFiles"
-                    Condition="REMOVEDATA=&quot;1&quot; AND REMOVE=&quot;ALL&quot;" />
+      <Custom Action="RemovePostinoUserData"
+              After="RemoveFiles"
+              Condition="REMOVEDATA=&quot;1&quot; AND REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
   </Package>
 
@@ -129,7 +131,7 @@
 
       <!-- Order 2 runs after the stock event and replaces its target. -->
       <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton"
-               Event="NewDialog" Value="PostinoRemoveDataDlg" Order="2">1</Publish>
+               Event="NewDialog" Value="PostinoRemoveDataDlg" Order="2" />
     </UI>
   </Fragment>
 
