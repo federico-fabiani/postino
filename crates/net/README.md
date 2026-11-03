@@ -22,7 +22,7 @@ session.logout().await?;
 | Call | Wire |
 |---|---|
 | `Session::connect` | TCP + TLS (implicit or STARTTLS), greeting, `CAPABILITY` |
-| `login` | `AUTHENTICATE PLAIN` when advertised, else `LOGIN` |
+| `login` | `AUTHENTICATE PLAIN` when advertised, else `LOGIN`; then `ID ("name" "Postino" …)` when the server advertises `ID` |
 | `list` | `LIST "" "*"` |
 | `select` / `examine` | `SELECT "X"` / `EXAMINE "X"` |
 | `fetch_envelopes` | `UID FETCH <set> (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)` |
@@ -39,8 +39,9 @@ Tags are `A0001`, `A0002`, ...; a response with any other tag is a `Protocol` er
 session. `BODY.PEEK[]` is used for bodies, never `BODY[]`: reading a message never sets `\Seen`.
 `UID STORE` is always `UID` and always silent. `fetch_body` refuses a body whose UID is not the one
 it asked for, and `fetch_envelopes` refuses a UID outside the requested set: a server that returns
-the wrong message must not be believed. `fetch_uid_flags` applies the same rule to a UID/FLAGS-only
-response. `fetch_body_opt` returns `None` when the server answers a fetch of an expunged UID with a
+the wrong message must not be believed. `fetch_uid_flags` instead skips a UID outside the requested
+set: the `<UIDNEXT>:*` liveness probe legitimately gets the last live message back (RFC 3501
+§6.4.8), and an unsolicited flag update carries a UID nobody asked for. `fetch_body_opt` returns `None` when the server answers a fetch of an expunged UID with a
 bare `OK` and no `FETCH`: a vanished message is a caller decision, not a protocol failure; the strict
 `fetch_body` keeps its old `Protocol` error for callers that need it. `select` honours
 `OK [READ-ONLY]` on the tagged response, not only on an untagged one.

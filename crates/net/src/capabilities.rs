@@ -65,6 +65,12 @@ impl Capabilities {
         self.has("IDLE")
     }
 
+    /// `ID` (RFC 2971): the session may name itself after authenticating.
+    #[must_use]
+    pub fn id(&self) -> bool {
+        self.has("ID")
+    }
+
     /// `AUTH=PLAIN`, preferred over `LOGIN`.
     #[must_use]
     pub fn auth_plain(&self) -> bool {

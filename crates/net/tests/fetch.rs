@@ -86,6 +86,33 @@ async fn unsolicited_exists_does_not_confuse_the_fetch() {
 }
 
 #[tokio::test]
+async fn a_uid_flag_probe_skips_the_last_message_below_its_range() {
+    // Aruba (Courier) answers `UID FETCH 64:*` on a folder whose highest UID is 63 with that message:
+    // RFC 3501 §6.4.8 resolves a `n:*` range above the highest UID to the last one. The liveness
+    // probe must skip it, not fail the whole sync.
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl().await;
+        conn.expect("A0003 SELECT \"INBOX\"").await;
+        conn.send_line("* 0 EXISTS").await;
+        conn.send_line("* OK [UIDVALIDITY 1] ok").await;
+        conn.send_line("A0003 OK selected").await;
+        conn.expect("A0004 UID FETCH 64:* (UID FLAGS)").await;
+        conn.send_line("* 1 FETCH (UID 63 FLAGS (\\Seen))").await;
+        conn.send_line("A0004 OK done").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("login");
+    session.select("INBOX").await.expect("select");
+    let probe = session.fetch_uid_flags(UidSet::parse("64:*").expect("set")).await.expect("probe");
+    assert!(probe.is_empty(), "an out-of-set UID is skipped, not reported: {probe:?}");
+    session.logout().await.expect("logout");
+    server.finish().await;
+}
+
+#[tokio::test]
 async fn an_oversized_literal_is_refused_before_it_is_allocated() {
     let tls = TlsFixture::generate();
     let server = FakeServer::start_tls(&tls, |mut conn| async move {

@@ -131,6 +131,14 @@ impl Session {
         if self.authenticated {
             return Ok(());
         }
+        self.authenticate().await?;
+        self.identify().await;
+        Ok(())
+    }
+
+    /// The authentication half of [`Session::login`], split out so [`Session::identify`] runs once,
+    /// after the tagged `OK` has had its chance to replace the capability list.
+    async fn authenticate(&mut self) -> Result<(), NetError> {
         if self.config.oauth.is_some() {
             return self.authenticate_xoauth2().await;
         }
@@ -142,6 +150,23 @@ impl Session {
         // TLS is guaranteed here: `connect` either completed the handshake (implicit) or refused to
         // leave `starttls` without an upgraded stream.
         if self.capabilities.auth_plain() { self.authenticate_plain().await } else { self.login_with_password().await }
+    }
+
+    /// `ID ("name" "Postino" ...)` (RFC 2971), best effort.
+    ///
+    /// The account's access history on the server can name the client only if the client names
+    /// itself; without this a provider reports an anonymous program and the user cannot tell a
+    /// legitimate sync from an intrusion. Sent only when the server advertises `ID`, and a refusal is
+    /// not fatal: RFC 2971 makes the command optional and a session works without it.
+    async fn identify(&mut self) {
+        if !self.capabilities.id() {
+            return;
+        }
+        let payload = format!("(\"name\" \"Postino\" \"version\" \"{}\" \"vendor\" \"Postino\")", env!("CARGO_PKG_VERSION"));
+        match self.execute("identify", "ID", Some(&payload)).await {
+            Ok(_) => log::debug!("imap: ID accepted"),
+            Err(error) => log::debug!("imap: the server did not accept ID: {error}"),
+        }
     }
 
     /// `LIST "" "*"`, with the folder count bounded.
@@ -218,8 +243,15 @@ impl Session {
     /// This is the folder liveness scan: no envelope and no body, so one response per message stays
     /// small and a whole folder fits in bounded windows. On Gmail the same scan carries the labels,
     /// so a label removed from an existing message is observed without a second request. A response
-    /// without a UID (an unsolicited update) is skipped; a UID outside the requested set is refused,
-    /// exactly as for envelopes.
+    /// without a UID (an unsolicited update) is skipped, and so is a UID outside the requested set.
+    ///
+    /// **Out-of-set UIDs are metadata, not messages.** The liveness probe asks for `<UIDNEXT>:*`, and
+    /// RFC 3501 §6.4.8 resolves a `n:*` range whose `n` is above the highest live UID to that last
+    /// message, so a server answers `64:*` on a folder whose highest UID is 63 with UID 63. An
+    /// unsolicited `FETCH` carrying a flag change is the other legitimate source. Neither entry can
+    /// store the wrong content: only a UID and a flag list arrive, and the caller's cursor, not the
+    /// response, decides the window. `fetch_envelopes` and `fetch_body` keep the strict refusal,
+    /// because there a wrong UID would store another message's content.
     pub async fn fetch_uid_flags(&mut self, uids: UidSet) -> Result<Vec<UidFlags>, NetError> {
         let set = uids.to_wire()?;
         let gmail = self.capabilities.x_gm_ext();
@@ -235,7 +267,10 @@ impl Session {
                 continue;
             };
             if !uids.contains(uid) {
-                return Err(protocol(format!("the server returned UID {uid}, outside the requested set")));
+                // The `n:*` artifact of RFC 3501 §6.4.8, or an unsolicited flag update: skip it and
+                // let the caller's own cursor decide which window it actually trusts.
+                log::debug!("imap: skipping UID {uid}, returned outside the requested flag set");
+                continue;
             }
             entries.push(UidFlags { uid, flags, labels: if gmail { labels } else { Vec::new() } });
         }

@@ -450,14 +450,18 @@ the socket are plaintext sent before the handshake — a command-injection attem
 rather than parsed. Capabilities collected before the upgrade are discarded and asked again over
 TLS, so a server cannot downgrade what it claims.
 
-**Command surface.** `CAPABILITY`, `AUTHENTICATE PLAIN` (preferred) or `LOGIN`, `LIST "" "*"`,
+**Command surface.** `CAPABILITY`, `AUTHENTICATE PLAIN` (preferred) or `LOGIN`, `ID` when the server
+advertises it (RFC 2971, so an account's access history can name the client), `LIST "" "*"`,
 `SELECT`/`EXAMINE`, `UID FETCH ... (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)`,
 `UID FETCH <uid> (BODY.PEEK[])`, `UID STORE` with `+FLAGS.SILENT`/`-FLAGS.SILENT`/`FLAGS.SILENT`,
 `NOOP`, `IDLE` with a single `DONE` cycle, `LOGOUT`. Tags are `A0001`… and an unexpected tag is a
 `Protocol` error. Bodies are never fetched with `BODY[]`: `BODY.PEEK[]` keeps reading from mutating
 `\Seen`. Modified UTF-7 is decoded for display and the wire name is kept for subsequent commands.
 A FETCH is checked back against the request: a body whose UID differs is refused, as is an envelope
-whose UID is outside the requested set, so a confused server cannot hand over the wrong message.
+whose UID is outside the requested set, so a confused server cannot hand over the wrong message. The
+`UID FLAGS` liveness scan is the exception: it skips an out-of-set UID, because the `<UIDNEXT>:*`
+probe legitimately returns the last live message (RFC 3501 §6.4.8) and an unsolicited flag update
+carries a UID nobody asked for.
 `SELECT` reads `READ-ONLY`/`READ-WRITE` from the tagged response as well as from untagged ones.
 
 **Bounds.** A response line is at most 64 KiB, a literal 25 MiB by default (configurable, hard

@@ -130,3 +130,38 @@ async fn sasl_continuation_timeout_closes_the_session() {
     drop(session);
     server.finish().await;
 }
+
+#[tokio::test]
+async fn id_names_the_client_once_the_server_advertises_it() {
+    let payload = format!("(\"name\" \"Postino\" \"version\" \"{}\" \"vendor\" \"Postino\")", env!("CARGO_PKG_VERSION"));
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl_with("ID").await;
+        conn.expect(&format!("A0003 ID {payload}")).await;
+        conn.send_line("* ID (\"name\" \"Courier-IMAP\" \"version\" \"4.1\")").await;
+        conn.send_line("A0003 OK done").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("login");
+    assert!(session.capabilities().id(), "the post-auth list is the one that counts");
+    session.logout().await.expect("logout");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn a_refused_id_is_not_a_failed_login() {
+    let tls = TlsFixture::generate();
+    let server = FakeServer::start_tls(&tls, |mut conn| async move {
+        conn.prepare_sasl_with("ID").await;
+        conn.expect_prefix("A0003 ID (").await;
+        conn.send_line("A0003 BAD unknown command").await;
+    })
+    .await;
+
+    let mut session = Session::connect(server.config(&tls)).await.expect("connect");
+    session.login().await.expect("ID is optional, the session must survive its refusal");
+    session.logout().await.expect("logout");
+    server.finish().await;
+}
