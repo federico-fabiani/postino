@@ -1,6 +1,6 @@
 # UI foundation — plan
 
-> **Status:** U0.1–U0.5 foundations, P2a/P2b, P6b onboarding/sync and P6c reading/settings done · **Last updated:** 2026-10-27
+> **Status:** the UI foundation shipped through U0.1—U0.5 and the M2—M4 screens; M5 is in progress. See ROADMAP.md. · **Last updated:** 2026-11-04
 >
 > Inputs: the owner's hands-on feedback, a blind UX review (`review-blind.md`), and desk research
 > on nine email clients (`market-research.md`). No deadlines: the goal is a system, not a patch
