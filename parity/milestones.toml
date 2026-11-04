@@ -1,0 +1,141 @@
+# Postino milestone scorecard — the source of truth for `cargo xtask scorecard`.
+#
+# One row per milestone/feature area, never one per operation: 70 operation rows would be
+# busywork, while a dozen areas are the things a user can actually do.
+#
+# - target: one sentence on what the user can do once the area is shipped.
+# - status: "shipped" (reachable from the engine, with a test), "partial" (some of it is real and
+#   the rest is missing, see note) or "planned" (not built).
+# - test:   the exact Rust test function that proves the row. A "shipped" row must name a test that
+#   exists in the tree; `cargo xtask scorecard --check` fails otherwise. Partial and planned rows
+#   may leave it empty, and their note says what is missing or what proves the shipped half.
+# - note:   the evidence file, or the honest gap.
+version = 1
+
+[[feature]]
+id = "m0-registry"
+milestone = "M0"
+status = "shipped"
+test = "tools_list_contains_the_registry"
+target = "Every operation lives in one registry, and the CLI and the MCP server dispatch the same names and schemas."
+note = "apps/postino-cli/src/mcp.rs; the schemas are derived from the request types in crates/core/src/ops.rs."
+
+[[feature]]
+id = "u0-design-system"
+milestone = "U0"
+status = "shipped"
+test = "gallery_renders_light"
+target = "Every screen is composed from tokenised components, and the shell renders headlessly without a window."
+note = "apps/postino-app/src/gallery.rs; the real shell render is shell_renders_one_frame in apps/postino-app/src/app.rs."
+
+[[feature]]
+id = "u0-compose"
+milestone = "U0"
+status = "shipped"
+test = "autosave_updates_one_draft_in_place"
+target = "The user writes a draft that is autosaved and revisioned, and the draft survives a reopen."
+note = "apps/postino-app/src/app.rs; draft_save_revision_and_send_survive_a_reopen in crates/core/tests/engine_store.rs proves the stored side."
+
+[[feature]]
+id = "u0-labels"
+milestone = "U0"
+status = "shipped"
+test = "deleting_a_label_detaches_it_from_every_message"
+target = "The user creates, renames, applies and deletes labels, and deleting a label detaches it from every message."
+note = "crates/core/src/ops.rs; the app-side undo and menu are covered by apps/postino-app/src/app.rs."
+
+[[feature]]
+id = "m1-store"
+milestone = "M1"
+status = "shipped"
+test = "file_and_wal_carry_no_plaintext"
+target = "Mail lives in an SQLCipher store whose key is in the OS keyring, and neither the file nor the WAL carries plaintext."
+note = "crates/store/tests/encryption.rs."
+
+[[feature]]
+id = "m1-mime"
+milestone = "M1"
+status = "shipped"
+test = "scripts_styles_and_handlers_never_reach_the_model"
+target = "Received MIME is parsed, sanitised against an allowlist and turned into a bounded block model."
+note = "crates/mime/tests/blocks.rs; parsing and serialisation are in the sibling test files."
+
+[[feature]]
+id = "m1-imap-sync"
+milestone = "M1"
+status = "shipped"
+test = "a_synced_mailbox_is_readable_offline_through_the_engine"
+target = "The user syncs a real IMAP mailbox into the encrypted cache and reads it with the network off."
+note = "crates/sync/tests/sync.rs; the IMAP client itself is covered by the crates/net/tests suite."
+
+[[feature]]
+id = "m1-accounts"
+milestone = "M1"
+status = "shipped"
+test = "account_add_writes_account_server_folders_and_credential_only_after_the_login"
+target = "The user adds, tests, syncs and removes an account, and the password reaches the keyring only after a successful login."
+note = "crates/core/tests/accounts.rs."
+
+[[feature]]
+id = "m2-send"
+milestone = "M2"
+status = "shipped"
+test = "the_exact_bytes_envelope_bcc_and_sent_append_are_written_once"
+target = "The user sends through SMTP with a journaled outbox, scheduled send and exactly one local Sent copy."
+note = "crates/core/tests/send.rs; the SMTP client stages are in crates/net/tests/smtp.rs."
+
+[[feature]]
+id = "m2-compose"
+milestone = "M2"
+status = "shipped"
+test = "exact_bytes_survive_blob_draft_reopen_queue_and_mime"
+target = "Attachments, per-account signatures, identities and reply/forward keep their exact bytes all the way to the wire."
+note = "crates/core/tests/attachments.rs."
+
+[[feature]]
+id = "m2-drafts-append"
+milestone = "M2"
+status = "partial"
+test = ""
+target = "The user's drafts are autosaved, revisioned and recoverable after a crash, and mirrored to the server Drafts folder."
+note = "Autosave, revisions and crash recovery are shipped (see u0-compose); the APPEND to the server Drafts folder is not implemented."
+
+[[feature]]
+id = "m3-organize"
+milestone = "M3"
+status = "shipped"
+test = "search_is_sql_backed_and_returns_plain_hits"
+target = "The user searches the cached mailbox with operators, reads threads and runs local rules."
+note = "The thread half is threads_list_and_thread_get_return_the_documented_shape, the rules half priority_and_stop_are_observable."
+
+[[feature]]
+id = "m4-daemon"
+milestone = "M4"
+status = "shipped"
+test = "two_clients_mutate_one_store_through_the_daemon"
+target = "One daemon owns the store and the scheduler, the CLI, MCP and app are IPC clients, and scheduled mail sends with the app closed."
+note = "apps/postino-daemon/tests/daemon.rs."
+
+[[feature]]
+id = "m5-html"
+milestone = "M5"
+status = "partial"
+test = "an_html_draft_compiles_inline_css_and_serializes_both_parts"
+target = "The user composes email-safe HTML that compiles to tables and inline CSS with a matching plain-text alternative."
+note = "The compiler, the block renderer and the live preview are shipped; the block/advanced editor is still a Markdown-like text field."
+
+[[feature]]
+id = "m6-maturity"
+milestone = "M6"
+status = "partial"
+test = "an_mbox_imports_every_message_and_exports_as_one_file"
+target = "The user imports and exports eml/mbox, maps Gmail labels, unsubscribes and uses PGP, with the same tools under MCP guardrails."
+note = "PGP is covered by crates/core/tests/pgp.rs; signing, clean-VM verification and non-Windows packaging are still open."
+
+[[feature]]
+id = "m6-sieve"
+milestone = "M6"
+status = "planned"
+test = ""
+target = "Server-side filters and a vacation responder through ManageSieve where the provider supports it."
+note = "Deferred: no confirmed provider, and Gmail has no ManageSieve."

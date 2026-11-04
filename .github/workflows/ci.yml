@@ -1,0 +1,43 @@
+# The single gate is `cargo xtask ci`: rustfmt --check, clippy -D warnings, test --workspace,
+# the layering check (`cargo xtask layers`), the asset attribution check (`cargo xtask assets`)
+# and the scorecard check (`cargo xtask scorecard --check`). Adding a gate here means adding it
+# to the xtask task, never to this workflow, so CI cannot drift from what runs locally.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # postino-store builds SQLCipher and OpenSSL from source.
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
+      - run: cargo xtask ci
+
+  windows:
+    name: windows
+    runs-on: windows-latest
+    # No clippy and no tests here on purpose: SQLCipher and OpenSSL build from source on a cold
+    # Windows runner, which costs roughly 15 minutes per push. The linux job runs the full
+    # `cargo xtask ci` gate; this job is the fast check that formatting, layering and attribution
+    # stay honest on the host the app actually ships for.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo run -p xtask -- layers
+      - run: cargo run -p xtask -- assets
