@@ -48,6 +48,7 @@
 //! later folder wins the `folder_id` and labels are preserved. The trade-off is documented in
 //! `docs/architecture.md` §4.6.
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![deny(missing_docs)]
 
 mod folder;

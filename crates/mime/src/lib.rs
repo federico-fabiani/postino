@@ -20,6 +20,7 @@
 //! See `README.md` for the contract, the allowlist and the limits. `docs/architecture.md`
 //! describes where attachments go next (P4b).
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![deny(missing_docs)]
 
 mod blocks;

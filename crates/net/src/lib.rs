@@ -30,6 +30,7 @@
 //!
 //! See `README.md` for the command grammar, the bounds and the fake server that proves each path.
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![deny(missing_docs)]
 
 mod capabilities;

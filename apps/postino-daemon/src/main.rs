@@ -5,6 +5,7 @@
 //! The release binary uses the Windows GUI subsystem: started from the Run key it must not flash a
 //! console. When stderr is absent, logging goes to a bounded `%APPDATA%\Postino\daemon.log`.
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod logging;

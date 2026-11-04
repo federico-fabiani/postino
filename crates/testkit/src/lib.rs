@@ -23,14 +23,23 @@
 //! # }
 //! ```
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![deny(missing_docs)]
 
+// This crate is test support: a scripted server that swallows a mismatched expectation turns a
+// broken client green (see the contract above), so the four modules that assert the wire protocol
+// keep `expect`/`panic!` on purpose. The crate-level deny above stays in force everywhere else,
+// including any new module, so an accidental panic still has to be a decision, not an oversight.
 mod mailbox;
+#[allow(clippy::expect_used, clippy::panic)]
 mod oauth;
 mod responses;
+#[allow(clippy::expect_used, clippy::panic)]
 mod server;
+#[allow(clippy::expect_used, clippy::panic)]
 mod smtp;
 mod synthetic;
+#[allow(clippy::expect_used, clippy::panic)]
 mod tls;
 
 pub use mailbox::{FailPoint, MailboxScript, TestFolder, TestMessage, serve_mailbox, serve_mailbox_with, serve_mailbox_with_xoauth2};

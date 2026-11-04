@@ -45,6 +45,8 @@
 //! keeps only the hash, and the hash is computed over the plaintext, so identical attachments are
 //! stored once. The directory belongs to the file, so two stores in one folder never share it.
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
 mod blob;
 mod gc;
 mod links;
