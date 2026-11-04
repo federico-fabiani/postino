@@ -3,32 +3,11 @@
 **Local-first, agent-first mail.** A fast, native email client written in Rust, with one operation
 registry shared by the desktop app, the CLI and an MCP server.
 
-> **Status: M0 walking skeleton + U0 UI foundation + the engine on the encrypted store (P3c/P3d) +
-> the MIME crate (P4a) + encrypted attachment blobs (P4b) + the IMAP client (P5a) + sync into the
-> store (P5b/P5c) + accounts, credentials and sync operations (P6a) + onboarding and the app on real
-> data (P6b) + the text reading pane, safe links, attachment Save and full settings (P6c) + SMTP
-> submission and the outbox (P7) + compose depth: attachment bytes, per-account signatures and
-> reply/forward headers (P8) + encrypted FTS5 search with a documented query language, a
-> body-free read path and schema v7 (P9a) + conversations from the reference chain, thread
-> operations, the one-open-card conversation view and saved searches (P9b) + local rules with
-> preview, idempotent runs, undo and forwarding through the P7 outbox (P9c).** The desktop app opens
-> the encrypted SQLCipher store by default,
-> offers a guided Aruba/Gmail/custom onboarding with a real connection test and background sync, and
-> reads cached mail offline; `--demo` keeps the synthetic mailbox for screenshots and trials. The CLI
-> and the MCP server use the same operation registry: `postino --store <path>` (or the default
-> `%LOCALAPPDATA%\Postino\mail.db` on Windows) runs the same operations on the encrypted database,
-> and the CLI can add a real Aruba or Gmail account with an app password, test it, sync it and remove
-> it. **Postino can now send real mail with real attachments:** the composer queues a draft, the exact
-> RFC 5322 bytes (including every attachment byte) are stored before any network call, an outbox
-> survives restarts, a 5-second undo window precedes the first attempt, and a Sent APPEND is retried
-> independently of submission. The transaction never resubmits an uncertain message. Passwords live
-> only in the OS keyring; **Windows Credential Manager is the only keyring backend in this build**,
-> and macOS/Linux fail at the platform seam until their keychains land with packaging. MIME parsing,
-> sanitization and serialization exist as `postino-mime`; `postino-net` is an IMAP4rev1 client and
-> the SMTP submission client; and `postino-sync` reconciles one account into the encrypted store.
-> Attachment bytes are encrypted at rest in a content-addressed blob directory next to the database.
-> Gmail OAuth is P12 and the background daemon is P10a; the tray, autostart and notifications are
-> P10b; inline `cid:` images and server-side signatures are explicitly out of scope for M2.
+> **Status: Postino reads, searches, organizes and sends real mail, and its daemon owns the store.**
+> M0, the U0 UI foundation and M1-M4 are complete on the encrypted store; M5 and M6 are in progress,
+> with P13i (multiple senders) the latest merged phase. One Rust engine and one operation registry
+> serve the desktop app, the CLI and the MCP server. See [ROADMAP.md](ROADMAP.md) for the current
+> milestone.
 
 ![Postino M0 desktop shell: folder rail, message list and reading pane in forest, ivory and gold](docs/images/postino-m0.png)
 
@@ -261,8 +240,8 @@ MCP      ─┘
   UTF-7 names, selects and examines, fetches envelopes and whole bodies with `BODY.PEEK[]` (never
   setting `\Seen`), stores flags by UID, runs one `IDLE` cycle and logs out. Every line, literal,
   command and response is bounded, the password is zeroised and redacted, and a scripted TLS server
-  in `postino-testkit` proves each path, including a 54-case hostile corpus. It is not wired into the
-  app or a scheduler yet.
+  in `postino-testkit` proves each path, including a 54-case hostile corpus. Both the daemon's
+  scheduler and the app drive it.
 - The M1 synchronization crate (`postino-sync`, P5b): `sync_account` reconciles one IMAP account into
   one encrypted store. It lists folders once and maps RFC 6154 special-use (`\Inbox`, `\Sent`,
   `\Drafts`, `\Trash`, `\Junk`, `\Archive`, `\Flagged`), resets a folder when `UIDVALIDITY` changes,
@@ -458,9 +437,9 @@ create the default store. Exit codes are 0 for success, 1 for an operation failu
 error, including `OpError::InvalidArgs` (missing `--yes`, an invalid address/name/endpoint, an unknown
 id) and malformed `postino run` arguments. The `add | test | list | remove` account commands,
 `sync run | status`, `send` and the desktop onboarding all use the same encrypted store; Gmail OAuth
-is P12. Sending opens the account's SMTP server; a dry run never connects.
+is P12a. Sending opens the account's SMTP server; a dry run never connects.
 
-### Daemon (P10a)
+### Daemon (P10a/P10b)
 
 The daemon is the one process allowed to write the store, run sync, the outbox scheduler, local rules,
 the search-index batches and blob GC. It listens only on a per-user Windows named pipe or Unix domain
@@ -481,10 +460,10 @@ file, speaks JSON-RPC 2.0 over the local endpoint and prints the same results as
 `postino send --at …` now leaves the machine even when no app or CLI is connected. When the daemon is
 absent, read-only commands use the local cache directly; a mutation **starts the daemon** (that is the
 documented fallback) and never opens a second writer. `--in-process` is a diagnostic for a stopped
-daemon; it is refused while the daemon owns the store. The app stays in-process in P10a1: if the
-daemon is running it shows "the store is owned by the daemon" instead of opening a second writer;
-P10a2 connects the app to the same client. The tray, autostart and notifications are P10b and are not
-implemented here.
+daemon; it is refused while the daemon owns the store. The desktop app is a daemon client (P10a2): it
+opens the store read-only while the daemon owns the writer, sends every mutation through the same
+client, reconnects after a restart and keeps its view state. The tray, autostart and notifications are
+daemon-owned (P10b1), and the app's daemon settings, close-to-tray and activation are P10b2.
 
 `daemon status` answers with version, pid, start instant, store root, endpoint kind, accounts syncing,
 the next outbox wake, search-index state, the scheduler wake count and the last redacted error. The

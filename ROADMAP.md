@@ -1,15 +1,22 @@
 # Postino roadmap
 
-> **Current milestone:** M2 complete for SMTP/outbox and compose depth (P7/P8); M3 organize is
-> complete for encrypted search (P9a), conversations/saved searches (P9b) and local rules (P9c).
-> Attachment preview and HTML compose remain; the folder-thread view and the open/RSS halves of the
-> 100k gate are still open · **Last updated:** 2026-10-27
+> **Current milestone:** M4 is complete. `postino-daemon` owns the single writer, the sync/rules/
+> search-batch scheduler and the local JSON-RPC IPC (P10a1); the desktop app is a daemon client with
+> reconnect and preserved view state (P10a2); the tray, autostart and notifications shipped in P10b1,
+> and the app's daemon-brokered settings, close-to-tray and activation in P10b2. M5 and M6 are the
+> current work, with P13i (multiple senders) as the latest merged phase.
+> **Last reviewed:** 2026-11-04
+> **Last updated:** 2026-11-04
+> **Change:** The header stopped at M3 and still claimed there was no daemon; it now names M4 as
+> shipped and P13i as the newest phase.
 >
-> M1 is complete: the store, MIME, blobs, IMAP, sync, accounts and onboarding are real, and the
-> desktop app reads and syncs a real mailbox from the encrypted cache. M2 has started with SMTP,
-> the journaled outbox and independent Sent APPEND, and P8 closes compose depth. There is still no
-> daemon: scheduled mail waits for the app or `postino send`, and an APPEND that keeps failing has no
-> terminal give-up state (P9).
+> M0, the U0 UI foundation and M1-M4 are done: the store, MIME, blobs, IMAP, sync, accounts and
+> onboarding are real, the app reads and syncs a real mailbox from the encrypted cache, SMTP with the
+> journaled outbox and compose depth close M2, and search/conversations/rules close M3. A scheduled
+> message now leaves the machine while the app is closed. Still open: the folder-thread view and the
+> open/RSS halves of the 100k gate, the server-side Drafts APPEND, the block composer/HTML editor
+> mode and the optional WebView2 backend (P11b) in M5, and signing, clean-VM verification and the
+> non-Windows packages in M6.
 
 The full design is in [docs/architecture.md](docs/architecture.md). Each milestone ends with a
 verifiable demo, not a promise.

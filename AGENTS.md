@@ -8,13 +8,14 @@ If a rule here conflicts with a habit from another project, this file wins.
 Postino is a local-first, agent-first mail client written in Rust. The desktop app, the `postino`
 CLI and the `postino mcp` server are three clients of **one operation registry**. The engine runs on
 synthetic demo mail in memory or on the encrypted local store (`postino --store <path>`); accounts,
-credentials, IMAP sync, SMTP submission with the outbox and the desktop onboarding exist (P6/P7), the
-daemon IPC, scheduler and CLI/MCP clients exist (P10a1), and the desktop app boots on the encrypted
-store with `--demo` as the synthetic fallback. The app's daemon client is P10a2; tray/autostart are
-P10b.
+credentials, IMAP sync, SMTP submission with the outbox and the desktop onboarding exist (P6/P7). The
+daemon owns the store, the scheduler and the JSON-RPC IPC (P10a1); the desktop app is a daemon client
+with reconnect and preserved view state (P10a2); the tray, autostart and notifications shipped in
+P10b1, and single-instance activation and crash recovery in P10b2. The app boots on the encrypted
+store with `--demo` as the synthetic fallback.
 
 **The current milestone is the only source of truth for scope.** Read `ROADMAP.md` before
-starting. Do not build M1 features into M0.
+starting. Do not build a later milestone's features into the current one.
 
 ## 2. Non-negotiables
 

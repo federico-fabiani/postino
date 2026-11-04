@@ -551,6 +551,46 @@ sha256 = "9a5b6383e7b32e540b920302df64cfc932885b7544833acf0dfb0eb2cdd21735"
 usage = "Documentation screenshot of the settings dialog at the minimum window in the dark theme"
 
 [[asset]]
+path = "docs/images/postino-p7-compose-980.png"
+title = "Postino composer at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "91e9e58de1d18901d5b53ed0f463b2dd6bd4a2202dcb766e0320fdf7e41423d6"
+usage = "Documentation screenshot of the composer sheet at the minimum window with two attachment rows, the running total, Invia and the demo send notice"
+
+[[asset]]
+path = "docs/images/postino-p7-compose-980-dark.png"
+title = "Postino composer at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "855cd97de79b57583b05fe9103c4b834da97020e865c11f9ff6ca5d2a00f69d2"
+usage = "Documentation screenshot of the dark composer sheet at the minimum window"
+
+[[asset]]
+path = "docs/images/postino-p7-outbox-980.png"
+title = "Postino outbox at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "0e603ed9f163822207913ab0852ac72c58a8ae5d3d4815cfe3009dabc9890744"
+usage = "Documentation screenshot of the Coda di invio sheet at the minimum window: an uncertain row with Segna come inviato and Riprova manualmente, a queued row with Annulla, a failed 550 with Scarta and Riprova, and a sent row"
+
+[[asset]]
+path = "docs/images/postino-p7-outbox-980-dark.png"
+title = "Postino outbox at 980x600, dark theme"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "0af53a16e2aea3803dfcc6d1f1820a13fe9afc51231f994f5c0120144ad0b448"
+usage = "Documentation screenshot of the dark Coda di invio sheet at the minimum window"
+
+[[asset]]
 path = "docs/images/postino-p8-compose-980.png"
 title = "Postino composer with attachments at 980x600"
 author = "Postino contributors"
@@ -760,6 +800,16 @@ license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
 sha256 = "89f55b23a8469691b885d109325bdafdb83af49dc653d0fc1cfa9eb538af2968"
 usage = "Documentation screenshot of the dark-theme rule preview"
+
+[[asset]]
+path = "docs/images/postino-p12d-invite-980.png"
+title = "Postino calendar invite at 980x600"
+author = "Postino contributors"
+source = "original work"
+license = "MIT OR Apache-2.0"
+license_file = "LICENSE-MIT"
+sha256 = "e90685b7d5b4544bc3561f7fbd9c74dd819bc8432e526fff285467cbcec8254d"
+usage = "Documentation screenshot of the reading pane's INVITO card at the minimum window: organizer, time range, location, the declared-time-zone warning and the Accetta/Tentativo/Rifiuta reply actions"
 
 [[dependency]]
 name = "Phosphor Icons"
