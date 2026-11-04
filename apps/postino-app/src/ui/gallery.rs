@@ -4,6 +4,8 @@
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, Rect, ScrollArea, Stroke, StrokeKind, Ui, UiBuilder, Vec2};
 use postino_core::{Account, Attachment};
 
+use crate::commands::command_label;
+use crate::copy;
 use crate::theme;
 use crate::ui::icons;
 use crate::ui::tokens::{self, Tokens, inset, radius, size as ui_size, space};
@@ -191,10 +193,10 @@ impl GalleryApp {
     fn buttons(&self, ui: &mut Ui, t: &Tokens) {
         section(ui, "Pulsanti", t);
         ui.horizontal_wrapped(|ui| {
-            Button::primary("Scrivi").icon(icons::COMPOSE).shortcut("C").show(ui);
-            Button::new("Rispondi").icon(icons::REPLY).shortcut("R").show(ui);
+            Button::primary(command_label("compose", "Scrivi")).icon(icons::COMPOSE).shortcut("C").show(ui);
+            Button::new(command_label("reply", "Rispondi")).icon(icons::REPLY).shortcut("R").show(ui);
             Button::ghost("Annulla").show(ui);
-            Button::danger("Elimina").icon(icons::TRASH).shortcut("⌫").show(ui);
+            Button::danger(command_label("delete", copy::DELETE)).icon(icons::TRASH).shortcut("⌫").show(ui);
         });
         ui.add_space(space::MD);
         ui.horizontal_wrapped(|ui| {
@@ -205,11 +207,11 @@ impl GalleryApp {
         });
         ui.add_space(space::MD);
         ui.horizontal_wrapped(|ui| {
-            IconButton::new(icons::ARCHIVE, "Archivia").show(ui);
-            IconButton::new(icons::TRASH, "Elimina").danger(true).show(ui);
+            IconButton::new(icons::ARCHIVE, command_label("archive", "Archivia")).show(ui);
+            IconButton::new(icons::TRASH, command_label("delete", copy::DELETE)).danger(true).show(ui);
             IconButton::new(icons::STAR, "Preferito").selected(true).show(ui);
             IconButton::new(icons::MORE, "Altro").size(IconButtonSize::Sm).show(ui);
-            IconButton::new(icons::SETTINGS, "Impostazioni").enabled(false).show(ui);
+            IconButton::new(icons::SETTINGS, command_label("settings", "Impostazioni")).enabled(false).show(ui);
         });
     }
 
@@ -287,15 +289,15 @@ impl GalleryApp {
         section(ui, "Menu contestuale", t);
         let items = [
             MenuItem::new("Apri").icon(icons::MAIL).shortcut("Enter"),
-            MenuItem::new("Rispondi").icon(icons::REPLY).shortcut("R"),
-            MenuItem::new("Inoltra").icon(icons::FORWARD).shortcut("F"),
+            MenuItem::new(command_label("reply", "Rispondi")).icon(icons::REPLY).shortcut("R"),
+            MenuItem::new(command_label("forward", copy::FORWARD)).icon(icons::FORWARD).shortcut("F"),
             MenuItem::separator(),
-            MenuItem::new("Segna come letto").icon(icons::MARK_READ).shortcut("U"),
-            MenuItem::new("Aggiungi stella").icon(icons::STAR).shortcut("S"),
-            MenuItem::new("Etichetta").icon(icons::TAG).shortcut("L"),
+            MenuItem::new(command_label("read", copy::READ)).icon(icons::MARK_READ).shortcut("U"),
+            MenuItem::new(command_label("star", "Aggiungi stella")).icon(icons::STAR).shortcut("S"),
+            MenuItem::new(command_label("label_menu", copy::LABEL)).icon(icons::TAG).shortcut("L"),
             MenuItem::separator(),
-            MenuItem::new("Archivia").icon(icons::ARCHIVE).shortcut("E"),
-            MenuItem::new("Elimina").icon(icons::TRASH).shortcut("⌫").danger(true),
+            MenuItem::new(command_label("archive", "Archivia")).icon(icons::ARCHIVE).shortcut("E"),
+            MenuItem::new(command_label("delete", copy::DELETE)).icon(icons::TRASH).shortcut("⌫").danger(true),
         ];
         let _ = Menu::new(&items).show(ui);
     }
