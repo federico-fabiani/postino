@@ -622,6 +622,17 @@ fn the_reading_pane_clamps_a_hostile_fraction() {
 }
 
 #[test]
+fn a_panicking_action_is_contained_instead_of_closing_the_window() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let contained = guarded(|| panic!("boom")).is_none();
+    let passed = guarded(|| 7);
+    std::panic::set_hook(previous);
+    assert!(contained, "the panic must not escape the guard");
+    assert_eq!(passed, Some(7), "a normal action keeps its value");
+}
+
+#[test]
 fn a_partial_batch_move_still_offers_undo_for_the_moved_messages() {
     let mut app = PostinoApp::demo(true);
     app.threads_view = false;

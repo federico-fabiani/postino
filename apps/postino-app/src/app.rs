@@ -584,6 +584,12 @@ pub struct PostinoApp {
     pending_activation: Option<Activation>,
 }
 
+/// Runs one user action behind `catch_unwind`. A panic in a handler is contained here instead of
+/// escaping through the frame and closing the window with unsaved work in it.
+fn guarded<R>(action: impl FnOnce() -> R) -> Option<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).ok()
+}
+
 impl PostinoApp {
     /// Normal desktop launch. The command line chose demo or a store; a failure is a recovery
     /// screen, never a panic and never an empty mailbox.
@@ -5689,6 +5695,13 @@ impl PostinoApp {
     }
 
     fn execute_command(&mut self, id: CommandId, ctx: &egui::Context) {
+        if guarded(|| self.execute_command_inner(id, ctx)).is_none() {
+            let label = command_label(id.as_str(), "comando");
+            self.push_info_toast(format!("«{label}» non è andata a buon fine. Postino resta aperto."), ToastKind::Error);
+        }
+    }
+
+    fn execute_command_inner(&mut self, id: CommandId, ctx: &egui::Context) {
         self.show_palette = false;
         ctx.memory_mut(|memory| memory.stop_text_input());
         match id {
