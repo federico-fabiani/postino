@@ -289,9 +289,10 @@ open** and every blob file for the canary, for the store key and for the canary 
 `crates/core/tests/engine_blobs.rs` proves the seam survives a reopen and that a one-byte flip is
 `CorruptBlob` → `OpError::Failed` without poisoning the message.
 
-**Remaining gaps.** No key rotation (rotating the store key would orphan every blob), no garbage
-collection for unreferenced blobs, no passphrase recovery for the keyring entry, and the header, the
-file name and the size class are visible without the key. Swap/crash dumps are still outside our
+**Remaining gaps.** No key rotation (rotating the store key would orphan every blob); garbage
+collection for unreferenced blobs runs only in the daemon's bounded batches (P10a1); no passphrase
+recovery for the keyring entry, and the header, the file name and the size class are visible without
+the key. Swap/crash dumps are still outside our
 control; `docs/threat-model.md` §4.3 lists all of it.
 
 ## P4c outcome

@@ -246,11 +246,11 @@ What is **not** encrypted, and the consequence:
   allocator before the tag check fails. None of them is written to disk by Postino, logged or
   returned, and closing them would mean a custom in-place AEAD construction and hand-rolled HMAC.
 - **Orphaned blobs.** A crash between writing a blob and committing the attachment row leaves an
-  encrypted, deduplicated file with no row pointing at it. There is no garbage collector yet; a
-  deleted message also leaves its blob because another message may share the content. Removing an
-  account deletes its rows but not those files: the bytes are encrypted and deduplicated, and the
-  sweep belongs to P9/the daemon. A disk thief therefore still sees encrypted bytes for attachments
-  that were removed, but cannot read them.
+  encrypted, deduplicated file with no row pointing at it. The daemon's bounded GC batches sweep
+  unreferenced blobs (P10a1); until a batch runs, a deleted message also leaves its blob because
+  another message may share the content. Removing an account deletes its rows but not those files: the
+  bytes are encrypted and deduplicated, and the sweep collects them later. A disk thief therefore
+  still sees encrypted bytes for attachments that were removed, but cannot read them.
 - **Backups.** A backup of the folder copies the database and the blobs. It is unreadable without the
   keyring entry, and there is no passphrase export yet, so the keyring entry is a single point of
   failure for restores.
@@ -577,8 +577,8 @@ crash-dump entry above.
 - **Logs and status.** Logs and `daemon_status` carry counters, pids, categories and the store root;
   never a token, body, subject, address, query or credential. `last_error` is the category sentence,
   not raw server text.
-- **Out of scope here.** Tray, autostart and notifications are P10b; this build makes no claim about
-  them and installs no OS integration.
+- **Out of scope here.** Tray, autostart and notifications are P10b; this section makes no claim about
+  them and their threat surface is recorded in `docs/decisions/0006-tray-autostart-notifications.md`.
 
 - A compromised operating system, kernel, firmware or keylogger.
 - A compromised mail provider.

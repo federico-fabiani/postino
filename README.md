@@ -204,7 +204,7 @@ MCP      ─┘
   An index build never blocks open: the app builds batches in the background and shows the progress
   banner.
 - Real accounts from the CLI: Aruba and Gmail are discovered offline (Gmail needs 2FA + an app
-  password; OAuth is P12), `custom` takes host/port/TLS, a no-echo prompt or `--password-stdin` is the
+  password, or OAuth since P12a), `custom` takes host/port/TLS, a no-echo prompt or `--password-stdin` is the
   only way in, and MCP cannot add or remove an account. Passwords live in the OS keyring, never in
   the database, logs or tool output.
 - `postino` CLI for humans and scripts, including friendly `draft save --send`, `label` and
@@ -222,8 +222,8 @@ MCP      ─┘
   recorded warnings, an allowlist HTML sanitizer that removes remote images (counting the
   `http`/`https` ones), HTML-to-text, and deterministic RFC 5322 serialization with header-injection
   guards and `Bcc` kept in the envelope. It is wired into sync and the engine; the desktop reading
-  pane shows its text alternative, does not render HTML yet and reports the stored blocked-image
-  count without loading anything.
+  pane renders the sanitized block model and reports the stored blocked-image count without loading
+  anything.
 - Encrypted attachment bytes (P4b): `postino-crypto` derives an HKDF-SHA256 `blob` subkey from the
   store key and seals bytes with XChaCha20-Poly1305; `postino-store` keeps each distinct attachment
   content once under `<db file>.blobs/<xx>/<hash>.blob` (BLAKE3 name, zstd only when it helps,
@@ -305,7 +305,7 @@ MCP      ─┘
   missing source is reported and blocks the send. CLI `draft attach/detach` and MCP
   `draft_attachment_add` reach the same operation; MCP accepts bytes, never a path. The reply link uses
   the existing `drafts.in_reply_to`; the received `Reply-To` still rides the existing `meta` table, and
-  v7 stores the incoming `In-Reply-To`/`References` for the future thread view.
+  v9 stores the incoming `In-Reply-To`/`References` that the thread view reads.
 - Headless rendering tests of the shell, gallery, composer, label and search flows (980×600
   light/dark, including the parse error), the reading pane's link/attachment/settings paths with
   injected opener/saver recorders, operation-schema tests, MCP protocol tests, store round-trip tests
@@ -559,8 +559,8 @@ The GNU toolchain plus MSYS2 is the path documented here.
   fidelity without letting a browser engine into the rest of the app.
 - **Honest limits.** IMAP is the sync protocol; the server stays the source of truth. Avatars shown
   to recipients depend on BIMI or a signature, not on this client. Auto-reply and server-side
-  filters are provider features. The reading pane shows the plain-text alternative: it does not
-  render HTML and never loads remote images. The MIME sanitizer removes remote images before storage
+  filters are provider features. The reading pane renders the sanitized block model and never loads
+  remote images. The MIME sanitizer removes remote images before storage
   and counts them; sync stores that count, `message_get` exposes it and the pane names it in Italian,
   never fetching or re-adding a URL. Compose attachments are real files in the encrypted store, not
   inline images or HTML: the caps are 20 files, 25 MiB each and 25 MiB total, unknown extensions are

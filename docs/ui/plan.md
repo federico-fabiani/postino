@@ -332,7 +332,7 @@ per action, no hidden mutation.
   button is labelled **Invia** and carries the notice `Invio reale via SMTP. Puoi annullare entro 5
   secondi.`; the outbox dialog (`Ctrl+Shift+O`) shows every state, including **Invio incerto** with
   the two explicit resolutions. The demo has no SMTP endpoint and disables Send with a reason.
-- The composer is a component, so the future HTML/Tailwind advanced mode can reuse its shell.
+- The composer is a component, so the M5 block/Tailwind advanced mode can reuse its shell.
 
 Shipped in U0.4 and revised in P7: `ComposerState` + `Composer` in `ui/widgets/composer.rs`,
 autosave after 1.2 s of inactivity, `draft_save`/`message_send` in the registry, `Re:`/`Fwd:`
@@ -580,8 +580,8 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   use the deterministic demo mailbox with seeded sync states; no real address, credential or store
   is captured.
 - **Closed by P6c.** Link opening, attachment Save, the full settings page and the remaining
-  reading-pane attachment affordances. The sandboxed HTML viewer (P11b), SMTP and OAuth remain
-  later milestones.
+  reading-pane attachment affordances. The sandboxed HTML viewer (P11b) remains the later milestone;
+  SMTP shipped in P7 and OAuth in P12a.
 
 ### P6c Reading pane, attachments and settings — done
 
@@ -777,7 +777,8 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   reachable with Tab and distinct from selection.
 - `U` immediately after opening leaves the message unread after the auto-read delay; plain `J`/`K`
   collapse to the focused row while `Shift+J`/`Shift+K` extend the batch from its anchor.
-- Theme, reading width, last folder and reduced motion survive a restart; no draft text does.
+- Theme, reading width, last folder and reduced motion survive a restart; a draft autosaves to the
+  store and reopens from Bozze.
 - No ad-hoc literals in screens: spacing/type/radii/control sizes come from tokens.
 - `cargo xtask ci` stays green; headless tests cover the shell, gallery, palette, composer, sidebar
   drawer, pane proportions and double-click.

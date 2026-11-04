@@ -7,8 +7,11 @@
 > reply/forward headers (P8) + encrypted FTS5 search, the body-free read path and schema v7 (P9a) +
 > conversation derivation/merge/alias, the conversation view and saved searches (P9b) + local rules
 > with preview, idempotent runs, undo and forwarding through P7 (P9c) + PGP key storage and schema v8
-> (P12c1) + exact PGP/MIME raw retention and schema v9 (P12c2a).
-> **Last updated:** 2026-10-27 ·
+> (P12c1) + exact PGP/MIME raw retention and schema v9 (P12c2a) + PGP/MIME verify/decrypt/send and the
+> app surface (P12c2b/P12c2c) + the daemon, IPC and its clients (P10a1/P10a2) + tray, autostart and
+> notifications (P10b1/P10b2) + the sanitized block renderer (P11a1/P11a2) + Gmail OAuth (P12a),
+> invitations (P12d), packaging source (P12e) and fuzz/security CI (P12f) + P13a-P13i.
+> **Last updated:** 2026-11-04 ·
 > **Target:** a local-first, agent-first mail client that is fast on every desktop.
 
 ## 1. Shape today
@@ -39,8 +42,8 @@ The engine has two sources of truth, chosen at construction:
 
 The UI, CLI and MCP read both through the same `Engine::call(name, args)` door. The MCP server and
 the GUI never touch SQL directly. Mail is fetched from IMAP by `postino-sync`; SMTP submission and
-the outbox are P7 (§4.9), with the desktop send worker and the CLI as the two schedulers until the
-daemon in M4.
+the outbox are P7 (§4.9); since M4 the daemon owns the outbox scheduler, and the desktop send worker
+and the CLI remain the in-process path when no daemon is running.
 
 ## 2. The seam that matters: operations, not functions
 
@@ -71,8 +74,10 @@ Current operations: `app_info`, `accounts_list`, `account_add`, `account_update`
 `messages_list`, `message_get`, `attachment_get`, `message_invite`, `invite_reply_draft`, `message_flag`, `message_move`, `draft_save`, `draft_attachment_add`,
 `draft_attachment_remove`, `message_send`, `send_schedule`, `outbox_list`, `outbox_cancel`,
 `outbox_retry`, `outbox_mark_sent`, `send_dry_run`, `search`, `search_status`, `search_reindex`,
-`labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`. They are enough to
-prove the path through all three clients. `draft_save` updates one draft in place and `body_format: "html"` compiles its Markdown-like source into email-safe HTML plus a text alternative (raw HTML is never accepted);
+`labels_list`, `label_create`, `label_update`, `label_delete`, `label_apply`. Later phases added the
+thread, saved-search, rule, template, identity and PGP key groups, `message_export`/`message_import`,
+the mbox pair and `message_unsubscribe`; together they are enough to prove the path through all three
+clients. `draft_save` updates one draft in place and `body_format: "html"` compiles its Markdown-like source into email-safe HTML plus a text alternative (raw HTML is never accepted);
 `draft_attachment_add/remove` own the attachment bytes; `message_send` queues it with the undo
 window; `send_dry_run` returns the exact bytes without a row. Labels are local metadata: in memory in
 the demo, in the encrypted store otherwise, and never synced to a server. `search` is SQL over the
@@ -123,9 +128,9 @@ endpoint), opens the one write connection and builds the `Engine`. The lock is s
 a direct `postino --store` writer, the desktop app or a second daemon is refused with the owner's pid
 before it can race a transaction. A crash needs no repair: the kernel releases the lock, the next
 owner overwrites the stale record, and the fixed restart sentence says that every outbox row is kept
-and an expired submission lease becomes `uncertain` rather than being resent. The app holds the same
-lock in P10a1 and shows a readable "the daemon owns the store" state instead of opening a second
-writer; P10a2 replaces that with a daemon client.
+and an expired submission lease becomes `uncertain` rather than being resent. The app held the same
+lock in P10a1 and showed a readable "the daemon owns the store" state instead of opening a second
+writer; P10a2 replaced that with a daemon client.
 
 The endpoint is derived from the current user id (SID on Windows, uid on Unix) and a BLAKE3 hash of
 the absolute store path. Windows uses a named pipe whose DACL is one generic-all ACE for the current
@@ -164,7 +169,7 @@ Fallback matrix (P10a1):
 
 | Client | Daemon absent | Daemon present |
 |---|---|---|
-| App | in-process, holds the writer lock | readable "store owned by daemon" state; P10a2 connects it |
+| App | in-process, holds the writer lock | daemon client (P10a2): read-only store, mutations through `op`, view state preserved across reconnect |
 | CLI read | local store, opened read-only, no writer lock | through `op` |
 | CLI mutation | starts the daemon, then through `op`; `--in-process` locks and is refused if the daemon owns the store | through `op`; `--in-process` is refused |
 | MCP read | local cache, opened read-only | through `op` |
@@ -174,7 +179,7 @@ A 25 MiB attachment is ~35 MB of base64 and does not fit the 16 MiB IPC frame. P
 request before writing a frame and refuses an oversized attachment with a specific readable sentence;
 it also replaces an oversized response (for example a dry-run of a large draft) with a same-id
 `FRAME_TOO_LARGE` error and keeps the connection. The effective over-IPC attachment size is roughly
-12 MiB of bytes; an out-of-band blob path is future work (P10a2).
+12 MiB of bytes; an out-of-band blob path is still future work.
 
 ### Planned crates
 
@@ -189,7 +194,7 @@ it also replaces an oversized response (for example a dry-run of a large draft) 
 | `postino-rules` | Sieve generation later; P9c's local rules deliberately live in `postino-store` and `postino-core`, not in a new crate |
 | `postino-ipc` | JSON-RPC over pipe/socket, token, versioning |
 | `postino-daemon` | the one writer: store ownership, scheduler, outbox, rules-after-sync, index batches, blob GC, IPC server (P10a) |
-| `postino-platform` | keyring (P3b); tray, desktop notifications and per-user autostart (P10b1); paths, single instance later |
+| `postino-platform` | keyring (P3b); tray, desktop notifications and per-user autostart (P10b1); paths and single-instance activation (P10b2) |
 | `postino-testkit` | fake IMAP/SMTP, TLS fixture, response builders and synthetic messages (P5b; dev-dependency only) |
 
 Layers: foundation (platform, store, mime, crypto) → network (net) and sync → features (compose,
@@ -374,14 +379,15 @@ failure cannot leave the store one step ahead of memory within an operation. Act
 desktop app both use the store now; the engine writes attachment bytes only through the P4b seam, and
 it writes local drafts with `uid`, `Message-ID` and `size` empty. Received mail is different:
 `postino-sync` (P5b) fills those columns, parses the MIME body and stores attachment bytes through
-the same seam. The keyring lock protects every keyring access, not the store file itself. P10a adds
-the independent `<store>.lock` writer guard and the daemon that holds it; in P10a1 the app still owns
-the store in-process and its sync worker opens a second connection in that same process. The
+the same seam. The keyring lock protects every keyring access, not the store file itself. P10a added
+the independent `<store>.lock` writer guard and the daemon that holds it; with no daemon running the
+app still owns the store in-process and its sync worker opens a second connection in that same process. The
 repository returns folders and labels ordered by name; onboarding writes the server's folder tree in
 that order.
 
 **Still in memory / demo:** the desktop app, the composer's view state, and any engine built without
-a store. **Still missing:** the daemon scheduler (M4) and HTML rendering (M5). Server-side
+a store. **Still missing:** the block composer mode (M5), the optional sandboxed webview (P11b) and
+the server-side Drafts APPEND. Server-side
 Sieve/ManageSieve is not implemented and is out of scope for M3 (a possible later M6 item); local
 rules (§4.13) never generate a Sieve script.
 The default store path, the account/sync operations and their CLI/MCP bindings landed in P6a (§4.7);
@@ -485,8 +491,8 @@ bodies or credentials. Server text in errors is cut to printable ASCII.
 
 **Not implemented.** Sync loops, store writes, engine operations, `COPY`/`MOVE`/`EXPUNGE`,
 QRESYNC/CONDSTORE beyond reading `HIGHESTMODSEQ` when the server volunteers it, SORT/THREAD,
-METADATA, ACL, SIEVE, NOTIFY, ESEARCH, `BODYSTRUCTURE` and per-part fetches, OAuth/SASL XOAUTH2 and
-any mechanism other than PLAIN, SMTP, autodiscovery and MIME parsing. The fake server and its TLS
+METADATA, ACL, SIEVE, NOTIFY, ESEARCH, `BODYSTRUCTURE` and per-part fetches, SASL mechanisms other
+than PLAIN, LOGIN and XOAUTH2, autodiscovery and MIME parsing. The fake server and its TLS
 fixture live in `postino-testkit` (P5b), a dev-dependency shared with `postino-sync`; the reconciler
 that consumes this client is `postino-sync`, not part of this crate.
 
@@ -598,11 +604,11 @@ draft re-save replaces the attachment rows from metadata that carries no hash an
 size; the repository keeps the stored hash **and** the stored size for an id that survives, and the
 engine re-reads the rows after the write so memory cannot disagree with the bytes on disk. The demo
 engine and a store-less engine answer with a readable `OpError::Failed`. Consumers: sync (P5b) now
-calls the write for every ingested attachment; the reading pane (P6) will call the read to preview or
-save.
+calls the write for every ingested attachment; the reading pane (P6c) calls the read to preview
+(P13b) or save.
 
-**Cleanup.** There is no garbage collection yet: deleting a message leaves its blob file, because
-another message may reference the same content; P9 or the daemon will sweep unreferenced hashes.
+**Cleanup.** Deleting a message leaves its blob file, because another message may reference the same
+content; the daemon's bounded, resumable GC batches sweep unreferenced hashes (P10a1).
 `BlobStore::remove` exists for an explicit delete and for tests, not as a repair step.
 
 ### 4.6 Implemented in P5b, hardened in P5c: syncing an account into the store
@@ -804,7 +810,7 @@ are unchanged from P5b.
 | Provider | Host | Port | TLS | Note |
 |---|---|---|---|---|
 | `aruba` | `imaps.aruba.it` | 993 | implicit | app password when 2FA is on; IMAP must be enabled |
-| `gmail` | `imap.gmail.com` | 993 | implicit | 2-Step Verification + app password; OAuth is P12 |
+| `gmail` | `imap.gmail.com` | 993 | implicit | 2-Step Verification + app password, or OAuth (P12a) |
 | `custom` | caller | caller | caller | host, port and TLS are required; there is no plaintext mode |
 
 Known providers refuse a `host`/`port`/`tls` override instead of silently ignoring it. The operation
@@ -827,7 +833,8 @@ window is therefore an orphan credential (reported; re-adding the same address r
 cached mail whose password is already gone. `confirm: true` is mandatory; labels stay; a failure of the
 cache delete aborts before the keyring so the account remains fully usable. Attachment bytes are
 content-addressed and may be shared with a message of another account, so removing the account deletes
-their rows but not the blob files themselves; the unreferenced-file sweep is still P9/daemon work.
+their rows but not the blob files themselves; the unreferenced-file sweep belongs to the daemon's GC
+batches (P10a1).
 
 **`sync_now`.** Load the server row and the credential, build an `ImapConfig`, call
 `postino_sync::sync_account` with the engine's store connection and the default limits, then reload
@@ -889,9 +896,10 @@ drives `postino_sync::sync_account` directly, polls the persisted status for pro
 its engine from disk before reporting. Duplicate requests coalesce and a second UI request says
 “Sincronizzazione già in corso”. The UI thread polls events, never calls egui from the worker and
 reloads the account without losing selection, filters or the open message. Events from an account the
-user switched away from are ignored for the UI while the store is still refreshed. Two connections
-live in one process in P10a1 (the app is not yet a daemon client); SQLite WAL and the busy timeout
-serialise them, and the app holds the store's writer lock so a daemon cannot start beside it.
+user switched away from are ignored for the UI while the store is still refreshed. With no daemon
+the app runs two connections in one process, SQLite WAL and the busy timeout serialise them, and the
+app holds the store's writer lock so a daemon cannot start beside it; with a daemon running the app is
+a client (P10a2) and opens no writer.
 
 **Mailbox.** Folders, messages and counts come from the store; the account switcher carries the
 active identity and offers add/manage; Refresh runs the worker; the status bar shows syncing with
@@ -901,7 +909,7 @@ consequences, and returns to onboarding when the last account goes.
 
 **Deferred to P6c.** Link opening with a scheme allowlist, attachment Save through the blob seam,
 the full settings/licences surface and the remaining reading-pane affordances. SMTP, HTML rendering
-and OAuth remain later packages.
+and OAuth landed later in P7, P11a and P12a. The daemon, tray and notifications arrived in M4.
 
 ### 4.9 Implemented in P7: SMTP submission and the outbox
 
@@ -1119,7 +1127,7 @@ claims bytes it does not have. Before either attachment write the engine compare
 revision with its metadata-only snapshot map (loaded at open and kept through cache eviction); a draft
 saved, sent or moved by another process is refused with “changed in another session; refresh the
 mailbox” instead of overwriting the newer body or resurrecting a Sent row. `draft_attachment_remove` deletes the row and
-leaves the blob for the future GC. The desktop picker/drop reads a path locally with the same 25 MiB bound and calls the
+leaves the blob for the daemon's GC. The desktop picker/drop reads a path locally with the same 25 MiB bound and calls the
 engine method; CLI `draft attach` reads the path and calls the operation with base64; MCP receives
 base64 and never a path. The metadata-only `draft_save` path runs the same sanitizer and duplicate
 renaming on its attachment names, so a caller cannot create reserved, tabbed or duplicate chips
@@ -1127,7 +1135,7 @@ before the bytes arrive.
 
 **Blob lifecycle.** The blob store is content-addressed and encrypted; two drafts that forward or
 attach the same content share one file. Removing an attachment or deleting a draft frees the row, not
-necessarily the disk file; the unreferenced sweep is still P9/daemon work. Send reads every
+necessarily the disk file; the daemon's GC sweeps unreferenced blobs. Send reads every
 attachment through `attachment_bytes`, capped at the recorded size plus 1 MiB, and refuses a missing
 or corrupt blob with the filename before writing an outbox row. A 25 MiB attachment plus ten
 recipients is covered by the P7 submission test; the P8 add path accepts exactly 25 MiB and refuses
@@ -1547,7 +1555,7 @@ conflict. Imports are capped at 64 keys per account in one immediate transaction
 `pgp_keys_list` (read-only, metadata), `pgp_key_import` (sensitive), `pgp_key_delete` (destructive)
 and `pgp_key_export_public` (read-only); MCP excludes the import. The library decision and its
 licence review are in `docs/decisions/0007-pgp-key-storage.md`. P12c1 does not verify, decrypt, sign,
-encrypt, fetch keys or downgrade to plaintext; P12c2 owns MIME and UI.
+encrypt, fetch keys or downgrade to plaintext; P12c2 added the MIME and UI layers.
 
 ### 4.15 Implemented in P12c2a: exact bytes for received PGP/MIME
 
@@ -1640,7 +1648,7 @@ a time. P6a wires it to the engine: `sync_now` is the only operation that calls 
 and the desktop worker reach it through the same registry. P10a's daemon runs it on start, on a
 jittered interval and on a manual request; the app's in-process worker remains for P10a1.
 
-The target loop, most of which does not exist yet:
+The target loop, still incomplete:
 
 - Discover settings with RFC 6186 SRV records, autoconfig, then a manual fallback.
 - One connection per account for IDLE; separate short-lived connections for bulk fetch.
@@ -1649,7 +1657,7 @@ The target loop, most of which does not exist yet:
 - Fetch envelopes and flags first; bodies on demand, with a bounded prefetch of recent mail. P5b
   downloads each body during the reconciliation pass; on-demand reads are P6.
 - Send is optimistic and journaled in `outbox` with an idempotency key (P7); flags, moves and draft
-  saves are still local-only. The daemon will replay the remaining intents on reconnect (M4).
+  saves are still local-only. Replaying them on reconnect is not implemented.
 - Sent mail is `APPEND`ed to the server's Sent folder with `\Seen` (P7) and retried independently of
   submission. A local Sent row and the server copy with the same `Message-ID` are one row, including
   the provider auto-save and Sent/Archive move orders; when the server copy was cached first, the local
@@ -1659,8 +1667,9 @@ The target loop, most of which does not exist yet:
   two devices can briefly create two copies. This is a protocol limit, documented rather than
   hidden. Not implemented.
 - Two devices converge through the server: IDLE pushes within seconds when the network and provider
-  cooperate; otherwise polling (default 60 s) is the floor. P5b is a one-shot run; P10a's daemon adds
-  the interval scheduler and IDLE remains optional and unimplemented.
+  cooperate; otherwise polling (default 60 s) is the floor. P5b is a one-shot run; the daemon added
+  the interval scheduler (P10a) and the sync loop still polls — the client's single-cycle `IDLE` is
+  not wired into a push loop yet.
 
 ADR-0003 records the decision and the rejected alternatives (POP3, a custom sync service, Gmail API
 as the primary protocol).
@@ -1676,15 +1685,18 @@ pub trait BodyRenderer {
 }
 ```
 
-- **M0-M4:** a `TextBodyRenderer` and a small, sanitized HTML subset (paragraphs, emphasis, links,
-  lists, simple tables, images blocked). Complex mail has an "open in browser" action.
-- **M5:** an optional `WebviewBodyRenderer` behind a feature flag. It uses the OS webview
+- **M0-M4:** a `TextBodyRenderer`; the reading pane showed the stored plain-text alternative.
+- **Shipped (P11a1/P11a2):** a bounded, sanitized block model rendered in egui — paragraphs,
+  headings, emphasis/strong/code, lists, quotes, simple tables, links and `cid:` alt text as text —
+  with the text fallback kept for damaged, empty or oversized bodies. Remote images stay blocked and
+  are counted.
+- **P11b (open):** an optional `WebviewBodyRenderer` behind a feature flag. It uses the OS webview
   (WebView2 / WKWebView / WebKitGTK) in a dedicated, sandboxed surface: no JavaScript, no
   application IPC, a strict CSP, remote content blocked, and a custom protocol for local
   attachments. The rest of the app stays egui.
-- The composer has two modes: **base** (block editor: paragraph, heading, list, quote, divider,
-  image, button, signature) and **advanced** (HTML source with a constrained Tailwind subset,
-  linting and live preview). Both compile to table-based, inline-styled, email-safe HTML with a
+- **Planned (M5):** the composer gains two modes, **base** (block editor: paragraph, heading, list,
+  quote, divider, image, button, signature) and **advanced** (HTML source with a constrained Tailwind
+  subset, linting and live preview). Both compile to table-based, inline-styled, email-safe HTML with a
   plain-text alternative.
 
 This is the one deliberate exception to "no webview", and it is isolated behind a trait. See

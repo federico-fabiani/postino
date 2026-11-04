@@ -96,10 +96,10 @@ without the other leaves the attachment rows pointing at `BlobMissing`. A damage
 `CorruptBlob`; the engine reports it as `OpError::Failed` and leaves the message intact. `put`
 authenticates an existing file before it deduplicates, so storing the same bytes again repairs a
 damaged or foreign file; there is no separate repair command. A draft re-save keeps the stored hash
-and size of an attachment that survives, so a stale metadata size cannot shrink the read cap. There
-is no garbage collector yet: deleting a message leaves its blob, because the same content may belong
-to another message. `postino-sync` writes received attachment bytes through the seam; the reading
-pane's Save action arrives with P6c.
+and size of an attachment that survives, so a stale metadata size cannot shrink the read cap. The
+daemon sweeps unreferenced blobs in bounded GC batches (P10a1): deleting a message leaves its blob
+until then, because the same content may belong to another message. `postino-sync` writes received
+attachment bytes through the seam; the reading pane's Save action arrived with P6c.
 
 What is still demo or missing:
 
@@ -113,15 +113,16 @@ What is still demo or missing:
   claim and their guarded transitions make two passes (app + CLI) safe row by row. Every lease and
   append claim is stamped when it is taken, so a row leased after an earlier row spent time in SMTP, or
   an APPEND that follows a long submission, still owns a full window. This paragraph describes the
-  pre-P10a P7 state; P10a adds the daemon, the local pipe and the cross-process writer lock.
+  pre-P10a P7 state; P10a added the daemon, the local pipe and the cross-process writer lock.
 - IMAP, MIME, attachment blobs, sync, real accounts, SMTP submission, the outbox, compose depth,
   encrypted search, conversations, saved searches and local rules (attachment bytes, per-account
-  signatures, reply/forward headers, P5-P9c) exist. Still missing: the daemon and a scheduled send
-  that runs with the app closed (M4), server-side HTML rendering (M5/M6), server-side signatures and
-  Gmail OAuth (P12). Server-side Sieve/ManageSieve is not implemented and is out of scope for M3
+  signatures, reply/forward headers, P5-P9c) exist. Still missing: server-side signatures, the
+  server-side Drafts APPEND, the block composer mode (M5) and the optional sandboxed webview (P11b).
+  Server-side Sieve/ManageSieve is not implemented and is out of scope for M3
   (it remains a possible later M6 item); Postino's rules are local and never generate a Sieve script.
   `message_send` queues real mail; the desktop send worker (which polls the store every two seconds)
-  and `postino send` process the outbox, so a future `--at` row waits until one of them runs.
+  and `postino send` process the outbox, and since M4 the daemon scheduler submits a due `--at` row
+  with the app closed; with no daemon a future `--at` row waits until an app or CLI pass runs.
   A plain `postino send` (no `--at`) waits the 5-second undo window and submits in the same command.
   MCP only queues.
 - Sync writes `uid`, `Message-ID` and the RFC 822 size; a local draft keeps them empty until the
@@ -270,7 +271,8 @@ they have a reason to exist.
   Retry, Cc layout, the stored remote-image line with no URL painted, and compose/reply identity. No UI test
   opens a browser, a native dialog or a shell.
 - **Test infrastructure:** the fake IMAP/SMTP servers and TLS fixture live in `postino-testkit` and
-  run in CI. Property tests for the network parsers and fuzzing for MIME remain future work.
+  run in CI. Property tests for the network parsers remain future work; MIME, HTML, PGP/MIME
+  structure and calendar have standalone fuzz targets (P12f).
 - **IPC (P10a):** the real pipe/socket, token accept/refuse, stale-token rotation, version mismatch,
   16 MiB requests and responses (including a readable oversized-response error that keeps the
   connection), a greedily drained oversized line, a ping heartbeat, an idle close only when no work is
@@ -518,9 +520,10 @@ cancellation, progress, a second request, and reload preservation.
 `postino-daemon` is the only process that writes the store while it runs. It acquires the OS lock on
 `<store>.lock` and records `<store>.owner`; the lock file is just the lock because Windows byte-range
 locks are mandatory (a locked file cannot be read to report its owner). A direct `postino --store`
-writer takes the same lock; the app takes it in `boot.rs` and keeps it for its lifetime. When the
-daemon owns the store, the app shows `BootStage::Daemon` ("the store is owned by the daemon") instead
-of opening a second writer; P10a2 replaces that screen with a daemon client. Do not delete
+writer takes the same lock; with no daemon the app takes it in `boot.rs` and keeps it for its
+lifetime. When the daemon owns the store, the app opens no second writer: P10a2 replaced the old
+`BootStage::Daemon` screen with a daemon client that reads the store read-only and sends mutations
+through `op`. Do not delete
 `.lock`/`.owner`/`.token` while a process is running; a stale set is harmless and overwritten at the
 next launch.
 

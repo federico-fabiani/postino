@@ -137,8 +137,8 @@ remainder is deferred. MCP gates `rules_run`, forward payloads, enabling a store
 `sync_now` rule pass behind `--allow-send`; the Rules page has list/editor/preview/run/undo at 980×600
 in both themes and blocks every shell shortcut behind it. Rule runs were measured at 20k and 100k
 (empty `new` 67/327 ms, one `all` page 184/455 ms; a 2 000-action page 7.3/10.0 s). M3 is complete.
-P10a starts the M4 daemon: one writer, same-user IPC with a per-launch token, scheduler, GC and
-app/CLI/MCP clients; P10b adds tray, autostart and notifications.
+P10a started the M4 daemon: one writer, same-user IPC with a per-launch token, scheduler, GC and
+app/CLI/MCP clients; P10b added tray, autostart and notifications.
 **P10a1** is merged at `688863b`: the `postino-ipc` transport (named pipe/UDS, token file, version
 handshake, 16 MiB frames, bounded queues, cancel and ping), `postino-daemon` with the store lock,
 scheduler, outbox crash recovery, rules-after-sync, index batches and blob GC, plus the CLI/`postino

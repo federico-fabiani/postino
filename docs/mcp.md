@@ -162,9 +162,9 @@ from the CLI or the desktop instead.
 
 **MCP only queues.** The server has no timer and never runs the outbox pass. A `message_send` or
 `send_schedule` call writes the journal row and returns; the message leaves the machine when the
-desktop app (which polls the store every two seconds) or `postino send` processes it. `outbox_list`
-therefore shows `queued` until one of those runs, and `outbox list` from the CLI is read-only — it does
-not drain either.
+daemon scheduler (M4) reaches the due instant, when `postino send` runs, or when the desktop app's
+two-second poll drains it with no daemon running. `outbox_list` therefore shows `queued` until one of
+those runs, and `outbox list` from the CLI is read-only — it does not drain either.
 
 `message_send` is **not** marked destructive: sending is the product's purpose, and the annotation
 would mislead an agent that treats destructive as "deletes data". The guardrail is the server flag,
@@ -186,7 +186,7 @@ engine accepts a declared type only when it matches the extension table, so a va
 result is the updated draft; read the attachment list from `draft_save`/`message_get` afterwards.
 
 `draft_attachment_remove` takes the draft and an attachment id (or exact filename) and returns the
-updated draft. It deletes the row, not the deduplicated blob; there is no GC yet.
+updated draft. It deletes the row, not the deduplicated blob; the blob waits for the daemon's GC.
 
 `account_signature_set` sets one account's plain-text signature. HTML, images and tracking are not
 supported. The change applies to new messages; an existing draft keeps the text it saved.
@@ -363,8 +363,8 @@ refused or deferred.
 draft with a stable id. **It is a patch on update:** every content field (`to`, `cc`, `bcc`,
 `subject`, `body_text`, `attachments`, `in_reply_to`) is optional; omitting a field keeps its current
 value and sending it — even as an empty list or empty string — replaces it, with one exception:
-`in_reply_to` cannot be cleared in P8. Omitting it keeps the stored parent; an empty string is
-rejected because there is no explicit clear field yet (P9 adds the full thread model). On create,
+`in_reply_to` cannot be cleared: omitting it keeps the stored parent, and an empty string is rejected
+because there is no explicit clear field. On create,
 omitted fields are empty, and `account` chooses the account; it is required when more than one account
 exists. `attachments` is metadata only: the bytes come from `draft_attachment_add`, and a row without
 a stored blob is refused at send time with the filename. `in_reply_to` is a parent `Message-ID`,

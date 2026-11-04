@@ -1,6 +1,6 @@
 # Postino design
 
-> **Status:** M0 · **Last updated:** 2026-10-23
+> **Status:** M4 complete, M5/M6 in progress · **Last updated:** 2026-11-04
 
 ## 1. Idea
 
