@@ -10,6 +10,7 @@ use postino_core::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::copy;
 use crate::theme;
 use crate::ui::icons;
 use crate::ui::tokens::{self, inset, radius, space};
@@ -29,12 +30,12 @@ enum ActionKind {
 impl ActionKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Move => "Sposta",
-            Self::Label => "Etichetta",
-            Self::Read => "Segna letto",
-            Self::Unread => "Segna non letto",
-            Self::Trash => "Cestina",
-            Self::Forward => "Inoltra",
+            Self::Move => copy::RULE_MOVE,
+            Self::Label => copy::LABEL,
+            Self::Read => copy::READ,
+            Self::Unread => copy::UNREAD,
+            Self::Trash => copy::RULE_TRASH,
+            Self::Forward => copy::FORWARD,
         }
     }
 }
@@ -528,7 +529,7 @@ impl RulesPage {
                         if button.clicked() {
                             close = true;
                         }
-                        if Button::new("Nuova regola").icon(icons::PLUS).show(ui).clicked() {
+                        if Button::new(copy::NEW_RULE).icon(icons::PLUS).show(ui).clicked() {
                             action = Some(PageAction::New);
                         }
                     });
@@ -832,7 +833,7 @@ impl RulesPage {
                 }
             };
             let duplicate = has(ActionKind::Move);
-            if Button::ghost("+ Sposta")
+            if Button::ghost(format!("+ {}", copy::RULE_MOVE).as_str())
                 .size(ButtonSize::Sm)
                 .enabled(!duplicate && !folders.is_empty())
                 .disabled_reason(if folders.is_empty() { "Nessuna cartella disponibile." } else { "Azione già presente." })
@@ -842,7 +843,7 @@ impl RulesPage {
                 add(ActionKind::Move);
             }
             let duplicate = has(ActionKind::Label);
-            if Button::ghost("+ Etichetta")
+            if Button::ghost(format!("+ {}", copy::LABEL).as_str())
                 .size(ButtonSize::Sm)
                 .enabled(!duplicate && !labels.is_empty())
                 .disabled_reason(if labels.is_empty() { "Nessuna etichetta disponibile." } else { "Azione già presente." })
@@ -851,16 +852,20 @@ impl RulesPage {
             {
                 add(ActionKind::Label);
             }
-            for (kind, label) in [(ActionKind::Read, "+ Letto"), (ActionKind::Unread, "+ Non letto"), (ActionKind::Trash, "+ Cestina")] {
+            for (kind, label) in
+                [(ActionKind::Read, copy::RULE_READ_SHORT), (ActionKind::Unread, copy::RULE_UNREAD_SHORT), (ActionKind::Trash, copy::RULE_TRASH)]
+            {
+                let label = format!("+ {label}");
                 let duplicate = has(kind)
                     || (matches!(kind, ActionKind::Read) && has(ActionKind::Unread))
                     || (matches!(kind, ActionKind::Unread) && has(ActionKind::Read));
-                if Button::ghost(label).size(ButtonSize::Sm).enabled(!duplicate).disabled_reason("Azione già presente.").show(ui).clicked() {
+                if Button::ghost(label.as_str()).size(ButtonSize::Sm).enabled(!duplicate).disabled_reason("Azione già presente.").show(ui).clicked()
+                {
                     add(kind);
                 }
             }
             let duplicate = has(ActionKind::Forward);
-            if Button::ghost("+ Inoltra")
+            if Button::ghost(format!("+ {}", copy::FORWARD).as_str())
                 .size(ButtonSize::Sm)
                 .enabled(!duplicate && forward_allowed)
                 .disabled_reason(if duplicate { "Azione già presente." } else { forward_reason })
@@ -971,12 +976,12 @@ fn new_action(kind: ActionKind, folders: &[(String, String)], labels: &[(String,
 
 fn action_label(action: &RuleAction) -> String {
     match action {
-        RuleAction::Move { .. } => "Sposta".to_owned(),
-        RuleAction::Label { .. } => "Etichetta".to_owned(),
-        RuleAction::Read => "Letto".to_owned(),
-        RuleAction::Unread => "Non letto".to_owned(),
-        RuleAction::Trash => "Cestina".to_owned(),
-        RuleAction::Forward { to } => format!("Inoltra a {}", to.len()),
+        RuleAction::Move { .. } => copy::RULE_MOVE.to_owned(),
+        RuleAction::Label { .. } => copy::LABEL.to_owned(),
+        RuleAction::Read => copy::RULE_READ_SHORT.to_owned(),
+        RuleAction::Unread => copy::RULE_UNREAD_SHORT.to_owned(),
+        RuleAction::Trash => copy::RULE_TRASH.to_owned(),
+        RuleAction::Forward { to } => format!("{} a {}", copy::FORWARD, to.len()),
     }
 }
 
@@ -1002,5 +1007,18 @@ mod tests {
         let editor = Editor::blank();
         assert!(editor.actions.is_empty(), "a new rule must not apply a folder or label the user did not choose");
         assert!(editor.name.is_empty() && editor.query.is_empty());
+    }
+
+    #[test]
+    fn every_rule_action_keeps_the_command_table_label() {
+        // The rule editor and the palette must name the same action with the same words. Trash is
+        // the one deliberate exception (`Cestina` against the command's `Elimina`); both constants
+        // live in `copy`, so they still change in one file.
+        for (kind, id) in
+            [(ActionKind::Read, "read"), (ActionKind::Unread, "unread"), (ActionKind::Forward, "forward"), (ActionKind::Label, "label_menu")]
+        {
+            let command = crate::commands::command(id).expect("the command is registered");
+            assert_eq!(kind.label(), command.label, "the rule action {id} drifted from the command table");
+        }
     }
 }

@@ -4,6 +4,7 @@
 //! sheet read it, and `app::execute_command` matches `CommandId` exhaustively, so a command cannot
 //! be listed without a handler.
 
+use crate::copy;
 use crate::ui::icons;
 use crate::ui::widgets::MenuItem;
 
@@ -198,7 +199,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         rule: CommandRule::Message,
         in_palette: true,
     },
-    Command { id: CommandId::Forward, label: "Inoltra", icon: icons::FORWARD, shortcut: "F", rule: CommandRule::Message, in_palette: true },
+    Command { id: CommandId::Forward, label: copy::FORWARD, icon: icons::FORWARD, shortcut: "F", rule: CommandRule::Message, in_palette: true },
     Command {
         id: CommandId::InviteAccept,
         label: "Accetta",
@@ -250,20 +251,13 @@ pub(crate) const COMMANDS: &[Command] = &[
         rule: CommandRule::Message,
         in_palette: true,
     },
-    Command { id: CommandId::Read, label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", rule: CommandRule::Message, in_palette: true },
-    Command {
-        id: CommandId::Unread,
-        label: "Segna come non letto",
-        icon: icons::MARK_UNREAD,
-        shortcut: "U",
-        rule: CommandRule::Message,
-        in_palette: true,
-    },
+    Command { id: CommandId::Read, label: copy::READ, icon: icons::MARK_READ, shortcut: "", rule: CommandRule::Message, in_palette: true },
+    Command { id: CommandId::Unread, label: copy::UNREAD, icon: icons::MARK_UNREAD, shortcut: "U", rule: CommandRule::Message, in_palette: true },
     Command { id: CommandId::Star, label: "Aggiungi stella", icon: icons::STAR, shortcut: "S", rule: CommandRule::Message, in_palette: true },
     Command { id: CommandId::Unstar, label: "Togli stella", icon: icons::STAR, shortcut: "S", rule: CommandRule::Message, in_palette: true },
     Command { id: CommandId::Archive, label: "Archivia", icon: icons::ARCHIVE, shortcut: "E", rule: CommandRule::Message, in_palette: true },
-    Command { id: CommandId::Delete, label: "Elimina", icon: icons::TRASH, shortcut: "Canc", rule: CommandRule::Message, in_palette: true },
-    Command { id: CommandId::LabelMenu, label: "Etichetta", icon: icons::TAG, shortcut: "L", rule: CommandRule::Message, in_palette: true },
+    Command { id: CommandId::Delete, label: copy::DELETE, icon: icons::TRASH, shortcut: "Canc", rule: CommandRule::Message, in_palette: true },
+    Command { id: CommandId::LabelMenu, label: copy::LABEL, icon: icons::TAG, shortcut: "L", rule: CommandRule::Message, in_palette: true },
     Command { id: CommandId::LabelNew, label: "Nuova etichetta", icon: icons::PLUS, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
         id: CommandId::LabelRename,
@@ -359,7 +353,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         in_palette: false,
     },
     Command { id: CommandId::Rules, label: "Regole locali", icon: icons::FILTER, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: CommandId::RulesNew, label: "Nuova regola", icon: icons::PLUS, shortcut: "", rule: CommandRule::Always, in_palette: true },
+    Command { id: CommandId::RulesNew, label: copy::NEW_RULE, icon: icons::PLUS, shortcut: "", rule: CommandRule::Always, in_palette: true },
     Command {
         id: CommandId::SavedSearchClearRecent,
         label: "Cancella ricerche recenti",

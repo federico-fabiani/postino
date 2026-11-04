@@ -10,6 +10,7 @@ mod body;
 mod body_ui;
 mod boot;
 mod commands;
+mod copy;
 mod daemon;
 mod onboarding;
 mod reading;
