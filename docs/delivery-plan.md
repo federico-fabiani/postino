@@ -102,6 +102,15 @@ Status: `todo` · `active` · `review` · `done`.
 | P12d | M6 ship | iCalendar invites, RSVP drafts | done |
 | P12e | M6 ship | Windows per-user MSI/portable ZIP, signing, manifest | done |
 | P12f | M6 ship | standalone fuzz targets and security CI | done |
+| P13a | M6 ship | MCP read-only resources, `--compact` listings, rolling send guardrail, JSONL audit log | done |
+| P13b | M5 render | bounded 64 KiB text / 2048 px image preview through `attachment_get` | done |
+| P13c | M5 compose | local compose templates in encrypted `meta` (≤ 20), composer insert, Settings management | done |
+| P13d | M5 compose | bounded `List-Unsubscribe` capture; explicit mailto draft or web confirmation, no background request | done |
+| P13e | M6 ship | `X-GM-LABELS` mapped onto local labels; applied ids stay account-scoped | done |
+| P13f | M6 ship | `message_export`/`message_import`, CLI/app/MCP parity, local **Import** folder | done |
+| P13g | M6 ship | `folder_export_mbox`/`folder_import_mbox` with a validated split and reported skips | done |
+| P13h | M5 compose | `body_format` compiles Markdown-like source to inline-CSS HTML plus a text alternative | done |
+| P13i | M5 compose | up to 10 alternative From identities, identity operations, composer **Da** picker | done |
 
 P0-P2 close U0. P3-P6d make M1 real; P7-P8 close M2. Each package may split when the brief is too
 large; splits are recorded here. The P6c blind review found one filename-warning blocker and several

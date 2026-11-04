@@ -81,9 +81,12 @@ directory. **Windows Credential Manager is the only native keyring backend in th
 and Linux the platform seam returns `PlatformError::Unsupported` until native keychains land with
 packaging.
 
-What is persisted today: accounts, folders with their cached counts, messages with recipients,
-bodies, flags and labels, attachment metadata, labels, message/label links and draft revisions.
-Writes are write-through: the repository commits first, the engine updates memory second, and a
+What is persisted today: accounts and their servers, folders with their cached counts, messages with
+recipients, bodies, flags, labels and threading headers, attachment metadata, labels, message/label
+links and draft revisions; the outbox journal, rules with their actions and runs, threads and their
+aliases, saved searches, sync state, PGP keys, the text FTS and rank tables, and an encrypted `meta`
+key/value table for templates, identities, saved queries, unsubscribe targets and Gmail label
+state. Writes are write-through: the repository commits first, the engine updates memory second, and a
 failed write returns `OpError::Failed` without changing memory. Moving, flagging, labelling,
 renaming labels and saving/sending drafts all survive a restart.
 
