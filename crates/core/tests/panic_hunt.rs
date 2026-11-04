@@ -48,11 +48,10 @@ fn hostile_cases(def: &OpDef, big: &str) -> Vec<HostileCase> {
         HostileCase { label: "empty object", args: json!({}), must_refuse: required > 0 },
         // Every request struct uses #[serde(deny_unknown_fields)].
         HostileCase { label: "unknown field", args: json!({ "unknown_field": 1 }), must_refuse: true },
-        // The body is an object by contract. serde's derived `Deserialize` for a struct also accepts
-        // the positional sequence form, so an empty array is only refused when a field is required
-        // (`[]` then means "missing field"); for an all-optional request it is exactly `{}`, which
-        // the schema itself allows. Anything with a required field must reject it.
-        HostileCase { label: "array instead of object", args: json!([]), must_refuse: required > 0 },
+        // The body is an object by contract. `parse` refuses anything else before serde can read the
+        // derived positional form, so the sequence is rejected for every operation, including the
+        // ones whose fields are all optional.
+        HostileCase { label: "array instead of object", args: json!([]), must_refuse: true },
     ];
 
     let Some(properties) = def.input_schema.get("properties").and_then(Value::as_object) else {

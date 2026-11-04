@@ -2345,6 +2345,12 @@ fn draft_attachments(attachments: Vec<DraftAttachment>) -> Vec<Attachment> {
 }
 
 fn parse<T: DeserializeOwned>(args: Value) -> Result<T, OpError> {
+    // serde also accepts a sequence as a struct, so an empty array would deserialize into any
+    // request whose fields are all optional and reach the operation as a silent `{}`. The MCP and
+    // CLI front doors already reject a non-object; the registry refuses it on its own too.
+    if !args.is_object() {
+        return Err(OpError::InvalidArgs("arguments must be a JSON object".to_owned()));
+    }
     serde_json::from_value(args).map_err(|error| OpError::InvalidArgs(error.to_string()))
 }
 
