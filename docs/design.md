@@ -92,23 +92,26 @@ Three panes, keyboard-first:
 
 ## 5. Logo
 
-The mark is a forest tile with an ivory envelope and a gold chevron. It is drawn from primitives in
-the app (`logo()` in `apps/postino-app/src/app.rs`) and shipped as SVG in `assets/brand/`.
+The mark is a forest tile with a tilted ivory envelope and a gold cockade on the flap. It is drawn from
+primitives in the app (`logo()` in `apps/postino-app/src/app.rs`) and shipped as SVG in
+`assets/brand/`.
 
-- **Full colour:** forest tile, ivory envelope, gold chevron. Use on ivory, white or photography
-  with enough contrast.
-- **Inverse:** ivory tile, forest envelope, gold chevron. Use on forest or dark surfaces.
+- **Full colour:** forest tile, ivory envelope, gold cockade. Use on ivory, white or photography with
+  enough contrast.
+- **Inverse:** ivory tile, forest envelope, gold cockade. Use on forest or dark surfaces.
 - **Monochrome:** forest or ivory only; no gold.
-- **Small:** at 16 px the envelope keeps two ivory sides, the bottom and the flap; the gold chevron
-  may disappear. The silhouette must still read as mail.
+- **Small:** at 16 px the cockade collapses to a gold point; the tilted silhouette must still read as
+  mail. The cockade is a seal, not a star: the star is the app's favourite control, never the brand.
 
-Construction: 48 × 48, corner radius 10, stroke 2.4, envelope inset 24% horizontally, flap apex at
-52% of the envelope height, chevron 12% of the tile width per side. Clear space: at least 25% of the
-mark on every side.
+Construction: 48 × 48, tile corner radius 10, envelope 26 × 20 at (11, 14) with a 2.5 corner
+radius, rotated 7° clockwise around the centre, flap stroke 2.2, gold cockade at the flap apex:
+eight semicircular petals of radius 1.33 on a 3.21 radius, forest centre radius 1.63. Clear space:
+at least 25% of the mark on every side.
 
 The wordmark is lowercase **postino**. The dot of the `i` is the brand's small gold signature; it
-may be the only gold element in a monochrome context. Do not set the wordmark in a different colour
-than forest/ivory except for that dot.
+may be the only gold element in a monochrome context. The app paints it in `wordmark()`, keeping the
+text a single shape. Do not set the wordmark in a different colour than forest/ivory except for that
+dot.
 
 ## 6. Components
 

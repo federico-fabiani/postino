@@ -957,7 +957,7 @@ impl PostinoApp {
                 logo(ui, 48.0);
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Postino").font(FontId::new(22.0, theme::display())).color(t.text));
+                    wordmark(ui, "Postino", 22.0, t.text);
                     ui.label(RichText::new(format!("Versione {}", env!("CARGO_PKG_VERSION"))).size(11.0).color(t.text_muted));
                 });
             });

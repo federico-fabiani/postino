@@ -47,7 +47,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "6174107f54f82dfc533298e947028f95629d97b771d72b032b9317337f1fd522"
+sha256 = "c788f6496140fd925101137e77a3c271bb3ea8952bd7ff3e536de0a30e2197c7"
 usage = "Application and documentation mark on light surfaces"
 
 [[asset]]
@@ -57,7 +57,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "4eb485fbea7b2e9cb4d4d8d595753ef6adb5fc91610732e3c75cd577b345c13f"
+sha256 = "78e03ee04e65b50cee4d66a6235d6ddeb96ca3ee500b434a1660655aea6b7506"
 usage = "Application and documentation mark on dark surfaces"
 
 [[asset]]
@@ -67,7 +67,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "1bd497292b5ccfe7ef12f235fcee0d53b5d24f1685a0423183e4e38cf7020879"
+sha256 = "7b9501d9390704d104f9cc189ff888ba936dfc13d55aec8801b00086bad586c0"
 usage = "One-colour contexts and small sizes"
 
 [[asset]]
@@ -307,7 +307,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "f0657daa2d48f63178a1d8d4c54bff009e093631a4fa4c4f2e3eb51e0514579b"
+sha256 = "632cc75fd8d58447c8a35e8fd7cd2217bfedbff2daeadc75356edd3ba4c18199"
 usage = "Desktop window and taskbar icon"
 
 [[asset]]
@@ -317,7 +317,7 @@ author = "Postino contributors"
 source = "original work"
 license = "MIT OR Apache-2.0"
 license_file = "LICENSE-MIT"
-sha256 = "72e5aa6216ccb0c87dfb94f76538a0aa89b297402a30cfe864c815a9e2d576ee"
+sha256 = "d987a49b74253db62f1d27facc71251ce07f033abab037afdf71bf17bfa680ac"
 usage = "Daemon tray icon and Windows executable icon"
 
 [[asset]]

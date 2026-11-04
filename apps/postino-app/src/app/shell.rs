@@ -82,7 +82,7 @@ impl PostinoApp {
                     ui.add_space(space::SM);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new("postino").font(FontId::new(15.0, theme::display())).color(t.text));
+                        wordmark(ui, "postino", 15.0, t.text);
                         ui.label(typography::text(Role::Caption, "posta locale", t.text_faint));
                     });
                 });

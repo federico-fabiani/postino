@@ -7061,26 +7061,71 @@ fn avatar(ui: &mut Ui, size: f32, initials: &str, bg: Color32, fg: Color32) {
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, initials, FontId::new(size * 0.36, theme::medium()), fg);
 }
 
+/// The product mark: a forest tile, a tilted ivory envelope and a gold cockade. The envelope is
+/// drawn as a rotated rounded rectangle so the app and the SVG share one geometry.
 fn logo(ui: &mut Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(6), theme::FOREST);
-    let inset_x = size * 0.24;
-    let top = rect.top() + size * 0.31;
-    let bottom = rect.bottom() - size * 0.29;
-    let left = rect.left() + inset_x;
-    let right = rect.right() - inset_x;
-    let stroke = Stroke::new((size * 0.045).max(1.2), IVORY);
-    ui.painter().line_segment([egui::pos2(left, top), egui::pos2(left, bottom)], stroke);
-    ui.painter().line_segment([egui::pos2(right, top), egui::pos2(right, bottom)], stroke);
-    ui.painter().line_segment([egui::pos2(left, bottom), egui::pos2(right, bottom)], stroke);
-    let mid = egui::pos2(rect.center().x, top + (bottom - top) * 0.52);
-    ui.painter().line_segment([egui::pos2(left, top), mid], stroke);
-    ui.painter().line_segment([egui::pos2(right, top), mid], stroke);
-    let gold = Stroke::new(stroke.width, GOLD);
-    let chevron_y = bottom - size * 0.02;
-    let half = size * 0.12;
-    ui.painter().line_segment([egui::pos2(rect.center().x - half, chevron_y - size * 0.07), egui::pos2(rect.center().x, chevron_y)], gold);
-    ui.painter().line_segment([egui::pos2(rect.center().x + half, chevron_y - size * 0.07), egui::pos2(rect.center().x, chevron_y)], gold);
+    let radius = (size * 10.0 / 48.0).round() as u8;
+    ui.painter().rect_filled(rect, CornerRadius::same(radius), theme::FOREST);
+    let scale = size / 48.0;
+    let center = rect.center();
+    let angle = 7.0_f32.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let map = |x: f32, y: f32| {
+        let dx = (x - 24.0) * scale;
+        let dy = (y - 24.0) * scale;
+        pos2(center.x + dx * cos - dy * sin, center.y + dx * sin + dy * cos)
+    };
+    let body = rounded_rect_points(11.0, 14.0, 26.0, 20.0, 2.5).into_iter().map(|point| map(point.x, point.y)).collect::<Vec<_>>();
+    ui.painter().add(egui::Shape::convex_polygon(body, IVORY, Stroke::NONE));
+    let stroke = Stroke::new((size * 2.2 / 48.0).max(1.0), theme::FOREST);
+    ui.painter().line_segment([map(12.5, 15.8), map(24.0, 25.0)], stroke);
+    ui.painter().line_segment([map(24.0, 25.0), map(35.5, 15.8)], stroke);
+    // Eight overlapping gold discs form the scalloped cockade; the forest centre is the embossed
+    // hole of the seal. The SVG path is the same union, so app and asset stay one drawing.
+    let petal_radius = (size * 1.3285 / 48.0).max(0.45);
+    for index in 0..8 {
+        let angle = (22.5 + index as f32 * 45.0).to_radians();
+        let x = 24.0 + 3.2071 * angle.cos();
+        let y = 25.0 + 3.2071 * angle.sin();
+        ui.painter().circle_filled(map(x, y), petal_radius, GOLD);
+    }
+    ui.painter().circle_filled(map(24.0, 25.0), (size * 1.632 / 48.0).max(0.55), theme::FOREST);
+}
+
+/// The wordmark keeps the typeface and paints the dot of the `i` in gold, the brand's small
+/// signature. It stays one text shape, so the shell still paints a single product wordmark.
+fn wordmark(ui: &mut Ui, text: &str, size: f32, color: Color32) {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::new(size, theme::display()), color);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    ui.painter().galley(rect.min, galley.clone(), color);
+    for row in &galley.rows {
+        let Some(glyph) = row.glyphs.iter().find(|glyph| glyph.chr == 'i') else {
+            continue;
+        };
+        let center =
+            pos2(rect.min.x + row.pos.x + glyph.pos.x + glyph.advance_width * 0.5 + size * 0.03, rect.min.y + row.pos.y + glyph.pos.y - size * 0.72);
+        ui.painter().circle_filled(center, size * 0.075, GOLD);
+        break;
+    }
+}
+
+/// A rounded rectangle as a point ring, in the 48 × 48 mark space. Four segments per corner keep
+/// the silhouette smooth at 48 px without a second drawing path.
+fn rounded_rect_points(x: f32, y: f32, w: f32, h: f32, r: f32) -> Vec<egui::Pos2> {
+    let mut points = Vec::with_capacity(24);
+    let steps = 4;
+    let quarter = std::f32::consts::FRAC_PI_2;
+    points.push(pos2(x + r, y));
+    for (cx, cy, start) in
+        [(x + w - r, y + r, -quarter), (x + w - r, y + h - r, 0.0), (x + r, y + h - r, quarter), (x + r, y + r, std::f32::consts::PI)]
+    {
+        for step in 0..=steps {
+            let angle = start + (step as f32 / steps as f32) * quarter;
+            points.push(pos2(cx + r * angle.cos(), cy + r * angle.sin()));
+        }
+    }
+    points
 }
 
 fn format_when(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
