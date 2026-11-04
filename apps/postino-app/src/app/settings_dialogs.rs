@@ -50,7 +50,7 @@ impl PostinoApp {
             let value = std::mem::take(&mut prompt.value);
             match prompt.purpose {
                 PgpPromptPurpose::Decrypt => {
-                    let Some(id) = self.pgp_reading.as_ref().map(|state| state.message_id.clone()) else { return };
+                    let Some(id) = self.reading.pgp_reading.as_ref().map(|state| state.message_id.clone()) else { return };
                     match self.pgp_decrypt(&id, value.as_str()) {
                         Some(result) if result.state == PgpDecryptState::WrongPassphrase => {
                             prompt.error = Some("La passphrase non apre la chiave. Riprova.".to_owned());

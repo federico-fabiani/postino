@@ -54,14 +54,14 @@ fn attachment_preview_shows_bounded_text_at_980_in_both_themes_without_saving() 
         settle_at(&ctx, &mut app, Vec2::new(980.0, 600.0));
         let preview = probe::attachment_preview_rect(&ctx, &attachment.id).expect("the Anteprima button");
         click_at(&ctx, &mut app, preview.center(), Vec2::new(980.0, 600.0));
-        let state = app.attachment_preview.as_ref().expect("the preview sheet");
+        let state = app.reading.attachment_preview.as_ref().expect("the preview sheet");
         assert_eq!(state.text.as_deref(), Some("riga uno\nriga due"), "dark={dark}");
         assert!(state.error.is_none(), "dark={dark}: {:?}", state.error);
         let modal = probe::attachment_preview_modal_rect(&ctx).expect("the preview modal");
         let content = ctx.content_rect();
         assert!(content.contains_rect(modal), "dark={dark}: the preview is off-screen: {modal:?} vs {content:?}");
         app.close_reading();
-        assert!(app.attachment_preview.is_none(), "closing the reading pane must drop the preview");
+        assert!(app.reading.attachment_preview.is_none(), "closing the reading pane must drop the preview");
     }
 }
 
@@ -83,14 +83,14 @@ fn attachment_preview_decodes_a_small_png_and_explains_an_unsupported_pdf() {
     settle_at(&ctx, &mut app, Vec2::new(980.0, 600.0));
     let preview = probe::attachment_preview_rect(&ctx, &attachment.id).expect("the Anteprima button");
     click_at(&ctx, &mut app, preview.center(), Vec2::new(980.0, 600.0));
-    assert!(app.attachment_preview.as_ref().and_then(|state| state.texture.as_ref()).is_some(), "the PNG texture");
+    assert!(app.reading.attachment_preview.as_ref().and_then(|state| state.texture.as_ref()).is_some(), "the PNG texture");
 
     let (mut pdf_app, pdf_message, pdf_attachment) = seeded_attachment_app("p6c-preview-pdf", "report.pdf", Some(b"%PDF-1.7"));
     pdf_app.open_message(pdf_message);
     settle_at(&ctx, &mut pdf_app, Vec2::new(980.0, 600.0));
     let preview = probe::attachment_preview_rect(&ctx, &pdf_attachment.id).expect("the PDF preview button");
     click_at(&ctx, &mut pdf_app, preview.center(), Vec2::new(980.0, 600.0));
-    let state = pdf_app.attachment_preview.as_ref().expect("the PDF preview sheet");
+    let state = pdf_app.reading.attachment_preview.as_ref().expect("the PDF preview sheet");
     assert!(state.error.as_deref().is_some_and(|error| error.contains("Anteprima non disponibile")), "{:?}", state.error);
 }
 
@@ -109,8 +109,8 @@ fn saving_an_attachment_writes_exact_blob_bytes() {
     settle_at(&ctx, &mut app, Vec2::new(1200.0, 800.0));
     let save = probe::attachment_save_rect(&ctx, &attachment.id).expect("the attachment Save button");
     click_at(&ctx, &mut app, save.center(), Vec2::new(1200.0, 800.0));
-    assert!(!app.attachment_warning.is_some(), "a PDF needs no warning");
-    assert!(!app.attachment_overwrite.is_some(), "a new path needs no overwrite confirmation");
+    assert!(!app.reading.attachment_warning.is_some(), "a PDF needs no warning");
+    assert!(!app.reading.attachment_overwrite.is_some(), "a new path needs no overwrite confirmation");
     assert_eq!(std::fs::read(&path).expect("the saved file"), b"blob esatto\nseconda riga");
     assert_eq!(saver.writes(), vec![(path.clone(), b"blob esatto\nseconda riga".to_vec())]);
     assert_eq!(app.toast.as_ref().map(|toast| toast.kind), Some(ToastKind::Success));
@@ -153,7 +153,7 @@ fn dangerous_attachments_warn_before_choosing_a_path() {
         saver.set_path(Some(path.clone()));
         app.file_saver = saver.clone();
         app.request_attachment_save(&attachment);
-        let warning = app.attachment_warning.as_ref().expect("a warning before the native dialog");
+        let warning = app.reading.attachment_warning.as_ref().expect("a warning before the native dialog");
         assert_eq!(warning.dangerous, Some(kind));
         assert_eq!(saver.choose_calls(), 0, "the path must not be chosen before the warning");
         let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
@@ -177,7 +177,7 @@ fn a_dangerous_extension_chosen_in_the_native_dialog_is_warned_again() {
     app.file_saver = saver.clone();
     app.request_attachment_save(&attachment);
     assert_eq!(saver.choose_calls(), 1);
-    let warning = app.attachment_warning.as_ref().expect("the chosen path must be re-classified");
+    let warning = app.reading.attachment_warning.as_ref().expect("the chosen path must be re-classified");
     assert_eq!(warning.dangerous, Some(DangerousKind::Executable));
     assert_eq!(warning.path.as_deref(), Some(path.as_path()));
     assert!(saver.writes().is_empty(), "nothing is written before the second confirmation");
@@ -232,8 +232,8 @@ fn demo_save_is_disabled_and_never_reports_a_corrupt_attachment() {
     assert_eq!(probe::attachment_save_is_enabled(&ctx, &attachment.id), Some(false), "demo Save must be visibly disabled");
     let save = probe::attachment_save_rect(&ctx, &attachment.id).expect("the disabled Save rect");
     click_at(&ctx, &mut app, save.center(), Vec2::new(1200.0, 800.0));
-    assert!(app.attachment_warning.is_none());
-    assert!(app.attachment_overwrite.is_none());
+    assert!(app.reading.attachment_warning.is_none());
+    assert!(app.reading.attachment_overwrite.is_none());
     assert!(app.toast.is_none(), "a disabled button must not open a misleading error");
     let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
     assert!(text.iter().any(|line| line.contains("La modalità demo non ha allegati reali")), "{text:?}");
@@ -258,7 +258,7 @@ fn the_attachment_save_button_is_keyboard_reachable() {
     theme::apply(&ctx, false);
     frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());
     assert!(probe::attachment_save_rect(&ctx, &attachment.id).is_some());
-    let save_id = app.attachment_save_ids.get(&attachment.id).copied().expect("the Save button id");
+    let save_id = app.reading.attachment_save_ids.get(&attachment.id).copied().expect("the Save button id");
     ctx.memory_mut(|memory| memory.request_focus(save_id));
     frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), vec![key(Key::Enter, Modifiers::NONE)]);
     assert_eq!(saver.writes().len(), 1, "Enter on the focused Save button saves");
@@ -277,20 +277,20 @@ fn a_link_requires_confirmation_and_reaches_the_injected_opener_exactly() {
     let size = Vec2::new(980.0, 600.0);
     let link = reading::find_links("Vai su https://example.com/preventivo?token=abc, grazie.").pop().expect("a link");
     app.request_link_open(&link);
-    assert_eq!(app.pending_link.as_ref().map(|pending| pending.url.as_str()), Some("https://example.com/preventivo?token=abc"));
+    assert_eq!(app.reading.pending_link.as_ref().map(|pending| pending.url.as_str()), Some("https://example.com/preventivo?token=abc"));
     assert!(opener.opened().is_empty(), "the sheet has not been confirmed");
     click_dialog_button(&ctx, &mut app, size, "Aprire il link?", true);
     assert_eq!(opener.opened(), vec!["https://example.com/preventivo?token=abc".to_owned()]);
-    assert!(app.pending_link.is_none());
+    assert!(app.reading.pending_link.is_none());
 
     // The secondary button, not a hand-cleared field, is the cancel path.
     app.request_link_open(&link);
     click_dialog_button(&ctx, &mut app, size, "Aprire il link?", false);
-    assert!(app.pending_link.is_none());
+    assert!(app.reading.pending_link.is_none());
     assert_eq!(opener.opened().len(), 1, "Annulla calls nothing");
 
     // The action boundary rechecks even when a pending value is set directly.
-    app.pending_link = Some(PendingLink {
+    app.reading.pending_link = Some(PendingLink {
         url: "javascript:alert(1)".to_owned(),
         host: "example.com".to_owned(),
         recipient: None,
@@ -315,7 +315,7 @@ fn a_link_requires_confirmation_and_reaches_the_injected_opener_exactly() {
         backslash: false,
     };
     app.request_link_open(&bad);
-    assert!(app.pending_link.is_none(), "a hostile scheme never reaches the sheet");
+    assert!(app.reading.pending_link.is_none(), "a hostile scheme never reaches the sheet");
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn the_link_sheet_shows_the_full_destination_and_the_effective_host() {
 
     // A backslash ends the authority in a browser, so the sheet names evil.example and warns.
     let backslash = reading::find_links("https://evil.example\\@bank.example/").pop().expect("a backslash link");
-    app.pending_link = None;
+    app.reading.pending_link = None;
     app.request_link_open(&backslash);
     let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
     assert!(text.iter().any(|line| line.contains("Host di destinazione: evil.example")), "{text:?}");
@@ -342,7 +342,7 @@ fn the_link_sheet_shows_the_full_destination_and_the_effective_host() {
     // A Cyrillic host has no literal xn-- label but the browser punycodes it. The line names the
     // spelling in the link, not a host the browser will contact.
     let cyrillic = reading::find_links("https://аpple.com/x").pop().expect("a non-ASCII link");
-    app.pending_link = None;
+    app.reading.pending_link = None;
     app.request_link_open(&cyrillic);
     let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
     assert!(text.iter().any(|line| line.contains("caratteri non ASCII")), "{text:?}");
@@ -351,7 +351,7 @@ fn the_link_sheet_shows_the_full_destination_and_the_effective_host() {
 
     // A mailto opens a mail client and names its explicit recipient, not a browser host.
     let mailto = reading::find_links("mailto:help@example.com?subject=Preventivo").pop().expect("a mailto link");
-    app.pending_link = None;
+    app.reading.pending_link = None;
     app.request_link_open(&mailto);
     let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));
     assert!(text.iter().any(|line| line.contains("client di posta")), "{text:?}");
@@ -372,7 +372,7 @@ fn the_reading_pane_link_widget_opens_the_sheet() {
     let url = "https://example.com/preventivo/postino-2026?token=anteprima";
     let link = probe::link_rect(&ctx, url).expect("the reading-pane link widget");
     click_at(&ctx, &mut app, link.center(), size);
-    let pending = app.pending_link.as_ref().expect("clicking the link opens the sheet");
+    let pending = app.reading.pending_link.as_ref().expect("clicking the link opens the sheet");
     assert_eq!(pending.url, url);
 }
 
@@ -502,7 +502,7 @@ fn an_overlong_chosen_name_keeps_its_extension_warning() {
     saver.set_path(Some(path.clone()));
     app.file_saver = saver.clone();
     app.request_attachment_save(&attachment);
-    let warning = app.attachment_warning.as_ref().expect("the long chosen .exe must be warned");
+    let warning = app.reading.attachment_warning.as_ref().expect("the long chosen .exe must be warned");
     assert_eq!(warning.dangerous, Some(DangerousKind::Executable));
     assert!(saver.writes().is_empty());
     let ctx = egui::Context::default();
@@ -897,7 +897,7 @@ fn block_links_open_only_through_the_existing_confirmation_sheet() {
     // The plain https anchor: the sheet names the exact host and only Apri opens it.
     let link = probe::link_rect(&ctx, "https://example.com/sicuro").expect("the safe anchor");
     click_at(&ctx, &mut app, link.center(), size);
-    let pending = app.pending_link.as_ref().expect("the confirmation sheet opens");
+    let pending = app.reading.pending_link.as_ref().expect("the confirmation sheet opens");
     assert_eq!(pending.url, "https://example.com/sicuro");
     assert_eq!(pending.host, "example.com");
     assert!(opener.opened().is_empty(), "the click alone must not open a browser");
@@ -905,11 +905,11 @@ fn block_links_open_only_through_the_existing_confirmation_sheet() {
     assert_eq!(opener.opened(), vec!["https://example.com/sicuro".to_owned()]);
 
     // An IDN anchor keeps the punycode warning instead of claiming the spelling is the host.
-    app.pending_link = None;
+    app.reading.pending_link = None;
     settle_at(&ctx, &mut app, size);
     let link = probe::link_rect(&ctx, idn).expect("the IDN anchor");
     click_at(&ctx, &mut app, link.center(), size);
-    let pending = app.pending_link.as_ref().expect("the IDN sheet opens");
+    let pending = app.reading.pending_link.as_ref().expect("the IDN sheet opens");
     assert!(pending.idn, "the IDN flag survives the block path");
     let sheet = painted_text(&ctx, &mut app, size);
     assert!(sheet.iter().any(|line| line.contains("Host di destinazione: xn--bcher-kva.example")), "{sheet:?}");
@@ -917,22 +917,22 @@ fn block_links_open_only_through_the_existing_confirmation_sheet() {
     assert_eq!(opener.opened().len(), 1, "the IDN sheet must not open without Apri");
 
     // A backslash anchor is presented with the authority a browser would really use.
-    app.pending_link = None;
+    app.reading.pending_link = None;
     settle_at(&ctx, &mut app, size);
     let link = probe::link_rect(&ctx, backslash).expect("the backslash anchor");
     click_at(&ctx, &mut app, link.center(), size);
-    let pending = app.pending_link.as_ref().expect("the backslash sheet opens");
+    let pending = app.reading.pending_link.as_ref().expect("the backslash sheet opens");
     assert!(pending.backslash, "the backslash flag survives the block path");
     let sheet = painted_text(&ctx, &mut app, size);
     assert!(sheet.iter().any(|line| line.contains("Host di destinazione: evil.example")), "{sheet:?}");
     assert!(sheet.iter().any(|line| line.contains("barra rovesciata")), "{sheet:?}");
 
     // A mailto anchor names its explicit recipient and reaches the mail client only on Apri.
-    app.pending_link = None;
+    app.reading.pending_link = None;
     settle_at(&ctx, &mut app, size);
     let link = probe::link_rect(&ctx, mailto).expect("the mailto anchor");
     click_at(&ctx, &mut app, link.center(), size);
-    let pending = app.pending_link.as_ref().expect("the mailto sheet opens");
+    let pending = app.reading.pending_link.as_ref().expect("the mailto sheet opens");
     assert!(pending.mailto, "the mailto flag survives the block path");
     assert_eq!(pending.recipient.as_deref(), Some("help@example.com"));
     let sheet = painted_text(&ctx, &mut app, size);
@@ -956,7 +956,7 @@ fn the_keyboard_reaches_a_block_link_and_its_sheet() {
     let link = probe::link_id(&ctx, url).expect("the block link widget");
     ctx.memory_mut(|memory| memory.request_focus(link));
     frame_at(&ctx, &mut app, size, vec![key(Key::Enter, Modifiers::NONE)]);
-    let pending = app.pending_link.as_ref().expect("Enter on a focused link opens the sheet");
+    let pending = app.reading.pending_link.as_ref().expect("Enter on a focused link opens the sheet");
     assert_eq!(pending.url, url);
 }
 
@@ -1036,7 +1036,7 @@ fn a_file_created_after_the_overwrite_check_is_not_silently_replaced() {
     };
     app.write_attachment(pending);
     assert_eq!(std::fs::read(&path).expect("the racing file survives"), b"creato da un altro processo");
-    assert!(app.attachment_overwrite.is_some(), "the late file needs the overwrite sheet, not a silent replace");
+    assert!(app.reading.attachment_overwrite.is_some(), "the late file needs the overwrite sheet, not a silent replace");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1060,7 +1060,7 @@ fn pgp_badges_and_the_decrypt_sheet_are_rendered_from_the_engine_verdict() {
         app.selected.clone().or_else(|| app.visible_messages().0.first().map(|message| message.id.clone())).expect("the demo has one open message");
     app.open_message(id.clone());
     app.pgp_checked = Some(id.clone());
-    app.pgp_reading = Some(PgpReadingState {
+    app.reading.pgp_reading = Some(PgpReadingState {
         message_id: id.clone(),
         kind: PgpMimeKind::Signed,
         verify: Some(PgpVerifyResult {
@@ -1078,7 +1078,7 @@ fn pgp_badges_and_the_decrypt_sheet_are_rendered_from_the_engine_verdict() {
     painted_visible(&runs, "Firma verificata");
     assert!(probe::reading_pgp_rect(&ctx).is_some(), "the badge row must be probe-able");
 
-    app.pgp_reading = Some(PgpReadingState {
+    app.reading.pgp_reading = Some(PgpReadingState {
         message_id: id.clone(),
         kind: PgpMimeKind::Encrypted,
         verify: Some(PgpVerifyResult {
@@ -1102,7 +1102,7 @@ fn pgp_badges_and_the_decrypt_sheet_are_rendered_from_the_engine_verdict() {
     app.dark = false;
     theme::apply(&ctx, false);
 
-    app.pgp_reading.as_mut().expect("the encrypted state").decrypt = Some(PgpDecryptResult {
+    app.reading.pgp_reading.as_mut().expect("the encrypted state").decrypt = Some(PgpDecryptResult {
         state: PgpDecryptState::Decrypted,
         key_id: Some("key_ada".to_owned()),
         fingerprint: None,
@@ -1128,12 +1128,12 @@ fn a_non_pgp_message_is_verified_once_and_never_gets_a_badge() {
     let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a seeded message");
     app.open_message(id.clone());
     app.pgp_checked = None;
-    app.pgp_reading = None;
+    app.reading.pgp_reading = None;
     let ctx = egui::Context::default();
     theme::install_fonts(&ctx);
     theme::apply(&ctx, false);
     frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
     assert_eq!(app.pgp_checked.as_deref(), Some(id.as_str()), "the pane checks a normal message once");
-    assert!(app.pgp_reading.is_none(), "a non-PGP message must not get a PGP badge");
+    assert!(app.reading.pgp_reading.is_none(), "a non-PGP message must not get a PGP badge");
     daemon.shutdown().expect("the daemon stops");
 }

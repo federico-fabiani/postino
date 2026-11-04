@@ -251,10 +251,11 @@ fn pgp_key_import_and_public_export_reach_the_daemon() {
     assert!(app.pgp_notice.as_deref().is_some_and(|notice| notice.contains("copiata")), "the export must report its result");
 
     app.pgp_checked = Some("msg_open".to_owned());
-    app.pgp_reading = Some(PgpReadingState { message_id: "msg_open".to_owned(), kind: PgpMimeKind::Signed, verify: None, decrypt: None, view: None });
+    app.reading.pgp_reading =
+        Some(PgpReadingState { message_id: "msg_open".to_owned(), kind: PgpMimeKind::Signed, verify: None, decrypt: None, view: None });
     app.delete_pgp_key(key_id.as_str());
     assert!(app.pgp_keys.is_empty(), "the deleted key leaves the list");
     assert!(app.pgp_checked.is_none(), "the deleted key must invalidate the open message verdict");
-    assert!(app.pgp_reading.is_none(), "the stale badge must not survive a key deletion");
+    assert!(app.reading.pgp_reading.is_none(), "the stale badge must not survive a key deletion");
     daemon.shutdown().expect("the daemon stops");
 }

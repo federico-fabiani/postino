@@ -863,10 +863,10 @@ fn unsubscribe_choices_open_a_draft_and_never_send_from_the_sheet() {
     theme::install_fonts(&ctx);
     theme::apply(&ctx, false);
     frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
-    let info = app.unsubscribe_info.clone().expect("the stored choices are loaded once");
+    let info = app.reading.unsubscribe_info.clone().expect("the stored choices are loaded once");
     assert_eq!(info.targets.len(), 2);
     assert!(info.one_click);
-    app.show_unsubscribe = true;
+    app.reading.show_unsubscribe = true;
     let size = Vec2::new(980.0, 600.0);
     frame_at(
         &ctx,
@@ -874,8 +874,8 @@ fn unsubscribe_choices_open_a_draft_and_never_send_from_the_sheet() {
         size,
         vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
     );
-    assert!(!app.show_unsubscribe, "Escape closes the choice sheet without action");
-    app.show_unsubscribe = true;
+    assert!(!app.reading.show_unsubscribe, "Escape closes the choice sheet without action");
+    app.reading.show_unsubscribe = true;
     let runs = painted_runs(&ctx, &mut app, size);
     painted_visible(&runs, "Disiscrizione");
     painted_visible(&runs, "Scrivi la disiscrizione");
@@ -886,7 +886,7 @@ fn unsubscribe_choices_open_a_draft_and_never_send_from_the_sheet() {
     assert!(app.composer.open, "the mailto choice opens the ordinary composer");
     assert_eq!(app.composer.to, "leave@example.com");
     assert_eq!(app.composer.subject, "unsubscribe");
-    assert!(!app.show_unsubscribe);
+    assert!(!app.reading.show_unsubscribe);
     assert!(app.outbox.entries.is_empty(), "the sheet never queues a send by itself");
     daemon.shutdown().expect("the daemon stops");
 }

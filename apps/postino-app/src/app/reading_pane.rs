@@ -4,6 +4,36 @@
 
 use super::*;
 
+/// Everything the reading pane owns while a message is open: the cached body, the invite, the
+/// pending link, the attachment sheets and the unsubscribe choice. It is defined here because the
+/// pane is the only screen that reads it; `close_reading` and `open_message` clear the parts that
+/// belong to the previous message.
+#[derive(Default)]
+pub(super) struct ReadingUi {
+    /// A link waiting for the confirmation sheet. The URL has already passed the allowlist.
+    pub(super) pending_link: Option<PendingLink>,
+    /// The block view of the open message: parsed once per body, not once per frame.
+    pub(super) body_cache: Option<BodyCache>,
+    /// A dangerous attachment waiting for the explicit warning.
+    pub(super) attachment_warning: Option<PendingAttachment>,
+    /// An attachment whose chosen path already exists and waits for overwrite confirmation.
+    pub(super) attachment_overwrite: Option<PendingAttachment>,
+    /// Stable Save-button ids so a headless test can drive the keyboard path.
+    pub(super) attachment_save_ids: BTreeMap<String, Id>,
+    /// A bounded, display-only attachment preview. The bytes are dropped when the sheet closes.
+    pub(super) attachment_preview: Option<AttachmentPreviewState>,
+    /// One-entry cache for the parsed invite of the open message.
+    pub(super) invite_cache: Option<(String, Option<CalendarInviteView>)>,
+    /// The PGP verdict and any display-only decrypted body for the open message.
+    pub(super) pgp_reading: Option<PgpReadingState>,
+    /// The unsubscribe choices for the open message. Empty means the header was absent or invalid.
+    pub(super) unsubscribe_info: Option<UnsubscribeInfo>,
+    /// The message whose headers were already checked; a negative result is cached too.
+    pub(super) unsubscribe_checked: Option<String>,
+    /// The choice sheet is open. It never sends or opens anything until the person picks a target.
+    pub(super) show_unsubscribe: bool,
+}
+
 impl PostinoApp {
     /// `full` is the overlay/full-screen path: the reading pane covers the list and offers
     /// "Torna alla posta". It is used for the explicit full-screen mode and below
@@ -125,7 +155,7 @@ impl PostinoApp {
                     }
                 });
         });
-        self.attachment_save_ids = save_ids;
+        self.reading.attachment_save_ids = save_ids;
         requested
     }
 
@@ -181,7 +211,7 @@ impl PostinoApp {
     /// The block view of one message, parsed from the stored sanitized fragment once per body.
     /// The reading pane must never re-parse raw HTML: `body_html` is already the sanitized form.
     pub(super) fn rendered_body(&mut self, message: &Message) -> Arc<body::View> {
-        let stale = match self.body_cache.as_ref() {
+        let stale = match self.reading.body_cache.as_ref() {
             None => true,
             Some(cache) => {
                 cache.message_id != message.summary.id || cache.html.as_deref() != message.body_html.as_deref() || cache.text != message.body_text
@@ -189,7 +219,7 @@ impl PostinoApp {
         };
         if stale {
             let view = Arc::new(body::SubsetBodyRenderer.render(&body::StoredBody { html: message.body_html.as_deref(), text: &message.body_text }));
-            self.body_cache = Some(BodyCache {
+            self.reading.body_cache = Some(BodyCache {
                 message_id: message.summary.id.clone(),
                 html: message.body_html.clone(),
                 text: message.body_text.clone(),
@@ -197,7 +227,7 @@ impl PostinoApp {
             });
             return view;
         }
-        match &self.body_cache {
+        match &self.reading.body_cache {
             Some(cache) => Arc::clone(&cache.view),
             // `stale` already filled the cache; this arm only keeps the function total.
             None => Arc::new(body::View::Text { text: String::new(), reason: body::TextReason::NoHtml }),
@@ -213,7 +243,7 @@ impl PostinoApp {
         {
             return;
         }
-        self.pgp_reading = None;
+        self.reading.pgp_reading = None;
         self.pgp_prompt = None;
         self.pgp_checked = Some(message.summary.id.clone());
         let mut args = json!({ "id": message.summary.id });
@@ -225,7 +255,7 @@ impl PostinoApp {
         if result.kind == PgpMimeKind::None {
             return;
         }
-        self.pgp_reading =
+        self.reading.pgp_reading =
             Some(PgpReadingState { message_id: message.summary.id.clone(), kind: result.kind, verify: Some(result), decrypt: None, view: None });
     }
 
@@ -234,12 +264,12 @@ impl PostinoApp {
     fn sync_unsubscribe(&mut self, message: &Message) {
         if self.demo
             || self.screenshot_message.as_ref().is_some_and(|shot| shot.summary.id == message.summary.id)
-            || self.unsubscribe_checked.as_deref() == Some(message.summary.id.as_str())
+            || self.reading.unsubscribe_checked.as_deref() == Some(message.summary.id.as_str())
         {
             return;
         }
-        self.unsubscribe_info = None;
-        self.show_unsubscribe = false;
+        self.reading.unsubscribe_info = None;
+        self.reading.show_unsubscribe = false;
         let mut args = json!({ "id": message.summary.id });
         if let Some(account) = &self.active_account {
             args["account"] = json!(account);
@@ -247,9 +277,9 @@ impl PostinoApp {
         // A transient daemon error must not hide the entry point until the message is reopened.
         let Ok(value) = self.op("message_unsubscribe", args) else { return };
         let Ok(info) = serde_json::from_value::<UnsubscribeInfo>(value) else { return };
-        self.unsubscribe_checked = Some(message.summary.id.clone());
+        self.reading.unsubscribe_checked = Some(message.summary.id.clone());
         if !info.targets.is_empty() {
-            self.unsubscribe_info = Some(info);
+            self.reading.unsubscribe_info = Some(info);
         }
     }
 
@@ -273,18 +303,18 @@ impl PostinoApp {
             self.push_info_toast("Il link di disiscrizione non è apribile.", ToastKind::Error);
             return;
         };
-        self.show_unsubscribe = false;
+        self.reading.show_unsubscribe = false;
         self.request_link_open(&link);
         ui.ctx().request_repaint();
     }
 
     /// The explicit choice sheet. It lists every target from the header and never performs one.
     pub(super) fn unsubscribe_sheet(&mut self, ui: &mut Ui) {
-        if !self.show_unsubscribe {
+        if !self.reading.show_unsubscribe {
             return;
         }
-        let Some(info) = self.unsubscribe_info.clone() else {
-            self.show_unsubscribe = false;
+        let Some(info) = self.reading.unsubscribe_info.clone() else {
+            self.reading.show_unsubscribe = false;
             return;
         };
         let t = theme::tokens(self.dark);
@@ -351,19 +381,19 @@ impl PostinoApp {
                 });
             });
         if let Some(target) = mailto {
-            self.show_unsubscribe = false;
+            self.reading.show_unsubscribe = false;
             self.unsubscribe_mailto(&target);
         } else if let Some(target) = web {
             self.unsubscribe_web(&target, ui);
         } else if close || response.should_close() {
-            self.show_unsubscribe = false;
+            self.reading.show_unsubscribe = false;
         }
     }
 
     /// Ask the engine to decrypt with no passphrase first. An unprotected key opens immediately; a
     /// protected key answers `Locked` and only then the sheet asks for the secret.
     fn begin_pgp_decrypt(&mut self) {
-        let Some(state) = self.pgp_reading.as_ref() else { return };
+        let Some(state) = self.reading.pgp_reading.as_ref() else { return };
         if !matches!(state.kind, PgpMimeKind::Encrypted) {
             return;
         }
@@ -400,7 +430,7 @@ impl PostinoApp {
     }
 
     pub(super) fn apply_pgp_decrypt(&mut self, result: PgpDecryptResult) {
-        let Some(state) = self.pgp_reading.as_mut() else { return };
+        let Some(state) = self.reading.pgp_reading.as_mut() else { return };
         if result.state == PgpDecryptState::Decrypted {
             let text = result.text.as_deref().unwrap_or_default();
             let view = body::SubsetBodyRenderer.render(&body::StoredBody { html: result.html.as_deref(), text });
@@ -410,7 +440,7 @@ impl PostinoApp {
     }
 
     fn pgp_body_view(&self, message_id: &str) -> Option<Arc<body::View>> {
-        let state = self.pgp_reading.as_ref().filter(|state| state.message_id == message_id)?;
+        let state = self.reading.pgp_reading.as_ref().filter(|state| state.message_id == message_id)?;
         state.decrypt.as_ref().filter(|result| result.state == PgpDecryptState::Decrypted)?;
         state.view.clone()
     }
@@ -418,7 +448,7 @@ impl PostinoApp {
     /// The badge and the decrypt action. It reads the cached verdict, never the parsed body: the
     /// UI cannot tell a signed message from an unsigned one without the retained raw bytes.
     fn pgp_reading_row(&mut self, ui: &mut Ui, t: &Tokens, message_id: &str) {
-        let Some(state) = self.pgp_reading.as_ref().filter(|state| state.message_id == message_id) else { return };
+        let Some(state) = self.reading.pgp_reading.as_ref().filter(|state| state.message_id == message_id) else { return };
         ui.add_space(space::XS);
         let mut decrypt = false;
         let mut hide = false;
@@ -471,7 +501,7 @@ impl PostinoApp {
         #[cfg(test)]
         probe::reading_pgp(ui, _row.response.rect);
         if hide
-            && let Some(state) = self.pgp_reading.as_mut()
+            && let Some(state) = self.reading.pgp_reading.as_mut()
             && state.message_id == message_id
         {
             state.decrypt = None;
@@ -487,13 +517,13 @@ impl PostinoApp {
         if self.screenshot_message.as_ref().is_some_and(|screenshot| screenshot.summary.id == message.summary.id) {
             return self.screenshot_invite.clone();
         }
-        if let Some((id, invite)) = &self.invite_cache
+        if let Some((id, invite)) = &self.reading.invite_cache
             && id == &message.summary.id
         {
             return invite.clone();
         }
         let invite = self.engine.message_invite(&message.summary.id).ok().flatten();
-        self.invite_cache = Some((message.summary.id.clone(), invite.clone()));
+        self.reading.invite_cache = Some((message.summary.id.clone(), invite.clone()));
         invite
     }
 
@@ -548,7 +578,7 @@ impl PostinoApp {
         #[cfg(test)]
         probe::reading_header(ui, header_rect);
 
-        let has_unsubscribe = self.unsubscribe_info.is_some();
+        let has_unsubscribe = self.reading.unsubscribe_info.is_some();
         let (left_action, right_action) = Sides::new().height(36.0).shrink_left().show(
             ui,
             |ui| {
@@ -879,7 +909,7 @@ impl PostinoApp {
             Some(ReadingAction::Read) => self.toggle_read(),
             Some(ReadingAction::Close) => self.close_reading(),
             Some(ReadingAction::Expand) => self.reading_full = true,
-            Some(ReadingAction::Unsubscribe) => self.show_unsubscribe = self.unsubscribe_info.is_some(),
+            Some(ReadingAction::Unsubscribe) => self.reading.show_unsubscribe = self.reading.unsubscribe_info.is_some(),
             Some(ReadingAction::Back) => {
                 // In the narrow overlay the back button leaves the reading pane entirely; only the
                 // wide window has a list to return to under the full-screen pane.
@@ -900,7 +930,7 @@ impl PostinoApp {
             self.push_info_toast("Questo link non è apribile: sono ammessi solo http, https e mailto.", ToastKind::Error);
             return;
         }
-        self.pending_link = Some(PendingLink {
+        self.reading.pending_link = Some(PendingLink {
             url: link.url.clone(),
             host: link.host.clone(),
             recipient: link.recipient.clone(),
@@ -913,7 +943,7 @@ impl PostinoApp {
     }
 
     pub(super) fn confirm_pending_link(&mut self) {
-        let Some(pending) = self.pending_link.take() else {
+        let Some(pending) = self.reading.pending_link.take() else {
             return;
         };
         // The sheet already showed the destination, but state can change between frames. Re-run the
@@ -929,11 +959,11 @@ impl PostinoApp {
     }
 
     pub(super) fn link_confirmation(&mut self, ui: &mut Ui) {
-        let Some(pending) = self.pending_link.clone() else {
+        let Some(pending) = self.reading.pending_link.clone() else {
             return;
         };
         let focus_cancel = pending.focus_cancel;
-        if let Some(link) = self.pending_link.as_mut() {
+        if let Some(link) = self.reading.pending_link.as_mut() {
             link.focus_cancel = false;
         }
         // The sheet never replaces the raw URL with a parsed one. The effective destination is
@@ -989,7 +1019,7 @@ impl PostinoApp {
         if confirm {
             self.confirm_pending_link();
         } else if cancel || response.should_close() {
-            self.pending_link = None;
+            self.reading.pending_link = None;
         }
     }
 
@@ -1019,7 +1049,7 @@ impl PostinoApp {
             overwrite_confirmed: false,
         };
         if pending.dangerous.is_some() {
-            self.attachment_warning = Some(pending);
+            self.reading.attachment_warning = Some(pending);
         } else {
             self.choose_attachment_path(pending);
         }
@@ -1035,7 +1065,7 @@ impl PostinoApp {
         let value = match self.op("attachment_get", json!({ "id": attachment.id })) {
             Ok(value) => value,
             Err(_) => {
-                self.attachment_preview = Some(AttachmentPreviewState {
+                self.reading.attachment_preview = Some(AttachmentPreviewState {
                     attachment: attachment.clone(),
                     text: None,
                     texture: None,
@@ -1062,7 +1092,7 @@ impl PostinoApp {
         let mut state = AttachmentPreviewState { attachment: result.attachment.clone(), text: None, texture: None, error: None, truncated: false };
         if bytes.len() as u64 != result.attachment.size {
             state.error = Some("La dimensione dei byte non corrisponde ai metadati dell'allegato.".to_owned());
-            self.attachment_preview = Some(state);
+            self.reading.attachment_preview = Some(state);
             return;
         }
         let mime = result.attachment.mime.to_ascii_lowercase();
@@ -1081,11 +1111,11 @@ impl PostinoApp {
         } else {
             state.error = Some("Anteprima non disponibile per questo tipo di file. Puoi salvarlo e aprirlo con un'altra applicazione.".to_owned());
         }
-        self.attachment_preview = Some(state);
+        self.reading.attachment_preview = Some(state);
     }
 
     pub(super) fn attachment_preview_dialog(&mut self, ui: &mut Ui) {
-        let Some(state) = self.attachment_preview.as_mut() else { return };
+        let Some(state) = self.reading.attachment_preview.as_mut() else { return };
         let t = theme::tokens(self.dark);
         let mut close = false;
         let mut save = false;
@@ -1133,11 +1163,11 @@ impl PostinoApp {
         #[cfg(test)]
         probe::attachment_preview_modal(ui, response.response.rect);
         if save {
-            if let Some(state) = self.attachment_preview.take() {
+            if let Some(state) = self.reading.attachment_preview.take() {
                 self.request_attachment_save(&state.attachment);
             }
         } else if close || response.should_close() {
-            self.attachment_preview = None;
+            self.reading.attachment_preview = None;
         }
     }
 
@@ -1157,7 +1187,7 @@ impl PostinoApp {
                 if chosen.is_some() && chosen != pending.dangerous {
                     pending.dangerous = chosen;
                     pending.focus_cancel = true;
-                    self.attachment_warning = Some(pending);
+                    self.reading.attachment_warning = Some(pending);
                     return;
                 }
                 self.finish_attachment_destination(pending);
@@ -1174,7 +1204,7 @@ impl PostinoApp {
         pending.focus_cancel = true;
         if path.exists() {
             pending.overwrite_confirmed = false;
-            self.attachment_overwrite = Some(pending);
+            self.reading.attachment_overwrite = Some(pending);
         } else {
             self.write_attachment(pending);
         }
@@ -1195,7 +1225,7 @@ impl PostinoApp {
                     let mut pending = pending;
                     pending.focus_cancel = true;
                     pending.overwrite_confirmed = false;
-                    self.attachment_overwrite = Some(pending);
+                    self.reading.attachment_overwrite = Some(pending);
                     return;
                 }
                 self.push_info_toast(format!("Non è stato possibile salvare “{}”: {error}", pending.filename), ToastKind::Error);
@@ -1204,14 +1234,14 @@ impl PostinoApp {
     }
 
     pub(super) fn attachment_warning_dialog(&mut self, ui: &mut Ui) {
-        let Some(pending) = self.attachment_warning.as_ref() else {
+        let Some(pending) = self.reading.attachment_warning.as_ref() else {
             return;
         };
         let filename = pending.filename.clone();
         let chosen = pending.path.as_ref().map(|path| path.display().to_string());
         let message = pending.dangerous.unwrap_or(DangerousKind::Executable).message();
         let focus_cancel = pending.focus_cancel;
-        if let Some(pending) = self.attachment_warning.as_mut() {
+        if let Some(pending) = self.reading.attachment_warning.as_mut() {
             pending.focus_cancel = false;
         }
         let mut body = format!("“{}”\n\n{}", filename, message);
@@ -1232,7 +1262,7 @@ impl PostinoApp {
                 cancel = response.secondary;
             });
         if confirm {
-            if let Some(pending) = self.attachment_warning.take() {
+            if let Some(pending) = self.reading.attachment_warning.take() {
                 if pending.path.is_some() {
                     self.finish_attachment_destination(pending);
                 } else {
@@ -1240,18 +1270,18 @@ impl PostinoApp {
                 }
             }
         } else if cancel || response.should_close() {
-            self.attachment_warning = None;
+            self.reading.attachment_warning = None;
             self.status = "Salvataggio annullato".to_owned();
         }
     }
 
     pub(super) fn attachment_overwrite_dialog(&mut self, ui: &mut Ui) {
-        let Some(pending) = self.attachment_overwrite.as_ref() else {
+        let Some(pending) = self.reading.attachment_overwrite.as_ref() else {
             return;
         };
         let path = pending.path.as_ref().map_or_else(|| pending.filename.clone(), |path| path.display().to_string());
         let focus_cancel = pending.focus_cancel;
-        if let Some(pending) = self.attachment_overwrite.as_mut() {
+        if let Some(pending) = self.reading.attachment_overwrite.as_mut() {
             pending.focus_cancel = false;
         }
         let body = format!("Il file esiste già:\n\n{path}\n\nSostituirlo? I dati del file esistente saranno persi.");
@@ -1271,12 +1301,12 @@ impl PostinoApp {
             },
         );
         if confirm {
-            if let Some(mut pending) = self.attachment_overwrite.take() {
+            if let Some(mut pending) = self.reading.attachment_overwrite.take() {
                 pending.overwrite_confirmed = true;
                 self.write_attachment(pending);
             }
         } else if cancel || response.should_close() {
-            self.attachment_overwrite = None;
+            self.reading.attachment_overwrite = None;
             self.status = "Salvataggio annullato".to_owned();
         }
     }

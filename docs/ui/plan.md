@@ -790,4 +790,7 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
 - Do not copy Superhuman's density wholesale; keep Postino's calmer rhythm.
 - Do not build the HTML/Tailwind composer before the plain composer works.
 - Do not let the UI own mail state or bypass the operation registry.
+- Do not hang a screen's transient state off `PostinoApp` as loose fields. A sheet, a cache or a
+  pending confirmation belongs to a struct in the module of the screen that reads it; the rule is
+  in `AGENTS.md` §5.
 - Do not ship dead actions to discover the roadmap.

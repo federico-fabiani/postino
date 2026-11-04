@@ -112,6 +112,13 @@ contract that keeps the app from becoming a pile of one-off patches.
 - Inter for interface text, JetBrains Mono for timestamps, identifiers and metadata.
 - **Screens compose components; they do not hand-roll them.** Spacing, type, radii, control heights
   and icon sizes come from tokens. If a screen needs a new value, add it to the tokens first.
+- **State belongs to the surface that owns it.** A screen's transient state — open sheets, caches,
+  pending confirmations, focus requests — is a struct defined in that screen's module and stored as
+  one field on `PostinoApp` (`reading: ReadingUi` in `app/reading_pane.rs`, `composer:
+  ComposerState`). Add a field to that struct, not to `PostinoApp`. A new screen starts by defining
+  its state struct; it does not add loose fields to the app. Global state (engine, store, daemon
+  link, theme, selection, filters) stays on `PostinoApp`. Never copy a value another surface already
+  owns: pass it in, or move it deliberately, once.
 - **One command table.** Every UI action has an id, label, icon, shortcut, enabled rule and handler
   in the UI command table. Palette, menus, context menus, tooltips and buttons read it. Never
   maintain a second list in the palette.

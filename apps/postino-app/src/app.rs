@@ -471,33 +471,17 @@ pub struct PostinoApp {
     file_saver: Arc<dyn FileSaver>,
     file_picker: Arc<dyn FilePicker>,
     folder_opener: Arc<dyn FolderOpener>,
-    /// A link waiting for the confirmation sheet. The URL has already passed the allowlist.
-    pending_link: Option<PendingLink>,
-    /// The block view of the message currently open. Bodies are immutable while a message is open,
-    /// so the pane parses once per body instead of once per frame. A sync refresh that replaces the
-    /// row changes the fragment and invalidates this.
-    body_cache: Option<BodyCache>,
-    /// A dangerous attachment waiting for the explicit warning.
-    attachment_warning: Option<PendingAttachment>,
-    /// An attachment whose chosen path already exists and waits for overwrite confirmation.
-    attachment_overwrite: Option<PendingAttachment>,
-    /// Stable Save-button ids so a headless test can drive the keyboard path.
-    attachment_save_ids: BTreeMap<String, Id>,
-    /// A bounded, display-only attachment preview. The bytes are dropped when the sheet closes.
-    attachment_preview: Option<AttachmentPreviewState>,
+    /// Everything the reading pane owns while a message is open: the cached body, the invite,
+    /// the pending link, the attachment sheets and the unsubscribe choice. The struct lives in
+    /// `reading_pane.rs`, next to the code that reads it.
+    reading: reading_pane::ReadingUi,
     /// A message override used only by deterministic screenshots (HTML plus attachment fixtures).
     screenshot_message: Option<Message>,
     /// The invite card shown for [`Self::screenshot_message`], when the scene is an invite.
     screenshot_invite: Option<CalendarInviteView>,
-    /// One-entry cache for the parsed invite of the open message. The part cannot change while the
-    /// message is open; a new selection replaces the entry and no re-read happens per frame.
-    invite_cache: Option<(String, Option<CalendarInviteView>)>,
     /// True while the reading pane shows a received, valid invite that can be answered. The three
     /// invite commands read this rule; the card never carries its own enabled state.
     invite_ready: bool,
-    /// The PGP verdict and any display-only decrypted body for the open message. Keyed by message
-    /// id so a list refresh cannot show the previous message's badge.
-    pgp_reading: Option<PgpReadingState>,
     /// The last message id a verify was attempted for, including a non-PGP or failed result, so the
     /// pane never re-runs the operation on every frame.
     pgp_checked: Option<String>,
@@ -532,12 +516,6 @@ pub struct PostinoApp {
     identity_delete: Option<Identity>,
     /// A one-line result under the identities settings section.
     identities_notice: Option<String>,
-    /// The unsubscribe choices for the open message. Empty means the header was absent or invalid.
-    unsubscribe_info: Option<UnsubscribeInfo>,
-    /// The message whose headers were already checked; a negative result is cached too.
-    unsubscribe_checked: Option<String>,
-    /// The choice sheet is open. It never sends or opens anything until the person picks a target.
-    show_unsubscribe: bool,
     /// The sidebar account row, used to return focus when settings closes.
     account_switcher_id: Option<Id>,
     /// The widget to restore when the settings dialog closes.
@@ -1210,17 +1188,10 @@ impl PostinoApp {
             file_saver: Arc::new(CancellingFileSaver),
             file_picker: Arc::new(UnavailableFilePicker),
             folder_opener: Arc::new(UnavailableFolderOpener),
-            pending_link: None,
-            body_cache: None,
-            attachment_warning: None,
-            attachment_overwrite: None,
-            attachment_save_ids: BTreeMap::new(),
-            attachment_preview: None,
+            reading: reading_pane::ReadingUi::default(),
             screenshot_message: None,
             screenshot_invite: None,
-            invite_cache: None,
             invite_ready: false,
-            pgp_reading: None,
             pgp_checked: None,
             pgp_prompt: None,
             pgp_keys: Vec::new(),
@@ -1239,9 +1210,6 @@ impl PostinoApp {
             identity_editor: None,
             identity_delete: None,
             identities_notice: None,
-            unsubscribe_info: None,
-            unsubscribe_checked: None,
-            show_unsubscribe: false,
             account_switcher_id: None,
             settings_return_focus: None,
             settings_focus_pending: false,
@@ -3298,7 +3266,7 @@ impl PostinoApp {
         let same = self.selected.as_deref() == Some(id.as_str());
         if !same {
             self.pending_read = None;
-            self.attachment_preview = None;
+            self.reading.attachment_preview = None;
         }
         self.select_only(id.clone());
         self.reading_open = true;
@@ -3499,10 +3467,10 @@ impl PostinoApp {
         self.reading_full = false;
         self.pending_read = None;
         self.invite_ready = false;
-        self.attachment_preview = None;
-        self.unsubscribe_info = None;
-        self.unsubscribe_checked = None;
-        self.show_unsubscribe = false;
+        self.reading.attachment_preview = None;
+        self.reading.unsubscribe_info = None;
+        self.reading.unsubscribe_checked = None;
+        self.reading.show_unsubscribe = false;
     }
 
     fn move_selected(&mut self, kind: FolderKind, confirmation: &str, plural: &str) {
@@ -4318,9 +4286,9 @@ impl PostinoApp {
             }
             return;
         }
-        if self.show_unsubscribe {
+        if self.reading.show_unsubscribe {
             if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
-                self.show_unsubscribe = false;
+                self.reading.show_unsubscribe = false;
                 ctx.memory_mut(|memory| memory.stop_text_input());
             }
             return;
@@ -4333,10 +4301,10 @@ impl PostinoApp {
             || self.show_accounts_dialog
             || self.account_remove.is_some()
             || self.show_licences
-            || self.pending_link.is_some()
-            || self.attachment_warning.is_some()
-            || self.attachment_overwrite.is_some()
-            || self.attachment_preview.is_some()
+            || self.reading.pending_link.is_some()
+            || self.reading.attachment_warning.is_some()
+            || self.reading.attachment_overwrite.is_some()
+            || self.reading.attachment_preview.is_some()
             || self.pgp_prompt.is_some()
             || self.composer_preview
             || self.pgp_import.is_some()
@@ -4345,7 +4313,7 @@ impl PostinoApp {
             || self.template_delete.is_some()
             || self.identity_editor.is_some()
             || self.identity_delete.is_some()
-            || self.show_unsubscribe
+            || self.reading.show_unsubscribe
             || self.rules_page.is_some()
         {
             return;
@@ -5564,14 +5532,14 @@ impl PostinoApp {
         self.pgp_keys.clear();
         self.pgp_keys_loaded = false;
         self.pgp_keys_retry_at = 0.0;
-        self.pgp_reading = None;
+        self.reading.pgp_reading = None;
         self.pgp_checked = None;
         self.pgp_prompt = None;
         self.pgp_import = None;
         self.pgp_delete = None;
-        self.unsubscribe_info = None;
-        self.unsubscribe_checked = None;
-        self.show_unsubscribe = false;
+        self.reading.unsubscribe_info = None;
+        self.reading.unsubscribe_checked = None;
+        self.reading.show_unsubscribe = false;
         self.identities.clear();
         self.identities_loaded = false;
         self.identities_retry_at = 0.0;
@@ -5632,7 +5600,7 @@ impl PostinoApp {
                 self.pgp_keys_loaded = false;
                 self.pgp_keys_retry_at = 0.0;
                 self.pgp_checked = None;
-                self.pgp_reading = None;
+                self.reading.pgp_reading = None;
                 self.refresh_pgp_keys();
                 self.pgp_notice = Some("Chiave PGP importata in questo archivio cifrato.".to_owned());
             }
@@ -5673,7 +5641,7 @@ impl PostinoApp {
                 self.pgp_keys_loaded = false;
                 self.pgp_keys_retry_at = 0.0;
                 self.pgp_checked = None;
-                self.pgp_reading = None;
+                self.reading.pgp_reading = None;
                 self.refresh_pgp_keys();
                 self.pgp_notice = Some("Chiave PGP eliminata.".to_owned());
             }
@@ -8022,9 +7990,10 @@ pub(crate) mod probe {
 use compose::{draft_save_error_message, pgp_send_request, send_error_message};
 #[cfg(test)]
 use list::{list_columns, search_chips, search_error_text, search_meta, show_list_avatars, subject_width, thread_star_menu};
-use reading_pane::{AttachmentPreviewState, BodyCache, PendingAttachment, PendingLink, PgpReadingState};
 #[cfg(test)]
 use reading_pane::{MAX_PREVIEW_TEXT, preview_text};
+#[cfg(test)]
+use reading_pane::{PendingAttachment, PendingLink, PgpReadingState};
 #[cfg(test)]
 use screenshot::write_png;
 

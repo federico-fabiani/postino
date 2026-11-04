@@ -2,6 +2,7 @@
 //! capture loop and the atomic PNG writer. Nothing here runs unless `--screenshot` built the app.
 
 use super::*;
+use reading_pane::PendingLink;
 
 impl PostinoApp {
     fn seed_background_rows(&mut self) {
@@ -26,7 +27,7 @@ impl PostinoApp {
     pub(super) fn seed_screenshot(&mut self, state: ScreenshotState) {
         self.screenshot_message = None;
         self.screenshot_invite = None;
-        self.invite_cache = None;
+        self.reading.invite_cache = None;
         self.invite_ready = false;
         match state {
             ScreenshotState::Shell => {}
@@ -247,7 +248,7 @@ impl PostinoApp {
                     }
                 }
                 if state == ScreenshotState::LinkConfirm {
-                    self.pending_link = Some(PendingLink {
+                    self.reading.pending_link = Some(PendingLink {
                         url: "https://example.com/preventivo/postino-2026?token=anteprima".to_owned(),
                         host: "example.com".to_owned(),
                         recipient: None,
