@@ -5004,11 +5004,11 @@ impl PostinoApp {
         }
         if self.reading_open && self.invite_ready {
             if invite_accept {
-                self.execute_command("invite_accept", ctx);
+                self.execute_command(CommandId::InviteAccept, ctx);
             } else if invite_tentative {
-                self.execute_command("invite_tentative", ctx);
+                self.execute_command(CommandId::InviteTentative, ctx);
             } else if invite_decline {
-                self.execute_command("invite_decline", ctx);
+                self.execute_command(CommandId::InviteDecline, ctx);
             }
         }
         if compose {
@@ -10632,7 +10632,7 @@ impl PostinoApp {
     fn template_delete_dialog(&mut self, ui: &mut Ui) {
         let Some(template) = self.template_delete.clone() else { return };
         let body = format!(
-            "Eliminare il modello �?o{}�?? Il testo viene rimosso da questo archivio cifrato. Le bozze che lo hanno già usato non cambiano.",
+            "Eliminare il modello «{}»? Il testo viene rimosso da questo archivio cifrato. Le bozze che lo hanno già usato non cambiano.",
             template.name
         );
         let mut confirm = false;
@@ -11378,41 +11378,41 @@ impl PostinoApp {
         }
     }
 
-    fn execute_command(&mut self, id: &'static str, ctx: &egui::Context) {
+    fn execute_command(&mut self, id: CommandId, ctx: &egui::Context) {
         self.show_palette = false;
         ctx.memory_mut(|memory| memory.stop_text_input());
         match id {
-            "compose" => self.compose_new(),
-            "reply" => {
+            CommandId::Compose => self.compose_new(),
+            CommandId::Reply => {
                 if let Some(message) = self.selected.clone() {
                     self.reply_to(&message, ComposeMode::Reply);
                 }
             }
-            "reply_all" => {
+            CommandId::ReplyAll => {
                 if let Some(message) = self.selected.clone() {
                     self.reply_to(&message, ComposeMode::ReplyAll);
                 }
             }
-            "invite_accept" => self.reply_to_invite(InviteResponse::Accept),
-            "invite_tentative" => self.reply_to_invite(InviteResponse::Tentative),
-            "invite_decline" => self.reply_to_invite(InviteResponse::Decline),
-            "forward" => {
+            CommandId::InviteAccept => self.reply_to_invite(InviteResponse::Accept),
+            CommandId::InviteTentative => self.reply_to_invite(InviteResponse::Tentative),
+            CommandId::InviteDecline => self.reply_to_invite(InviteResponse::Decline),
+            CommandId::Forward => {
                 if let Some(message) = self.selected.clone() {
                     self.reply_to(&message, ComposeMode::Forward);
                 }
             }
-            "edit_draft" => {
+            CommandId::EditDraft => {
                 if let Some(message) = self.selected.clone() {
                     self.edit_draft(&message);
                 }
             }
-            "send" => self.send_composer(),
-            "outbox" => {
+            CommandId::Send => self.send_composer(),
+            CommandId::Outbox => {
                 self.open_outbox();
             }
-            "export_eml" => self.export_selected_eml(),
-            "import_eml" => self.import_eml(),
-            "open" => {
+            CommandId::ExportEml => self.export_selected_eml(),
+            CommandId::ImportEml => self.import_eml(),
+            CommandId::Open => {
                 if self.threads_view {
                     if self.reading_open && self.selected_thread.is_some() && self.thread_summary.is_some() {
                         if let Some(card) = self.thread_open.clone().or_else(|| self.selected.clone()) {
@@ -11425,7 +11425,7 @@ impl PostinoApp {
                     self.open_message(message);
                 }
             }
-            "expand" => {
+            CommandId::Expand => {
                 if self.threads_view {
                     if self.reading_open && self.selected_thread.is_some() && self.thread_summary.is_some() {
                         self.reading_full = true;
@@ -11438,96 +11438,96 @@ impl PostinoApp {
                     self.reading_full = true;
                 }
             }
-            "read" => {
+            CommandId::Read => {
                 if let Some(message) = self.selected.clone() {
                     self.set_unread_for(&message, false);
                 }
             }
-            "unread" => self.mark_unread(),
-            "star" => self.set_starred(true),
-            "unstar" => self.set_starred(false),
-            "archive" => self.move_selected(FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati"),
-            "delete" => self.move_selected(FolderKind::Trash, "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
-            "label_menu" => {
+            CommandId::Unread => self.mark_unread(),
+            CommandId::Star => self.set_starred(true),
+            CommandId::Unstar => self.set_starred(false),
+            CommandId::Archive => self.move_selected(FolderKind::Archive, "Messaggio archiviato", "Messaggi archiviati"),
+            CommandId::Delete => self.move_selected(FolderKind::Trash, "Messaggio spostato nel cestino", "Messaggi spostati nel cestino"),
+            CommandId::LabelMenu => {
                 let ids = self.action_ids();
                 self.open_label_menu(ids);
             }
-            "label_new" => self.start_label_create(),
-            "label_rename" => {
+            CommandId::LabelNew => self.start_label_create(),
+            CommandId::LabelRename => {
                 if let Some(id) = self.label_filter.clone() {
                     self.start_label_rename(&id);
                 }
             }
-            "label_delete" => {
+            CommandId::LabelDelete => {
                 if let Some(id) = self.label_filter.clone() {
                     self.request_label_delete(&id);
                 }
             }
-            "label_clear_filter" => {
+            CommandId::LabelClearFilter => {
                 if self.label_filter.is_some() {
                     self.clear_label_filter();
                 } else {
                     self.status = "Nessun filtro etichetta attivo".to_owned();
                 }
             }
-            "inbox" => {
+            CommandId::Inbox => {
                 if let Some(folder) = self.folder_for_kind(FolderKind::Inbox) {
                     self.select_folder(folder);
                 } else {
                     self.status = "Il server non ha una cartella Posta in arrivo".to_owned();
                 }
             }
-            "starred" => {
+            CommandId::Starred => {
                 if let Some(folder) = self.folder_for_kind(FolderKind::Starred) {
                     self.select_folder(folder);
                 } else {
                     self.status = "Il server non espone una cartella Preferiti".to_owned();
                 }
             }
-            "theme" => {
+            CommandId::Theme => {
                 let dark = !self.dark;
                 self.set_dark(ctx, dark);
             }
-            "reduced_motion" => {
+            CommandId::ReducedMotion => {
                 let reduced = !self.reduced_motion;
                 self.set_reduced_motion(ctx, reduced);
                 self.status = if reduced { "Animazioni ridotte" } else { "Animazioni attive" }.to_owned();
             }
-            "about" => self.show_about = true,
-            "shortcuts" => {
+            CommandId::About => self.show_about = true,
+            CommandId::Shortcuts => {
                 self.show_shortcuts = true;
                 self.shortcut_query.clear();
                 self.shortcut_focus = true;
             }
-            "palette" => self.show_palette = true,
-            "select_all" => {
+            CommandId::Palette => self.show_palette = true,
+            CommandId::SelectAll => {
                 let (rows, _, _) = self.visible_messages();
                 self.select_all(&rows);
             }
-            "toggle" => {
+            CommandId::Toggle => {
                 if let Some(message) = self.selected.clone() {
                     self.toggle_selection(message);
                 }
             }
-            "clear_selection" => self.clear_selection(),
-            "focus_search" => self.focus_search = true,
-            "threads_toggle" => self.toggle_threads_view(),
-            "saved_search_save" => self.start_saved_search_save(),
-            "saved_search_rename" => {
+            CommandId::ClearSelection => self.clear_selection(),
+            CommandId::FocusSearch => self.focus_search = true,
+            CommandId::ThreadsToggle => self.toggle_threads_view(),
+            CommandId::SavedSearchSave => self.start_saved_search_save(),
+            CommandId::SavedSearchRename => {
                 if let Some(id) = self.applied_saved.clone() {
                     self.start_saved_search_rename(&id);
                 } else {
                     self.status = "Seleziona prima una ricerca salvata".to_owned();
                 }
             }
-            "saved_search_delete" => {
+            CommandId::SavedSearchDelete => {
                 if let Some(id) = self.applied_saved.clone() {
                     self.delete_saved_search(&id);
                 } else {
                     self.status = "Seleziona prima una ricerca salvata".to_owned();
                 }
             }
-            "saved_search_clear_recent" => {
+            CommandId::SavedSearchClearRecent => {
                 let account = self.active_account.clone();
                 match self.clear_recent_searches(account.as_deref()) {
                     Ok(true) => {
@@ -11538,43 +11538,42 @@ impl PostinoApp {
                     Err(_) => self.report_failure("Non è stato possibile cancellare le ricerche recenti.", false),
                 }
             }
-            "rules" => self.open_rules(false),
-            "rules_new" => self.open_rules(true),
-            "next" => self.step_selection(1, false),
-            "previous" => self.step_selection(-1, false),
-            "extend_next" => self.step_selection(1, true),
-            "extend_previous" => self.step_selection(-1, true),
-            "mark_folder_read" => {
+            CommandId::Rules => self.open_rules(false),
+            CommandId::RulesNew => self.open_rules(true),
+            CommandId::Next => self.step_selection(1, false),
+            CommandId::Previous => self.step_selection(-1, false),
+            CommandId::ExtendNext => self.step_selection(1, true),
+            CommandId::ExtendPrevious => self.step_selection(-1, true),
+            CommandId::MarkFolderRead => {
                 let folder = self.folder.clone();
                 self.mark_all_read(&folder);
             }
-            "back" => self.reading_full = false,
-            "close" => {
+            CommandId::Back => self.reading_full = false,
+            CommandId::Close => {
                 if self.reading_full {
                     self.reading_full = false;
                 } else {
                     self.close_reading();
                 }
             }
-            "undo" => self.undo_last(),
-            "sync" => self.request_sync(),
-            "daemon_start" => self.request_start_daemon(),
-            "daemon_stop" => self.request_stop_daemon(),
-            "quit" => {
+            CommandId::Undo => self.undo_last(),
+            CommandId::Sync => self.request_sync(),
+            CommandId::DaemonStart => self.request_start_daemon(),
+            CommandId::DaemonStop => self.request_stop_daemon(),
+            CommandId::Quit => {
                 // Explicit exit: the close handler must not turn this into a hide.
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
-            "daemon_status" => self.status = self.daemon_status_text(),
-            "settings" => self.open_settings(ctx, self.account_switcher_id),
-            "add_account" => {
+            CommandId::DaemonStatus => self.status = self.daemon_status_text(),
+            CommandId::Settings => self.open_settings(ctx, self.account_switcher_id),
+            CommandId::AddAccount => {
                 if self.can_add_account() {
                     self.onboarding = Some(Onboarding::add_account());
                 } else {
                     self.status = "La modalità demo non ha un archivio locale".to_owned();
                 }
             }
-            _ => {}
         }
     }
 }
@@ -12488,221 +12487,11 @@ enum SavedAction {
     Apply(String),
 }
 
-/// What a command needs to be enabled. The palette, the context menus and the keyboard map read
-/// the same rule, so a disabled action always explains itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandRule {
-    Always,
-    Message,
-    ActiveLabel,
-    LabelFilter,
-    /// Sync needs a store-backed account. It is disabled with a reason in the demo.
-    Sync,
-    /// Adding or removing accounts needs the encrypted store; the demo is memory-only.
-    Store,
-    /// The three replies need a received, valid METHOD:REQUEST that names an organizer.
-    Invite,
-    /// Export needs both a selected message and the encrypted store that holds its bytes.
-    StoredMessage,
-}
-
-impl CommandRule {
-    /// `None` when the command is always available, so a caller can show a reason only when one
-    /// exists instead of matching on an empty string.
-    fn reason(self) -> Option<&'static str> {
-        match self {
-            Self::Always => None,
-            Self::Message => Some("Seleziona prima un messaggio"),
-            Self::ActiveLabel => Some("Seleziona prima un'etichetta"),
-            Self::LabelFilter => Some("Nessun filtro etichetta attivo"),
-            Self::Sync => Some("Aggiungi un account per sincronizzare"),
-            Self::Store => Some("La modalità demo non ha un archivio locale"),
-            Self::Invite => Some("Apri un invito ricevuto per rispondere"),
-            Self::StoredMessage => Some("Seleziona un messaggio in un archivio locale"),
-        }
-    }
-
-    fn disabled_reason(self) -> &'static str {
-        self.reason().unwrap_or("")
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Command {
-    id: &'static str,
-    label: &'static str,
-    icon: &'static str,
-    shortcut: &'static str,
-    rule: CommandRule,
-    in_palette: bool,
-}
-
-const COMMANDS: &[Command] = &[
-    Command { id: "compose", label: "Scrivi", icon: icons::COMPOSE, shortcut: "C", rule: CommandRule::Always, in_palette: true },
-    Command { id: "open", label: "Apri messaggio", icon: icons::MAIL, shortcut: "Invio", rule: CommandRule::Message, in_palette: true },
-    Command { id: "reply", label: "Rispondi", icon: icons::REPLY, shortcut: "R", rule: CommandRule::Message, in_palette: true },
-    Command { id: "reply_all", label: "Rispondi a tutti", icon: icons::REPLY_ALL, shortcut: "A", rule: CommandRule::Message, in_palette: true },
-    Command { id: "forward", label: "Inoltra", icon: icons::FORWARD, shortcut: "F", rule: CommandRule::Message, in_palette: true },
-    Command { id: "invite_accept", label: "Accetta", icon: icons::CHECK, shortcut: "Ctrl+Shift+1", rule: CommandRule::Invite, in_palette: true },
-    Command { id: "invite_tentative", label: "Tentativo", icon: icons::CLOCK, shortcut: "Ctrl+Shift+2", rule: CommandRule::Invite, in_palette: true },
-    Command { id: "invite_decline", label: "Rifiuta", icon: icons::X_CIRCLE, shortcut: "Ctrl+Shift+3", rule: CommandRule::Invite, in_palette: true },
-    Command { id: "edit_draft", label: "Modifica bozza", icon: icons::COMPOSE, shortcut: "", rule: CommandRule::Message, in_palette: false },
-    Command { id: "send", label: "Invia", icon: icons::SEND, shortcut: "Ctrl+Invio", rule: CommandRule::Always, in_palette: false },
-    Command { id: "outbox", label: "Coda di invio", icon: icons::SEND, shortcut: "Ctrl+Shift+O", rule: CommandRule::Always, in_palette: true },
-    Command { id: "export_eml", label: "Esporta .eml", icon: icons::DOWNLOAD, shortcut: "", rule: CommandRule::StoredMessage, in_palette: true },
-    Command { id: "import_eml", label: "Importa .eml", icon: icons::UPLOAD, shortcut: "", rule: CommandRule::Store, in_palette: true },
-    Command { id: "expand", label: "Apri a schermo intero", icon: icons::SQUARE, shortcut: "", rule: CommandRule::Message, in_palette: true },
-    Command { id: "read", label: "Segna come letto", icon: icons::MARK_READ, shortcut: "", rule: CommandRule::Message, in_palette: true },
-    Command { id: "unread", label: "Segna come non letto", icon: icons::MARK_UNREAD, shortcut: "U", rule: CommandRule::Message, in_palette: true },
-    Command { id: "star", label: "Aggiungi stella", icon: icons::STAR, shortcut: "S", rule: CommandRule::Message, in_palette: true },
-    Command { id: "unstar", label: "Togli stella", icon: icons::STAR, shortcut: "S", rule: CommandRule::Message, in_palette: true },
-    Command { id: "archive", label: "Archivia", icon: icons::ARCHIVE, shortcut: "E", rule: CommandRule::Message, in_palette: true },
-    Command { id: "delete", label: "Elimina", icon: icons::TRASH, shortcut: "Canc", rule: CommandRule::Message, in_palette: true },
-    Command { id: "label_menu", label: "Etichetta", icon: icons::TAG, shortcut: "L", rule: CommandRule::Message, in_palette: true },
-    Command { id: "label_new", label: "Nuova etichetta", icon: icons::PLUS, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command {
-        id: "label_rename",
-        label: "Rinomina etichetta",
-        icon: icons::COMPOSE,
-        shortcut: "F2",
-        rule: CommandRule::ActiveLabel,
-        in_palette: true,
-    },
-    Command { id: "label_delete", label: "Elimina etichetta", icon: icons::TRASH, shortcut: "", rule: CommandRule::ActiveLabel, in_palette: true },
-    Command {
-        id: "label_clear_filter",
-        label: "Togli filtro etichetta",
-        icon: icons::FILTER,
-        shortcut: "",
-        rule: CommandRule::LabelFilter,
-        in_palette: true,
-    },
-    Command { id: "inbox", label: "Vai a Posta in arrivo", icon: icons::INBOX, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "starred", label: "Vai a Preferiti", icon: icons::STAR, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "theme", label: "Cambia tema", icon: icons::MOON, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "about", label: "Informazioni su Postino", icon: icons::INFO, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "shortcuts", label: "Scorciatoie da tastiera", icon: icons::KEYBOARD, shortcut: "?", rule: CommandRule::Always, in_palette: true },
-    Command { id: "select_all", label: "Seleziona tutto", icon: icons::LIST, shortcut: "Ctrl+A", rule: CommandRule::Always, in_palette: true },
-    Command {
-        id: "toggle",
-        label: "Seleziona o deseleziona",
-        icon: icons::CHECK,
-        shortcut: "X / Spazio",
-        rule: CommandRule::Message,
-        in_palette: true,
-    },
-    Command { id: "clear_selection", label: "Deseleziona", icon: icons::X_CIRCLE, shortcut: "Esc", rule: CommandRule::Always, in_palette: true },
-    Command { id: "focus_search", label: "Cerca nelle mail", icon: icons::SEARCH, shortcut: "/", rule: CommandRule::Always, in_palette: true },
-    Command { id: "threads_toggle", label: "Conversazioni o messaggi", icon: icons::LIST, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "saved_search_save", label: "Salva ricerca", icon: icons::TAG, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command {
-        id: "saved_search_rename",
-        label: "Rinomina ricerca",
-        icon: icons::COMPOSE,
-        shortcut: "",
-        rule: CommandRule::Always,
-        in_palette: false,
-    },
-    Command { id: "saved_search_delete", label: "Elimina ricerca", icon: icons::TRASH, shortcut: "", rule: CommandRule::Always, in_palette: false },
-    Command { id: "rules", label: "Regole locali", icon: icons::FILTER, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "rules_new", label: "Nuova regola", icon: icons::PLUS, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command {
-        id: "saved_search_clear_recent",
-        label: "Cancella ricerche recenti",
-        icon: icons::SEARCH,
-        shortcut: "",
-        rule: CommandRule::Always,
-        in_palette: true,
-    },
-    Command {
-        id: "next",
-        label: "Sposta il focus in basso",
-        icon: icons::CHEVRON_DOWN,
-        shortcut: "J / ↓",
-        rule: CommandRule::Always,
-        in_palette: false,
-    },
-    Command {
-        id: "previous",
-        label: "Sposta il focus in alto",
-        icon: icons::CHEVRON_UP,
-        shortcut: "K / ↑",
-        rule: CommandRule::Always,
-        in_palette: false,
-    },
-    Command {
-        id: "extend_next",
-        label: "Estendi selezione in basso",
-        icon: icons::CHEVRON_DOWN,
-        shortcut: "Shift+J / Shift+↓",
-        rule: CommandRule::Always,
-        in_palette: false,
-    },
-    Command {
-        id: "extend_previous",
-        label: "Estendi selezione in alto",
-        icon: icons::CHEVRON_UP,
-        shortcut: "Shift+K / Shift+↑",
-        rule: CommandRule::Always,
-        in_palette: false,
-    },
-    Command { id: "close", label: "Chiudi lettura", icon: icons::CLOSE, shortcut: "Esc", rule: CommandRule::Always, in_palette: false },
-    Command { id: "undo", label: "Annulla ultima azione", icon: icons::UNDO, shortcut: "Z", rule: CommandRule::Always, in_palette: false },
-    Command { id: "palette", label: "Apri i comandi", icon: icons::COMMAND, shortcut: "Ctrl+K", rule: CommandRule::Always, in_palette: false },
-    Command { id: "sync", label: "Aggiorna la posta", icon: icons::SYNC, shortcut: "", rule: CommandRule::Sync, in_palette: true },
-    Command { id: "settings", label: "Impostazioni", icon: icons::SETTINGS, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "add_account", label: "Aggiungi account", icon: icons::PLUS, shortcut: "", rule: CommandRule::Store, in_palette: true },
-    Command { id: "daemon_start", label: "Avvia il daemon", icon: icons::SYNC, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "daemon_stop", label: "Ferma il daemon", icon: icons::CLOSE, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "quit", label: "Esci da Postino", icon: icons::CLOSE, shortcut: "Ctrl+Q", rule: CommandRule::Always, in_palette: true },
-    Command { id: "daemon_status", label: "Stato del daemon", icon: icons::INFO, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command { id: "reduced_motion", label: "Riduci le animazioni", icon: icons::CLOCK, shortcut: "", rule: CommandRule::Always, in_palette: true },
-    Command {
-        id: "mark_folder_read",
-        label: "Segna tutto come letto",
-        icon: icons::MARK_READ,
-        shortcut: "",
-        rule: CommandRule::Always,
-        in_palette: false,
-    },
-    Command { id: "back", label: "Torna alla posta", icon: icons::ARROW_LEFT, shortcut: "Esc", rule: CommandRule::Always, in_palette: false },
-];
-
-fn command(id: &str) -> Option<&'static Command> {
-    COMMANDS.iter().find(|command| command.id == id)
-}
-
-fn command_label(id: &str, fallback: &'static str) -> &'static str {
-    command(id).map_or(fallback, |command| command.label)
-}
-
-fn command_icon(id: &str, fallback: &'static str) -> &'static str {
-    command(id).map_or(fallback, |command| command.icon)
-}
-
-fn command_shortcut(id: &str, fallback: &'static str) -> &'static str {
-    command(id).map_or(fallback, |command| command.shortcut)
-}
-
-fn menu_item(id: &str) -> MenuItem<'static> {
-    match command(id) {
-        Some(Command { rule: CommandRule::Sync, .. }) => MenuItem::new(command_label(id, "Aggiorna"))
-            .icon(command_icon(id, icons::SYNC))
-            .enabled(false)
-            .reason(command(id).and_then(|command| command.rule.reason()).unwrap_or("")),
-        Some(command) => MenuItem::new(command.label).icon(command.icon).shortcut(command.shortcut),
-        None => MenuItem::new("Azione non disponibile").enabled(false).reason("Comando non registrato"),
-    }
-}
-
-fn filtered_commands(query: &str) -> Vec<&'static Command> {
-    let query = query.trim().to_lowercase();
-    COMMANDS
-        .iter()
-        .filter(|command| command.in_palette)
-        .filter(|command| query.is_empty() || command.label.to_lowercase().contains(&query) || command.shortcut.to_lowercase().contains(&query))
-        .collect()
-}
+#[cfg(test)]
+pub(crate) use crate::commands::command;
+pub(crate) use crate::commands::{
+    COMMANDS, Command, CommandId, CommandRule, command_icon, command_label, command_shortcut, filtered_commands, menu_item,
+};
 
 fn window_control(ui: &mut Ui, glyph: &str, label: &str, close: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, ui_size::TITLE_BAR), Sense::click());
@@ -13067,7 +12856,7 @@ fn invite_when(invite: &CalendarInviteView) -> Option<String> {
 /// The reading-pane invite card. It only reports a click; the caller owns the draft. Buttons are
 /// disabled with a visible reason when the event cannot be answered, and never rendered for a
 /// cancelled or invalid event.
-fn reading_invite_card(ui: &mut Ui, invite: &CalendarInviteView, t: &Tokens) -> Option<&'static str> {
+fn reading_invite_card(ui: &mut Ui, invite: &CalendarInviteView, t: &Tokens) -> Option<CommandId> {
     let headline = match invite.method.as_str() {
         "request" => "INVITO",
         "cancel" => "INVITO ANNULLATO",
@@ -13137,16 +12926,18 @@ fn reading_invite_card(ui: &mut Ui, invite: &CalendarInviteView, t: &Tokens) -> 
                 ui.add_space(space::XS);
                 let enabled = invite.can_reply;
                 ui.horizontal_wrapped(|ui| {
-                    for id in ["invite_accept", "invite_tentative", "invite_decline"] {
-                        let label = command_label(id, "Accetta");
+                    for id in [CommandId::InviteAccept, CommandId::InviteTentative, CommandId::InviteDecline] {
+                        let label = command_label(id.as_str(), "Accetta");
                         let button = match id {
-                            "invite_accept" => Button::new(label),
-                            "invite_tentative" => Button::ghost(label),
+                            CommandId::InviteAccept => Button::new(label),
+                            CommandId::InviteTentative => Button::ghost(label),
+                            // The three buttons above are the whole set; the third reply is the
+                            // refusal and is the only one that stays destructive.
                             _ => Button::danger(label),
                         };
                         let response = button.enabled(enabled).show(ui);
                         #[cfg(test)]
-                        probe::invite_action(ui, id, &response, enabled);
+                        probe::invite_action(ui, id.as_str(), &response, enabled);
                         if response.clicked() {
                             command = Some(id);
                         }
@@ -15999,8 +15790,105 @@ mod tests {
         let all = filtered_commands("");
         assert!(all.len() > 4, "the palette should list more than the first command");
         let search = filtered_commands("stella");
-        assert!(search.iter().any(|command| command.id == "star"));
+        assert!(search.iter().any(|command| command.id.as_str() == "star"));
         assert!(search.iter().all(|command| command.label.to_lowercase().contains("stella")));
+    }
+
+    #[test]
+    fn the_command_table_is_exhaustive_and_unique() {
+        // The table is the single source of the palette, the menus and the shortcut sheet, so a
+        // missing, duplicated or half-registered command is a dead button. Pin all three.
+        const ALL: &[CommandId] = &[
+            CommandId::Compose,
+            CommandId::Open,
+            CommandId::Reply,
+            CommandId::ReplyAll,
+            CommandId::Forward,
+            CommandId::InviteAccept,
+            CommandId::InviteTentative,
+            CommandId::InviteDecline,
+            CommandId::EditDraft,
+            CommandId::Send,
+            CommandId::Outbox,
+            CommandId::ExportEml,
+            CommandId::ImportEml,
+            CommandId::Expand,
+            CommandId::Read,
+            CommandId::Unread,
+            CommandId::Star,
+            CommandId::Unstar,
+            CommandId::Archive,
+            CommandId::Delete,
+            CommandId::LabelMenu,
+            CommandId::LabelNew,
+            CommandId::LabelRename,
+            CommandId::LabelDelete,
+            CommandId::LabelClearFilter,
+            CommandId::Inbox,
+            CommandId::Starred,
+            CommandId::Theme,
+            CommandId::About,
+            CommandId::Shortcuts,
+            CommandId::SelectAll,
+            CommandId::Toggle,
+            CommandId::ClearSelection,
+            CommandId::FocusSearch,
+            CommandId::ThreadsToggle,
+            CommandId::SavedSearchSave,
+            CommandId::SavedSearchRename,
+            CommandId::SavedSearchDelete,
+            CommandId::Rules,
+            CommandId::RulesNew,
+            CommandId::SavedSearchClearRecent,
+            CommandId::Next,
+            CommandId::Previous,
+            CommandId::ExtendNext,
+            CommandId::ExtendPrevious,
+            CommandId::Close,
+            CommandId::Undo,
+            CommandId::Palette,
+            CommandId::Sync,
+            CommandId::Settings,
+            CommandId::AddAccount,
+            CommandId::DaemonStart,
+            CommandId::DaemonStop,
+            CommandId::Quit,
+            CommandId::DaemonStatus,
+            CommandId::ReducedMotion,
+            CommandId::MarkFolderRead,
+            CommandId::Back,
+        ];
+        assert_eq!(ALL.len(), 58, "one variant per command");
+        assert_eq!(COMMANDS.len(), ALL.len(), "one table entry per CommandId");
+
+        let mut listed = Vec::new();
+        for command in COMMANDS {
+            assert!(!listed.contains(&command.id), "{:?} is listed twice", command.id);
+            listed.push(command.id);
+        }
+        for id in ALL {
+            assert!(listed.contains(id), "{id:?} has no COMMANDS entry");
+        }
+
+        // Star/unstar share S because the key toggles, and the three Escape commands belong to
+        // different surfaces. Every other shortcut must name exactly one command.
+        let mut shortcuts: std::collections::HashMap<&'static str, Vec<CommandId>> = std::collections::HashMap::new();
+        for command in COMMANDS.iter().filter(|command| !command.shortcut.is_empty()) {
+            shortcuts.entry(command.shortcut).or_default().push(command.id);
+        }
+        for (shortcut, ids) in shortcuts {
+            let mut ids = ids;
+            ids.sort_by_key(|id| id.as_str());
+            let expected: &[CommandId] = match shortcut {
+                "S" => &[CommandId::Star, CommandId::Unstar],
+                "Esc" => &[CommandId::Back, CommandId::ClearSelection, CommandId::Close],
+                _ => {
+                    assert_eq!(ids.len(), 1, "the shortcut {shortcut} is assigned to more than one command: {ids:?}");
+                    continue;
+                }
+            };
+            assert_eq!(ids, expected, "the shared shortcut {shortcut} drifted to another command");
+        }
     }
 
     #[test]
@@ -17114,7 +17002,7 @@ mod tests {
         assert!(app.command_enabled(clear));
         assert!(app.command_enabled(rename));
         let ctx = egui::Context::default();
-        app.execute_command("label_clear_filter", &ctx);
+        app.execute_command(CommandId::LabelClearFilter, &ctx);
         assert!(app.label_filter.is_none(), "the enabled command changes the view");
     }
 
@@ -19604,7 +19492,7 @@ mod tests {
         theme::apply(&ctx, false);
         let mut app = PostinoApp::demo(true);
         assert!(command("settings").is_some());
-        app.execute_command("settings", &ctx);
+        app.execute_command(CommandId::Settings, &ctx);
         assert!(app.show_accounts_dialog);
         app.open_licences(&ctx);
         let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
@@ -20599,7 +20487,7 @@ mod tests {
         frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), Vec::new());
         let button = probe::outbox_button_rect(&ctx).expect("the status bar has no outbox button when rows are active");
         assert!(button.width() > 0.0 && button.height() > 0.0);
-        app.execute_command("outbox", &ctx);
+        app.execute_command(CommandId::Outbox, &ctx);
         frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), Vec::new());
         assert!(app.outbox_open);
         let text = painted_text(&ctx, &mut app, Vec2::new(980.0, 600.0));

@@ -9,6 +9,7 @@ mod background;
 mod body;
 mod body_ui;
 mod boot;
+mod commands;
 mod daemon;
 mod onboarding;
 mod reading;
