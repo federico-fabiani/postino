@@ -110,7 +110,7 @@ mod imp {
                 if parent.exists() {
                     crate::platform::verify_owner_only_dir(parent).map_err(IpcError::Io)?;
                 } else {
-                    std::fs::DirBuilder::new().mode(0o700).create_all(parent)?;
+                    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
                     crate::platform::verify_owner_only_dir(parent).map_err(IpcError::Io)?;
                 }
             }
