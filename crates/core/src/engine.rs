@@ -5064,11 +5064,11 @@ impl Engine {
             return Ok(());
         };
         let changed = || draft_changed(&current.summary.id);
-        let row = store.get_message(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(&changed)?;
+        let row = store.get_message(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(changed)?;
         if row.summary.folder_id != current.summary.folder_id {
             return Err(draft_changed(&current.summary.id));
         }
-        let revision = store.draft_revision(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(&changed)?;
+        let revision = store.draft_revision(&current.summary.id).map_err(store_map::read_error)?.ok_or_else(changed)?;
         if self.draft_snapshots.get(&current.summary.id).is_some_and(|snapshot| *snapshot != revision) {
             return Err(draft_changed(&current.summary.id));
         }
