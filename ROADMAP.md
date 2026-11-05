@@ -4,11 +4,11 @@
 > search-batch scheduler and the local JSON-RPC IPC (P10a1); the desktop app is a daemon client with
 > reconnect and preserved view state (P10a2); the tray, autostart and notifications shipped in P10b1,
 > and the app's daemon-brokered settings, close-to-tray and activation in P10b2. M5 and M6 are the
-> current work, with P13i (multiple senders) as the latest merged phase.
+> current work, with P13j (search autocomplete) as the latest merged phase.
 > **Last reviewed:** 2026-11-04
 > **Last updated:** 2026-11-04
-> **Change:** The header stopped at M3 and still claimed there was no daemon; it now names M4 as
-> shipped and P13i as the newest phase.
+> **Change:** P13j added relative dates, `is:favourite`, the search completion popover and recipient
+> autocomplete from local history; the header now names it as the newest phase.
 >
 > M0, the U0 UI foundation and M1-M4 are done: the store, MIME, blobs, IMAP, sync, accounts and
 > onboarding are real, the app reads and syncs a real mailbox from the encrypted cache, SMTP with the
@@ -173,6 +173,12 @@ interaction model before real mail makes them expensive to change. Full spec:
       architecture table; RSS is unverified (154.7–156.5 MiB is the seeding process, not an opened
       mailbox).
 - [x] Flags, move, archive, delete and undo; spam classification is out of scope for M3.
+- [x] Search autocomplete (P13j): relative dates (`today`, `yesterday`, `7d`, `2w`, `1m`, `1y`) and
+      `is:favourite` in the grammar, a token-aware completion popover in the search bar (fields,
+      `is:`/`has:`/date/size values, labels, folders, people from local history), and the same
+      popover on the composer's To/Cc/Bcc fields, fed by a derived `correspondents` table (schema
+      v10) built from received mail, newest first, never the account's own address. Operations
+      `search_suggest` and `correspondents_suggest` keep the CLI and MCP paths equal.
 - [x] Local rules (P9c): a validated query plus 1-5 actions (move, label, read/unread, trash,
       forward), `priority ASC, id ASC` with `stop`, ≤100 rules and ≤5 actions per account. `new`
       runs after `sync_now` or on demand on received-origin mail ingested after the rule was created;
@@ -248,6 +254,15 @@ interaction model before real mail makes them expensive to change. Full spec:
       `--audit-log`, read-only mailbox/message resources, a rolling 300-call guard, and a
       metadata-only JSONL trail rotated at 8 MiB.
 - [x] Windows per-user packaging source: MSI/ZIP, manifest, external signing (P12e).
+- [x] GitHub repository, release pipeline and update check (P14a): `federico-fabiani/postino`,
+      `.github/workflows/release.yml` builds the GNU payload, MSI and ZIP from a `release` branch
+      push, verifies them with `Test-Package.ps1` and opens a draft Release; `update_check` reads the
+      newest published tag with one bounded request and names the release page.
+- [x] In-app update install (P14b): the banner offers the published version, and `update_install`
+      downloads the `-windows-x64.msi` of that release, refuses it unless its SHA-256 matches the
+      `SHA256SUMS.txt` of the same release, and starts `msiexec /qb` detached. Reading the MSI URL
+      and the manifest is confined to this project's `/releases/download/` paths. Signing, a clean
+      VM and the other installers are still open.
 - [ ] Signing (external certificate), clean-VM verification, DMG/AppImage/deb/rpm. An unsigned
       per-user MSI and portable ZIP are built from a clean stamped release; the MSI installs and
       uninstalls on the development host, while Authenticode, a fresh VM, upgrade and the other

@@ -69,6 +69,22 @@ pub fn op_defs() -> Vec<OpDef> {
             false
         ),
         def!(
+            "update_check",
+            "Check for updates",
+            "Reads the latest published Postino release from GitHub and compares it with this build. Read-only and bounded: one request, a 10 s timeout, a 1 MiB answer cap, and only a release page under the project is ever returned. This is the only network destination outside the user's own mail and calendar servers. It downloads nothing and installs nothing.",
+            UpdateCheckArgs,
+            true,
+            false
+        ),
+        def!(
+            "update_install",
+            "Install the newest update",
+            "Downloads the Windows installer of the newest published release, refuses it unless its SHA-256 matches the SHA256SUMS.txt of the same release, then starts it detached and returns the verified path. Requires \"confirm\": true and is destructive: Windows Installer replaces the program files and may close the running app and daemon. Only Windows installs are supported; on other platforms it fails with a readable message.",
+            UpdateInstallArgs,
+            false,
+            true
+        ),
+        def!(
             "accounts_list",
             "List accounts",
             "Every configured account with its IMAP provider, address, server host/port/TLS, optional SMTP submission endpoint and last sync status. A damaged sync_status value is reported as null with a warning, never as a listing failure. Never includes a password or a credential: account_add and account_remove are sensitive operations available only from the CLI and the desktop app.",
@@ -241,8 +257,24 @@ pub fn op_defs() -> Vec<OpDef> {
         def!(
             "search",
             "Search mail",
-            "Search the encrypted local index. Grammar: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:unread|read|starred|unstarred`, `has:attachment`, `before:`/`after:` (YYYY-MM-DD UTC), `larger:`/`smaller:` (k/m/g). Bare terms search all text, `*` marks a prefix, quoted values support `\\\"`, and AND/OR/NOT (uppercase) plus parentheses compose clauses. Hits are bm25-ranked with an exact global date/id tie-break; `sort: \"date\"` orders newest first. `unread_only` and `with_attachments` filter the same scope as the page. `total` is exact up to 10 000 and `total_capped` says when it is not. At most 200 hits per page and offset 5000. Snippets are plain text, never HTML. Unknown folder or label names/ids are an error. A parse error is an invalid argument carrying the error code and position. While a pending index is building, the result has empty hits and an `index` object with state/counts/last_error.",
+            "Search the encrypted local index. Grammar: `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `folder:`, `is:unread|read|starred|unstarred` (also `favourite`), `has:attachment`, `before:`/`after:` (a real `YYYY-MM-DD` in UTC, or `today`, `yesterday`, `7d`, `2w`, `1m`, `1y` relative to now), `larger:`/`smaller:` (k/m/g). Bare terms search all text, `*` marks a prefix, quoted values support `\\\"`, and AND/OR/NOT (uppercase) plus parentheses compose clauses. Hits are bm25-ranked with an exact global date/id tie-break; `sort: \"date\"` orders newest first. `unread_only` and `with_attachments` filter the same scope as the page. `total` is exact up to 10 000 and `total_capped` says when it is not. At most 200 hits per page and offset 5000. Snippets are plain text, never HTML. Unknown folder or label names/ids are an error. A parse error is an invalid argument carrying the error code and position. While a pending index is building, the result has empty hits and an `index` object with state/counts/last_error.",
             SearchArgs,
+            true,
+            false
+        ),
+        def!(
+            "search_suggest",
+            "Complete a search token",
+            "Complete the token at the caret of a search query. Pass the word being typed, not the whole query: `fro` returns `from:`, `from:giu` returns the people whose address or name matches, `label:lav` the labels, `folder:arc` the folders, `is:un` the states, `after:7` the relative days. Each row carries `insert`, the canonical clause that replaces the token, `label`, the readable form, and `kind` (`field`, `operator`, `from`, `to`, `label`, `folder`, `is`, `has`, `date`, `size`). People come from the local correspondent list, newest first, so the answer never scans the mailbox. Read-only and offline; an empty or unknown token returns no rows.",
+            SearchSuggestArgs,
+            true,
+            false
+        ),
+        def!(
+            "correspondents_suggest",
+            "Suggest people",
+            "The addresses this account has received mail from or alongside, newest first. Matches `query` as a case-insensitive substring of the address or the display name; an empty query returns the most recent people. Each row has `address`, `name` and `last_date`. Only received mail feeds the list, the account's own address is never included, and the list is local derived data maintained inside the message transaction. The composer's recipient autocomplete and `from:` completion both read it.",
+            CorrespondentsSuggestArgs,
             true,
             false
         ),
@@ -622,6 +654,20 @@ pub fn op_defs() -> Vec<OpDef> {
 #[serde(deny_unknown_fields)]
 pub struct AppInfoArgs {}
 
+/// `update_check` takes no arguments: the build knows its own version and the repository is fixed
+/// at compile time, so a request cannot point the check at another server.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateCheckArgs {}
+
+/// `update_install` writes to disk and replaces the program, so it needs an explicit `confirm`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateInstallArgs {
+    /// Must be `true`. Without it the operation refuses instead of installing.
+    pub confirm: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountsListArgs {}
@@ -930,6 +976,40 @@ pub enum SearchSort {
     Relevance,
     /// Newest first.
     Date,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSuggestArgs {
+    /// The token at the caret: the text after the last space, quote or parenthesis. The caller
+    /// passes the word it is completing, not the whole query.
+    pub token: String,
+    /// Restrict people and folders to one account. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Maximum suggestions, 1-20. Defaults to 8.
+    pub limit: Option<u32>,
+}
+
+/// What one completion inserts and how it reads.
+#[derive(Debug, Serialize)]
+pub struct SearchSuggest {
+    pub suggestions: Vec<crate::search::Suggestion>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorrespondentsSuggestArgs {
+    /// Matched against the address and the display name. Empty returns the most recent people.
+    pub query: Option<String>,
+    /// Restrict to one account. Required when the mailbox has several accounts.
+    pub account: Option<String>,
+    /// Maximum rows, 1-50. Defaults to 10.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CorrespondentsSuggest {
+    pub correspondents: Vec<postino_store::Correspondent>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1915,6 +1995,19 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
             let _: AppInfoArgs = parse(args)?;
             value(app_info(engine))
         }
+        "update_check" => {
+            let _: UpdateCheckArgs = parse(args)?;
+            value(crate::update::check().map_err(|error| OpError::Failed(error.to_string()))?)
+        }
+        "update_install" => {
+            let request: UpdateInstallArgs = parse(args)?;
+            if !request.confirm {
+                return Err(OpError::Failed(
+                    "update_install needs \"confirm\": true: it downloads the installer of the newest release and starts it".into(),
+                ));
+            }
+            value(crate::update::install().map_err(|error| OpError::Failed(error.to_string()))?)
+        }
         "accounts_list" => {
             let _: AccountsListArgs = parse(args)?;
             let (accounts, warnings) = engine.account_views_report()?;
@@ -2031,6 +2124,17 @@ pub fn dispatch(engine: &mut Engine, name: &str, args: Value) -> Result<Value, O
         "search" => {
             let args: SearchArgs = parse(args)?;
             search(engine, args)
+        }
+        "search_suggest" => {
+            let args: SearchSuggestArgs = parse(args)?;
+            let limit = usize::try_from(args.limit.unwrap_or(8)).unwrap_or(8).clamp(1, 20);
+            value(SearchSuggest { suggestions: engine.search_suggest(args.account.as_deref(), &args.token, limit)? })
+        }
+        "correspondents_suggest" => {
+            let args: CorrespondentsSuggestArgs = parse(args)?;
+            let limit = usize::try_from(args.limit.unwrap_or(10)).unwrap_or(10).clamp(1, 50);
+            let correspondents = engine.correspondents(args.account.as_deref(), args.query.as_deref().unwrap_or_default(), limit)?;
+            value(CorrespondentsSuggest { correspondents })
         }
         "search_status" => {
             let _args: SearchStatusArgs = parse(args)?;
@@ -3057,6 +3161,25 @@ mod tests {
         let save = find("draft_save");
         assert!(save.input_schema["properties"]["in_reply_to"].is_object(), "draft_save has no in_reply_to field");
         assert!(save.description.contains("metadata only"), "{}", save.description);
+    }
+
+    #[test]
+    fn update_check_is_read_only_and_never_installs() {
+        let defs = super::op_defs();
+        let def = defs.iter().find(|def| def.name == "update_check").expect("update_check is missing");
+        assert!(def.read_only, "an update check must be read-only");
+        assert!(!def.destructive);
+        assert!(!def.sensitive, "it takes no credential and must stay available over MCP");
+        assert!(def.input_schema["properties"].as_object().is_none_or(|properties| properties.is_empty()));
+        assert!(def.description.contains("downloads nothing"), "{}", def.description);
+        assert!(def.description.contains("GitHub"), "{}", def.description);
+
+        let install = defs.iter().find(|def| def.name == "update_install").expect("update_install is missing");
+        assert!(!install.read_only, "installing writes and replaces files");
+        assert!(install.destructive);
+        assert!(!install.sensitive, "it takes no credential");
+        assert_eq!(install.input_schema["required"], serde_json::json!(["confirm"]));
+        assert!(install.description.contains("SHA-256"), "{}", install.description);
     }
 
     #[test]

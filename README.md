@@ -545,8 +545,30 @@ If `cargo test` says `error calling dlltool`, the MinGW folder is missing from `
 SQLCipher/OpenSSL build takes ~4.5 min with `MAKEFLAGS` and ~14 min without; warm builds are seconds.
 See `docs/store-spike.md`.
 
-The MSVC toolchain is also installed on some machines, but it needs Visual Studio's `link.exe`.
-The GNU toolchain plus MSYS2 is the path documented here.
+The MSVC toolchain builds the shipped payload. `.github/workflows/release.yml` uses it with a static
+CRT (`+crt-static` in `.cargo/config.toml`), so a release needs no Visual C++ redistributable and
+no MinGW DLLs. Local development stays on GNU; `installer\Build-Package.ps1` refuses a target that
+does not match the host, so the two never mix in one package.
+
+## Releases
+
+Releases are cut by the pipeline, never by hand:
+
+```powershell
+# after bumping [workspace.package] version in Cargo.toml and committing
+git push origin main:release
+```
+
+That push runs the full `ci.yml` gate, builds the MSVC payload, the per-user MSI and the portable
+ZIP with `installer\Build-Package.ps1` and `Build-Msi.ps1`, proves them with
+`installer\Test-Package.ps1`, and opens a **draft** GitHub Release with the tag `v<version>`. Publish
+the draft in the UI when the checksum looks right; `update_check` only sees published releases.
+
+The app checks that feed once at start. When the published version is newer, a banner names it and
+offers one button; `update_install` downloads the MSI of that release, refuses it unless its SHA-256
+matches the release's `SHA256SUMS.txt`, saves it under `%LOCALAPPDATA%\Postino\updates` and starts
+`msiexec`. Nothing is downloaded or run without that press. The releases are unsigned for now:
+Windows SmartScreen will warn on first run, and the checksum proves integrity, not authorship.
 
 ## Design
 

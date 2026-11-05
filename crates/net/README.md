@@ -136,6 +136,20 @@ needs.
 - Error text is reduced to 200 bytes of printable ASCII, so a hostile server cannot inject control
   characters or unbounded data into a log.
 
+## Release feed
+
+`release` is the only module that talks to a server that is not the user's own. One GET against
+`api.github.com/repos/federico-fabiani/postino/releases/latest`, with the OS trust roots, a 10 s
+global timeout, a 1 MiB answer cap and `http_status_as_error(false)` so a 403 becomes the "shared
+hourly quota" message instead of a bare status. It returns a tag and a release page; a `html_url`
+that is not under `https://github.com/federico-fabiani/postino/releases/` falls back to that page,
+so the client can never be pointed at another host. A check downloads nothing.
+
+`download` is the second half, used only by `update_install`: it accepts a URL under
+`.../releases/download/`, refuses a 403 the same way, caps the body at the size the caller asks
+for, and returns the bytes with their SHA-256 so the caller compares it to the published manifest
+before anything touches the disk.
+
 ## Tests
 
 `cargo test -p postino-net`. Two zooms:

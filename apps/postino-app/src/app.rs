@@ -11,8 +11,8 @@ use base64::Engine as _;
 use chrono::{DateTime, Datelike, Local, Utc};
 use eframe::egui::containers::Sides;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Rect, ResizeDirection,
-    RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, FocusDirection, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Rect,
+    ResizeDirection, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, UserData, Vec2, ViewportCommand, WidgetInfo, WidgetType, pos2,
 };
 use postino_core::{
     Account, Address, Attachment, AttachmentGet, BodyFormat, CalendarInviteView, DraftSave, Engine, FolderKind, Identity, InviteResponse, LabelApply,
@@ -60,6 +60,7 @@ mod reading_pane;
 mod screenshot;
 mod settings_dialogs;
 mod shell;
+mod update;
 
 /// Which view the command line asked for. Only the tray passes `Outbox`; a desktop launch keeps
 /// the mail list.
@@ -282,6 +283,10 @@ pub struct PostinoApp {
     folder: String,
     /// The account whose mail is on screen. Every folder view is scoped to it.
     active_account: Option<String>,
+    /// The search bar's completion popover. Transient, owned by the shell.
+    search_suggest: crate::ui::widgets::suggest::SuggestState,
+    /// The update banner: one startup check and the optional install it starts.
+    update: update::UpdateUi,
     /// `Some` only for a normal launch that opened the encrypted store. The sync worker and the
     /// post-sync reload use this handle; a demo session has none.
     store: Option<StoreHandle>,
@@ -408,6 +413,8 @@ pub struct PostinoApp {
     scroll_saved_into_view: bool,
     /// The sidebar scroll offset computed from the last RICERCHE reveal, applied next frame.
     sidebar_scroll_target: Option<f32>,
+    /// Bring a newly opened label or saved-search editor into view once, without pinning it there.
+    scroll_editor_into_view: bool,
     /// True while the centred search field owns the keyboard; the empty-focus recent chips read it.
     search_focus: bool,
     unread_only: bool,
@@ -475,6 +482,8 @@ pub struct PostinoApp {
     /// the pending link, the attachment sheets and the unsubscribe choice. The struct lives in
     /// `reading_pane.rs`, next to the code that reads it.
     reading: reading_pane::ReadingUi,
+    /// Transient window-chrome state (currently the sync button's success/failure flash).
+    shell: shell::ShellUi,
     /// A message override used only by deterministic screenshots (HTML plus attachment fixtures).
     screenshot_message: Option<Message>,
     /// The invite card shown for [`Self::screenshot_message`], when the scene is an invite.
@@ -1079,6 +1088,8 @@ impl PostinoApp {
             engine,
             folder,
             active_account,
+            search_suggest: crate::ui::widgets::suggest::SuggestState::default(),
+            update: update::UpdateUi::new(),
             store,
             store_path,
             demo_return: None,
@@ -1144,6 +1155,7 @@ impl PostinoApp {
             recording_recent: false,
             scroll_saved_into_view: false,
             sidebar_scroll_target: None,
+            scroll_editor_into_view: false,
             search_focus: false,
             index_progress: None,
             index_checked: false,
@@ -1189,6 +1201,7 @@ impl PostinoApp {
             file_picker: Arc::new(UnavailableFilePicker),
             folder_opener: Arc::new(UnavailableFolderOpener),
             reading: reading_pane::ReadingUi::default(),
+            shell: shell::ShellUi::default(),
             screenshot_message: None,
             screenshot_invite: None,
             invite_ready: false,
@@ -1578,6 +1591,7 @@ impl PostinoApp {
             SyncRequest::Started => {
                 self.sync_account = Some(account);
                 self.sync_view = SyncView::Running(SyncProgress::default());
+                self.shell.clear_sync_flash();
                 self.status = "Sincronizzazione avviata".to_owned();
             }
             SyncRequest::AlreadyRunning => self.status = "Sincronizzazione già in corso".to_owned(),
@@ -1618,6 +1632,7 @@ impl PostinoApp {
         let applies = event_account.is_none() || event_account.as_deref() == active.as_deref();
         match event {
             SyncEvent::Started { .. } => {
+                self.shell.clear_sync_flash();
                 if applies && !matches!(self.sync_view, SyncView::Running(_)) {
                     if self.sync_account.is_none() {
                         self.sync_account = event_account;
@@ -1642,6 +1657,7 @@ impl PostinoApp {
                 let last = self.last_sync.or_else(|| Some(self.now_utc.timestamp_millis()));
                 self.last_sync = last;
                 self.sync_view = SyncView::Idle { last_sync: last };
+                self.shell.note_sync_finished(true, self.now);
                 self.status = format!(
                     "Sincronizzazione completata · {}",
                     plural(usize::try_from(report.fetched).unwrap_or(usize::MAX), "messaggio aggiornato", "messaggi aggiornati")
@@ -1666,6 +1682,7 @@ impl PostinoApp {
                     } else {
                         SyncView::Error { reason: message.clone(), last_sync: self.last_sync }
                     };
+                    self.shell.note_sync_finished(false, self.now);
                     self.status = message.clone();
                 }
                 if let Some(onboarding) = self.onboarding.as_mut() {
@@ -2529,6 +2546,7 @@ impl PostinoApp {
             error: None,
             focus: true,
         });
+        self.scroll_editor_into_view = true;
     }
 
     fn start_saved_search_rename(&mut self, id: &str) {
@@ -2542,6 +2560,7 @@ impl PostinoApp {
             error: None,
             focus: true,
         });
+        self.scroll_editor_into_view = true;
     }
 
     fn cancel_saved_search_editor(&mut self) {
@@ -2560,6 +2579,7 @@ impl PostinoApp {
         if name.is_empty() || query.is_empty() {
             if let Some(editor) = self.saved_editor.as_mut() {
                 editor.error = Some("Servono un nome e una ricerca".to_owned());
+                self.scroll_editor_into_view = true;
             }
             return;
         }
@@ -2593,6 +2613,7 @@ impl PostinoApp {
                 if let Some(editor) = self.saved_editor.as_mut() {
                     editor.error = Some(saved_editor_error(&message));
                 }
+                self.scroll_editor_into_view = true;
             }
             Err(_) => {
                 self.report_failure("Non è stato possibile salvare la ricerca.", false);
@@ -2812,8 +2833,8 @@ impl PostinoApp {
         self.open_message(id);
     }
 
-    /// J/K inside a conversation moves the open card, not the thread list. At the top of the loaded
-    /// page it pulls the previous page in first.
+    /// Alt+J/K inside a conversation moves the open card, not the thread list. At the top of the
+    /// loaded page it pulls the previous page in first.
     fn step_thread_message(&mut self, delta: i32) {
         if self.thread_messages.is_empty() {
             return;
@@ -2997,6 +3018,7 @@ impl PostinoApp {
             apply_to,
         });
         self.label_delete = None;
+        self.scroll_editor_into_view = true;
     }
 
     fn start_label_rename(&mut self, id: &str) {
@@ -3017,6 +3039,7 @@ impl PostinoApp {
             apply_to: Vec::new(),
         });
         self.label_delete = None;
+        self.scroll_editor_into_view = true;
     }
 
     fn cancel_label_editor(&mut self) {
@@ -3084,6 +3107,7 @@ impl PostinoApp {
                     swatch_focused: false,
                     apply_to: editor.apply_to,
                 });
+                self.scroll_editor_into_view = true;
             }
         }
     }
@@ -3539,12 +3563,11 @@ impl PostinoApp {
     }
 
     fn step_selection(&mut self, delta: i32, extend: bool) {
+        // In the conversation list the arrows always walk the rows, even with the preview open:
+        // the preview follows the newly selected thread instead of trapping the keyboard inside
+        // a one-message conversation. `Alt+J/K` is the card navigation; it never reaches here.
         if self.threads_view {
-            if self.selected_thread.is_some() && self.reading_open && !extend {
-                self.step_thread_message(delta);
-            } else {
-                self.step_thread_row(delta);
-            }
+            self.step_thread_row(delta);
             return;
         }
         let (rows, _, _) = self.visible_messages();
@@ -3576,7 +3599,9 @@ impl PostinoApp {
     }
 
     /// J/K in the conversation list moves the selected thread without opening it. Enter opens the
-    /// latest unread card through the `open` command.
+    /// latest unread card through the `open` command. An already open preview follows the new
+    /// thread, so the list keeps the arrow keys and the pane stays where the user put it; a closed
+    /// pane stays closed, because browsing must never mark mail read.
     fn step_thread_row(&mut self, delta: i32) {
         let (threads, _, _, _) = self.visible_threads();
         if threads.is_empty() {
@@ -3591,8 +3616,27 @@ impl PostinoApp {
             None => 0,
         };
         let Some(thread) = threads.get(next) else { return };
-        self.load_thread_page(thread.id.clone(), false, None);
+        self.load_thread_page(thread.id.clone(), self.reading_open, None);
         self.scroll_to_selected = true;
+        // The next frame hands keyboard focus to the selected row through `sync_thread_row_focus`.
+        self.focus_selected_row = true;
+    }
+
+    /// Move keyboard focus with the selection. Arrow movement changes `selected_thread` while the
+    /// focus stays on whatever row the user clicked last, which would paint the gold ring on a row
+    /// that is no longer selected. The thread list registers its rows in `row_ids`, so the new
+    /// selected row can own focus before it is drawn. Tab is untouched: this only runs when a
+    /// keyboard move asked for it.
+    fn sync_thread_row_focus(&mut self, ctx: &egui::Context) {
+        if !self.threads_view || !self.focus_selected_row {
+            return;
+        }
+        if let Some(row) = self.selected_thread.as_ref().and_then(|thread| self.row_ids.get(thread)).copied() {
+            ctx.memory_mut(|memory| memory.request_focus(row));
+            self.focus_selected_row = false;
+        } else if self.selected_thread.is_none() {
+            self.focus_selected_row = false;
+        }
     }
 
     fn set_flag_for(&mut self, id: &str, unread: Option<bool>, starred: Option<bool>) -> bool {
@@ -4385,6 +4429,8 @@ impl PostinoApp {
         let mut open = false;
         let mut next = false;
         let mut previous = false;
+        let mut card_next = false;
+        let mut card_previous = false;
         let mut mark_unread = false;
         let mut star = false;
         let mut archive = false;
@@ -4418,8 +4464,14 @@ impl PostinoApp {
             shortcuts = !typing && !input.modifiers.command && input.key_pressed(Key::Questionmark);
             enter = !typing && !input.modifiers.command && input.key_pressed(Key::Enter) && row_focused;
             open = !typing && !input.modifiers.command && input.key_pressed(Key::O);
-            next = !typing && !input.modifiers.command && (input.key_pressed(Key::J) || input.key_pressed(Key::ArrowDown));
-            previous = !typing && !input.modifiers.command && (input.key_pressed(Key::K) || input.key_pressed(Key::ArrowUp));
+            next = !typing && !input.modifiers.command && !input.modifiers.alt && (input.key_pressed(Key::J) || input.key_pressed(Key::ArrowDown));
+            previous = !typing && !input.modifiers.command && !input.modifiers.alt && (input.key_pressed(Key::K) || input.key_pressed(Key::ArrowUp));
+            // Alt+J/K and Alt+↓/↑ move between the cards of the open conversation instead of the
+            // rows of the list. Landing on the same card twice is a no-op, so the delta clamps.
+            card_next =
+                !typing && !input.modifiers.command && input.modifiers.alt && (input.key_pressed(Key::J) || input.key_pressed(Key::ArrowDown));
+            card_previous =
+                !typing && !input.modifiers.command && input.modifiers.alt && (input.key_pressed(Key::K) || input.key_pressed(Key::ArrowUp));
             extend = input.modifiers.shift;
             mark_unread = !typing && !input.modifiers.command && input.key_pressed(Key::U);
             star = !typing && !input.modifiers.command && input.key_pressed(Key::S);
@@ -4483,6 +4535,15 @@ impl PostinoApp {
         }
         if self.show_palette || self.show_shortcuts || self.show_about {
             return;
+        }
+        // The list owns the arrow keys. egui's own focus navigation also reacts to them at the end
+        // of the pass, which moved focus from the first visible row to the toolbar. Consume the
+        // arrow events and clear the pending direction so only `step_selection` moves.
+        if next || previous || card_next || card_previous {
+            ctx.input_mut(|input| {
+                input.events.retain(|event| !matches!(event, egui::Event::Key { key: Key::ArrowUp | Key::ArrowDown, pressed: true, .. }));
+            });
+            ctx.memory_mut(|memory| memory.move_focus(FocusDirection::None));
         }
         if rename_label && let Some(id) = self.label_filter.clone() {
             self.start_label_rename(&id);
@@ -4568,6 +4629,18 @@ impl PostinoApp {
         }
         if previous {
             self.step_selection(-1, extend);
+        }
+        // Keyboard moves take focus with them, even when the preview overlay hides the list.
+        self.sync_thread_row_focus(ctx);
+        // The card navigation is deliberately separate from `step_selection`: it never changes
+        // `selected_thread`, and it only exists while a conversation is actually open.
+        if self.threads_view && self.reading_open && self.selected_thread.is_some() {
+            if card_next {
+                self.step_thread_message(1);
+            }
+            if card_previous {
+                self.step_thread_message(-1);
+            }
         }
     }
 
@@ -4813,11 +4886,11 @@ impl PostinoApp {
         };
         let unread = self.account_unread(&account.id);
         let provider = account.provider.trim();
-        // The provider stays in the accessible name and tooltip: the provider suffix would push the
-        // account name under the unread badge in the 240 px sidebar.
+        // The unread total lives on the folder badge and in the accessible label, never twice on
+        // screen: painting it here squeezed the account name under the number in the 240 px
+        // sidebar. With no meta the title gets the whole row width.
         let title = account.name.clone();
-        let meta = if unread > 0 { unread_text(unread as usize) } else { String::new() };
-        let row = ListRow::account(title.as_str(), account.email.as_str(), meta.as_str()).icon(icons::USER).height(40.0);
+        let row = ListRow::account(title.as_str(), account.email.as_str(), "").icon(icons::USER).height(40.0);
         let response = row.show(ui);
         let accessible = if provider.is_empty() {
             format!("Account {} — {} · {}. Premi Invio per cambiare account.", title, account.email, account_unread_tooltip(unread))
@@ -4859,49 +4932,19 @@ impl PostinoApp {
                 let mut saved_action = None;
                 let mut editor_action = LabelEditorAction::None;
 
-                // Panels nest in the order they are added. The label drawer is a bottom panel, and
-                // the folder/label list scrolls in what remains: opening the editor shrinks the
-                // viewport and never moves the list.
-                if self.label_editor.is_some() || self.saved_editor.is_some() {
-                    let drawer = egui::Panel::bottom("sidebar-editor")
-                        .exact_size(ui_size::LABEL_EDITOR_DRAWER)
-                        .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(0, inset::MD)))
-                        .show_separator_line(false)
-                        .show(ui, |ui| {
-                            if self.saved_editor.is_some() {
-                                editor_action = saved_search_editor_widget(ui, &mut self.saved_editor, &t);
-                            } else {
-                                let Some(editor) = self.label_editor.as_mut() else {
-                                    return;
-                                };
-                                let editor_scope = ui.scope(|ui| label_editor_widget(ui, editor, &t));
-                                #[cfg(test)]
-                                probe::editor(ui, editor_scope.response.rect);
-                                // The drawer is a pinned surface: the editor's own focus request is
-                                // enough, no scroll-to-rect is allowed to move the navigation.
-                                editor_action = editor_scope.inner;
-                            }
-                        });
-                    ui.painter().hline(drawer.response.rect.x_range(), drawer.response.rect.top(), Stroke::new(1.0, t.border));
-                    #[cfg(test)]
-                    probe::editor_drawer(ui, drawer.response.rect);
-                }
-
                 #[cfg(test)]
                 probe::clear_rows(ui);
                 self.sidebar_account(ui);
                 ui.add_space(space::XS);
-                // A visible bar, local to the sidebar: egui's default is a 2 pt floating sliver
-                // that only appears on hover, which at 980×600 hid the overflow instead of
-                // revealing it. Text colour on ivory is 10:1, and on the dark panel 12:1.
-                ui.spacing_mut().scroll = sidebar_scroll_style();
+                // The sidebar scrolls exactly like the list and the reading pane: the shared
+                // floating style and egui's default `VisibleWhenNeeded`. There is no local
+                // override, so the bar appears only when folders, labels or saved searches
+                // overflow, stays a thin sliver until hovered and thickens while dragged.
                 let sidebar_offset = self.sidebar_scroll_target.take();
                 let mut saved_header_rect: Option<Rect> = None;
                 let mut save_header_scroll = false;
-                let mut sidebar_scroll = egui::ScrollArea::vertical()
-                    .id_salt("sidebar-scroll")
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+                let mut editor_rect: Option<Rect> = None;
+                let mut sidebar_scroll = egui::ScrollArea::vertical().id_salt("sidebar-scroll").auto_shrink([false, false]);
                 if let Some(offset) = sidebar_offset {
                     sidebar_scroll = sidebar_scroll.vertical_scroll_offset(offset);
                 }
@@ -4934,7 +4977,8 @@ impl PostinoApp {
                         } else {
                             String::new()
                         };
-                        let row = ListRow::folder(folder.name.as_str(), meta.as_str())
+                        let display_name = folder_display_name(&folder.name, folder.kind);
+                        let row = ListRow::folder(display_name.as_str(), meta.as_str())
                             .icon(folder_icon(folder.kind))
                             .selected(if self.saved_folder_scope && !self.saved_query_folder {
                                 false
@@ -4973,19 +5017,20 @@ impl PostinoApp {
                     }
 
                     ui.add_space(space::LG);
-                    if ui
-                        .scope(|ui| {
-                            ui.spacing_mut().interact_size.y = 20.0;
-                            SectionHeader::new("ETICHETTE").count(labels.len()).action(icons::PLUS, "Nuova etichetta").show(ui)
-                        })
-                        .inner
-                        .is_some_and(|response| response.clicked())
-                    {
+                    let label_header = ui.scope(|ui| {
+                        ui.spacing_mut().interact_size.y = 20.0;
+                        SectionHeader::new("ETICHETTE").count(labels.len()).action(icons::PLUS, "Nuova etichetta").show(ui)
+                    });
+                    #[cfg(test)]
+                    probe::sidebar_header(ui, "ETICHETTE", label_header.response.rect);
+                    if label_header.inner.is_some_and(|response| response.clicked()) {
                         label_action = Some(LabelAction::New);
                     }
                     ui.add_space(space::XS);
                     for label in &labels {
-                        let meta = if label.unread_count > 0 { label.unread_count.to_string() } else { String::new() };
+                        // Unread is a folder fact and lives on the folder badge, once. The label's
+                        // own badge carries its total, so no row number can read as unread.
+                        let meta = if label.message_count > 0 { label.message_count.to_string() } else { String::new() };
                         let detail = format!(
                             "{} · {} · conteggi su tutte le cartelle",
                             messages_text(label.message_count as usize),
@@ -5022,6 +5067,21 @@ impl PostinoApp {
                     if labels.is_empty() && !editor_open {
                         ui.label(typography::text(Role::Caption, "Nessuna etichetta. Usa + per crearne una.", t.text_faint));
                     }
+                    if self.label_editor.is_some() {
+                        ui.add_space(space::XXS);
+                        let shown = editor_frame(&t).show(ui, |ui| {
+                            let Some(editor) = self.label_editor.as_mut() else {
+                                return LabelEditorAction::None;
+                            };
+                            label_editor_widget(ui, editor, &t)
+                        });
+                        #[cfg(test)]
+                        probe::editor(ui, shown.response.rect);
+                        editor_rect = Some(shown.response.rect);
+                        if shown.inner != LabelEditorAction::None {
+                            editor_action = shown.inner;
+                        }
+                    }
 
                     ui.add_space(space::LG);
                     let can_save = !self.search_committed.trim().is_empty() && saved_searches.len() < 12;
@@ -5040,6 +5100,8 @@ impl PostinoApp {
                             .show(ui)
                     });
                     saved_header_rect = Some(search_header.response.rect);
+                    #[cfg(test)]
+                    probe::sidebar_header(ui, "RICERCHE", search_header.response.rect);
                     if self.scroll_saved_into_view {
                         self.scroll_saved_into_view = false;
                         save_header_scroll = true;
@@ -5049,13 +5111,9 @@ impl PostinoApp {
                     }
                     ui.add_space(space::XS);
                     for saved in &saved_searches {
-                        let meta = if !saved.valid {
-                            String::new()
-                        } else if saved.unread > 0 {
-                            saved.unread.to_string()
-                        } else {
-                            saved.total.to_string()
-                        };
+                        // Same rule as labels: the row badge counts messages, never unread. The
+                        // unread count stays on the folder badge, and the tooltip keeps both.
+                        let meta = if saved.valid && saved.total > 0 { saved.total.to_string() } else { String::new() };
                         let detail = if saved.index_pending {
                             "Indice di ricerca in preparazione".to_owned()
                         } else if saved.valid {
@@ -5106,7 +5164,38 @@ impl PostinoApp {
                     if saved_searches.is_empty() && !editor_open {
                         ui.label(typography::text(Role::Caption, "Nessuna ricerca salvata. Cerca qualcosa e usa +.", t.text_faint));
                     }
+                    if self.saved_editor.is_some() {
+                        ui.add_space(space::SM);
+                        let shown = editor_frame(&t).show(ui, |ui| saved_search_editor_widget(ui, &mut self.saved_editor, &t));
+                        #[cfg(test)]
+                        probe::editor(ui, shown.response.rect);
+                        editor_rect = Some(shown.response.rect);
+                        if shown.inner != LabelEditorAction::None {
+                            editor_action = shown.inner;
+                        }
+                    }
                 });
+                if self.scroll_editor_into_view
+                    && let Some(editor) = editor_rect
+                {
+                    self.scroll_editor_into_view = false;
+                    let content_top = scroll.inner_rect.top() - scroll.state.offset.y;
+                    let current = scroll.state.offset.y;
+                    let top = editor.top() - content_top;
+                    let bottom = editor.bottom() - content_top;
+                    let viewport = scroll.inner_rect.height();
+                    let target = if bottom > viewport - 6.0 {
+                        bottom - viewport + 6.0
+                    } else if top < 6.0 {
+                        top
+                    } else {
+                        current
+                    };
+                    if (target - current).abs() > 0.5 {
+                        self.sidebar_scroll_target = Some(target.max(0.0));
+                        ui.ctx().request_repaint();
+                    }
+                }
                 if save_header_scroll && let Some(header) = saved_header_rect {
                     let content_top = scroll.inner_rect.top() - scroll.state.offset.y;
                     self.sidebar_scroll_target = Some((header.top() - content_top - 4.0).max(0.0));
@@ -5701,7 +5790,7 @@ impl PostinoApp {
             CommandId::Outbox => {
                 self.open_outbox();
             }
-            CommandId::ExportEml => self.export_selected_eml(),
+            CommandId::ExportEml => self.reading.export_open = true,
             CommandId::ImportEml => self.import_eml(),
             CommandId::Open => {
                 if self.threads_view {
@@ -5906,6 +5995,7 @@ impl PostinoApp {
         let composer_was_open = self.composer.open;
         self.capture_screenshot(ui.ctx());
         self.tick(ui.ctx());
+        self.update.tick(ui.ctx());
         self.poll_search_index(ui.ctx());
         self.refresh_saved_searches_if_stale();
         self.resize_handles(ui.ctx());
@@ -5936,6 +6026,7 @@ impl PostinoApp {
             self.title_bar(ui);
         }
         self.toolbar(ui);
+        self.update.banner(ui, self.dark);
         self.loading_line(ui);
         self.sidebar(ui);
         // Below 1000 px the side pane cannot keep a usable list, so reading reuses the full path
@@ -5981,6 +6072,7 @@ impl PostinoApp {
         self.attachment_warning_dialog(ui);
         self.attachment_overwrite_dialog(ui);
         self.attachment_preview_dialog(ui);
+        self.export_picker_dialog(ui);
         self.licences_dialog(ui);
         // The composer owns the keyboard while it is open. Capture the widget that had it before
         // the composer requests focus, so closing returns the user exactly where they were.
@@ -6672,6 +6764,58 @@ fn folder_icon(kind: FolderKind) -> &'static str {
     }
 }
 
+/// The sidebar name for a folder. Servers expose path-like identifiers (`INBOX.Drafts`,
+/// `[Gmail]/Sent Mail`), not product names: map the standard leaves once here so every account
+/// reads in Italian without renaming anything on the server. Unknown folders keep their path,
+/// with separators spaced so a nested name is not a wall of dots.
+fn folder_display_name(name: &str, kind: FolderKind) -> String {
+    let role = match kind {
+        FolderKind::Inbox => Some("Posta in arrivo"),
+        FolderKind::Starred => Some("Preferiti"),
+        FolderKind::Sent => Some("Inviate"),
+        FolderKind::Drafts => Some("Bozze"),
+        FolderKind::Archive => Some("Archivio"),
+        FolderKind::Spam => Some("Spam"),
+        FolderKind::Trash => Some("Cestino"),
+        FolderKind::Custom => None,
+    };
+    if let Some(role) = role {
+        return role.to_owned();
+    }
+    let trimmed = name.trim();
+    let base = ["INBOX.", "INBOX/", "INBOX\\"]
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))
+        .or_else(|| {
+            let lower = trimmed.get(..6)?;
+            lower.eq_ignore_ascii_case("inbox.").then(|| trimmed.get(6..)).flatten()
+        })
+        .unwrap_or(trimmed);
+    let parts = base.split(['.', '/', '\\']).map(str::trim).filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    let Some(leaf) = parts.last() else { return base.to_owned() };
+    if let Some(mapped) = folder_alias(leaf) {
+        return mapped.to_owned();
+    }
+    parts.join(" / ")
+}
+
+fn folder_alias(leaf: &str) -> Option<&'static str> {
+    const ALIASES: &[(&[&str], &str)] = &[
+        (&["inbox"], "Posta in arrivo"),
+        (&["drafts", "draft"], "Bozze"),
+        (&["sent", "sent items", "sent mail"], "Inviate"),
+        (&["trash", "deleted", "deleted items", "deleted messages"], "Cestino"),
+        (&["junk", "junk email", "spam"], "Spam"),
+        (&["archive", "archives"], "Archivio"),
+        (&["all mail"], "Tutti i messaggi"),
+        (&["templates", "template"], "Modelli"),
+        (&["outbox"], "In uscita"),
+        (&["starred"], "Preferiti"),
+        (&["important"], "Importanti"),
+    ];
+    ALIASES.iter().find(|(names, _)| names.iter().any(|name| leaf.eq_ignore_ascii_case(name))).map(|(_, mapped)| *mapped)
+}
+
 /// Italian singular/plural for a count: `plural(1, "messaggio", "messaggi")` → "1 messaggio".
 pub(crate) fn plural(count: usize, singular: &str, plural: &str) -> String {
     if count == 1 { format!("1 {singular}") } else { format!("{count} {plural}") }
@@ -6863,43 +7007,43 @@ enum LabelEditorAction {
     Cancel,
 }
 
-/// The inline create/rename editor: title, one-line field, error, colour row, hint and the two
-/// pointer controls. It sits directly under the ETICHETTE header so none of those parts can scroll
-/// out of view.
+/// The inline editor card shared by labels and saved searches. It sits in the sidebar flow, between
+/// the rows it edits and the next section, so the navigation keeps its natural order.
+fn editor_frame(t: &Tokens) -> Frame {
+    Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::SM, inset::XS))
+}
+
+/// The inline create/rename editor: one dense field and one row with the colour swatches and the
+/// two icon controls. Enter saves, Esc cancels; both are also in the tooltips.
 fn label_editor_widget(ui: &mut Ui, editor: &mut LabelEditor, t: &Tokens) -> LabelEditorAction {
     let mut action = LabelEditorAction::None;
     ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
-        let title = match &editor.mode {
-            LabelEditorMode::Create => "Nuova etichetta",
-            LabelEditorMode::Rename(_) => "Rinomina etichetta",
-        };
-        ui.label(typography::text(Role::Meta, title, t.text_muted));
+        ui.spacing_mut().item_spacing.y = space::XS;
         let focus = editor.focus;
         editor.focus = false;
         let error = editor.error.clone();
-        let mut field = TextField::new(&mut editor.text, "Nome etichetta").width(ui.available_width()).focus(focus);
+        let mut field = TextField::new(&mut editor.text, "Nome etichetta").width(ui.available_width()).focus(focus).dense();
         if let Some(error) = error.as_deref() {
             field = field.error(error);
         }
         editor.focused = field.show(ui).has_focus();
-        ui.add_space(space::XS);
-        editor.swatch_focused = label_color_swatches(ui, &mut editor.color, t);
-        ui.label(typography::text(Role::Caption, "Invio salva · Esc annulla\nTab poi ←/→ e Invio", t.text_faint));
-        ui.add_space(space::XS);
         ui.horizontal(|ui| {
-            let save = Button::primary("Salva").size(ButtonSize::Sm).show(ui);
-            #[cfg(test)]
-            probe::editor_save(ui, save.rect);
-            if save.clicked() {
-                action = LabelEditorAction::Save;
-            }
-            let cancel = Button::ghost("Annulla").size(ButtonSize::Sm).show(ui);
-            #[cfg(test)]
-            probe::editor_cancel(ui, cancel.rect);
-            if cancel.clicked() {
-                action = LabelEditorAction::Cancel;
-            }
+            editor.swatch_focused = label_color_swatches(ui, &mut editor.color, t);
+            ui.spacing_mut().item_spacing.x = space::XXS;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let cancel = IconButton::new(icons::CLOSE, "Annulla").size(IconButtonSize::Sm).shortcut_hint("Esc").show(ui);
+                #[cfg(test)]
+                probe::editor_cancel(ui, cancel.rect);
+                if cancel.clicked() {
+                    action = LabelEditorAction::Cancel;
+                }
+                let save = IconButton::new(icons::CHECK, "Salva").size(IconButtonSize::Sm).shortcut_hint("Invio").show(ui);
+                #[cfg(test)]
+                probe::editor_save(ui, save.rect);
+                if save.clicked() {
+                    action = LabelEditorAction::Save;
+                }
+            });
         });
     });
     action
@@ -6976,14 +7120,14 @@ fn label_color_swatches(ui: &mut Ui, selected: &mut LabelColor, t: &Tokens) -> b
     let mut focused = false;
     ui.horizontal(|ui| {
         for (index, (color, name)) in LABEL_COLORS.iter().enumerate() {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
             let id = ids.get(index).copied().unwrap_or_else(|| ui.make_persistent_id(("label-color", index)));
             let response = ui.interact(rect, id, Sense::click());
             let active = *selected == *color;
             if active {
-                ui.painter().circle_stroke(rect.center(), 10.0, Stroke::new(2.0, t.gold_ink));
+                ui.painter().circle_stroke(rect.center(), 8.0, Stroke::new(1.5, t.gold_ink));
             }
-            ui.painter().circle_filled(rect.center(), 6.5, label_color(*color, t));
+            ui.painter().circle_filled(rect.center(), 5.0, label_color(*color, t));
             if response.has_focus() {
                 focused = true;
                 crate::ui::tokens::paint_focus_ring(ui, rect, radius::PILL, t);
@@ -7006,12 +7150,6 @@ fn label_color_swatches(ui: &mut Ui, selected: &mut LabelColor, t: &Tokens) -> b
         }
     });
     focused
-}
-
-/// The sidebar uses the shared always-visible scroll bar: at 980×600 an overflowing list with
-/// only a hover-revealed sliver looked broken.
-fn sidebar_scroll_style() -> egui::style::ScrollStyle {
-    crate::ui::tokens::scroll_style()
 }
 
 /// The reading pane takes 52% of the content width left by the sidebar, clamped to 420 pt and 62%,
@@ -7201,10 +7339,6 @@ pub(crate) mod probe {
         ctx.data(|data| data.get_temp(id("scroll-content")))
     }
 
-    pub fn scroll_offset(ctx: &Context) -> Option<f32> {
-        ctx.data(|data| data.get_temp(id("scroll-offset")))
-    }
-
     pub fn sidebar_panel(ui: &Ui, rect: Rect) {
         ui.ctx().data_mut(|data| data.insert_temp(id("sidebar-panel"), rect));
     }
@@ -7375,14 +7509,6 @@ pub(crate) mod probe {
 
     pub fn editor_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("editor")))
-    }
-
-    pub fn editor_drawer(ui: &Ui, rect: Rect) {
-        ui.ctx().data_mut(|data| data.insert_temp(id("editor-drawer"), rect));
-    }
-
-    pub fn editor_drawer_rect(ctx: &Context) -> Option<Rect> {
-        ctx.data(|data| data.get_temp(id("editor-drawer")))
     }
 
     pub fn composer_card(ui: &Ui, rect: Rect) {
@@ -7852,6 +7978,83 @@ pub(crate) mod probe {
 
     pub fn reading_body_rect(ctx: &Context) -> Option<Rect> {
         ctx.data(|data| data.get_temp(id("reading-body")))
+    }
+
+    pub fn reading_panel(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("reading-panel"), rect));
+    }
+
+    pub fn reading_panel_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("reading-panel")))
+    }
+
+    pub fn reading_scroll(ui: &Ui, viewport: Rect, content: Vec2, offset: Vec2) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("reading-scroll-view"), viewport);
+            data.insert_temp(id("reading-scroll-content"), content);
+            data.insert_temp(id("reading-scroll-offset"), offset);
+        });
+    }
+
+    pub fn reading_scroll_view(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("reading-scroll-view")))
+    }
+
+    pub fn reading_scroll_content(ctx: &Context) -> Option<Vec2> {
+        ctx.data(|data| data.get_temp(id("reading-scroll-content")))
+    }
+
+    pub fn reading_scroll_offset(ctx: &Context) -> Option<Vec2> {
+        ctx.data(|data| data.get_temp(id("reading-scroll-offset")))
+    }
+
+    pub fn toolbar(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("toolbar"), rect));
+    }
+
+    pub fn toolbar_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("toolbar")))
+    }
+
+    pub fn search_field(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("search-field"), rect));
+    }
+
+    pub fn search_field_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("search-field")))
+    }
+
+    pub fn status_bar(ui: &Ui, rect: Rect) {
+        ui.ctx().data_mut(|data| data.insert_temp(id("status-bar"), rect));
+    }
+
+    pub fn status_bar_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("status-bar")))
+    }
+
+    pub fn status_item(ui: &Ui, key: &str, rect: Rect) {
+        ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<BTreeMap<String, Rect>>(id("status-items")).insert(key.to_owned(), rect);
+        });
+    }
+
+    pub fn status_item_rect(ctx: &Context, key: &str) -> Option<Rect> {
+        ctx.data(|data| data.get_temp::<BTreeMap<String, Rect>>(id("status-items"))).and_then(|items| items.get(key).copied())
+    }
+
+    pub fn sync_button(ui: &Ui, rect: Rect, state: &str) {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(id("sync-button"), rect);
+            data.insert_temp(id("sync-button-state"), state.to_owned());
+        });
+    }
+
+    pub fn sync_button_rect(ctx: &Context) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(id("sync-button")))
+    }
+
+    pub fn sync_button_state(ctx: &Context) -> Option<String> {
+        ctx.data(|data| data.get_temp(id("sync-button-state")))
     }
 
     pub fn attachment_save_enabled(ui: &Ui, attachment_id: &str, enabled: bool) {

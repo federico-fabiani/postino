@@ -36,8 +36,13 @@ starting. Do not build a later milestone's features into the current one.
    - Bound recursion, allocations, decompression and attachment sizes.
    - Keep a last-resort panic guard around work that touches untrusted data.
 5. **Privacy first.** No telemetry, no analytics, no cloud account, no remote AI call by default.
-   The only network destinations are the user's own IMAP/SMTP/CalDAV servers. Logs must not contain
-   message bodies, credentials or full addresses unless the user explicitly asks.
+   The network destinations are the user's own IMAP/SMTP/CalDAV servers, plus exactly one release
+   feed: `update_check` reads `api.github.com/repos/federico-fabiani/postino/releases/latest` in one
+   bounded request (10 s, 1 MiB), and dismissing its banner is the only opt-out. The only
+   write path is `update_install`, which runs when the person presses the button: it downloads the
+   MSI of that release, refuses it unless its SHA-256 matches the published `SHA256SUMS.txt`, and
+   starts `msiexec`. Logs must not contain message bodies, credentials or full
+   addresses unless the user explicitly asks.
 6. **Secrets never touch disk in plaintext.** OS keyring only. The future store is encrypted at
    rest; the future key lives in the keyring.
 7. **MCP is opt-in.** It runs only when the user launches `postino mcp`, speaks stdio only, opens
@@ -163,7 +168,11 @@ cargo test --workspace
 Without `MAKEFLAGS`, `openssl-src` builds serially on Windows (~14 min cold instead of ~4.5 min).
 The VS 2022 BuildTools instance has the C++ workload, Windows SDK and AddressSanitizer for native
 fuzzing (`fuzz/run-windows.ps1`); product builds stay on GNU, so do not switch the default toolchain
-casually. `cargo xtask ci` prints a clear error when `dlltool`, `make` or `perl` is missing.
+casually. The one exception is the release pipeline: `.github/workflows/release.yml` builds the
+shipped payload on the MSVC host with `+crt-static`, because that is the toolchain the GitHub runner
+provides and the static CRT removes the MinGW runtime DLLs. `installer\Build-Package.ps1` refuses a
+target that does not match the rustc host, so the two never mix in one payload. `cargo xtask ci`
+prints a clear error when `dlltool`, `make` or `perl` is missing.
 
 ## 8. Commits
 

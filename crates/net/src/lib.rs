@@ -27,6 +27,8 @@
 //!   authorization-code flow with PKCE in [`oauth`], and SASL `XOAUTH2` is the only thing it does.
 //!   QRESYNC, CONDSTORE, SORT/THREAD, METADATA, ACL, S/MIME and autodiscovery are not implemented;
 //!   unknown untagged responses are collected as [`response`] noise and ignored rather than trusted.
+//! - **One exception.** [`release`] reads the release feed from GitHub: one bounded GET, when the
+//!   user (or the update check they enabled) asks for it. It never downloads or installs anything.
 //!
 //! See `README.md` for the command grammar, the bounds and the fake server that proves each path.
 
@@ -43,6 +45,7 @@ mod mailbox;
 mod message;
 pub mod oauth;
 mod parser;
+pub mod release;
 mod response;
 mod secret;
 mod session;
@@ -59,6 +62,7 @@ pub use limits::Limits;
 pub use mailbox::{decode_utf7, encode_utf7};
 pub use message::{Address, Envelope, Flag, FlagMode, IdleEvent, UidFlags};
 pub use oauth::{AuthRequest, Authorization, Loopback, OAuthProvider, Pkce, REFRESH_SKEW, TokenEndpoint, TokenSet};
+pub use release::{LATEST_RELEASE_API, RELEASES_PAGE, Release, ReleaseError};
 pub use rustls::pki_types::CertificateDer;
 pub use secret::Secret;
 pub use session::Session;

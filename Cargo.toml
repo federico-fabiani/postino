@@ -4,11 +4,11 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/postino-app", "apps/postino-cli", "apps/postino-daemon", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.98"
-repository = "https://github.com/federicopostino/postino"
+repository = "https://github.com/federico-fabiani/postino"
 
 [workspace.dependencies]
 # internal
@@ -52,6 +52,10 @@ tokio-rustls = { version = "=0.26.5", default-features = false, features = ["log
 rustls = { version = "=0.23.46", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-platform-verifier = "=0.7.1"
 base64 = "=0.22.1"
+# The release feed (crates/net/src/release.rs). No bundled root list: trust roots come from the
+# operating system, because webpki-roots and webpki-root-certs are CDLA-licensed.
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "_ring"] }
+rustls-native-certs = "0.8"
 
 # network tests
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }

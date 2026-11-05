@@ -25,6 +25,7 @@ mod rules;
 pub mod search;
 mod store_map;
 mod unsubscribe;
+pub mod update;
 pub mod vault;
 
 pub use engine::{
@@ -60,4 +61,5 @@ pub use rules::{
     RuleUndoOutcome,
 };
 pub use search::{Expr as SearchExpr, Field as SearchField, IsFilter, ParsedQuery, SearchError, Snippet, make_snippet, parse as parse_search};
+pub use update::{RELEASES_PAGE, Release, ReleaseError, UpdateStatus};
 pub use vault::{CredentialVault, VaultError};

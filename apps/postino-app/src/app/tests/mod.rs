@@ -31,6 +31,7 @@ mod reading;
 mod rules;
 mod search;
 mod shell;
+mod update;
 
 /// One text run actually painted by a frame: the galley text, its rectangle and the clip that
 /// applied to it. `clip` is what makes a layout assertion clip-aware: a section painted outside
@@ -246,6 +247,18 @@ fn wheel_by(pos: egui::Pos2, steps: usize, step: f32) -> Vec<egui::Event> {
         delta: Vec2::new(0.0, step),
         phase: egui::TouchPhase::Move,
         modifiers: Modifiers::NONE,
+    }));
+    events
+}
+
+/// A horizontal wheel, the way a shift-wheel or a trackpad reports it.
+fn wheel_horizontal(pos: egui::Pos2, steps: usize) -> Vec<egui::Event> {
+    let mut events = vec![egui::Event::PointerMoved(pos)];
+    events.extend((0..steps).map(|_| egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: Vec2::new(0.0, -60.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: Modifiers::SHIFT,
     }));
     events
 }
@@ -591,4 +604,15 @@ fn pgp_key(id: &str) -> PgpKey {
         created_at: 0,
         updated_at: 0,
     }
+}
+
+#[test]
+fn folder_names_read_in_italian_without_losing_custom_paths() {
+    assert_eq!(folder_display_name("INBOX", FolderKind::Inbox), "Posta in arrivo");
+    assert_eq!(folder_display_name("INBOX.Drafts", FolderKind::Custom), "Bozze");
+    assert_eq!(folder_display_name("INBOX.Sent Items", FolderKind::Custom), "Inviate");
+    assert_eq!(folder_display_name("[Gmail]/Sent Mail", FolderKind::Custom), "Inviate");
+    assert_eq!(folder_display_name("[Gmail]/All Mail", FolderKind::Custom), "Tutti i messaggi");
+    assert_eq!(folder_display_name("Progetti.Cliente", FolderKind::Custom), "Progetti / Cliente");
+    assert_eq!(folder_display_name("Viaggi", FolderKind::Custom), "Viaggi");
 }

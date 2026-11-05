@@ -188,7 +188,7 @@ it also replaces an oversized response (for example a dry-run of a large draft) 
 | `postino-crypto` | HKDF-SHA256 subkeys, XChaCha20-Poly1305 seal/open, zeroising key type (P4b) |
 | `postino-store` | SQLCipher schema, migrations, repository (P3b); encrypted content-addressed blobs (P4b); FTS5 search and schema v7 (P9a); thread cache and saved searches (P9b); local rules, candidate query and journal (P9c); PGP key rows and schema v8 (P12c1); raw PGP/MIME retention and schema v9 (P12c2a) |
 | `postino-mime` | MIME parse/serialize, HTML-to-text, sanitization, header-injection guards (P4a; attachment blob storage was P4b) |
-| `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. Autodiscovery and QRESYNC later |
+| `postino-net` | IMAP4rev1 client (P5a) and SMTP submission client (P7): TLS, bounded responses, testable against scripted servers. One bounded GET for the release feed behind `update_check` (P14a). Autodiscovery and QRESYNC later |
 | `postino-sync` | Reconciliation (P5b) and submission serialization / Sent append (P7); scheduler later |
 | `postino-compose` | block model → email-safe HTML, CSS inlining, signatures, templates |
 | `postino-rules` | Sieve generation later; P9c's local rules deliberately live in `postino-store` and `postino-core`, not in a new crate |
