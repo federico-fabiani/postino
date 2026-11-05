@@ -377,3 +377,62 @@ fn deleting_a_label_with_more_than_five_hundred_assignments_restores_them_all() 
     assert!(ids.iter().all(|id| !has_label(&app, id, &label.id)), "the retired id carries no assignment");
     assert_eq!(app.labels_cache.iter().find(|candidate| candidate.id == restored.id).map(|candidate| candidate.message_count), Some(501));
 }
+
+/// The numeric-only text runs painted inside `rect`: a row badge is its own run, while a subtitle
+/// that happens to contain digits stays a single long run and never matches here.
+fn number_badges(runs: &[PaintedRun], rect: Rect) -> Vec<String> {
+    runs.iter()
+        .filter(|run| rect.intersects(run.rect))
+        .map(|run| run.text.trim())
+        .filter(|text| !text.is_empty() && text.chars().all(|character| character.is_ascii_digit()))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn sidebar_paints_unread_once_on_the_folder_badge() {
+    let mut app = booted_app("issue9-unread-once", Vec::new(), |store| {
+        seed_account_rows(store, "acc_once", "studio@example.com", None);
+        // A second inbox message that is already read, so a label and a saved search both have a
+        // total above their unread count and the badge number cannot be mistaken for unread.
+        let mut read = store_message("fld_acc_once_inbox", "acc_once", "msg_acc_once_2", "Messaggio già letto");
+        read.summary.unread = false;
+        store.upsert_message(&read).expect("read message");
+    });
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, false);
+    let value = app.engine.call("label_create", json!({ "name": "Lavoro", "color": "muted" })).expect("label");
+    let label_id = serde_json::from_value::<LabelCreate>(value).expect("label response").label.id;
+    app.engine
+        .call("label_apply", json!({ "id": label_id, "message_ids": ["msg_acc_once_1", "msg_acc_once_2"], "apply": true }))
+        .expect("label applied");
+    app.refresh_labels();
+    app.engine.call("search_reindex", json!({})).expect("the index is ready");
+    app.engine.call("saved_search_create", json!({ "name": "Posta salvata", "query": "folder:fld_acc_once_inbox" })).expect("save");
+    app.refresh_saved_searches();
+
+    let label = app.labels_cache.iter().find(|label| label.name == "Lavoro").cloned().expect("Lavoro");
+    assert_eq!((label.message_count, label.unread_count), (2, 1), "the label has read and unread mail: {label:?}");
+    let saved = app.saved_searches.iter().find(|saved| saved.name == "Posta salvata").cloned().expect("saved");
+    assert!(saved.valid, "the saved search is valid: {saved:?}");
+    assert_eq!((saved.total, saved.unread), (2, 1), "the saved search has read and unread matches: {saved:?}");
+    let account = app.active_account.clone().expect("account");
+    let inbox = app.engine.folders().iter().find(|folder| folder.account_id == account && folder.kind == FolderKind::Inbox).cloned().expect("inbox");
+    assert_eq!(inbox.unread, 1, "the folder badge owns the unread count");
+
+    for size in [Vec2::new(1280.0, 900.0), Vec2::new(980.0, 600.0)] {
+        let runs = painted_runs(&ctx, &mut app, size);
+        let rows = probe::rows(&ctx);
+        for (name, total) in [("Lavoro".to_owned(), label.message_count), (format!("saved:{}", saved.name), saved.total)] {
+            let rect = rows.get(&name).copied().unwrap_or_else(|| panic!("{name:?} is not a sidebar row at {size:?}"));
+            assert_eq!(number_badges(&runs, rect), vec![total.to_string()], "{name:?} badges its total, never its unread count, at {size:?}");
+        }
+        let inbox_rect = rows.get(&inbox.name).copied().unwrap_or_else(|| panic!("the {inbox:?} row is not painted"));
+        assert_eq!(
+            number_badges(&runs, inbox_rect),
+            vec![inbox.unread.to_string()],
+            "the folder badge keeps the account's single unread count at {size:?}"
+        );
+    }
+}

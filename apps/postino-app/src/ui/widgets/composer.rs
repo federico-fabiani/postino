@@ -16,6 +16,7 @@ use crate::theme::Tokens;
 use crate::ui::icons;
 use crate::ui::tokens::{self, inset, radius, size as ui_size, space, type_size};
 use crate::ui::typography::{self, Role};
+use crate::ui::widgets::suggest;
 use crate::ui::widgets::{Button, ButtonSize, IconButton, IconButtonSize, SectionHeader, TextField};
 
 /// Wait this long after the last keystroke before autosaving. Short enough to feel automatic,
@@ -89,6 +90,8 @@ pub struct ComposerState {
     pub to: String,
     pub cc: String,
     pub bcc: String,
+    /// The recipient autocomplete. One popover, because only one of To/Cc/Bcc can hold focus.
+    pub suggest: crate::ui::widgets::suggest::SuggestState,
     pub show_cc: bool,
     pub show_bcc: bool,
     pub subject: String,
@@ -136,6 +139,7 @@ impl ComposerState {
             to: String::new(),
             cc: String::new(),
             bcc: String::new(),
+            suggest: crate::ui::widgets::suggest::SuggestState::default(),
             show_cc: false,
             show_bcc: false,
             subject: String::new(),
@@ -298,12 +302,30 @@ pub struct Composer<'a> {
     pgp_keys: &'a [PgpKey],
     templates: &'a [MessageTemplate],
     identities: &'a [Identity],
+    correspondents: Option<&'a mut suggest::Fetch<'a>>,
 }
 
 impl<'a> Composer<'a> {
     #[must_use]
     pub fn new(state: &'a mut ComposerState, account: &'a Account) -> Self {
-        Self { state, account, send_available: true, demo: true, attachments_available: false, pgp_keys: &[], templates: &[], identities: &[] }
+        Self {
+            state,
+            account,
+            send_available: true,
+            demo: true,
+            attachments_available: false,
+            pgp_keys: &[],
+            templates: &[],
+            identities: &[],
+            correspondents: None,
+        }
+    }
+
+    /// Recipient completions for the To/Cc/Bcc fields. The provider runs once per typed token.
+    #[must_use]
+    pub fn correspondents(mut self, fetch: &'a mut suggest::Fetch<'a>) -> Self {
+        self.correspondents = Some(fetch);
+        self
     }
 
     /// Alternate senders for the account. An empty list keeps the From row read-only.
@@ -591,12 +613,15 @@ impl<'a> Composer<'a> {
             // The A row also carries the Cc and Bcc reveal buttons to its right. Reserving only
             // their label width let the row grow past the 640 pt card and shifted the whole modal.
             let reserved = 112.0;
-            let field_response = TextField::new(text, hint)
+            let mut input = TextField::new(text, hint)
                 .id_salt(salt)
                 .icon(icon)
                 .width((ui.available_width() - reserved).max(120.0))
-                .focus(self.state.focus == Some(field))
-                .show(ui);
+                .focus(self.state.focus == Some(field));
+            if let Some(fetch) = self.correspondents.as_mut() {
+                input = input.suggestions(&mut self.state.suggest, fetch);
+            }
+            let field_response = input.show(ui);
             if hide {
                 let empty = text.trim().is_empty();
                 if IconButton::new(icons::CLOSE, if empty { "Nascondi campo" } else { "Svuota il campo per nasconderlo" })
@@ -727,7 +752,8 @@ impl<'a> Composer<'a> {
                         .response
                         .on_hover_text("Inserisci un modello locale");
                     }
-                    ui.label(typography::text(Role::Caption, "Markdown", t.text_faint));
+                    ui.label(typography::text(Role::Caption, "Formattazione", t.text_faint))
+                        .on_hover_text("Scrivi in Markdown: **grassetto**, *corsivo*, elenchi puntati, citazioni e link");
                 });
             });
         });
@@ -890,8 +916,6 @@ impl<'a> Composer<'a> {
                 (format!("Bozza non salvata · {error}"), t.danger)
             } else if self.state.dirty {
                 ("Salvataggio automatico in corso…".to_owned(), t.text_faint)
-            } else if let Some(at) = &self.state.saved_at {
-                (format!("Bozza salvata alle {at}"), t.success)
             } else {
                 ("La bozza si salva da sola".to_owned(), t.text_faint)
             };

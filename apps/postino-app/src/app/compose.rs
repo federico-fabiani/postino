@@ -854,7 +854,10 @@ impl PostinoApp {
             .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
             .show(ui.ctx(), |ui| {
                 ui.set_width(width);
-                ui.set_max_height(card_height);
+                // `set_max_height` applies to the content, and the modal frame adds its inner
+                // margin on both sides. Subtract that margin so the painted card (not just its
+                // contents) ends above the status bar.
+                ui.set_max_height(card_height - 2.0 * f32::from(inset::XXL));
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
@@ -1184,6 +1187,17 @@ impl PostinoApp {
             ui.set_min_size(inner.size());
             ui.set_max_width(inner.width());
             ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
+                let mut fetch = |token: &str| -> Vec<crate::ui::widgets::suggest::Suggestion> {
+                    self.engine
+                        .correspondents(Some(&account.id), token, 6)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|row| {
+                            let label = if row.name.is_empty() { row.address.clone() } else { format!("{} <{}>", row.name, row.address) };
+                            crate::ui::widgets::suggest::Suggestion { insert: label.clone(), label, kind: "person" }
+                        })
+                        .collect()
+                };
                 Composer::new(&mut self.composer, &account)
                     .send_available(smtp_available)
                     .demo(self.demo)
@@ -1191,6 +1205,7 @@ impl PostinoApp {
                     .pgp_keys(&self.pgp_keys)
                     .templates(&self.templates)
                     .identities(&self.identities)
+                    .correspondents(&mut fetch)
                     .show(ui)
             })
             .inner

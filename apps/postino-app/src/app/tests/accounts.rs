@@ -704,7 +704,8 @@ fn the_settings_screenshot_state_has_the_same_unread_total_at_both_sizes() {
         theme::install_fonts(&ctx);
         theme::apply(&ctx, false);
         let text = painted_text(&ctx, &mut app, size);
-        assert!(text.iter().any(|line| line.contains("5 non letti")), "the sidebar badge at {size:?}: {text:?}");
+        assert!(!text.iter().any(|line| line.contains("5 non letti")), "the account row must not repeat the account total at {size:?}: {text:?}");
+        assert!(text.iter().any(|line| line == "4"), "the inbox folder badge still carries its unread count at {size:?}: {text:?}");
     }
 }
 
@@ -883,6 +884,55 @@ fn the_account_removal_button_warns_and_starts_on_cancel() {
 }
 
 #[test]
+fn the_account_row_gives_the_name_the_full_width_and_leaves_unread_to_the_badges() {
+    let mut app = booted_app("p9c-account-row-name", Vec::new(), |store| {
+        seed_account_rows(store, "acc_federico", "studio@federicofabiani.it", None);
+    });
+    let name = app.active_account().map(|account| account.name.clone()).expect("the seeded account");
+    let unread = app.account_unread("acc_federico");
+    assert_eq!(name, "Account acc_federico");
+    assert!(unread > 0, "the seeded inbox is unread, so the old row painted a total beside the name");
+    let repeated = unread_text(unread as usize);
+
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    for dark in [false, true] {
+        theme::apply(&ctx, dark);
+        app.dark = dark;
+        for size in [Vec2::new(1280.0, 900.0), Vec2::new(980.0, 600.0)] {
+            let runs = painted_runs(&ctx, &mut app, size);
+            let row = runs.iter().find(|run| run.text.starts_with("Account acc_")).unwrap_or_else(|| {
+                panic!("the account name is painted at {size:?} (dark={dark}): {:?}", runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>())
+            });
+            assert_eq!(row.text, name, "the name keeps the full row width instead of truncating under a count (dark={dark}, {size:?})");
+
+            // The account block is the only sidebar content above the scrolling folders and labels.
+            let panel = probe::sidebar_panel_rect(&ctx).expect("the sidebar panel");
+            let view = probe::scroll_view(&ctx).expect("the sidebar scroll area");
+            let header: Vec<&str> = runs
+                .iter()
+                .filter(|run| run.rect.max.y <= view.min.y + 1.0 && run.rect.min.x >= panel.min.x - 1.0 && run.rect.max.x <= panel.max.x + 1.0)
+                .map(|run| run.text.as_str())
+                .collect();
+            assert!(
+                !header.iter().any(|text| text.contains("non lett") || text.contains(&repeated)),
+                "the account block must not repeat the folder badge (dark={dark}, {size:?}): {header:?}"
+            );
+        }
+    }
+
+    // The shipped demo account too: its name is painted whole, never merged with a count.
+    let (ctx, mut demo) = ready_app();
+    let demo_name = demo.active_account().map(|account| account.name.clone()).expect("the demo account");
+    let runs = painted_runs(&ctx, &mut demo, Vec2::new(980.0, 600.0));
+    assert!(
+        runs.iter().any(|run| run.text == demo_name),
+        "the demo account name {demo_name:?} is painted whole: {:?}",
+        runs.iter().map(|run| run.text.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn there_is_one_identity_and_one_offline_retry() {
     let (mut app, _, _) = seeded_attachment_app("p6c-chrome", "report.pdf", None);
     let email = app.engine.accounts().first().map(|account| account.email.clone()).expect("the seeded account");
@@ -894,7 +944,8 @@ fn there_is_one_identity_and_one_offline_retry() {
     let text = painted_text(&ctx, &mut app, Vec2::new(1200.0, 800.0));
     let identity_lines = text.iter().filter(|line| line.contains(&email)).count();
     assert_eq!(identity_lines, 1, "the account e-mail must appear once in the chrome: {text:?}");
-    assert!(text.iter().any(|line| line.contains("1 non letto")), "the unread badge names unread mail: {text:?}");
+    assert!(!text.iter().any(|line| line.contains("1 non letto")), "the account row must not repeat the folder badge on the name line: {text:?}");
+    assert!(text.iter().any(|line| line == "1"), "the inbox folder badge names unread mail: {text:?}");
     assert!(account_unread_tooltip(1).contains("tutte le cartelle"));
     app.sync_view = SyncView::Offline { last_sync: Some(1_700_000_000_000) };
     frame_at(&ctx, &mut app, Vec2::new(1200.0, 800.0), Vec::new());

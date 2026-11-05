@@ -18,6 +18,24 @@ fn the_demo_composer_disables_attaching_with_a_reason_and_never_opens_a_picker()
 }
 
 #[test]
+fn typing_a_recipient_offers_the_people_who_already_wrote_to_you() {
+    let mut app = picker_app("p-auto-recipients");
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, false);
+    app.compose_new();
+    app.composer.to = "mit".to_owned();
+    app.composer.focus = Some(crate::ui::widgets::ComposerFocus::To);
+    frame_at(&ctx, &mut app, Vec2::new(980.0, 600.0), vec![]);
+    assert!(app.composer.suggest.is_open(), "the recipient popover never opened");
+    assert_eq!(
+        app.composer.suggest.selected().map(|row| row.insert.as_str()),
+        Some("Mittente <mittente@example.com>"),
+        "the person who wrote to the account is offered with their stored name"
+    );
+}
+
+#[test]
 fn the_picker_attaches_exact_bytes_lists_the_total_and_removes_the_row() {
     let mut app = picker_app("p8-picker");
     let directory = test_directory("p8-picker-files");

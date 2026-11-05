@@ -19,7 +19,7 @@ fn raw_open(path: &Path, key: &StoreKey) -> Connection {
     connection
 }
 
-/// Remove every v7, v8 and v9 object from a current store so a test can forge the schema a shipped
+/// Remove every v7 to v10 object from a current store so a test can forge the schema a shipped
 /// build left behind. The order matters: the FTS triggers reference the virtual table.
 const DROP_POST_V6: &str = "
 DROP TRIGGER IF EXISTS messages_fts_insert;
@@ -54,6 +54,7 @@ ALTER TABLE messages DROP COLUMN raw_blob_hash;
 DROP INDEX IF EXISTS pgp_keys_fingerprint;
 DROP INDEX IF EXISTS pgp_keys_account;
 DROP TABLE IF EXISTS pgp_keys;
+DROP TABLE IF EXISTS correspondents;
 DELETE FROM meta WHERE key = 'search_index';
 DELETE FROM meta WHERE key = 'search_updated_at';
 DELETE FROM meta WHERE key = 'message_origin_backfilled';
@@ -93,14 +94,14 @@ fn upgrades_a_v1_database_additively() {
 
     {
         let store = Store::open(&path, &key).expect("upgrade v1 to v6");
-        assert_eq!(store.schema_version().expect("version"), 9);
+        assert_eq!(store.schema_version().expect("version"), 10);
         assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v1"), "the upgrade lost meta data");
         store.upsert_account(&account("acc_1")).expect("the v2 tables exist");
         store.set_meta("schema", "v4").expect("write");
     }
 
     let store = Store::open(&path, &key).expect("reopen");
-    assert_eq!(store.schema_version().expect("version"), 9);
+    assert_eq!(store.schema_version().expect("version"), 10);
     assert!(store.get_account("acc_1").expect("account").is_some());
     assert_eq!(store.get_meta("schema").expect("meta").as_deref(), Some("v4"));
 }
@@ -141,7 +142,7 @@ fn upgrades_a_v2_database_and_seeds_the_draft_sequence() {
 
     {
         let store = Store::open(&path, &key).expect("upgrade v2 to v6");
-        assert_eq!(store.schema_version().expect("version"), 9);
+        assert_eq!(store.schema_version().expect("version"), 10);
         let saved = store.save_draft(&draft("terza")).expect("the seeded sequence must continue");
         assert_eq!(saved.revision, 3, "the v2 draft revision did not seed draft_seq");
     }
@@ -209,7 +210,7 @@ fn upgrades_a_v3_database_and_keeps_its_mail() {
 
     {
         let store = Store::open(&path, &key).expect("upgrade v3 to v6");
-        assert_eq!(store.schema_version().expect("version"), 9);
+        assert_eq!(store.schema_version().expect("version"), 10);
         let rows = store.list_all_messages().expect("messages");
         assert_eq!(rows.len(), 1, "the upgrade lost mail");
         assert_eq!(rows[0].remote_images, 0, "a v3 row did not default the remote-image count to 0");
@@ -286,7 +287,7 @@ fn upgrades_a_v5_database_and_defaults_every_remote_count_to_zero() {
     }
 
     let store = Store::open(&path, &key).expect("upgrade v5 to v6");
-    assert_eq!(store.schema_version().expect("version"), 9);
+    assert_eq!(store.schema_version().expect("version"), 10);
     let rows = store.list_all_messages().expect("messages");
     assert_eq!(rows.len(), 2, "the upgrade lost mail");
     assert!(rows.iter().all(|row| row.remote_images == 0), "a v5 row did not default the count to 0: {rows:?}");
@@ -295,7 +296,7 @@ fn upgrades_a_v5_database_and_defaults_every_remote_count_to_zero() {
 
     // Reopening a migrated store keeps the zero counts and does not add the column again.
     let reopened = Store::open(&path, &key).expect("reopen v6");
-    assert_eq!(reopened.schema_version().expect("version"), 9);
+    assert_eq!(reopened.schema_version().expect("version"), 10);
     assert!(reopened.list_all_messages().expect("messages").iter().all(|row| row.remote_images == 0));
 }
 
@@ -457,7 +458,7 @@ fn upgrades_a_v6_database_to_v7_with_the_search_columns_and_index() {
     }
 
     let store = Store::open(&path, &key).expect("upgrade v6 to v7");
-    assert_eq!(store.schema_version().expect("version"), 9);
+    assert_eq!(store.schema_version().expect("version"), 10);
     let pending = store.search_status().expect("pending status");
     assert!(!pending.ready, "the migrated v7 index must start pending");
     assert_eq!(pending.total, 2);
@@ -547,13 +548,17 @@ fn upgrades_a_v7_database_to_v8_with_the_pgp_key_table() {
     {
         let store = Store::open(&path, &key).expect("open the current schema");
         store.upsert_account(&account("acc_1")).expect("account");
-        // Forge a v7 database by removing every v8/v9 object and rewinding the version.
+        // Forge a v7 database by removing every v8/v9/v10 object and rewinding the version.
         let connection = raw_open(&path, &key);
-        connection.execute_batch("DROP TABLE pgp_keys; ALTER TABLE messages DROP COLUMN raw_blob_hash; PRAGMA user_version = 7;").expect("forge v7");
+        connection
+            .execute_batch(
+                "DROP TABLE pgp_keys; DROP TABLE IF EXISTS correspondents; ALTER TABLE messages DROP COLUMN raw_blob_hash; PRAGMA user_version = 7;",
+            )
+            .expect("forge v7");
     }
 
     let store = Store::open(&path, &key).expect("upgrade v7 to v9");
-    assert_eq!(store.schema_version().expect("version"), 9);
+    assert_eq!(store.schema_version().expect("version"), 10);
     assert!(store.list_pgp_keys("acc_1").expect("empty key list").is_empty());
     drop(store);
 
@@ -576,7 +581,7 @@ fn a_failed_v8_migration_rolls_back_and_keeps_v7() {
         // A conflicting table with the v8 name makes the v8 migration fail before it can commit.
         connection
             .execute_batch(
-                "DROP TABLE pgp_keys; CREATE TABLE pgp_keys(dummy TEXT); ALTER TABLE messages DROP COLUMN raw_blob_hash; PRAGMA user_version = 7;",
+                "DROP TABLE pgp_keys; DROP TABLE IF EXISTS correspondents; CREATE TABLE pgp_keys(dummy TEXT); ALTER TABLE messages DROP COLUMN raw_blob_hash; PRAGMA user_version = 7;",
             )
             .expect("forge the failing v7 fixture");
     }
@@ -645,11 +650,13 @@ fn upgrades_a_v8_database_to_v9_with_the_raw_blob_column() {
         // A v8 file has no `raw_blob_hash` column at all, so dropping it reproduces that file: every
         // row cached before v9 has NULL there.
         let connection = raw_open(&path, &key);
-        connection.execute_batch("ALTER TABLE messages DROP COLUMN raw_blob_hash; PRAGMA user_version = 8;").expect("forge v8");
+        connection
+            .execute_batch("DROP TABLE IF EXISTS correspondents; ALTER TABLE messages DROP COLUMN raw_blob_hash; PRAGMA user_version = 8;")
+            .expect("forge v8");
     }
 
     let store = Store::open(&path, &key).expect("upgrade v8 to v9");
-    assert_eq!(store.schema_version().expect("version"), 9);
+    assert_eq!(store.schema_version().expect("version"), 10);
     assert_eq!(store.message_raw_blob_hash("msg_1").expect("raw hash"), None, "a pre-v9 row must report `Not stored`");
     assert_eq!(store.get_message("msg_1").expect("message").expect("row").body_text, "Il verbale della riunione", "the upgrade lost the mail");
     drop(store);
@@ -675,7 +682,8 @@ fn a_failed_v9_migration_rolls_back_and_keeps_v8() {
         // A pre-existing column with the v9 name makes the additive migration fail before it commits.
         connection
             .execute_batch(
-                "ALTER TABLE messages DROP COLUMN raw_blob_hash;
+                "DROP TABLE IF EXISTS correspondents;
+                 ALTER TABLE messages DROP COLUMN raw_blob_hash;
                  ALTER TABLE messages ADD COLUMN raw_blob_hash INTEGER;
                  PRAGMA user_version = 8;",
             )
@@ -703,7 +711,7 @@ fn reopening_does_not_run_a_migration_twice() {
 
     for round in 0..3 {
         let store = Store::open(&path, &key).unwrap_or_else(|error| panic!("open round {round}: {error}"));
-        assert_eq!(store.schema_version().expect("version"), 9);
+        assert_eq!(store.schema_version().expect("version"), 10);
         store.set_meta("rounds", &round.to_string()).expect("write");
         // Dropping the store closes the connection and checkpoints the WAL.
     }
@@ -728,7 +736,7 @@ fn a_newer_schema_is_refused_with_its_version() {
     }
 
     let error = Store::open(&path, &key).err().expect("a newer schema must not be opened");
-    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 9 }), "{error}");
+    assert!(matches!(error, StoreError::SchemaTooNew { found: 99, supported: 10 }), "{error}");
 }
 
 #[test]

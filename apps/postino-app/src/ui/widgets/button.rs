@@ -1,6 +1,9 @@
 //! Buttons and icon buttons. One geometry, one focus ring, one disabled rule.
 
-use eframe::egui::{Color32, CornerRadius, FontFamily, FontId, Response, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType};
+use eframe::egui::{
+    Align2, Color32, CornerRadius, FontFamily, FontId, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType,
+    epaint::TextShape,
+};
 
 use crate::theme::{self, IVORY, Tokens};
 use crate::ui::icons;
@@ -49,6 +52,9 @@ pub struct Button<'a> {
     dot: Option<Color32>,
     trailing_icon: Option<&'a str>,
     shortcut: Option<&'a str>,
+    /// Whether the shortcut is painted inside the button. The toolbar and the reading header keep
+    /// the hint in the tooltip only, where it does not compete with the label.
+    shortcut_visible: bool,
     kind: ButtonKind,
     size: ButtonSize,
     enabled: bool,
@@ -66,6 +72,7 @@ impl<'a> Button<'a> {
             dot: None,
             trailing_icon: None,
             shortcut: None,
+            shortcut_visible: true,
             kind: ButtonKind::Secondary,
             size: ButtonSize::Md,
             enabled: true,
@@ -123,9 +130,21 @@ impl<'a> Button<'a> {
         self
     }
 
+    /// The shortcut is painted inside the button. Use it only where the key is the point of the
+    /// control, such as the component gallery; a working toolbar keeps it in the tooltip.
     #[must_use]
     pub fn shortcut(mut self, shortcut: &'a str) -> Self {
         self.shortcut = Some(shortcut);
+        self.shortcut_visible = true;
+        self
+    }
+
+    /// The shortcut lives only in the tooltip, not inside the label. A toolbar button then keeps
+    /// its label and its icon without an extra key competing for the same width.
+    #[must_use]
+    pub fn shortcut_hint(mut self, shortcut: &'a str) -> Self {
+        self.shortcut = Some(shortcut);
+        self.shortcut_visible = false;
         self
     }
 
@@ -163,7 +182,11 @@ impl<'a> Button<'a> {
         let label_width = layout(ui, self.label, &font, t.text).size().x;
         let icon_width = if self.icon.is_some() || self.dot.is_some() { icon_size + space::SM } else { 0.0 };
         let trailing_width = self.trailing_icon.map_or(0.0, |icon| layout(ui, icon, &icons::font(icon_size), t.text).size().x + space::SM);
-        let shortcut_width = self.shortcut.map_or(0.0, |shortcut| layout(ui, shortcut, &shortcut_font, t.text_faint).size().x + space::LG);
+        let shortcut_width = if self.shortcut_visible {
+            self.shortcut.map_or(0.0, |shortcut| layout(ui, shortcut, &shortcut_font, t.text_faint).size().x + space::LG)
+        } else {
+            0.0
+        };
         let content_width = padding * 2.0 + icon_width + label_width + shortcut_width + trailing_width;
         let width = if self.full_width { ui.available_width().max(content_width) } else { content_width };
 
@@ -215,7 +238,9 @@ impl<'a> Button<'a> {
             paint_right(ui, rect, right, &galley);
             right -= galley.size().x + space::SM;
         }
-        if let Some(shortcut) = self.shortcut {
+        if self.shortcut_visible
+            && let Some(shortcut) = self.shortcut
+        {
             // The hint is text on the button's own fill: derive it from the foreground and keep a
             // measured 4.5:1 floor instead of reusing a faint token that only works on the panel.
             let shortcut_color = tokens::supporting_text(foreground, effective_fill(fill, &t));
@@ -267,12 +292,16 @@ impl IconButtonSize {
 pub struct IconButton<'a> {
     icon: &'a str,
     label: &'a str,
+    /// A tooltip-only key hint. It is never painted: an icon has no room for a second glyph.
+    shortcut: Option<&'a str>,
     size: IconButtonSize,
     selected: bool,
     filled: bool,
     accent: bool,
     enabled: bool,
     danger: bool,
+    success: bool,
+    angle: f32,
     disabled_reason: Option<&'a str>,
 }
 
@@ -282,12 +311,15 @@ impl<'a> IconButton<'a> {
         Self {
             icon,
             label,
+            shortcut: None,
             size: IconButtonSize::Md,
             selected: false,
             filled: false,
             accent: false,
             enabled: true,
             danger: false,
+            success: false,
+            angle: 0.0,
             disabled_reason: None,
         }
     }
@@ -295,6 +327,13 @@ impl<'a> IconButton<'a> {
     #[must_use]
     pub fn size(mut self, size: IconButtonSize) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Show the key that triggers this action in the tooltip only. The square keeps one glyph.
+    #[must_use]
+    pub fn shortcut_hint(mut self, shortcut: &'a str) -> Self {
+        self.shortcut = Some(shortcut);
         self
     }
 
@@ -330,6 +369,22 @@ impl<'a> IconButton<'a> {
         self
     }
 
+    /// Tint the glyph with the success colour. Used for a transient confirmation, such as the sync
+    /// check that replaces the arrows when a refresh finishes.
+    #[must_use]
+    pub fn success(mut self, success: bool) -> Self {
+        self.success = success;
+        self
+    }
+
+    /// Rotate the glyph by `angle` radians around its own centre. The box, the focus ring and the
+    /// hover background stay still; only the glyph turns.
+    #[must_use]
+    pub fn angle(mut self, angle: f32) -> Self {
+        self.angle = angle;
+        self
+    }
+
     #[must_use]
     pub fn disabled_reason(mut self, reason: &'a str) -> Self {
         self.disabled_reason = Some(reason);
@@ -345,32 +400,25 @@ impl<'a> IconButton<'a> {
         let pressed = self.enabled && response.is_pointer_button_down_on();
 
         let accent_color = t.gold_ink;
+        // One semantic foreground, whichever state the caller asked for. `success` wins over
+        // `danger` because a caller never sets both; the order is only here to be deterministic.
+        let semantic = if self.success {
+            Some(t.success)
+        } else if self.danger {
+            Some(t.danger)
+        } else if self.accent {
+            Some(accent_color)
+        } else {
+            None
+        };
         let (fill, foreground) = if !self.enabled {
             (Color32::TRANSPARENT, t.text_faint)
         } else if self.selected || pressed {
             (t.selected, t.selected_text)
         } else if hovered {
-            (
-                t.hover,
-                if self.danger {
-                    t.danger
-                } else if self.accent {
-                    accent_color
-                } else {
-                    t.text
-                },
-            )
+            (t.hover, semantic.unwrap_or(t.text))
         } else {
-            (
-                Color32::TRANSPARENT,
-                if self.danger {
-                    t.danger
-                } else if self.accent {
-                    accent_color
-                } else {
-                    t.text_muted
-                },
-            )
+            (Color32::TRANSPARENT, semantic.unwrap_or(t.text_muted))
         };
         if fill != Color32::TRANSPARENT {
             ui.painter().rect_filled(rect, CornerRadius::same(radius::CONTROL), fill);
@@ -384,7 +432,14 @@ impl<'a> IconButton<'a> {
         let font = if self.filled { icons::font_filled(icon_size) } else { icons::font(icon_size) };
         let galley = layout(ui, self.icon, &font, foreground);
         let pos = eframe::egui::pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5);
-        ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+        if self.angle.abs() > f32::EPSILON {
+            // Rotate the glyph itself, anchored at its centre, so a spinning icon keeps the same
+            // box: the focus ring and the hover square must not turn with it.
+            let shape = Shape::Text(TextShape::new(pos, galley, Color32::PLACEHOLDER).with_angle_and_anchor(self.angle, Align2::CENTER_CENTER));
+            ui.painter().add(shape);
+        } else {
+            ui.painter().galley(pos, galley, Color32::PLACEHOLDER);
+        }
 
         response.widget_info(|| {
             if self.selected {
@@ -394,6 +449,10 @@ impl<'a> IconButton<'a> {
             }
         });
         let mut tooltip = self.label.to_owned();
+        if let Some(shortcut) = self.shortcut {
+            tooltip.push_str(" · ");
+            tooltip.push_str(shortcut);
+        }
         if !self.enabled
             && let Some(reason) = self.disabled_reason
         {

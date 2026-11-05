@@ -1137,3 +1137,444 @@ fn a_non_pgp_message_is_verified_once_and_never_gets_a_badge() {
     assert!(app.reading.pgp_reading.is_none(), "a non-PGP message must not get a PGP badge");
     daemon.shutdown().expect("the daemon stops");
 }
+
+#[test]
+fn the_split_reading_pane_keeps_its_width_across_messages_and_remembers_a_drag() {
+    let (ctx, mut app) = ready_app();
+    let size = Vec2::new(1280.0, 720.0);
+    let ids: Vec<String> = app.visible_messages().0.iter().take(2).map(|message| message.id.clone()).collect();
+    assert_eq!(ids.len(), 2, "the demo has two messages to compare");
+
+    app.open_message(ids[0].clone());
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let first = probe::reading_panel_rect(&ctx).expect("the reading pane rect");
+    let ratio = app.reading_ratio;
+
+    app.open_message(ids[1].clone());
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let second = probe::reading_panel_rect(&ctx).expect("the reading pane rect");
+    assert!((first.width() - second.width()).abs() < 0.5, "the pane changed width between messages: {} then {}", first.width(), second.width());
+    assert!((first.left() - second.left()).abs() < 0.5, "the pane moved between messages: {first:?} then {second:?}");
+
+    // Grab the boundary and drag it left: the pane must widen and remember the new width.
+    let edge = pos2(second.left() + 1.0, second.center().y);
+    frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(edge)]);
+    frame_at(&ctx, &mut app, size, vec![pointer(edge, true)]);
+    frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(pos2(edge.x - 60.0, edge.y))]);
+    assert!((app.reading_ratio - ratio).abs() < 0.005, "the width is persisted mid-drag");
+    frame_at(&ctx, &mut app, size, vec![pointer(pos2(edge.x - 60.0, edge.y), false)]);
+    frame_at(&ctx, &mut app, size, Vec::new());
+    assert!(app.reading_ratio > ratio + 0.005, "the drag did not widen the pane: {} -> {}", ratio, app.reading_ratio);
+    assert!(app.settings_dirty, "the new width must be saved");
+    let dragged = probe::reading_panel_rect(&ctx).expect("the dragged pane rect");
+    assert!(dragged.width() > first.width() + 10.0, "the drag did not change the pane: {first:?} -> {dragged:?}");
+
+    app.open_message(ids[0].clone());
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let after = probe::reading_panel_rect(&ctx).expect("the pane rect after reopening");
+    assert!((after.width() - dragged.width()).abs() < 0.5, "the dragged width was forgotten: {} then {}", dragged.width(), after.width());
+
+    // The settings reset must also drop the persisted panel width, not only the stored fraction.
+    app.reset_reading_pane_width(&ctx);
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let reset = probe::reading_panel_rect(&ctx).expect("the pane rect after reset");
+    assert!((reset.width() - first.width()).abs() < 0.5, "the reset kept the dragged width: {} then {}", first.width(), reset.width());
+}
+
+#[test]
+fn the_reading_split_rescales_with_the_window_and_keeps_the_stored_ratio() {
+    let (ctx, mut app) = ready_app();
+    let wide_size = Vec2::new(1280.0, 720.0);
+    let ids: Vec<String> = app.visible_messages().0.iter().take(2).map(|message| message.id.clone()).collect();
+    assert_eq!(ids.len(), 2, "the demo has two messages to compare");
+
+    app.open_message(ids[0].clone());
+    frame_at(&ctx, &mut app, wide_size, Vec::new());
+    let wide = probe::reading_panel_rect(&ctx).expect("the reading pane at 1280");
+    let ratio = app.reading_ratio;
+    let expected = reading_pane_width_with_ratio(wide_size.x, ratio);
+    assert!((wide.width() - expected).abs() < 1.0, "the pane is not the stored fraction of the window: {} vs {expected}", wide.width());
+    let (_, wide_list) = probe::list_widths(&ctx).expect("the list width at 1280");
+
+    // A different message must not change the split: the model is the stored ratio, not the first
+    // message's rendered width.
+    app.open_message(ids[1].clone());
+    frame_at(&ctx, &mut app, wide_size, Vec::new());
+    let second = probe::reading_panel_rect(&ctx).expect("the second message pane");
+    assert!((second.width() - wide.width()).abs() < 0.5, "the pane changed width between messages: {} then {}", wide.width(), second.width());
+    assert!((second.left() - wide.left()).abs() < 0.5, "the pane moved between messages: {wide:?} then {second:?}");
+
+    // Shrinking the window applies the same fraction to the narrower content area; it must not
+    // freeze the old pixel width or rewrite the ratio from the clamped render.
+    let narrow_size = Vec2::new(1120.0, 720.0);
+    frame_at(&ctx, &mut app, narrow_size, Vec::new());
+    let narrow = probe::reading_panel_rect(&ctx).expect("the reading pane at 1120");
+    let expected = reading_pane_width_with_ratio(narrow_size.x, ratio);
+    assert!((app.reading_ratio - ratio).abs() < f32::EPSILON, "resizing rewrote the stored ratio: {ratio} -> {}", app.reading_ratio);
+    assert!((narrow.width() - expected).abs() < 1.0, "the pane did not scale with the window: {} vs {expected}", narrow.width());
+    assert!(narrow.width() < wide.width() - 50.0, "the pane kept its stale absolute width: {} then {}", wide.width(), narrow.width());
+    assert!(narrow.right() <= narrow_size.x + 1.0, "the pane is not anchored to the right edge: {narrow:?}");
+    let (_, narrow_list) = probe::list_widths(&ctx).expect("the list width at 1120");
+    let remaining = narrow_size.x - ui_size::SIDEBAR;
+    assert!((narrow_list - (remaining - narrow.width())).abs() < 1.5, "the list did not take the width the pane left: {narrow_list}");
+    assert!(narrow_list <= wide_list + 0.5, "the list widened while the pane shrank: {wide_list} then {narrow_list}");
+
+    // Growing back must return to the same model width, with the list back to its 1280 width.
+    frame_at(&ctx, &mut app, wide_size, Vec::new());
+    let restored = probe::reading_panel_rect(&ctx).expect("the reading pane after growing back");
+    assert!((app.reading_ratio - ratio).abs() < f32::EPSILON, "growing back rewrote the stored ratio: {ratio} -> {}", app.reading_ratio);
+    assert!((restored.width() - wide.width()).abs() < 0.5, "the pane did not return to its model width: {} then {}", wide.width(), restored.width());
+    let (_, restored_list) = probe::list_widths(&ctx).expect("the list width after growing back");
+    assert!((restored_list - wide_list).abs() < 0.5, "the list did not return to its model width: {wide_list} then {restored_list}");
+    assert!(restored_list <= wide_size.x - ui_size::SIDEBAR - restored.width() + 1.5, "the list widened past the pane's model width");
+
+    // The OS resize keeps the pointer down on the window border. The pane must follow the window
+    // in that same frame, not wait for the button release.
+    let mid_size = Vec2::new(1240.0, 720.0);
+    frame_at(&ctx, &mut app, mid_size, vec![pointer(pos2(8.0, 8.0), true)]);
+    let mid = probe::reading_panel_rect(&ctx).expect("the reading pane while the window resizes");
+    let mid_expected = reading_pane_width_with_ratio(mid_size.x, ratio);
+    assert!((mid.width() - mid_expected).abs() < 1.0, "the pane waited for the pointer release while resizing: {} vs {mid_expected}", mid.width());
+    frame_at(&ctx, &mut app, mid_size, vec![pointer(pos2(8.0, 8.0), false)]);
+
+    // Below the minimum the list no longer fits beside the pane and the reading view takes over.
+    assert!(reading_overlay(980.0), "980 px must use the reading overlay");
+    assert!(!reading_overlay(1120.0), "1120 px must keep the split");
+}
+
+#[test]
+fn header_words_wrap_without_being_split_unless_a_token_is_wider_than_the_pane() {
+    let (ctx, mut app) = ready_app();
+    frame_at(&ctx, &mut app, Vec2::new(1280.0, 720.0), Vec::new());
+    let font = Role::Page.font();
+    let normal =
+        crate::app::reading_pane::header_layout_job(&ctx, "Preventivo per la migrazione del sito web", font.clone(), egui::Color32::BLACK, 220.0);
+    assert!(!normal.wrap.break_anywhere, "normal prose must wrap at spaces, not split a word");
+
+    let token = crate::app::reading_pane::header_layout_job(&ctx, &"a".repeat(80), font, egui::Color32::BLACK, 220.0);
+    assert!(token.wrap.break_anywhere, "an unbreakable token wider than the pane must be cut at a glyph");
+}
+
+#[test]
+fn a_long_subject_and_sender_stay_inside_the_pane_and_tooltip_the_full_text() {
+    let (ctx, mut app) = ready_app();
+    let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+    app.open_message(id.clone());
+    let mut message = app.engine.message(&id).expect("the open message");
+    let subject = format!("Report Domain: federicofabiani.it Submitter: {} END-OF-SUBJECT", "a".repeat(220));
+    let sender = format!("no-reply-{}@example.com", "b".repeat(220));
+    message.summary.subject = subject.clone();
+    message.summary.from = Address::new("", sender.clone());
+    app.screenshot_message = Some(message);
+
+    for size in [Vec2::new(1280.0, 720.0), Vec2::new(1100.0, 720.0)] {
+        ctx.all_styles_mut(|style| style.interaction.tooltip_delay = 0.0);
+        frame_at(&ctx, &mut app, size, Vec::new());
+        let panel = probe::reading_panel_rect(&ctx).expect("the reading pane rect");
+        let runs = painted_runs(&ctx, &mut app, size);
+
+        let subject_run = runs
+            .iter()
+            .find(|run| run.text.contains("Report Domain") && run.rect.top() >= panel.top() && run.rect.top() < panel.top() + 80.0)
+            .expect("the painted subject");
+        assert!(
+            subject_run.clip.contains_rect(subject_run.rect),
+            "the subject paints outside its clip: {:?} {:?}",
+            subject_run.rect,
+            subject_run.clip
+        );
+        assert!(subject_run.rect.right() <= panel.right() + 0.5, "the subject paints outside the pane: {:?} vs {panel:?}", subject_run.rect);
+        assert!(subject_run.rect.height() <= 3.0 * Role::Page.font().size + 16.0, "the subject is not capped at three rows: {subject_run:?}");
+
+        let sender_run = runs
+            .iter()
+            .find(|run| run.text.starts_with("no-reply-") && run.rect.top() >= panel.top() && run.rect.top() < panel.top() + 220.0)
+            .expect("the painted sender");
+        assert!(sender_run.clip.contains_rect(sender_run.rect), "the sender paints outside its clip: {:?} {:?}", sender_run.rect, sender_run.clip);
+        assert!(sender_run.rect.right() <= panel.right() + 0.5, "the sender paints outside the pane: {:?} vs {panel:?}", sender_run.rect);
+
+        // The truncated header keeps its full text in a tooltip, so the clipping is not data loss.
+        let subject_center = subject_run.rect.center();
+        frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(subject_center)]);
+        let tooltip_runs = painted_runs(&ctx, &mut app, size);
+        assert!(
+            tooltip_runs.iter().any(|run| run.text.contains("END-OF-SUBJECT") && !runs.iter().any(|old| old.rect == run.rect)),
+            "the subject tooltip does not carry the full text at {size:?}"
+        );
+        let sender_center = sender_run.rect.center();
+        frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(pos2(0.0, 0.0))]);
+        frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(sender_center)]);
+        let tooltip_runs = painted_runs(&ctx, &mut app, size);
+        let tooltip_text = tooltip_runs
+            .iter()
+            .filter(|run| run.rect.top() > sender_run.rect.bottom() + 1.0 && run.text.contains("no-reply-"))
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        assert!(tooltip_text.contains(&sender), "the sender tooltip does not carry the full address at {size:?}: {tooltip_text:?}");
+    }
+}
+
+#[test]
+fn a_windowed_pane_keeps_its_width_with_wide_thread_content_and_after_a_click() {
+    let clock = screenshot_clock().expect("the frozen screenshot clock");
+    let mut app = PostinoApp::demo_at(true, clock);
+    app.seed_screenshot(ScreenshotState::Conversation);
+    let id = app.selected.clone().expect("the open thread message");
+    let mut message = app.engine.message(&id).expect("the open message");
+    message.summary.subject = format!("Report Domain: federicofabiani.it Submitter: google.com Report-ID: 15533896837282044035 {}", "x".repeat(80));
+    message.summary.from = Address::new("", "noreply-dmarc-support@google.com");
+    message.remote_images = 3;
+    message.attachments = vec![Attachment {
+        id: "att_long".to_owned(),
+        filename: "google.com!federicofabiani.it!1792713600!1792799999-very-long-attachment-name.zip".to_owned(),
+        mime: "application/zip".to_owned(),
+        size: 719,
+    }];
+    app.screenshot_message = Some(message);
+    if let Some(summary) = app.thread_summary.as_mut() {
+        summary.subject = format!("Report Domain: federicofabiani.it Submitter: google.com Report-ID: 15533896837282044035 {}", "y".repeat(80));
+    }
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, false);
+    let size = Vec2::new(1280.0, 720.0);
+    frame_at(&ctx, &mut app, size, Vec::new());
+    frame_at(&ctx, &mut app, size, Vec::new());
+
+    let panel = probe::reading_panel_rect(&ctx).expect("the reading pane rect");
+    let expected = reading_pane_width_with_ratio(size.x, app.reading_ratio);
+    assert!((panel.width() - expected).abs() < 1.0, "the wide thread content inflated the pane: {} vs {expected}", panel.width());
+    assert!(panel.right() <= size.x + 1.0, "the pane paints past the window: {panel:?}");
+    let list_before = panel.left() - ui_size::SIDEBAR;
+
+    // A press inside the body must not resize the pane and must not change the split. This is the
+    // behaviour that made the idle and clicked screenshots disagree at the same window size.
+    let click = pos2(panel.left() + panel.width() / 2.0, panel.top() + 180.0);
+    frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(click)]);
+    frame_at(&ctx, &mut app, size, vec![pointer(click, true)]);
+    frame_at(&ctx, &mut app, size, vec![pointer(click, false)]);
+    let clicked = probe::reading_panel_rect(&ctx).expect("the pane after the click");
+    assert!(
+        (clicked.width() - panel.width()).abs() < 0.5,
+        "a click inside the body changed the pane width: {} then {}",
+        panel.width(),
+        clicked.width()
+    );
+    let list_after = clicked.left() - ui_size::SIDEBAR;
+    assert!((list_after - list_before).abs() < 0.5, "a click changed the list width: {list_before} then {list_after}");
+
+    // The panel's frame must not be anchored left of its own content. Every run painted with the
+    // pane's clip rect must start inside the pane; before the fix the banner widened the frame and
+    // the body started to the left of the panel's reported rect.
+    let runs = painted_runs(&ctx, &mut app, size);
+    for run in runs.iter().filter(|run| run.clip.left() >= panel.left() - 0.5 && run.rect.top() >= panel.top() - 1.0) {
+        assert!(
+            run.rect.left() >= panel.left() - 0.5,
+            "reading content starts left of the pane at {:?}: {:?} (clip {:?})",
+            run.text,
+            run.rect,
+            run.clip
+        );
+    }
+}
+
+#[test]
+fn arrow_navigation_between_messages_keeps_the_pane_width() {
+    let (ctx, mut app) = ready_app();
+    let ids: Vec<String> = app.visible_messages().0.iter().take(3).map(|message| message.id.clone()).collect();
+    assert_eq!(ids.len(), 3, "the demo has three messages to navigate");
+    app.open_message(ids[0].clone());
+    let size = Vec2::new(1280.0, 720.0);
+    let mut widths = Vec::new();
+
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(app.selected.as_deref(), Some(id.as_str()), "navigation did not select the expected message");
+        let mut message = app.engine.message(id).expect("the navigated message");
+        message.summary.subject = format!("Report Domain: federicofabiani.it Submitter: {} END", "z".repeat(120));
+        message.attachments = if index % 2 == 0 {
+            vec![Attachment {
+                id: format!("att_nav_{index}"),
+                filename: format!("google.com!federicofabiani.it!1792713600!1792799999-{index}-a-very-long-attachment-name.zip"),
+                mime: "application/zip".to_owned(),
+                size: 719,
+            }]
+        } else {
+            Vec::new()
+        };
+        app.screenshot_message = Some(message);
+        frame_at(&ctx, &mut app, size, Vec::new());
+        let panel = probe::reading_panel_rect(&ctx).expect("the pane during navigation");
+        widths.push(panel.width());
+        if index + 1 < ids.len() {
+            frame_at(&ctx, &mut app, size, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+        }
+    }
+
+    let widest = widths.iter().copied().fold(f32::MIN, f32::max);
+    let narrowest = widths.iter().copied().fold(f32::MAX, f32::min);
+    assert!(widest - narrowest < 0.5, "the pane width followed the message content: {widths:?}");
+}
+
+#[test]
+fn a_wide_table_scrolls_sideways_while_paragraphs_still_wrap() {
+    let clock = screenshot_clock().expect("the frozen screenshot clock");
+    let mut app = PostinoApp::demo_at(true, clock);
+    let id = app.visible_messages().0.first().map(|message| message.id.clone()).expect("a demo message");
+    app.open_message(id.clone());
+    let mut message = app.engine.message(&id).expect("the open message");
+    let paragraph = "parola ".repeat(80);
+    let header: String = (0..12).map(|index| format!("<th>Colonna {index}</th>")).collect();
+    let row: String = (0..12).map(|index| format!("<td>Valore {index}</td>")).collect();
+    message.body_text = paragraph.clone();
+    message.body_html = Some(format!("<p>{paragraph}</p><table><tr>{header}</tr><tr>{row}</tr></table><p>{paragraph}</p>"));
+    message.attachments =
+        vec![Attachment { id: "att_wide_table".to_owned(), filename: "tabella.csv".to_owned(), mime: "text/csv".to_owned(), size: 4096 }];
+    app.screenshot_message = Some(message);
+    app.reading_full = false;
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, false);
+    let size = Vec2::new(1280.0, 720.0);
+    frame_at(&ctx, &mut app, size, Vec::new());
+
+    let view = probe::reading_scroll_view(&ctx).expect("the body viewport");
+    let content = probe::reading_scroll_content(&ctx).expect("the body content size");
+    assert!(content.x > view.width() + 40.0, "the wide table did not grow the body: content {content:?}, viewport {view:?}");
+    let strip = probe::reading_attachments_rect(&ctx).expect("the pinned attachment strip");
+    assert!(view.bottom() <= strip.top() + 1.0, "the horizontal bar band is covered by the attachment strip: body {view:?}, strip {strip:?}");
+    assert_eq!(probe::reading_scroll_offset(&ctx).map(|offset| offset.x), Some(0.0), "the body starts at the left edge");
+    let pane_before = probe::reading_panel_rect(&ctx).expect("the pane before the bar drag");
+    let ratio_before = app.reading_ratio;
+
+    // The floating bar lives in the last few pixels of the viewport, above the pinned strip. Drag
+    // its thumb: a bar that only reacts to the wheel would still leave the table unreachable.
+    let bar = pos2(view.left() + 6.0, view.bottom() - 2.0);
+    frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(bar)]);
+    frame_at(&ctx, &mut app, size, vec![pointer(bar, true)]);
+    frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(pos2(bar.x + 60.0, bar.y))]);
+    let dragged = probe::reading_scroll_offset(&ctx).expect("the body offset after a bar drag");
+    assert!(dragged.x > 0.0, "dragging the horizontal bar did not scroll the body: {dragged:?}");
+    let pane_after = probe::reading_panel_rect(&ctx).expect("the pane after the bar drag");
+    assert!((pane_after.width() - pane_before.width()).abs() < 0.5, "the bar drag resized the pane: {pane_before:?} then {pane_after:?}");
+    assert!((app.reading_ratio - ratio_before).abs() < f32::EPSILON, "the bar drag rewrote the split ratio: {ratio_before} -> {}", app.reading_ratio);
+    frame_at(&ctx, &mut app, size, vec![pointer(pos2(bar.x + 60.0, bar.y), false)]);
+    let pane_released = probe::reading_panel_rect(&ctx).expect("the pane after releasing the bar");
+    assert!((pane_released.width() - pane_before.width()).abs() < 0.5, "releasing the bar resized the pane: {pane_before:?} then {pane_released:?}");
+
+    let offset = probe::reading_scroll_offset(&ctx).expect("the body offset");
+    let before_wheel = offset.x;
+    frame_at(&ctx, &mut app, size, wheel_horizontal(view.center(), 4));
+    frame_at(&ctx, &mut app, size, wheel_horizontal(view.center(), 4));
+    let offset = probe::reading_scroll_offset(&ctx).expect("the body offset");
+    assert!(offset.x > before_wheel, "the horizontal wheel did not scroll the body: {offset:?}");
+    assert!(offset.x <= content.x - view.width() + 1.0, "the body scrolled past its content: {offset:?}");
+
+    // The same app without the table must not gain a horizontal overflow from wrapped text.
+    let plain = app.engine.message(&id).expect("the plain demo message");
+    app.screenshot_message = Some(plain);
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let view = probe::reading_scroll_view(&ctx).expect("the plain body viewport");
+    let content = probe::reading_scroll_content(&ctx).expect("the plain body content size");
+    assert!(content.x <= view.width() + 1.0, "wrapped paragraphs created a horizontal overflow: content {content:?}, viewport {view:?}");
+}
+
+/// The header action rects for the last painted frame, from the reading pane's own test hook.
+fn reading_header_actions(ctx: &egui::Context) -> Vec<(&'static str, Rect)> {
+    crate::app::reading_pane::header_action_rects(ctx)
+}
+
+/// The painted text of one frame that draws both the app and the export picker. The picker is not
+/// wired into `app.rs` yet, so the test calls the same method the shell will call.
+fn painted_with_export_picker(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, events: Vec<egui::Event>) -> Vec<String> {
+    fn collect(shape: &egui::epaint::Shape, clip: Rect, runs: &mut Vec<PaintedRun>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                let rect = Rect::from_min_size(text.pos, text.galley.size());
+                runs.push(PaintedRun { text: text.galley.text().to_owned(), rect, clip });
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, clip, runs);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut runs = Vec::new();
+    ctx.all_styles_mut(|style| style.animation_time = 0.0);
+    for _ in 0..4 {
+        let raw =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events: events.clone(), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| {
+            app.show(ui);
+            app.export_picker_dialog(ui);
+        });
+        runs.clear();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, clipped.clip_rect, &mut runs);
+        }
+        output.textures_delta.clear();
+    }
+    runs.into_iter().map(|run| run.text).collect()
+}
+
+#[test]
+fn the_reading_header_actions_never_overlap_at_any_width() {
+    // 1600 keeps the labelled strip; 1280 keeps the split pane; 1024 and 900 are the overlay widths
+    // where a fixed 400 pt breakpoint used to let the star/read group run into expand/close.
+    for size in [Vec2::new(1600.0, 720.0), Vec2::new(1280.0, 720.0), Vec2::new(1024.0, 720.0), Vec2::new(900.0, 720.0)] {
+        let (ctx, mut app) = ready_app();
+        let ids = app.visible_messages().0;
+        app.open_message(ids.first().expect("a demo message").id.clone());
+        frame_at(&ctx, &mut app, size, Vec::new());
+
+        let actions = reading_header_actions(&ctx);
+        assert!(actions.len() >= 5, "the header lost actions at {size:?}: {actions:?}");
+        let header = probe::reading_header_rect(&ctx).expect("the reading header rect");
+        for (index, (name, rect)) in actions.iter().enumerate() {
+            assert!(rect.width() > 0.0 && rect.height() > 0.0, "{name} has an empty hit rect: {rect:?}");
+            assert!(header.contains_rect(*rect), "{name} escapes the header at {size:?}: {rect:?} in {header:?}");
+            for (other, other_rect) in actions.iter().skip(index + 1) {
+                assert!(!rect.intersects(*other_rect), "{name} and {other} overlap at {size:?}: {rect:?} vs {other_rect:?}");
+            }
+        }
+        let names: Vec<&str> = actions.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"star") && names.contains(&"read"), "the star/read group vanished at {size:?}: {names:?}");
+        if size.x < 1000.0 {
+            assert!(names.contains(&"back"), "the overlay lost its back action at {size:?}: {names:?}");
+        } else {
+            assert!(names.contains(&"expand") && names.contains(&"close"), "the split lost its right group at {size:?}: {names:?}");
+        }
+    }
+}
+
+#[test]
+fn the_export_icon_opens_the_format_picker_instead_of_saving() {
+    let (mut app, id, _attachment) = seeded_attachment_app("reading-export-picker", "nota.txt", Some(b"ciao"));
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, false);
+    let size = Vec2::new(1280.0, 720.0);
+    app.open_message(id);
+    frame_at(&ctx, &mut app, size, Vec::new());
+
+    let actions = reading_header_actions(&ctx);
+    let export = actions
+        .iter()
+        .find(|(name, _)| *name == "export_eml")
+        .map(|(_, rect)| *rect)
+        .unwrap_or_else(|| panic!("the export icon in the reading header: {actions:?}"));
+    click_at(&ctx, &mut app, export.center(), size);
+    assert!(app.reading.export_open, "the export icon exported instead of asking for a format");
+    assert!(app.reading.attachment_warning.is_none(), "the picker must not start a save");
+
+    let text = painted_with_export_picker(&ctx, &mut app, size, Vec::new());
+    assert!(text.iter().any(|line| line.contains("Esporta messaggio")), "the picker title is not painted: {text:?}");
+    assert!(text.iter().any(|line| line.contains("Messaggio .eml")), "the .eml choice is missing: {text:?}");
+    assert!(text.iter().any(|line| line.contains("Documento PDF")), "the PDF choice is missing: {text:?}");
+    assert!(text.iter().any(|line| line.contains("In arrivo")), "the PDF row has no badge: {text:?}");
+    assert!(text.iter().any(|line| line.contains("arriva in una versione successiva")), "the PDF row hides its reason: {text:?}");
+
+    painted_with_export_picker(&ctx, &mut app, size, vec![key(Key::Escape, Modifiers::NONE)]);
+    assert!(!app.reading.export_open, "Escape did not close the export picker");
+}

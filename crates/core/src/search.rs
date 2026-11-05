@@ -4,10 +4,13 @@
 //! quotes values and parenthesises every non-leaf node, so `parse(print(ast)) == ast` holds without a
 //! special-case list. The parser never interpolates text into SQL or into an FTS expression: the
 //! operation layer escapes each value into an FTS5 phrase and the store binds it as `MATCH ?`.
+//!
+//! Dates accept an absolute `YYYY-MM-DD` or a relative form (`today`, `yesterday`, `7d`, `2w`,
+//! `3m`, `1y`) resolved to a UTC midnight when the query is parsed.
 
 use std::fmt;
 
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Days, NaiveDate, TimeZone, Utc};
 
 /// A query longer than this is refused before parsing.
 pub const MAX_QUERY_BYTES: usize = 1024;
@@ -96,8 +99,10 @@ impl IsFilter {
         match value {
             "unread" => Some(Self::Unread),
             "read" => Some(Self::Read),
-            "starred" => Some(Self::Starred),
-            "unstarred" => Some(Self::Unstarred),
+            // `favourite` is the word the product uses for a starred message; the canonical form is
+            // `starred`, so the tree round-trips under one spelling.
+            "starred" | "favourite" | "favorite" => Some(Self::Starred),
+            "unstarred" | "unfavourite" | "unfavorite" => Some(Self::Unstarred),
             _ => None,
         }
     }
@@ -245,7 +250,7 @@ impl SearchError {
             "dangling_operator" => "an AND or OR has no operand",
             "dangling_field" => "a field is missing its value",
             "negative_only" => "NOT needs a positive term",
-            "bad_date" => "a date must be a real YYYY-MM-DD day",
+            "bad_date" => "a date must be a real YYYY-MM-DD day, or today, yesterday, Nd, Nw, Nm, Ny",
             "bad_size" => "a size must be digits with an optional k, m or g suffix",
             "bad_is" => "is: accepts unread, read, starred or unstarred",
             "bad_has" => "has: accepts attachment",
@@ -267,8 +272,19 @@ pub struct ParsedQuery {
     pub text: String,
 }
 
-/// Parse one query. All limits are enforced here, before a store sees the query.
+/// Parse one query with the wall clock as the reference for relative dates. All limits are
+/// enforced here, before a store sees the query.
 pub fn parse(input: &str) -> Result<ParsedQuery, SearchError> {
+    parse_at(input, Utc::now())
+}
+
+/// Parse one query as if the clock read `now`.
+///
+/// Relative dates (`after:7d`, `before:today`) are resolved here, at parse time, to the UTC
+/// midnight they name. The tree therefore stays absolute and round-trips through its canonical
+/// text. A saved search freezes the resolved day; a rule stores the query text and re-parses it on
+/// every run, so a relative date in a rule is a moving window.
+pub fn parse_at(input: &str, now: DateTime<Utc>) -> Result<ParsedQuery, SearchError> {
     if input.len() > MAX_QUERY_BYTES {
         return Err(SearchError::new("too_long", MAX_QUERY_BYTES));
     }
@@ -277,7 +293,7 @@ pub fn parse(input: &str) -> Result<ParsedQuery, SearchError> {
             return Err(SearchError::new("control", index));
         }
     }
-    let mut parser = Parser { input, pos: 0, depth: 0, clauses: 0, terms: 0 };
+    let mut parser = Parser { input, pos: 0, depth: 0, clauses: 0, terms: 0, today: now.date_naive() };
     parser.skip_space();
     if parser.at_end() {
         return Err(SearchError::new("empty", 0));
@@ -307,6 +323,9 @@ struct Parser<'a> {
     depth: usize,
     clauses: usize,
     terms: usize,
+    /// UTC day used as the origin of a relative date. Fixed for the whole parse so `after:7d`
+    /// twice in one query means the same day.
+    today: NaiveDate,
 }
 
 impl<'a> Parser<'a> {
@@ -489,8 +508,8 @@ impl<'a> Parser<'a> {
                     Err(SearchError::new("bad_has", field_end))
                 }
             }
-            Field::Before => parse_date(&value, field_end).map(Expr::Before),
-            Field::After => parse_date(&value, field_end).map(Expr::After),
+            Field::Before => parse_date(&value, field_end, self.today).map(Expr::Before),
+            Field::After => parse_date(&value, field_end, self.today).map(Expr::After),
             Field::Larger => parse_size(&value, field_end).map(Expr::Larger),
             Field::Smaller => parse_size(&value, field_end).map(Expr::Smaller),
         }
@@ -585,7 +604,17 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn parse_date(value: &str, position: usize) -> Result<i64, SearchError> {
+/// One UTC-midnight day, from an absolute `YYYY-MM-DD` or from a relative form counted back from
+/// `today`: `today`, `yesterday`, or `Nd` / `Nw` / `Nm` / `Ny` (days, weeks of 7 days, months of 30
+/// days, years of 365 days).
+///
+/// The result is always a midnight, exactly like an absolute date, so the canonical text of the
+/// tree parses back to an equal tree.
+fn parse_date(value: &str, position: usize, today: NaiveDate) -> Result<i64, SearchError> {
+    if let Some(days) = relative_days(value) {
+        let date = today.checked_sub_days(Days::new(days)).ok_or_else(|| SearchError::new("bad_date", position))?;
+        return utc_midnight(date).ok_or_else(|| SearchError::new("bad_date", position));
+    }
     if value.len() != 10 || value.as_bytes().get(4) != Some(&b'-') || value.as_bytes().get(7) != Some(&b'-') {
         return Err(SearchError::new("bad_date", position));
     }
@@ -599,8 +628,34 @@ fn parse_date(value: &str, position: usize) -> Result<i64, SearchError> {
         return Err(SearchError::new("bad_date", position));
     }
     let date = NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| SearchError::new("bad_date", position))?;
-    let instant = date.and_hms_opt(0, 0, 0).map(|naive| Utc.from_utc_datetime(&naive));
-    instant.map(|date| date.timestamp_millis()).ok_or_else(|| SearchError::new("bad_date", position))
+    utc_midnight(date).ok_or_else(|| SearchError::new("bad_date", position))
+}
+
+fn utc_midnight(date: NaiveDate) -> Option<i64> {
+    date.and_hms_opt(0, 0, 0).map(|naive| Utc.from_utc_datetime(&naive).timestamp_millis())
+}
+
+/// How many days before today a relative value names. `None` means the value is not relative, and
+/// the caller falls back to the absolute form so the error stays `bad_date`.
+fn relative_days(value: &str) -> Option<u64> {
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "today" => return Some(0),
+        "yesterday" => return Some(1),
+        _ => {}
+    }
+    let (digits, unit) = lower.split_at(lower.len().checked_sub(1)?);
+    let multiplier = match unit {
+        "d" => 1u64,
+        "w" => 7,
+        "m" => 30,
+        "y" => 365,
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(multiplier)
 }
 
 fn format_date(instant: i64) -> String {
@@ -622,6 +677,159 @@ fn parse_size(value: &str, position: usize) -> Result<u64, SearchError> {
     }
     let base = digits.parse::<u64>().map_err(|_| SearchError::new("bad_size", position))?;
     base.checked_mul(multiplier).ok_or_else(|| SearchError::new("bad_size", position))
+}
+
+/// One completion row. `insert` replaces the token at the caret; `label` is what the popover shows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Suggestion {
+    /// The text that replaces the token the person is typing, in canonical grammar.
+    pub insert: String,
+    /// The readable form, with the field or the person's name spelled out.
+    pub label: String,
+    /// Where the row came from, so a client can group or filter: `field`, `operator`, `from`,
+    /// `to`, `label`, `folder`, `is`, `has`, `date`, `size`.
+    pub kind: &'static str,
+}
+
+/// What the token at the caret is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion<'a> {
+    /// No colon yet: a field name or a boolean operator.
+    Field { prefix: &'a str },
+    /// `field:value` whose values come from the store (people, labels, folders).
+    Stored { field: Field, prefix: &'a str, prefix_search: bool },
+    /// `field:value` with a closed set of values (states, dates, sizes).
+    Fixed { field: Field, prefix: &'a str },
+}
+
+/// The byte range of the token the caret is inside, and the token itself.
+///
+/// A token starts after the last space, tab, quote or parenthesis before the caret. A caret is a
+/// byte index; a value that is not on a character boundary is clamped to the previous one, so a
+/// caller can pass the caret straight from an editor.
+#[must_use]
+pub fn token_at(text: &str, caret: usize) -> (usize, &str) {
+    let mut caret = caret.min(text.len());
+    while caret > 0 && !text.is_char_boundary(caret) {
+        caret = caret.saturating_sub(1);
+    }
+    let before = text.get(..caret).unwrap_or("");
+    let start = before
+        .char_indices()
+        .rev()
+        .find(|(_, character)| matches!(character, ' ' | '\t' | '(' | ')' | '"'))
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    (start, text.get(start..caret).unwrap_or(""))
+}
+
+/// Classify the token. `None` means there is nothing to offer: an empty token, an unknown field, or
+/// a value that already ends a complete clause.
+#[must_use]
+pub fn completion(token: &str) -> Option<Completion<'_>> {
+    if token.is_empty() {
+        return None;
+    }
+    let Some((name, value)) = token.split_once(':') else {
+        return Some(Completion::Field { prefix: token });
+    };
+    let field = Field::parse(&name.to_ascii_lowercase())?;
+    let (value, prefix_search) = match value.strip_suffix('*') {
+        Some(value) => (value, true),
+        None => (value, false),
+    };
+    let prefix = value.strip_prefix('"').unwrap_or(value);
+    Some(match field {
+        Field::From | Field::To | Field::Cc | Field::Bcc | Field::Label | Field::Folder => Completion::Stored { field, prefix, prefix_search },
+        Field::Is | Field::Has | Field::Before | Field::After | Field::Larger | Field::Smaller => Completion::Fixed { field, prefix },
+        // A subject is free text with no list to offer.
+        Field::Subject => return None,
+    })
+}
+
+const FIELD_LABELS: [(Field, &str, &str); 13] = [
+    (Field::From, "from", "mittente"),
+    (Field::To, "to", "destinatario"),
+    (Field::Cc, "cc", "in copia"),
+    (Field::Bcc, "bcc", "in copia nascosta"),
+    (Field::Subject, "subject", "oggetto"),
+    (Field::Label, "label", "etichetta"),
+    (Field::Folder, "folder", "cartella"),
+    (Field::Is, "is", "stato"),
+    (Field::Has, "has", "allegato"),
+    (Field::Before, "before", "prima del"),
+    (Field::After, "after", "dal"),
+    (Field::Larger, "larger", "più grande di"),
+    (Field::Smaller, "smaller", "più piccolo di"),
+];
+
+/// Field names and boolean operators that start with `prefix`.
+#[must_use]
+pub fn field_suggestions(prefix: &str, limit: usize) -> Vec<Suggestion> {
+    let prefix = prefix.to_ascii_lowercase();
+    let mut rows = Vec::new();
+    for (field, name, hint) in FIELD_LABELS {
+        if name.starts_with(&prefix) {
+            rows.push(Suggestion { insert: format!("{name}:"), label: format!("{name}: · {hint}"), kind: "field" });
+        }
+        let _ = field;
+    }
+    for (operator, hint) in [("AND", "entrambi"), ("OR", "almeno uno"), ("NOT", "esclude")] {
+        if prefix.is_empty() || operator.to_ascii_lowercase().starts_with(&prefix) {
+            rows.push(Suggestion { insert: format!("{operator} "), label: format!("{operator} · {hint}"), kind: "operator" });
+        }
+    }
+    rows.truncate(limit);
+    rows
+}
+
+/// The closed value sets: `is:`, `has:`, `after:`, `before:`, `larger:`, `smaller:`.
+#[must_use]
+pub fn fixed_suggestions(field: Field, prefix: &str, limit: usize) -> Vec<Suggestion> {
+    let prefix = prefix.to_ascii_lowercase();
+    let mut rows = Vec::new();
+    match field {
+        Field::Is => {
+            for (value, hint) in [("unread", "non letti"), ("read", "letti"), ("starred", "preferiti"), ("unstarred", "non preferiti")] {
+                if value.starts_with(&prefix) {
+                    rows.push(Suggestion { insert: format!("is:{value}"), label: format!("is:{value} · {hint}"), kind: "is" });
+                }
+            }
+        }
+        Field::Has => {
+            if "attachment".starts_with(&prefix) {
+                rows.push(Suggestion { insert: "has:attachment".to_owned(), label: "has:attachment · con allegati".to_owned(), kind: "has" });
+            }
+        }
+        Field::After | Field::Before => {
+            let name = if field == Field::After { "after" } else { "before" };
+            for (value, hint) in [("today", "oggi"), ("yesterday", "ieri"), ("7d", "7 giorni fa"), ("30d", "30 giorni fa"), ("1y", "un anno fa")] {
+                if value.starts_with(&prefix) {
+                    rows.push(Suggestion { insert: format!("{name}:{value}"), label: format!("{name}:{value} · {hint}"), kind: "date" });
+                }
+            }
+        }
+        Field::Larger | Field::Smaller => {
+            let name = if field == Field::Larger { "larger" } else { "smaller" };
+            for (value, hint) in [("100k", "100 KB"), ("1m", "1 MB"), ("5m", "5 MB"), ("10m", "10 MB")] {
+                if value.starts_with(&prefix) {
+                    rows.push(Suggestion { insert: format!("{name}:{value}"), label: format!("{name}:{value} · {hint}"), kind: "size" });
+                }
+            }
+        }
+        // A stored field is never a fixed one; the caller routes on `Completion`.
+        Field::From | Field::To | Field::Cc | Field::Bcc | Field::Subject | Field::Label | Field::Folder => {}
+    }
+    rows.truncate(limit);
+    rows
+}
+
+/// The clause that inserts one stored value, quoted as the canonical printer writes it.
+#[must_use]
+pub fn stored_suggestion(field: Field, value: &str, label: &str, prefix_search: bool) -> Suggestion {
+    let name = FIELD_LABELS.iter().find(|(candidate, _, _)| *candidate == field).map_or("", |(_, name, _)| *name);
+    let escaped = value.replace('"', "\\\"");
+    let star = if prefix_search { "*" } else { "" };
+    Suggestion { insert: format!("{name}:\"{escaped}\"{star}"), label: label.to_owned(), kind: name }
 }
 
 /// A plain-text snippet, never HTML. The window is at most 240 characters and highlights are the
@@ -889,5 +1097,123 @@ mod tests {
         assert!(snippet.text.contains("fattura"));
         assert!(!snippet.text.contains('<'));
         assert_eq!(snippet.highlights, vec!["fattura".to_owned()]);
+    }
+
+    /// The clock is injected so the assertion does not depend on the day the test runs.
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 4, 15, 30, 0).single().expect("a valid instant")
+    }
+
+    fn relative_after(value: &str) -> i64 {
+        let query = format!("after:{value}");
+        let parsed = parse_at(&query, fixed_now()).unwrap_or_else(|error| panic!("{query:?}: {error}"));
+        match parsed.expr {
+            Expr::After(at) => at,
+            other => panic!("{query:?} is not a date: {other:?}"),
+        }
+    }
+
+    fn midnight(year: i32, month: u32, day: u32) -> i64 {
+        Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).single().expect("a valid day").timestamp_millis()
+    }
+
+    #[test]
+    fn relative_dates_resolve_to_the_utc_midnight_they_name() {
+        assert_eq!(relative_after("today"), midnight(2026, 11, 4));
+        assert_eq!(relative_after("TODAY"), midnight(2026, 11, 4));
+        assert_eq!(relative_after("yesterday"), midnight(2026, 11, 3));
+        assert_eq!(relative_after("7d"), midnight(2026, 10, 28));
+        assert_eq!(relative_after("2w"), midnight(2026, 10, 21));
+        assert_eq!(relative_after("1m"), midnight(2026, 10, 5));
+        assert_eq!(relative_after("1y"), midnight(2025, 11, 4));
+        // An absolute date still means the same day, so the two forms compare directly.
+        assert_eq!(relative_after("2026-10-28"), midnight(2026, 10, 28));
+    }
+
+    #[test]
+    fn a_relative_date_prints_as_the_day_it_resolved_to_and_round_trips() {
+        let parsed = parse_at("after:7d before:today", fixed_now()).expect("a valid query");
+        assert_eq!(parsed.expr.canonical(), "(after:2026-10-28 AND before:2026-11-04)");
+        assert_eq!(parse(&parsed.expr.canonical()).expect("canonical text parses").expr, parsed.expr);
+    }
+
+    #[test]
+    fn a_relative_date_that_does_not_exist_is_a_bad_date() {
+        for value in ["0x", "d", "-3d", "1.5d", "7 d", "after"] {
+            let query = format!("after:{value}");
+            assert_eq!(parse(&query).expect_err(&query).code, "bad_date", "{query:?}");
+        }
+        // An absurd count is refused instead of wrapping the subtraction.
+        assert_eq!(parse("after:99999999999999999999d").expect_err("overflow").code, "bad_date");
+    }
+
+    #[test]
+    fn is_accepts_the_product_word_favourite_as_starred() {
+        assert_eq!(parse_ok("is:favourite").canonical(), "is:starred");
+        assert_eq!(parse_ok("is:Favourite").canonical(), "is:starred");
+        assert_eq!(parse_ok("is:unfavourite").canonical(), "is:unstarred");
+    }
+
+    #[test]
+    fn the_token_under_the_caret_is_the_word_the_popover_completes() {
+        assert_eq!(token_at("", 0), (0, ""));
+        assert_eq!(token_at("from:giu", 8), (0, "from:giu"));
+        assert_eq!(token_at("from:giu is:un", 17), (9, "is:un"));
+        assert_eq!(token_at("(from:giu", 9), (1, "from:giu"));
+        assert_eq!(token_at("from:giu is:unread", 4), (0, "from"), "a caret inside a word completes that word");
+        // A byte index in the middle of a multi-byte character is clamped, never sliced.
+        let text = "from:giù";
+        assert_eq!(token_at(text, text.len() - 1), (0, "from:gi"));
+    }
+
+    #[test]
+    fn a_token_is_classified_by_the_field_it_names() {
+        assert_eq!(completion(""), None);
+        assert_eq!(completion("fro"), Some(Completion::Field { prefix: "fro" }));
+        assert_eq!(completion("from:giu"), Some(Completion::Stored { field: Field::From, prefix: "giu", prefix_search: false }));
+        assert_eq!(completion("from:\"giu"), Some(Completion::Stored { field: Field::From, prefix: "giu", prefix_search: false }));
+        assert_eq!(completion("from:giu*"), Some(Completion::Stored { field: Field::From, prefix: "giu", prefix_search: true }));
+        assert_eq!(completion("label:lav"), Some(Completion::Stored { field: Field::Label, prefix: "lav", prefix_search: false }));
+        assert_eq!(completion("is:un"), Some(Completion::Fixed { field: Field::Is, prefix: "un" }));
+        assert_eq!(completion("subject:fa"), None, "a subject has no list to offer");
+        assert_eq!(completion("foo:bar"), None, "an unknown field is plain text");
+    }
+
+    #[test]
+    fn field_suggestions_name_every_documented_field() {
+        let rows = field_suggestions("fro", 8);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].insert, "from:");
+        assert_eq!(rows[0].kind, "field");
+        let rows = field_suggestions("", 100);
+        assert!(rows.iter().any(|row| row.insert == "subject:"));
+        assert!(rows.iter().any(|row| row.insert == "larger:"));
+        assert!(rows.iter().any(|row| row.kind == "operator" && row.insert == "AND "));
+        assert_eq!(field_suggestions("", 2).len(), 2, "the limit is honoured");
+        assert!(field_suggestions("zzz", 8).is_empty());
+    }
+
+    #[test]
+    fn fixed_suggestions_are_the_values_the_grammar_accepts() {
+        let rows = fixed_suggestions(Field::Is, "un", 8);
+        assert_eq!(rows.iter().map(|row| row.insert.as_str()).collect::<Vec<_>>(), vec!["is:unread", "is:unstarred"]);
+        assert_eq!(fixed_suggestions(Field::Has, "", 8)[0].insert, "has:attachment");
+        assert_eq!(fixed_suggestions(Field::After, "7", 8)[0].insert, "after:7d");
+        assert_eq!(fixed_suggestions(Field::Before, "", 8)[0].insert, "before:today");
+        assert_eq!(fixed_suggestions(Field::Larger, "5", 8)[0].insert, "larger:5m");
+        // Every offered clause is a valid query once a term is present.
+        for row in fixed_suggestions(Field::Is, "", 8) {
+            assert!(parse(&format!("x {}", row.insert)).is_ok(), "{}", row.insert);
+        }
+    }
+
+    #[test]
+    fn a_stored_suggestion_quotes_the_value_and_keeps_a_prefix_star() {
+        let row = stored_suggestion(Field::From, "Giulia Rossi <giulia@example.com>", "Giulia Rossi", false);
+        assert_eq!(row.insert, "from:\"Giulia Rossi <giulia@example.com>\"");
+        assert_eq!(row.kind, "from");
+        let row = stored_suggestion(Field::Label, "Da \"leggere\"", "Da leggere", true);
+        assert_eq!(row.insert, "label:\"Da \\\"leggere\\\"\"*");
+        assert!(parse(&format!("x {}", row.insert)).is_ok());
     }
 }

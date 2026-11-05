@@ -293,7 +293,7 @@ impl GalleryApp {
             MenuItem::new(command_label("forward", copy::FORWARD)).icon(icons::FORWARD).shortcut("F"),
             MenuItem::separator(),
             MenuItem::new(command_label("read", copy::READ)).icon(icons::MARK_READ).shortcut("U"),
-            MenuItem::new(command_label("star", "Aggiungi stella")).icon(icons::STAR).shortcut("S"),
+            MenuItem::new(command_label("star", "Aggiungi una stella")).icon(icons::STAR).shortcut("S"),
             MenuItem::new(command_label("label_menu", copy::LABEL)).icon(icons::TAG).shortcut("L"),
             MenuItem::separator(),
             MenuItem::new(command_label("archive", "Archivia")).icon(icons::ARCHIVE).shortcut("E"),

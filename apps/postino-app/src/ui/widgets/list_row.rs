@@ -33,6 +33,7 @@ pub struct ListRow<'a> {
     show_avatar: bool,
     height: f32,
     kind: ListRowKind,
+    tooltip: Option<&'a str>,
 }
 
 impl<'a> ListRow<'a> {
@@ -52,6 +53,7 @@ impl<'a> ListRow<'a> {
             show_avatar: true,
             height: size::ROW,
             kind: ListRowKind::Message,
+            tooltip: None,
         }
     }
 
@@ -71,6 +73,7 @@ impl<'a> ListRow<'a> {
             show_avatar: false,
             height: size::ROW_COMPACT,
             kind: ListRowKind::Folder,
+            tooltip: None,
         }
     }
 
@@ -91,6 +94,7 @@ impl<'a> ListRow<'a> {
             show_avatar: false,
             height: 40.0,
             kind: ListRowKind::Account,
+            tooltip: None,
         }
     }
 
@@ -111,6 +115,7 @@ impl<'a> ListRow<'a> {
             show_avatar: false,
             height: 48.0,
             kind: ListRowKind::Thread,
+            tooltip: None,
         }
     }
 
@@ -164,6 +169,14 @@ impl<'a> ListRow<'a> {
         self
     }
 
+    /// Replace the default `title — subtitle` tooltip. Callers whose accessible label already
+    /// carries the full context pass it once here instead of stacking a second tooltip.
+    #[must_use]
+    pub fn tooltip(mut self, tooltip: &'a str) -> Self {
+        self.tooltip = Some(tooltip);
+        self
+    }
+
     #[must_use]
     pub fn height(mut self, height: f32) -> Self {
         self.height = height;
@@ -188,8 +201,10 @@ impl<'a> ListRow<'a> {
         } else if hovered {
             ui.painter().rect_filled(rect, CornerRadius::same(radius::CONTROL), t.hover);
         }
-        if self.focused || response.has_focus() {
-            tokens::paint_focus_ring_on(ui, rect, radius::CONTROL, &t, selected);
+        // Selection is the single state cue: a forest row already reads as selected, so the gold
+        // focus ring is only painted for keyboard focus on a row that is not selected.
+        if (self.focused || response.has_focus()) && !selected {
+            tokens::paint_focus_ring_on(ui, rect, radius::CONTROL, &t, false);
         }
 
         let foreground = if selected { t.selected_text } else { t.text };
@@ -299,7 +314,10 @@ impl<'a> ListRow<'a> {
             response.request_focus();
         }
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, self.title));
-        let tooltip = if self.subtitle.is_empty() { self.title.to_owned() } else { format!("{} — {}", self.title, self.subtitle) };
+        let tooltip = self
+            .tooltip
+            .map(String::from)
+            .unwrap_or_else(|| if self.subtitle.is_empty() { self.title.to_owned() } else { format!("{} — {}", self.title, self.subtitle) });
         let response = response.on_hover_text(tooltip);
         response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
     }

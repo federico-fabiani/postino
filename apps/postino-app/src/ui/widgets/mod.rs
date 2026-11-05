@@ -10,6 +10,7 @@ mod input;
 mod list_row;
 mod menu;
 mod section;
+pub mod suggest;
 
 pub use button::{Button, ButtonKind, ButtonSize, IconButton, IconButtonSize};
 pub use chip::{Badge, BadgeKind, Chip};

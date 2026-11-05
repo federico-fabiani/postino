@@ -35,6 +35,11 @@ pub const DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x1C, 0x17);
 pub const DARK_PANEL: Color32 = Color32::from_rgb(0x13, 0x28, 0x21);
 pub const DARK_ELEV: Color32 = Color32::from_rgb(0x1A, 0x35, 0x2B);
 pub const DARK_BORDER: Color32 = Color32::from_rgb(0x2B, 0x4A, 0x3E);
+/// One step above `DARK_BORDER`, for the panel and section separators only. The card border
+/// measured 1.59:1 on the panel (1.80:1 on the window) in dark mode, so the sidebar/list edge read
+/// as a gap rather than a border. `#345648` measures 1.90:1 on the panel and 2.15:1 on the window:
+/// the edge exists without becoming a rule that competes with the content.
+pub const DARK_SEPARATOR: Color32 = Color32::from_rgb(0x34, 0x56, 0x48);
 pub const DARK_TEXT: Color32 = Color32::from_rgb(0xF5, 0xEB, 0xD6);
 pub const DARK_MUTED: Color32 = Color32::from_rgb(0xB4, 0xC3, 0xB9);
 pub const DARK_FAINT: Color32 = Color32::from_rgb(0x8D, 0xA2, 0x96);
@@ -190,7 +195,9 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     visuals.selection.stroke = Stroke::new(1.0, t.gold);
     visuals.widgets.noninteractive.bg_fill = t.panel;
     visuals.widgets.noninteractive.weak_bg_fill = t.panel;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, t.border);
+    // The panel separator (sidebar/list edge, `ui.separator`) reads the non-interactive stroke, so
+    // it gets the slightly stronger dark step; card frames keep `t.border`.
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, if dark { DARK_SEPARATOR } else { t.border });
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text_muted);
     visuals.widgets.inactive.bg_fill = t.panel_alt;
     visuals.widgets.inactive.weak_bg_fill = t.panel_alt;

@@ -229,6 +229,7 @@ impl PostinoApp {
         let mut add = false;
         let mut leave_demo = false;
         let mut close = false;
+        let mut copied_path = false;
         let mut theme_choice: Option<(bool, bool)> = None;
         let mut reduced = self.reduced_motion;
         let mut reset_pane = false;
@@ -255,7 +256,7 @@ impl PostinoApp {
         let scroll_height = (window.height() - 160.0).clamp(240.0, 520.0);
         let response = egui::Modal::new(Id::new("postino-settings"))
             .backdrop_color(theme::scrim(self.dark))
-            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XXL)))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
             .show(ui.ctx(), |ui| {
                 ui.set_width(width);
                 ui.horizontal(|ui| {
@@ -274,10 +275,11 @@ impl PostinoApp {
                         }
                     });
                 });
-                ui.add_space(space::SM);
+                ui.add_space(space::XS);
                 let _settings_scroll = egui::ScrollArea::vertical()
                     .id_salt("settings-scroll")
                     .max_height(scroll_height)
+                    .content_margin(Margin { right: 10, ..Margin::ZERO })
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
@@ -478,32 +480,39 @@ impl PostinoApp {
                             let _data_header = ui.label(typography::strong(Role::BodySmall, "DATI", t.text_faint));
                             #[cfg(test)]
                             probe::settings_section(ui, "DATI", _data_header.rect);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let copy_blob = Button::ghost("Copia allegati")
-                                    .size(ButtonSize::Sm)
-                                    .icon(icons::COPY)
-                                    .enabled(blob.is_some())
-                                    .disabled_reason("La modalità demo non ha una cartella dati")
-                                    .show(ui);
-                                #[cfg(test)]
-                                probe::settings_copy(ui, "blob", copy_blob.rect);
-                                if copy_blob.clicked()
-                                    && let Some(blob) = &blob
-                                {
-                                    ui.ctx().copy_text(blob.clone());
-                                }
-                                let copy_store = Button::ghost("Copia archivio").size(ButtonSize::Sm).icon(icons::COPY).show(ui);
-                                #[cfg(test)]
-                                probe::settings_copy(ui, "store", copy_store.rect);
-                                if copy_store.clicked() {
-                                    ui.ctx().copy_text(path.clone());
-                                }
-                            });
+                            ui.add_space(space::SM);
+                            // The two path actions sit on the section line, left-aligned with the rest of
+                            // the DATI controls, instead of floating at the right edge of the heading.
+                            let copy_store = Button::ghost("Copia archivio").size(ButtonSize::Sm).icon(icons::COPY).show(ui);
+                            #[cfg(test)]
+                            probe::settings_copy(ui, "store", copy_store.rect);
+                            if copy_store.clicked() {
+                                ui.ctx().copy_text(path.clone());
+                                copied_path = true;
+                            }
+                            let copy_blob = Button::ghost("Copia allegati")
+                                .size(ButtonSize::Sm)
+                                .icon(icons::COPY)
+                                .enabled(blob.is_some())
+                                .disabled_reason("La modalità demo non ha una cartella dati")
+                                .show(ui);
+                            #[cfg(test)]
+                            probe::settings_copy(ui, "blob", copy_blob.rect);
+                            if copy_blob.clicked()
+                                && let Some(blob) = &blob
+                            {
+                                ui.ctx().copy_text(blob.clone());
+                                copied_path = true;
+                            }
                         });
                         ui.add_space(space::XS);
-                        ui.add(egui::Label::new(typography::mono(path.as_str(), type_size::CAPTION, t.text_faint)).selectable(true).wrap());
+                        ui.add(
+                            egui::Label::new(typography::mono(path.as_str(), type_size::CAPTION, t.text_faint)).selectable(true).wrap(),
+                        );
                         if let Some(blob) = &blob {
-                            ui.add(egui::Label::new(typography::mono(blob.as_str(), type_size::CAPTION, t.text_faint)).selectable(true).wrap());
+                            ui.add(
+                                egui::Label::new(typography::mono(blob.as_str(), type_size::CAPTION, t.text_faint)).selectable(true).wrap(),
+                            );
                         }
                         ui.add_space(space::XS);
                         let can_open = self.store_path.is_some();
@@ -745,15 +754,15 @@ impl PostinoApp {
                 ui.add_space(space::SM);
                 let _footer = ui.horizontal(|ui| {
                     ui.label(typography::text(Role::Caption, "Esc chiude e riporta al punto precedente", t.text_faint));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if Button::new("Chiudi").show(ui).clicked() {
-                            close = true;
-                        }
-                    });
                 });
                 #[cfg(test)]
                 probe::settings_footer(ui, _footer.response.rect);
             });
+        // A copy icon only raises the flag; the confirmation is written once the modal is closed,
+        // the same deferred-apply pattern the background toggles use.
+        if copied_path {
+            self.status = "Percorso copiato".to_owned();
+        }
         // A toggle was clicked inside the modal closure; write it now and read the stored value back.
         self.apply_background_change();
         if let Some((system, dark)) = theme_choice {
@@ -767,8 +776,7 @@ impl PostinoApp {
             self.set_reduced_motion(ui.ctx(), reduced);
         }
         if reset_pane {
-            self.reading_ratio = crate::settings::DEFAULT_READING_PANE_RATIO;
-            self.mark_settings_dirty();
+            self.reset_reading_pane_width(ui.ctx());
             self.persist_settings();
             self.status = "Larghezza lettura reimpostata".to_owned();
         }

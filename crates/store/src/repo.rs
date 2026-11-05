@@ -2034,6 +2034,11 @@ fn upsert_message_row(tx: &rusqlite::Transaction<'_>, message: &Message, refresh
             origin.as_str(),
         ],
     )?;
+    // The correspondent list is derived from received mail only: a Sent copy is not a person the
+    // account should be offered as a recipient.
+    if matches!(origin, MessageOrigin::Received) {
+        crate::correspondents::note_received(tx, message)?;
+    }
     // Counts only move when the folder or the read flag changes; a body/subject refresh during a
     // sync must not rescan the folder for every message.
     let folder_changed = previous.as_ref().is_none_or(|(folder, _)| folder != &message.summary.folder_id);

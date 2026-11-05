@@ -21,6 +21,7 @@ pub mod space {
 /// `Margin` uses `i8`; keep the inset values next to the spacing scale instead of casting in
 /// every component.
 pub mod inset {
+    pub const XXS: i8 = 2;
     pub const XS: i8 = 4;
     pub const SM: i8 = 6;
     pub const MD: i8 = 8;
@@ -51,8 +52,13 @@ pub mod size {
     pub const ROW: f32 = 44.0;
     pub const ROW_COMPACT: f32 = 36.0;
     pub const TITLE_BAR: f32 = 34.0;
-    pub const TOOLBAR: f32 = 56.0;
-    pub const STATUS: f32 = 28.0;
+    /// The toolbar leaves a clear band around the 40 pt search field: the panel's own 10 pt
+    /// vertical margin plus the slack inside the content rect. It used to be 56, which put the
+    /// field's lower edge against the separator.
+    pub const TOOLBAR: f32 = 60.0;
+    /// Tall enough for the 28 pt status buttons and their 6 pt vertical margin, so no label or
+    /// control sits on the panel edge.
+    pub const STATUS: f32 = 32.0;
     pub const SIDEBAR: f32 = 240.0;
     /// Composer modal card. Wider cards would leave the list and the reading pane too narrow to
     /// keep the composer a layer over the mail instead of a second window.
@@ -66,9 +72,6 @@ pub mod size {
     pub const COMPOSER_FOOTER_BLOCK: f32 = 68.0;
     pub const COMPOSER_BODY_MIN: f32 = 96.0;
     pub const ATTACHMENT_LIST_MAX: f32 = 72.0;
-    /// The inline label editor is a drawer above the sidebar footer, tall enough for the field, its
-    /// error line, the colour row, the hint and Save/Cancel at 980×600.
-    pub const LABEL_EDITOR_DRAWER: f32 = 208.0;
     /// Command palette: a modal layer, not a window. Ten rows are enough to scan a filtered list;
     /// the rest scrolls inside the palette.
     pub const PALETTE_WIDTH: f32 = 560.0;

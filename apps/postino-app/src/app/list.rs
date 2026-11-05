@@ -29,7 +29,7 @@ impl PostinoApp {
             .as_deref()
             .and_then(|id| self.label_summary(id))
             .map(|label| (label.id.clone(), label.name.clone(), label_color(label.color, &t)));
-        let (rows, total, unread) = self.visible_messages();
+        let (rows, total, _) = self.visible_messages();
         self.prune_selection(&rows);
         let searching = !self.search_committed.trim().is_empty();
         let saved_account_wide = self.saved_folder_scope && !self.saved_query_folder;
@@ -51,8 +51,8 @@ impl PostinoApp {
             search_meta(total, search_capped, scope.as_deref())
         } else {
             match &scope {
-                Some(scope) => format!("{} · {} · {scope}", unread_text(unread), messages_text(total)),
-                None => format!("{} · {}", unread_text(unread), messages_text(total)),
+                Some(scope) => format!("{} · {scope}", messages_text(total)),
+                None => messages_text(total),
             }
         };
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
@@ -93,6 +93,9 @@ impl PostinoApp {
                         if label_filter.is_some() && Button::ghost("Mostra tutte").size(ButtonSize::Sm).show(ui).clicked() {
                             clear_filter = true;
                         }
+                        if view_toggle_button(ui, self.threads_view) {
+                            self.toggle_threads_view();
+                        }
                     },
                 );
                 ui.add_space(space::XS);
@@ -113,6 +116,7 @@ impl PostinoApp {
                 ui.add_space(space::XS);
                 ui.horizontal(|ui| {
                     ui.label(typography::text(Role::Meta, format!("Risultati per “{}”", self.search_committed), t.text_muted));
+                    IconButton::new(icons::HELP, SEARCH_SYNTAX_HELP).size(IconButtonSize::Sm).show(ui);
                     if Button::ghost("Cancella").size(ButtonSize::Sm).show(ui).clicked() {
                         self.clear_search();
                     }
@@ -131,11 +135,6 @@ impl PostinoApp {
                         }
                     });
                 }
-                ui.label(typography::text(
-                    Role::Caption,
-                    "from: · to: · subject: · label: · folder: · is: · has: · after: · larger: — AND/OR/NOT, \"frase\", prefisso*",
-                    t.text_faint,
-                ));
             }
             if let Some((code, position)) = &search_error {
                 ui.add_space(space::XS);
@@ -267,252 +266,253 @@ impl PostinoApp {
             self.row_ids.clear();
             let ctx = ui.ctx().clone();
             let _ = &ctx;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let mut focus_rects = Vec::new();
-                // The table inserts `item_spacing.x` around every column; at five columns that is
-                // 40 pt the subject cannot spare. The cells carry their own insets instead.
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let mut table = egui_extras::TableBuilder::new(ui)
-                    .id_salt("message-list")
-                    .striped(false)
-                    .resizable(false)
-                    .sense(Sense::click())
-                    .auto_shrink([false, false])
-                    .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(egui_extras::Column::exact(12.0));
-                if show_avatars {
-                    table = table.column(egui_extras::Column::exact(30.0));
-                }
-                table = table.column(egui_extras::Column::exact(columns.sender));
-                table = table.column(egui_extras::Column::remainder());
-                if let Some(date) = columns.date {
-                    table = table.column(egui_extras::Column::exact(date));
-                }
-                table
-                    .column(egui_extras::Column::exact(28.0))
-                    .header(24.0, |mut header| {
+            // The table owns the only vertical scroll: an outer ScrollArea would give the list two
+            // scrollbars and leave the inner one at its 800 pt default height.
+            let mut focus_rects = Vec::new();
+            // The table inserts `item_spacing.x` around every column; at five columns that is
+            // 40 pt the subject cannot spare. The cells carry their own insets instead.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let scroll_to_row =
+                if self.scroll_to_selected { self.selected.as_deref().and_then(|id| rows.iter().position(|message| message.id == id)) } else { None };
+            let mut table = egui_extras::TableBuilder::new(ui)
+                .id_salt("message-list")
+                .striped(false)
+                .resizable(false)
+                .sense(Sense::click())
+                .auto_shrink([false, false])
+                .max_scroll_height(f32::INFINITY)
+                .min_scrolled_height(0.0)
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(egui_extras::Column::exact(12.0));
+            if let Some(index) = scroll_to_row {
+                table = table.scroll_to_row(index, Some(Align::Center));
+            }
+            if show_avatars {
+                table = table.column(egui_extras::Column::exact(30.0));
+            }
+            table = table.column(egui_extras::Column::exact(columns.sender));
+            table = table.column(egui_extras::Column::remainder());
+            if let Some(date) = columns.date {
+                table = table.column(egui_extras::Column::exact(date));
+            }
+            table
+                .column(egui_extras::Column::exact(28.0))
+                .header(24.0, |mut header| {
+                    header.col(|_| {});
+                    if show_avatars {
                         header.col(|_| {});
-                        if show_avatars {
-                            header.col(|_| {});
-                        }
+                    }
+                    header.col(|ui| {
+                        ui.add_space(space::XS);
+                        ui.add(egui::Label::new(typography::text(Role::Caption, "MITTENTE", t.text_faint)).selectable(false));
+                    });
+                    header.col(|ui| {
+                        ui.add_space(space::XS);
+                        ui.add(egui::Label::new(typography::text(Role::Caption, "OGGETTO", t.text_faint)).selectable(false));
+                    });
+                    // The compact date sits between the subject and the star, as in every mail
+                    // client; the header drops it with the column instead of leaving a hole.
+                    if columns.date.is_some() {
                         header.col(|ui| {
-                            ui.add_space(space::XS);
-                            ui.add(egui::Label::new(typography::text(Role::Caption, "MITTENTE", t.text_faint)).selectable(false));
-                        });
-                        header.col(|ui| {
-                            ui.add_space(space::XS);
-                            ui.add(egui::Label::new(typography::text(Role::Caption, "OGGETTO", t.text_faint)).selectable(false));
-                        });
-                        // The compact date sits between the subject and the star, as in every mail
-                        // client; the header drops it with the column instead of leaving a hole.
-                        if columns.date.is_some() {
-                            header.col(|ui| {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
-                                });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add(egui::Label::new(typography::text(Role::Caption, "DATA", t.text_faint)).selectable(false));
                             });
-                        }
-                        header.col(|_| {});
-                    })
-                    .body(|mut body| {
-                        for message in &rows {
-                            let focused = self.selected.as_deref() == Some(message.id.as_str());
-                            let selected = self.selection.contains(&message.id);
-                            let foreground = if selected { t.selected_text } else { t.text };
-                            let row_font =
-                                FontId::new(type_size::BODY_SMALL, if message.unread { theme::medium() } else { FontFamily::Proportional });
-                            let mut sender_truncated = false;
-                            let mut subject_truncated = false;
-                            let date_label = format_when(message.date, now_utc);
-                            let accessible = row_accessible_label(message, &date_label, selected);
-                            body.row(ui_size::ROW, |mut row| {
-                                row.set_selected(selected);
-                                row.col(|ui| {
-                                    if message.unread {
-                                        // Gold ink on ivory; the light gold returns on the forest
-                                        // selection where it measures 6.5:1.
-                                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                        ui.painter().circle_filled(rect.center(), 3.0, if selected { t.gold } else { t.gold_ink });
-                                    }
-                                });
-                                if show_avatars {
-                                    row.col(|ui| {
-                                        avatar(
-                                            ui,
-                                            24.0,
-                                            &message.from.initials(),
-                                            if selected { GOLD } else { t.panel_alt },
-                                            if selected { theme::FOREST } else { t.text },
-                                        );
-                                    });
+                        });
+                    }
+                    header.col(|_| {});
+                })
+                .body(|mut body| {
+                    for message in &rows {
+                        let selected = self.selection.contains(&message.id);
+                        let foreground = if selected { t.selected_text } else { t.text };
+                        let row_font = FontId::new(type_size::BODY_SMALL, if message.unread { theme::medium() } else { FontFamily::Proportional });
+                        let mut sender_truncated = false;
+                        let mut subject_truncated = false;
+                        let date_label = format_when(message.date, now_utc);
+                        let accessible = row_accessible_label(message, &date_label, selected);
+                        body.row(ui_size::ROW, |mut row| {
+                            row.set_selected(selected);
+                            row.col(|ui| {
+                                if message.unread {
+                                    // Gold ink on ivory; the light gold returns on the forest
+                                    // selection where it measures 6.5:1.
+                                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                    ui.painter().circle_filled(rect.center(), 3.0, if selected { t.gold } else { t.gold_ink });
                                 }
+                            });
+                            if show_avatars {
                                 row.col(|ui| {
-                                    let name =
-                                        if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
-                                    ui.add_space(space::XS);
-                                    sender_truncated = !text_fits(ui, name, &row_font, ui.available_width());
-                                    let text = RichText::new(name).font(row_font.clone()).color(foreground);
-                                    ui.add(egui::Label::new(text).truncate().selectable(false));
+                                    avatar(
+                                        ui,
+                                        24.0,
+                                        &message.from.initials(),
+                                        if selected { GOLD } else { t.panel_alt },
+                                        if selected { theme::FOREST } else { t.text },
+                                    );
                                 });
-                                row.col(|ui| {
-                                    // The cell layout starts content at the top. Centre the two lines
-                                    // explicitly so the subject never touches the selected row edge.
-                                    let top = ((ui.available_height() - 28.0) * 0.5).max(0.0);
-                                    ui.add_space(top);
-                                    ui.add_space(space::XS);
-                                    #[cfg(test)]
-                                    probe::subject_width(ui, ui.available_width());
-                                    ui.vertical(|ui| {
-                                        ui.spacing_mut().item_spacing.y = 1.0;
-                                        let subject_text =
-                                            if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() };
-                                        subject_truncated = !text_fits(ui, subject_text, &row_font, ui.available_width());
-                                        let subject = RichText::new(subject_text).font(row_font.clone()).color(foreground);
-                                        ui.add(egui::Label::new(subject).truncate().selectable(false));
-                                        let snippet = RichText::new(message.snippet.as_str()).size(type_size::META).color(if selected {
-                                            t.selected_muted
-                                        } else {
-                                            t.text_muted
-                                        });
-                                        ui.add(egui::Label::new(snippet).truncate().selectable(false));
-                                    });
-                                });
-                                if columns.date.is_some() {
-                                    row.col(|ui| {
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            ui.add(
-                                                egui::Label::new(typography::mono(
-                                                    date_label.as_str(),
-                                                    type_size::CAPTION,
-                                                    if selected { t.selected_muted } else { t.text_faint },
-                                                ))
-                                                .selectable(false),
-                                            );
-                                        });
-                                    });
-                                }
-                                row.col(|ui| {
-                                    let star_label = if message.starred { "Togli la stella" } else { "Segna con stella" };
-                                    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-                                    if response.hovered() {
-                                        let fill = if selected { tokens::mix(t.selected, t.selected_text, 0.12) } else { t.hover };
-                                        ui.painter().rect_filled(rect, CornerRadius::same(radius::SM), fill);
-                                    }
-                                    if response.has_focus() {
-                                        tokens::paint_focus_ring_on(ui, rect, radius::SM, &t, selected);
-                                    }
-                                    let star_color = if message.starred {
-                                        if selected { t.gold } else { t.gold_ink }
-                                    } else if selected {
+                            }
+                            row.col(|ui| {
+                                let name = if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
+                                ui.add_space(space::XS);
+                                sender_truncated = !text_fits(ui, name, &row_font, ui.available_width());
+                                let text = RichText::new(name).font(row_font.clone()).color(foreground);
+                                ui.add(egui::Label::new(text).truncate().selectable(false));
+                            });
+                            row.col(|ui| {
+                                // The cell layout starts content at the top. Centre the two lines
+                                // explicitly so the subject never touches the selected row edge.
+                                let top = ((ui.available_height() - 28.0) * 0.5).max(0.0);
+                                ui.add_space(top);
+                                ui.add_space(space::XS);
+                                #[cfg(test)]
+                                probe::subject_width(ui, ui.available_width());
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    let subject_text = if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() };
+                                    subject_truncated = !text_fits(ui, subject_text, &row_font, ui.available_width());
+                                    let subject = RichText::new(subject_text).font(row_font.clone()).color(foreground);
+                                    ui.add(egui::Label::new(subject).truncate().selectable(false));
+                                    let snippet = RichText::new(message.snippet.as_str()).size(type_size::META).color(if selected {
                                         t.selected_muted
                                     } else {
-                                        t.text_faint
-                                    };
-                                    let font = if message.starred { icons::font_filled(13.0) } else { icons::font(13.0) };
-                                    let glyph = if message.starred { icons::STAR_FILL } else { icons::STAR };
-                                    let galley = ui.painter().layout_no_wrap(glyph.to_owned(), font, star_color);
-                                    ui.painter().galley(
-                                        pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5),
-                                        galley,
-                                        Color32::PLACEHOLDER,
-                                    );
-                                    if response.clicked()
-                                        || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter) || input.key_pressed(Key::Space)))
-                                    {
-                                        star_clicked = Some(message.id.clone());
-                                    }
-                                    if response.hovered() {
-                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                    }
-                                    #[cfg(test)]
-                                    probe::star(ui, &message.id, rect);
-                                    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, star_label));
-                                    response.on_hover_text(star_label);
-                                });
-                                let response = row.response();
-                                self.row_ids.insert(message.id.clone(), response.id);
-                                // The table reports its row rect from the measuring pass, which can be
-                                // wider than the list. Clamp it to the visible content for the focus
-                                // ring and for the pointer tests.
-                                let row_rect = Rect::from_min_max(
-                                    response.rect.min,
-                                    pos2(response.rect.max.x.min(response.rect.min.x + content_width), response.rect.max.y),
-                                );
-                                #[cfg(test)]
-                                probe::message_row(&ctx, &message.id, row_rect);
-                                #[cfg(test)]
-                                probe::row_facts(&ctx, &message.id, &accessible, response.has_focus());
-                                // Accessibility: every row is a named button. The label carries all
-                                // the facts a sighted user reads from the columns plus the Enter
-                                // affordance, so a screen reader is not left with "message row".
-                                response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
-                                if focused && self.scroll_to_selected {
-                                    response.scroll_to_me(None);
-                                }
-                                if response.has_focus() {
-                                    // The ring follows real keyboard focus, not the selection: a
-                                    // selected-but-unfocused row must not look focused, and Tab can
-                                    // land on the list without changing what is selected.
-                                    focus_rects.push((row_rect.shrink(1.0), selected));
-                                    #[cfg(test)]
-                                    probe::focus_ring(&ctx, &message.id);
-                                }
-                                if response.secondary_clicked() {
-                                    context_clicked = Some(message.id.clone());
-                                }
-                                if response.clicked() {
-                                    clicked = Some((message.id.clone(), modifiers));
-                                }
-                                if double_activated(&response) {
-                                    double_clicked = Some(message.id.clone());
-                                }
-                                let mut tooltip = String::new();
-                                if sender_truncated {
-                                    let name =
-                                        if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
-                                    tooltip.push_str(name);
-                                }
-                                if subject_truncated {
-                                    if !tooltip.is_empty() {
-                                        tooltip.push('\n');
-                                    }
-                                    tooltip.push_str(if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() });
-                                }
-                                if !tooltip.is_empty() {
-                                    // A tooltip on hover has the usual delay; a keyboard-focused row
-                                    // shows it at once, so truncation is never information loss
-                                    // without a mouse.
-                                    if response.has_focus() && !response.hovered() {
-                                        #[cfg(test)]
-                                        probe::tooltip(&ctx, &tooltip);
-                                        let _ = egui::Tooltip::for_widget(&response).show(|ui| {
-                                            ui.label(typography::text(Role::BodySmall, tooltip.as_str(), t.text));
-                                        });
-                                    }
-                                    response.clone().on_hover_text(tooltip);
-                                }
-                                let is_draft = self
-                                    .engine
-                                    .folders()
-                                    .iter()
-                                    .find(|folder| folder.id == message.folder_id)
-                                    .is_some_and(|folder| folder.kind == FolderKind::Drafts);
-                                let (items, actions) = row_context_menu(message, is_draft);
-                                response.context_menu(|ui| {
-                                    if let Some(index) = Menu::new(&items).show(ui)
-                                        && let Some(Some(action)) = actions.get(index)
-                                    {
-                                        context_action = Some((message.id.clone(), *action));
-                                        ui.close();
-                                    }
+                                        t.text_muted
+                                    });
+                                    ui.add(egui::Label::new(snippet).truncate().selectable(false));
                                 });
                             });
-                        }
-                    });
-                for (rect, on_selected) in focus_rects {
-                    crate::ui::tokens::paint_focus_ring_on(ui, rect, radius::CONTROL, &t, on_selected);
-                }
-            });
+                            if columns.date.is_some() {
+                                row.col(|ui| {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(typography::mono(
+                                                date_label.as_str(),
+                                                type_size::CAPTION,
+                                                if selected { t.selected_muted } else { t.text_faint },
+                                            ))
+                                            .selectable(false),
+                                        );
+                                    });
+                                });
+                            }
+                            row.col(|ui| {
+                                let star_label = if message.starred { "Togli la stella" } else { "Segna con stella" };
+                                let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                                if response.hovered() {
+                                    let fill = if selected { tokens::mix(t.selected, t.selected_text, 0.12) } else { t.hover };
+                                    ui.painter().rect_filled(rect, CornerRadius::same(radius::SM), fill);
+                                }
+                                if response.has_focus() {
+                                    tokens::paint_focus_ring_on(ui, rect, radius::SM, &t, selected);
+                                }
+                                let star_color = if message.starred {
+                                    if selected { t.gold } else { t.gold_ink }
+                                } else if selected {
+                                    t.selected_muted
+                                } else {
+                                    t.text_faint
+                                };
+                                let font = if message.starred { icons::font_filled(13.0) } else { icons::font(13.0) };
+                                let glyph = if message.starred { icons::STAR_FILL } else { icons::STAR };
+                                let galley = ui.painter().layout_no_wrap(glyph.to_owned(), font, star_color);
+                                ui.painter().galley(
+                                    pos2(rect.center().x - galley.size().x * 0.5, rect.center().y - galley.size().y * 0.5),
+                                    galley,
+                                    Color32::PLACEHOLDER,
+                                );
+                                if response.clicked()
+                                    || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter) || input.key_pressed(Key::Space)))
+                                {
+                                    star_clicked = Some(message.id.clone());
+                                }
+                                if response.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                #[cfg(test)]
+                                probe::star(ui, &message.id, rect);
+                                response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, star_label));
+                                response.on_hover_text(star_label);
+                            });
+                            let response = row.response();
+                            self.row_ids.insert(message.id.clone(), response.id);
+                            // The table reports its row rect from the measuring pass, which can be
+                            // wider than the list. Clamp it to the visible content for the focus
+                            // ring and for the pointer tests.
+                            let row_rect = Rect::from_min_max(
+                                response.rect.min,
+                                pos2(response.rect.max.x.min(response.rect.min.x + content_width), response.rect.max.y),
+                            );
+                            #[cfg(test)]
+                            probe::message_row(&ctx, &message.id, row_rect);
+                            #[cfg(test)]
+                            probe::row_facts(&ctx, &message.id, &accessible, response.has_focus());
+                            // Accessibility: every row is a named button. The label carries all
+                            // the facts a sighted user reads from the columns plus the Enter
+                            // affordance, so a screen reader is not left with "message row".
+                            response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
+                            if response.has_focus() {
+                                // The selection is the single cue: a forest row already shows it, so
+                                // only keyboard focus on an unselected row needs the gold ring. Tab
+                                // can land on the list without changing what is selected.
+                                #[cfg(test)]
+                                probe::focus_ring(&ctx, &message.id);
+                                if !selected {
+                                    focus_rects.push(row_rect.shrink(1.0));
+                                }
+                            }
+                            if response.secondary_clicked() {
+                                context_clicked = Some(message.id.clone());
+                            }
+                            if response.clicked() {
+                                clicked = Some((message.id.clone(), modifiers));
+                            }
+                            if double_activated(&response) {
+                                double_clicked = Some(message.id.clone());
+                            }
+                            let mut tooltip = String::new();
+                            if sender_truncated {
+                                let name = if message.from.name.trim().is_empty() { message.from.email.as_str() } else { message.from.name.as_str() };
+                                tooltip.push_str(name);
+                            }
+                            if subject_truncated {
+                                if !tooltip.is_empty() {
+                                    tooltip.push('\n');
+                                }
+                                tooltip.push_str(if message.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.subject.as_str() });
+                            }
+                            if !tooltip.is_empty() {
+                                // A tooltip on hover has the usual delay; a keyboard-focused row
+                                // shows it at once, so truncation is never information loss
+                                // without a mouse.
+                                if response.has_focus() && !response.hovered() {
+                                    #[cfg(test)]
+                                    probe::tooltip(&ctx, &tooltip);
+                                    let _ = egui::Tooltip::for_widget(&response).show(|ui| {
+                                        ui.label(typography::text(Role::BodySmall, tooltip.as_str(), t.text));
+                                    });
+                                }
+                                response.clone().on_hover_text(tooltip);
+                            }
+                            let is_draft = self
+                                .engine
+                                .folders()
+                                .iter()
+                                .find(|folder| folder.id == message.folder_id)
+                                .is_some_and(|folder| folder.kind == FolderKind::Drafts);
+                            let (items, actions) = row_context_menu(message, is_draft);
+                            response.context_menu(|ui| {
+                                if let Some(index) = Menu::new(&items).show(ui)
+                                    && let Some(Some(action)) = actions.get(index)
+                                {
+                                    context_action = Some((message.id.clone(), *action));
+                                    ui.close();
+                                }
+                            });
+                        });
+                    }
+                });
+            for rect in focus_rects {
+                crate::ui::tokens::paint_focus_ring_on(ui, rect, radius::CONTROL, &t, false);
+            }
             if self.focus_selected_row {
                 if let Some(id) = self.selected.as_ref().and_then(|selected| self.row_ids.get(selected)) {
                     ui.ctx().memory_mut(|memory| memory.request_focus(*id));
@@ -566,7 +566,7 @@ impl PostinoApp {
             .as_deref()
             .and_then(|id| self.label_summary(id))
             .map(|label| (label.id.clone(), label.name.clone(), label_color(label.color, &t)));
-        let (threads, total, unread_threads, unread_messages) = self.visible_threads();
+        let (threads, total, _, _) = self.visible_threads();
         let searching = !self.search_committed.trim().is_empty();
         let saved_account_wide = self.saved_folder_scope && !self.saved_query_folder;
         let search_error = self.search_error.clone();
@@ -579,19 +579,8 @@ impl PostinoApp {
         } else {
             label_filter.as_ref().map_or(current_folder_name.clone(), |(_, name, _)| name.clone())
         };
-        let meta = if searching {
-            format!(
-                "{} nei risultati · {} nei risultati",
-                plural(usize::try_from(total).unwrap_or(usize::MAX), "conversazione", "conversazioni"),
-                plural(usize::try_from(unread_messages).unwrap_or(usize::MAX), "messaggio non letto", "messaggi non letti")
-            )
-        } else {
-            format!(
-                "{} con messaggi non letti · {}",
-                plural(usize::try_from(unread_threads).unwrap_or(usize::MAX), "conversazione", "conversazioni"),
-                plural(usize::try_from(total).unwrap_or(usize::MAX), "conversazione", "conversazioni")
-            )
-        };
+        let conversations = plural(usize::try_from(total).unwrap_or(usize::MAX), "conversazione", "conversazioni");
+        let meta = if searching { format!("{conversations} nei risultati") } else { conversations };
         egui::CentralPanel::default().frame(Frame::new().fill(t.bg).inner_margin(Margin::symmetric(inset::XL, inset::LG))).show(ui, |ui| {
             if matches!(self.sync_view, SyncView::Offline { .. }) {
                 self.offline_banner(ui, &t);
@@ -618,6 +607,9 @@ impl PostinoApp {
                     if label_filter.is_some() && Button::ghost("Mostra tutte").size(ButtonSize::Sm).show(ui).clicked() {
                         clear_filter = true;
                     }
+                    if view_toggle_button(ui, self.threads_view) {
+                        self.toggle_threads_view();
+                    }
                 },
             );
             ui.add_space(space::XS);
@@ -631,9 +623,6 @@ impl PostinoApp {
                 }
                 if Chip::new("Allegati").icon(icons::PAPERCLIP).selected(self.attachments_only).show(ui).clicked() {
                     self.attachments_only = !self.attachments_only;
-                }
-                if Chip::new("Messaggi").icon(icons::LIST).show(ui).clicked() {
-                    self.toggle_threads_view();
                 }
             });
             if searching {
@@ -733,6 +722,10 @@ impl PostinoApp {
                 }
                 return;
             }
+            // Keyboard focus belongs to the selected row. A row clicked earlier would otherwise
+            // keep the gold ring while an arrow selects a different conversation; asking before
+            // the rows are drawn removes the ring from the old row in the same frame.
+            self.sync_thread_row_focus(ui.ctx());
             let mut action: Option<ThreadRowAction> = None;
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -753,22 +746,10 @@ impl PostinoApp {
                     };
                     let meta = format_when(thread.last_date, self.now_utc);
                     let counts = messages_text(usize::try_from(thread.message_count).unwrap_or(usize::MAX));
-                    let unread_detail = if thread.unread_count > 0 {
-                        format!(" · {}", unread_text(usize::try_from(thread.unread_count).unwrap_or(usize::MAX)))
-                    } else {
-                        String::new()
-                    };
-                    let subtitle = format!("{participants} · {counts}{unread_detail}");
+                    let subtitle = format!("{participants} · {counts}");
                     let subject = thread_subject(&thread.subject);
                     let subject = if subject.trim().is_empty() { "(Nessun oggetto)" } else { subject.as_str() };
                     let starred = thread.starred_count > 0;
-                    let row =
-                        ListRow::thread(subject, &subtitle, &meta).unread(thread.unread_count > 0).starred(starred).selected(selected).height(48.0);
-                    let response = row.show(ui);
-                    #[cfg(test)]
-                    probe::row(ui, &format!("thread:{}", thread.id), response.rect);
-                    #[cfg(test)]
-                    probe::thread_star(ui, &thread.id, starred, response.rect);
                     let mut accessible = format!("{subject}. {subtitle}. {meta}.");
                     if thread.unread_count > 0 {
                         accessible.push_str(" Non letta.");
@@ -780,8 +761,22 @@ impl PostinoApp {
                         accessible.push_str(" Selezionata.");
                     }
                     accessible.push_str(" Premi Invio per aprire.");
+                    let row = ListRow::thread(subject, &subtitle, &meta)
+                        .unread(thread.unread_count > 0)
+                        .starred(starred)
+                        .selected(selected)
+                        .tooltip(&accessible)
+                        .height(48.0);
+                    let response = row.show(ui);
+                    self.row_ids.insert(thread.id.clone(), response.id);
+                    if selected && self.scroll_to_selected {
+                        response.scroll_to_me(Some(Align::Center));
+                    }
+                    #[cfg(test)]
+                    probe::row(ui, &format!("thread:{}", thread.id), response.rect);
+                    #[cfg(test)]
+                    probe::thread_star(ui, &thread.id, starred, response.rect);
                     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
-                    response.clone().on_hover_text(accessible);
                     if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter))) {
                         action = Some(ThreadRowAction::Open(thread.id.clone()));
                     }
@@ -828,6 +823,7 @@ impl PostinoApp {
                     });
                 }
             });
+            self.scroll_to_selected = false;
             if let Some(action) = action {
                 match action {
                     ThreadRowAction::Open(id) => self.select_thread(id),
@@ -856,6 +852,17 @@ impl PostinoApp {
             self.clear_label_filter();
         }
     }
+}
+
+/// The title-row switch between the flat message list and the conversation list. It stays out of
+/// the chip row so "Tutti / Non letti / Allegati" keep meaning only what they say.
+fn view_toggle_button(ui: &mut Ui, threads_view: bool) -> bool {
+    let (label, icon, tooltip) = if threads_view {
+        ("Vedi messaggi", icons::LIST, "Mostra i singoli messaggi invece delle conversazioni")
+    } else {
+        ("Vedi conversazioni", icons::LIST_BULLETS, "Raggruppa i messaggi in conversazioni")
+    };
+    Button::ghost(label).icon(icon).size(ButtonSize::Sm).show(ui).on_hover_text(tooltip).clicked()
 }
 
 #[derive(Clone, Copy)]
@@ -917,6 +924,11 @@ fn row_context_menu(message: &MessageSummary, is_draft: bool) -> (Vec<MenuItem<'
     actions.push(Some(RowAction::Delete));
     (items, actions)
 }
+
+/// The search syntax cheat sheet, kept as one string so the help button, the docs and the tests
+/// cannot drift apart.
+pub(super) const SEARCH_SYNTAX_HELP: &str =
+    "from: · to: · subject: · label: · folder: · is: · has: · after: · larger: — AND/OR/NOT, \"frase\", prefisso*, after:7d, is:favourite";
 
 /// Up to eight leaf clauses of a parsed search query, in source order, for the chips under the
 /// search field. A click replaces the query with that clause. An unparsable query has no chips; the

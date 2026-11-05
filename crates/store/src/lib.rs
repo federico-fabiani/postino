@@ -48,6 +48,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod blob;
+mod correspondents;
 mod gc;
 mod links;
 mod lock;
@@ -60,6 +61,7 @@ mod search;
 mod threads;
 
 pub use blob::BlobStore;
+pub use correspondents::{Correspondent, MAX_CORRESPONDENTS};
 pub use gc::BlobGcReport;
 pub use lock::{WriterLock, WriterOwner, lock_path, owner_path, read_writer, writer_lock_is_free};
 pub use model::{
@@ -80,7 +82,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Schema version this build understands. Bump together with [`MIGRATIONS`].
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// `meta` key that stores the highest label number ever allocated. It only ever grows, so a deleted
 /// label id is never handed out again.
@@ -484,6 +486,23 @@ CREATE INDEX pgp_keys_account ON pgp_keys(account_id, created_at);
     // reported as `Not stored` rather than re-derived into a fake verification. Additive, so an
     // existing row keeps its mail and reads NULL.
     "ALTER TABLE messages ADD COLUMN raw_blob_hash TEXT;",
+    // v10: the local correspondent list, one row per address this account has received mail from or
+    // alongside. It answers the two autocomplete questions without scanning the mailbox: who wrote
+    // to me recently (composer recipients) and which address a prefix names (`from:` in the search
+    // bar). `address` is lowercased and carries no display name; `name` is the most recent non-empty
+    // one. The row is derived data: `upsert_message_row` maintains it inside the message
+    // transaction and `ensure_correspondents` backfills an existing archive once, so it can never
+    // disagree with the mail it was derived from. The account's own address is never stored.
+    r#"
+CREATE TABLE correspondents(
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    address    TEXT NOT NULL,
+    name       TEXT NOT NULL DEFAULT '',
+    last_date  INTEGER NOT NULL,
+    PRIMARY KEY(account_id, address)
+) WITHOUT ROWID;
+CREATE INDEX correspondents_recent ON correspondents(account_id, last_date DESC);
+"#,
 ];
 
 /// A 256-bit store key.
@@ -763,6 +782,7 @@ impl Store {
         migrate(&mut conn)?;
         ensure_message_origin(&conn)?;
         ensure_rule_name_key(&conn)?;
+        correspondents::ensure_correspondents(&mut conn)?;
         // The thread cache is derived data. Its page is ordered by `last_date` and scoped by account;
         // without this index a 100k mailbox sorts the whole cache on every list. The reference and
         // subject indexes make a synced insert a lookup instead of a mailbox scan. This is derived

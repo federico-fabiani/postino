@@ -204,7 +204,6 @@ Candidate small features, each cheap but noticeable. Ship only after the milesto
 - `Ctrl+Z` undo for every mutation, with a single visible stack.
 - Thread-aware quote header and "reply to list" where headers allow it.
 - Snooze presets and a "returns at" badge.
-- Recipient autocomplete from local history, with keyboard-only selection.
 - Attachment size total with a warning before send.
 - Per-sender remote-content allowlist with a visible trust badge.
 - A true empty state for every filter, never a blank pane.

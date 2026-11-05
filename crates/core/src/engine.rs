@@ -30,6 +30,7 @@ use crate::outbox::{
     APPEND_LEASE_MS, BACKOFF_MAX_MS, LEASE_MS, MAX_ATTEMPTS, MAX_SUBMISSION_BYTES, OUTBOX_RETENTION_MS, OutboxEnvelope, OutboxList, OutboxRunReport,
     OutboxView, SendDryRun, SendEnvelope, SendQueued, UNDO_MS, backoff_ms, clear_halt, read_halt, view, write_halt,
 };
+use crate::search;
 use crate::store_map;
 use crate::vault::CredentialVault;
 
@@ -2053,6 +2054,81 @@ impl Engine {
     pub fn recent_searches(&self, account: Option<&str>) -> Result<Vec<String>, OpError> {
         let account = self.requested_account(account, "saved_searches_list")?;
         Ok(self.recent_searches.get(&account.id).cloned().unwrap_or_default())
+    }
+
+    /// The people this account has received mail from or alongside, newest first.
+    ///
+    /// `query` is matched against the address and the display name; an empty query returns the most
+    /// recent people. Only received mail feeds the list and the account's own address is never in
+    /// it, so the composer can offer a recipient without offering the person writing.
+    pub fn correspondents(&self, account: Option<&str>, query: &str, limit: usize) -> Result<Vec<postino_store::Correspondent>, OpError> {
+        let account = self.requested_account(account, "correspondents_suggest")?;
+        let limit = limit.clamp(1, postino_store::MAX_CORRESPONDENTS);
+        if let Some(store) = self.store() {
+            return store.correspondents(&account.id, query, limit).map_err(store_map::read_error);
+        }
+        Ok(demo_correspondents(&self.demo_messages, &self.folders, &account.id, query, limit))
+    }
+
+    /// What the token at the caret could become. Static grammar rows come from
+    /// [`crate::search::completion`]; people, labels and folders come from this engine, so the CLI,
+    /// MCP and the desktop app offer exactly the same completions.
+    pub fn search_suggest(&self, account: Option<&str>, token: &str, limit: usize) -> Result<Vec<search::Suggestion>, OpError> {
+        let limit = limit.clamp(1, 20);
+        let Some(completion) = search::completion(token) else {
+            return Ok(Vec::new());
+        };
+        Ok(match completion {
+            search::Completion::Field { prefix } => search::field_suggestions(prefix, limit),
+            search::Completion::Fixed { field, prefix } => search::fixed_suggestions(field, prefix, limit),
+            search::Completion::Stored { field, prefix, prefix_search } => match field {
+                search::Field::From | search::Field::To | search::Field::Cc | search::Field::Bcc => self
+                    .correspondents(account, prefix, limit)?
+                    .into_iter()
+                    .map(|row| {
+                        let label = if row.name.is_empty() { row.address.clone() } else { format!("{} <{}>", row.name, row.address) };
+                        search::stored_suggestion(field, &row.address, &label, prefix_search)
+                    })
+                    .collect(),
+                search::Field::Label => self.label_values(account, prefix, limit, prefix_search),
+                search::Field::Folder => self.folder_values(account, prefix, limit, prefix_search),
+                _ => Vec::new(),
+            },
+        })
+    }
+
+    /// Label names that start with `prefix`, as `label:"…"` clauses.
+    fn label_values(&self, account: Option<&str>, prefix: &str, limit: usize, prefix_search: bool) -> Vec<search::Suggestion> {
+        let _ = account;
+        let prefix = prefix.to_ascii_lowercase();
+        let mut rows = Vec::new();
+        for label in self.labels() {
+            if label.name.to_ascii_lowercase().starts_with(&prefix) {
+                rows.push(search::stored_suggestion(search::Field::Label, &label.name, &label.name, prefix_search));
+            }
+            if rows.len() == limit {
+                break;
+            }
+        }
+        rows
+    }
+
+    /// Folder names in the requested account that start with `prefix`, as `folder:"…"` clauses.
+    fn folder_values(&self, account: Option<&str>, prefix: &str, limit: usize, prefix_search: bool) -> Vec<search::Suggestion> {
+        let Ok(account) = self.requested_account(account, "search_suggest") else {
+            return Vec::new();
+        };
+        let prefix = prefix.to_ascii_lowercase();
+        let mut rows = Vec::new();
+        for folder in self.folders().iter().filter(|folder| folder.account_id == account.id) {
+            if folder.name.to_ascii_lowercase().starts_with(&prefix) {
+                rows.push(search::stored_suggestion(search::Field::Folder, &folder.name, &folder.name, prefix_search));
+            }
+            if rows.len() == limit {
+                break;
+            }
+        }
+        rows
     }
 
     /// Parse and resolve a query without running it. The UI uses this before recording a recent
@@ -5807,6 +5883,52 @@ fn validate_attachments(attachments: &[Attachment]) -> Result<(), OpError> {
         )));
     }
     Ok(())
+}
+
+/// The demo engine's correspondents, derived from its in-memory summaries.
+///
+/// A store engine answers from `correspondents`; the synthetic mailbox has no SQL, so the same rule
+/// is applied here: only received mail, the newest display name wins, the account's own address is
+/// never offered.
+fn demo_correspondents(
+    messages: &HashMap<String, crate::model::Message>,
+    folders: &[crate::model::Folder],
+    account_id: &str,
+    query: &str,
+    limit: usize,
+) -> Vec<postino_store::Correspondent> {
+    let own_folders = folders.iter().filter(|folder| folder.account_id == account_id).map(|folder| folder.id.as_str()).collect::<BTreeSet<_>>();
+    let mut rows: HashMap<String, postino_store::Correspondent> = HashMap::new();
+    for message in messages.values().filter(|message| own_folders.contains(message.summary.folder_id.as_str())) {
+        let date = message.summary.date.timestamp_millis();
+        for address in std::iter::once(&message.summary.from).chain(message.summary.to.iter()).chain(message.cc.iter()) {
+            let email = address.email.trim().to_ascii_lowercase();
+            if email.is_empty() {
+                continue;
+            }
+            let row = rows.entry(email.clone()).or_insert_with(|| postino_store::Correspondent {
+                address: email,
+                name: String::new(),
+                last_date: i64::MIN,
+            });
+            if date > row.last_date {
+                row.last_date = date;
+                if !address.name.trim().is_empty() {
+                    row.name = address.name.trim().to_owned();
+                }
+            } else if date == row.last_date && row.name.is_empty() && !address.name.trim().is_empty() {
+                row.name = address.name.trim().to_owned();
+            }
+        }
+    }
+    let needle = query.trim().to_ascii_lowercase();
+    let mut rows: Vec<_> = rows
+        .into_values()
+        .filter(|row| needle.is_empty() || row.address.contains(&needle) || row.name.to_ascii_lowercase().contains(&needle))
+        .collect();
+    rows.sort_by(|a, b| b.last_date.cmp(&a.last_date).then_with(|| a.address.cmp(&b.address)));
+    rows.truncate(limit);
+    rows
 }
 
 #[cfg(test)]

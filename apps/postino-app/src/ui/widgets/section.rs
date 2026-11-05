@@ -4,7 +4,7 @@ use eframe::egui::{Align, Layout, Response, Ui};
 
 use crate::ui::tokens::{self, space};
 use crate::ui::typography::{self, Role};
-use crate::ui::widgets::{IconButton, IconButtonSize};
+use crate::ui::widgets::{Badge, IconButton, IconButtonSize};
 
 #[derive(Clone, Copy)]
 pub struct SectionHeader<'a> {
@@ -54,7 +54,8 @@ impl<'a> SectionHeader<'a> {
             ui.label(typography::strong(Role::Caption, self.title, t.text_faint));
             if let Some(count) = self.count {
                 ui.add_space(space::XS);
-                ui.label(typography::mono(count.to_string(), 10.5, t.text_faint));
+                let label = count.to_string();
+                Badge::new(label.as_str()).show(ui);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let (Some(icon), Some(label)) = (self.action_icon, self.action_label) {

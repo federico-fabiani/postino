@@ -32,9 +32,25 @@ pub(super) struct ReadingUi {
     pub(super) unsubscribe_checked: Option<String>,
     /// The choice sheet is open. It never sends or opens anything until the person picks a target.
     pub(super) show_unsubscribe: bool,
+    /// The export format picker is open. The .eml path still goes through `export_selected_eml`.
+    pub(super) export_open: bool,
 }
 
+/// The bottom band of the reading body that egui paints the floating scroll bars over. The content
+/// keeps this much empty space after its last line and the fade stops above it, so the horizontal
+/// bar (a wide table, a long preformatted line) is never covered by a glyph or by the panel fade.
+const BODY_SCROLL_BAR_BAND: f32 = 12.0;
+
 impl PostinoApp {
+    /// Restore the default split and drop the panel's persisted width. Updating only
+    /// `reading_ratio` is not enough: once a panel has a `PanelState`, egui ignores
+    /// `default_size` and the reset would appear to do nothing.
+    pub(super) fn reset_reading_pane_width(&mut self, ctx: &egui::Context) {
+        self.reading_ratio = READING_PANE_DEFAULT_RATIO;
+        ctx.data_mut(|data| data.remove::<egui::containers::PanelState>(egui::Id::new("reading")));
+        self.mark_settings_dirty();
+    }
+
     /// `full` is the overlay/full-screen path: the reading pane covers the list and offers
     /// "Torna alla posta". It is used for the explicit full-screen mode and below
     /// [`READING_PANE_MIN_WIDTH`], where a side pane cannot keep a usable list.
@@ -48,23 +64,66 @@ impl PostinoApp {
                 .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::XXL, inset::XL)))
                 .show(ui, |ui| self.reading_content(ui, &t, true));
         } else {
-            let available = ui.ctx().content_rect().width();
+            // The pane is shown on the ui the sidebar already narrowed, so `available_width` is the
+            // real room for list plus reading. The helpers still take the whole content width.
+            let remaining = ui.available_width().max(1.0);
+            let available = remaining + ui_size::SIDEBAR;
             let default_width = reading_pane_width_with_ratio(available, self.reading_ratio);
             let max_width = reading_pane_max_width(available);
+            // The panel persists an absolute outer width. That width is only an input while the
+            // user is dragging the edge: on every other frame the model is the stored fraction
+            // applied to the current content width, so a window resize scales the pane instead of
+            // leaving a stale pixel width behind. The resize response is read from the previous
+            // pass, the same response egui itself uses before it lays the panel out.
+            let panel_id = egui::Id::new("reading");
+            let resize_id = panel_id.with("__resize");
+            let previous_resize = ui.ctx().read_response(resize_id);
+            let pointer_down = ui.input(|input| input.pointer.primary_down());
+            let panel_dragging = previous_resize.as_ref().is_some_and(|response| response.dragged());
+            let drag_ended = !pointer_down && previous_resize.as_ref().is_some_and(|response| response.dragged() || response.drag_stopped());
+            // While the OS resizes the window the pointer is usually down on the outer border. That
+            // must not freeze the pane: only a drag of the pane's own separator keeps the manual
+            // width for the frame, and the model is re-applied as soon as the pointer is released.
+            if !panel_dragging && !drag_ended {
+                let bounds = ui.available_rect_before_wrap();
+                let forced = Rect::from_min_max(pos2((bounds.right() - default_width).round(), bounds.top().round()), bounds.max.round());
+                ui.ctx().data_mut(|data| data.insert_persisted(panel_id, egui::containers::PanelState { outer_rect: forced }));
+            }
             let response = egui::Panel::right("reading")
                 .resizable(true)
+                // The separator line is the resize affordance: egui brightens it on hover and
+                // paints `ResizeHorizontal` over the grab band, which the panel hit-tests after
+                // the contents so the scroll areas cannot eat the drag.
+                .show_separator_line(true)
                 .default_size(default_width)
                 .min_size(READING_PANE_MIN_SIZE)
                 .max_size(max_width)
                 .frame(Frame::new().fill(t.panel).inner_margin(Margin::symmetric(inset::LG, inset::XL)))
-                .show(ui, |ui| self.reading_content(ui, &t, false));
-            // Remember the width the user dragged to. The fraction is relative to the width left
-            // by the sidebar, so a bigger window keeps the same split instead of the same pixels.
-            let remaining = (available - ui_size::SIDEBAR).max(1.0);
-            let ratio = (response.response.rect.width() / remaining).clamp(0.1, 0.9);
-            if (ratio - self.reading_ratio).abs() > 0.004 {
-                self.reading_ratio = ratio;
-                self.mark_settings_dirty();
+                .show(ui, |ui| {
+                    // The panel's frame is sized from the child UI's `min_rect`, so a single row
+                    // that paints past the inner width (a long banner, a filename, a wide label)
+                    // re-anchors the whole panel and steals width from the list. Contain the
+                    // content in a clipped child and advance the frame by the exact inner rect:
+                    // the pane width can then only change through the resize handle, never through
+                    // content overflow.
+                    let inner = ui.max_rect();
+                    let mut content = ui.new_child(UiBuilder::new().max_rect(inner));
+                    content.set_clip_rect(ui.clip_rect().intersect(inner));
+                    self.reading_content(&mut content, &t, false);
+                    ui.allocate_rect(inner, Sense::hover());
+                });
+            #[cfg(test)]
+            probe::reading_panel(ui, response.response.rect);
+            // Remember a manual drag only when the release produced a width different from the
+            // model. A window-resize clamp or an unusually wide body block must not rewrite the
+            // stored fraction, otherwise the next message opens at a different size.
+            if drag_ended {
+                let width = response.response.rect.width();
+                let ratio = (width / remaining).clamp(0.1, 0.9);
+                if (width - default_width).abs() > 0.5 && (ratio - self.reading_ratio).abs() > 0.004 {
+                    self.reading_ratio = ratio;
+                    self.mark_settings_dirty();
+                }
             }
         }
     }
@@ -79,7 +138,7 @@ impl PostinoApp {
         // bounded above it, but a line at the boundary can still paint its descenders.
         ui.painter().rect_filled(rect, CornerRadius::same(0), t.panel);
         ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, t.border));
-        let inner = rect.shrink2(Vec2::new(0.0, f32::from(inset::SM)));
+        let inner = rect.shrink2(Vec2::new(0.0, f32::from(inset::XS)));
         ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
             #[cfg(test)]
             probe::reading_attachments(ui, rect);
@@ -89,7 +148,7 @@ impl PostinoApp {
                     ui.label(typography::text(Role::Caption, "La modalità demo non ha allegati reali", t.text_faint));
                 }
             });
-            ui.add_space(space::XS);
+            ui.add_space(space::XXS);
             egui::ScrollArea::vertical()
                 .id_salt(("reading-attachments-scroll", message.summary.id.as_str()))
                 .max_height(ui.available_height().max(20.0))
@@ -171,20 +230,25 @@ impl PostinoApp {
             return;
         }
         Frame::new().fill(t.panel_alt).corner_radius(radius::CONTROL).inner_margin(Margin::symmetric(inset::LG, inset::XS)).show(ui, |ui| {
+            // Reserve the counts before laying out the subject: a plain horizontal row lets the
+            // truncated subject take all the width and paints the counts past the pane edge.
+            let counts = format!(
+                "{} · {}",
+                messages_text(usize::try_from(summary.message_count).unwrap_or(usize::MAX)),
+                unread_text(usize::try_from(summary.unread_count).unwrap_or(usize::MAX))
+            );
+            let counts_width = ui.painter().layout_no_wrap(counts.clone(), Role::Caption.font(), t.text_muted).size().x;
             ui.horizontal(|ui| {
                 ui.label(typography::strong(Role::Caption, "CONVERSAZIONE", t.text_faint));
                 ui.add_space(space::XS);
-                ui.add(egui::Label::new(typography::strong(Role::BodySmall, &subject, t.text)).truncate().selectable(false));
+                let subject_width = (ui.available_width() - counts_width - space::SM).max(1.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(subject_width);
+                    ui.add(egui::Label::new(typography::strong(Role::BodySmall, &subject, t.text)).truncate().selectable(false))
+                        .on_hover_text(&subject);
+                });
                 ui.add_space(space::SM);
-                ui.label(typography::text(
-                    Role::Caption,
-                    format!(
-                        "{} · {}",
-                        messages_text(usize::try_from(summary.message_count).unwrap_or(usize::MAX)),
-                        unread_text(usize::try_from(summary.unread_count).unwrap_or(usize::MAX))
-                    ),
-                    t.text_muted,
-                ));
+                ui.label(typography::text(Role::Caption, counts, t.text_muted));
             });
             ScrollArea::horizontal().id_salt("conversation-cards").max_height(30.0).auto_shrink([false, true]).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -559,6 +623,8 @@ impl PostinoApp {
         probe::clear_invite_actions(ui);
         #[cfg(test)]
         probe::clear_links(ui);
+        #[cfg(test)]
+        clear_header_actions(ui);
         if self.selected_thread.is_some() && self.threads_view {
             self.conversation_strip(ui, t);
             ui.add_space(space::XS);
@@ -579,67 +645,106 @@ impl PostinoApp {
         probe::reading_header(ui, header_rect);
 
         let has_unsubscribe = self.reading.unsubscribe_info.is_some();
+        let can_export = !self.demo && self.store.is_some();
         let (left_action, right_action) = Sides::new().height(36.0).shrink_left().show(
             ui,
             |ui| {
                 let mut action = None;
-                // The labels still fit the default 541 pt pane; the icon-only path is for the pane
-                // at its 420 pt minimum and for the overlay header, not for the default layout.
-                let compact = ui.available_width() < 400.0;
+                // Sides reserves the right group first, so `available_width` here is what is left
+                // for the actions. The labelled pair only fits when that budget also covers the
+                // whole icon strip; below it the two triage actions go icon-only *before* any
+                // widget can paint over the expand/close group (Sides limits, it does not clip).
+                let spacing = ui.spacing().item_spacing.x;
+                let available = ui.available_width();
                 // Below the pane breakpoint the reading view is an overlay with no list behind it,
                 // so it must keep Back and the two triage actions a user reaches for most.
                 let overlay = reading_overlay(ui.ctx().content_rect().width());
+                let labelled_pair = header_button_width(ui, command_label("archive", "Archivia"), t)
+                    + spacing
+                    + header_button_width(ui, command_label("delete", "Elimina"), t);
+                let leading = if full { header_button_width(ui, command_label("back", "Torna alla posta"), t) + spacing } else { 0.0 };
+                let mut show_export = !is_draft && can_export;
+                let mut show_unsubscribe = !is_draft && has_unsubscribe;
+                let strip = |export: bool, unsubscribe: bool| {
+                    let base = if is_draft { 1 } else { 3 + usize::from(export) + usize::from(unsubscribe) };
+                    header_icon_strip_width(ui, base + 2, space::SM + space::XS)
+                };
+                let compact = !full && available < leading + labelled_pair + spacing + strip(show_export, show_unsubscribe) + space::MD;
+                if compact && available < 2.0 * ui_size::CONTROL + 2.0 * spacing + strip(show_export, show_unsubscribe) + space::MD {
+                    // The narrowest pane cannot keep the optional icons and the star/read group
+                    // usable at the same time; triage and the toggles win.
+                    show_export = false;
+                    show_unsubscribe = false;
+                }
                 if full {
-                    if Button::ghost(command_label("back", "Torna alla posta"))
+                    let back = Button::ghost(command_label("back", "Torna alla posta"))
                         .icon(command_icon("back", icons::ARROW_LEFT))
-                        .shortcut(command_shortcut("back", "Esc"))
-                        .show(ui)
-                        .clicked()
-                    {
+                        .shortcut_hint(command_shortcut("back", "Esc"))
+                        .show(ui);
+                    note_header_action(ui, "back", back.rect);
+                    if back.clicked() {
                         action = Some(ReadingAction::Back);
                     }
                     #[cfg(test)]
                     probe::action(ui, "back");
                     if overlay {
-                        if IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia")).show(ui).clicked() {
+                        let archive = IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia"))
+                            .shortcut_hint(command_shortcut("archive", "E"))
+                            .show(ui);
+                        note_header_action(ui, "archive", archive.rect);
+                        if archive.clicked() {
                             action = Some(ReadingAction::Archive);
                         }
                         #[cfg(test)]
                         probe::action(ui, "archive");
-                        if IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina")).danger(true).show(ui).clicked() {
+                        let delete = IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina"))
+                            .danger(true)
+                            .shortcut_hint(command_shortcut("delete", "Canc"))
+                            .show(ui);
+                        note_header_action(ui, "delete", delete.rect);
+                        if delete.clicked() {
                             action = Some(ReadingAction::Delete);
                         }
                         #[cfg(test)]
                         probe::action(ui, "delete");
                     }
                 } else if compact {
-                    if IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia")).show(ui).clicked() {
+                    let archive = IconButton::new(command_icon("archive", icons::ARCHIVE), command_label("archive", "Archivia"))
+                        .shortcut_hint(command_shortcut("archive", "E"))
+                        .show(ui);
+                    note_header_action(ui, "archive", archive.rect);
+                    if archive.clicked() {
                         action = Some(ReadingAction::Archive);
                     }
                     #[cfg(test)]
                     probe::action(ui, "archive");
-                    if IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina")).danger(true).show(ui).clicked() {
+                    let delete = IconButton::new(command_icon("delete", icons::TRASH), command_label("delete", "Elimina"))
+                        .danger(true)
+                        .shortcut_hint(command_shortcut("delete", "Canc"))
+                        .show(ui);
+                    note_header_action(ui, "delete", delete.rect);
+                    if delete.clicked() {
                         action = Some(ReadingAction::Delete);
                     }
                     #[cfg(test)]
                     probe::action(ui, "delete");
                 } else {
-                    if Button::new(command_label("archive", "Archivia"))
+                    let archive = Button::new(command_label("archive", "Archivia"))
                         .icon(command_icon("archive", icons::ARCHIVE))
-                        .shortcut(command_shortcut("archive", "E"))
-                        .show(ui)
-                        .clicked()
-                    {
+                        .shortcut_hint(command_shortcut("archive", "E"))
+                        .show(ui);
+                    note_header_action(ui, "archive", archive.rect);
+                    if archive.clicked() {
                         action = Some(ReadingAction::Archive);
                     }
                     #[cfg(test)]
                     probe::action(ui, "archive");
-                    if Button::danger(command_label("delete", "Elimina"))
+                    let delete = Button::danger(command_label("delete", "Elimina"))
                         .icon(command_icon("delete", icons::TRASH))
-                        .shortcut(command_shortcut("delete", "Canc"))
-                        .show(ui)
-                        .clicked()
-                    {
+                        .shortcut_hint(command_shortcut("delete", "Canc"))
+                        .show(ui);
+                    note_header_action(ui, "delete", delete.rect);
+                    if delete.clicked() {
                         action = Some(ReadingAction::Delete);
                     }
                     #[cfg(test)]
@@ -647,49 +752,68 @@ impl PostinoApp {
                 }
                 ui.add_space(space::SM);
                 if is_draft {
-                    if IconButton::new(command_icon("edit_draft", icons::COMPOSE), command_label("edit_draft", "Modifica bozza")).show(ui).clicked() {
+                    let edit = IconButton::new(command_icon("edit_draft", icons::COMPOSE), command_label("edit_draft", "Modifica bozza")).show(ui);
+                    note_header_action(ui, "edit_draft", edit.rect);
+                    if edit.clicked() {
                         action = Some(ReadingAction::EditDraft);
                     }
                 } else {
-                    if IconButton::new(command_icon("reply", icons::REPLY), command_label("reply", "Rispondi")).show(ui).clicked() {
+                    let reply = IconButton::new(command_icon("reply", icons::REPLY), command_label("reply", "Rispondi"))
+                        .shortcut_hint(command_shortcut("reply", "R"))
+                        .show(ui);
+                    note_header_action(ui, "reply", reply.rect);
+                    if reply.clicked() {
                         action = Some(ReadingAction::Reply);
                     }
-                    if IconButton::new(command_icon("reply_all", icons::REPLY_ALL), command_label("reply_all", "Rispondi a tutti")).show(ui).clicked()
-                    {
+                    let reply_all = IconButton::new(command_icon("reply_all", icons::REPLY_ALL), command_label("reply_all", "Rispondi a tutti"))
+                        .shortcut_hint(command_shortcut("reply_all", "A"))
+                        .show(ui);
+                    note_header_action(ui, "reply_all", reply_all.rect);
+                    if reply_all.clicked() {
                         action = Some(ReadingAction::ReplyAll);
                     }
-                    if IconButton::new(command_icon("forward", icons::FORWARD), command_label("forward", "Inoltra")).show(ui).clicked() {
+                    let forward = IconButton::new(command_icon("forward", icons::FORWARD), command_label("forward", "Inoltra"))
+                        .shortcut_hint(command_shortcut("forward", "F"))
+                        .show(ui);
+                    note_header_action(ui, "forward", forward.rect);
+                    if forward.clicked() {
                         action = Some(ReadingAction::Forward);
                     }
-                    if !self.demo
-                        && self.store.is_some()
-                        && IconButton::new(command_icon("export_eml", icons::DOWNLOAD), command_label("export_eml", "Esporta .eml"))
-                            .show(ui)
-                            .clicked()
-                    {
-                        action = Some(ReadingAction::ExportEml);
+                    if show_export {
+                        let export =
+                            IconButton::new(command_icon("export_eml", icons::DOWNLOAD), command_label("export_eml", "Esporta .eml")).show(ui);
+                        note_header_action(ui, "export_eml", export.rect);
+                        if export.clicked() {
+                            action = Some(ReadingAction::ExportEml);
+                        }
                     }
                     #[cfg(test)]
                     probe::action(ui, "export_eml");
-                    if has_unsubscribe && IconButton::new(icons::EYE_OFF, "Disiscriviti").show(ui).on_hover_text("Opzioni di disiscrizione").clicked()
-                    {
-                        action = Some(ReadingAction::Unsubscribe);
+                    if show_unsubscribe {
+                        let unsubscribe = IconButton::new(icons::EYE_OFF, "Disiscriviti").show(ui).on_hover_text("Opzioni di disiscrizione");
+                        note_header_action(ui, "unsubscribe", unsubscribe.rect);
+                        if unsubscribe.clicked() {
+                            action = Some(ReadingAction::Unsubscribe);
+                        }
                     }
                 }
                 ui.add_space(space::XS);
                 let star_id = if message.summary.starred { "unstar" } else { "star" };
                 let star_icon = if message.summary.starred { icons::STAR_FILL } else { icons::STAR };
-                if IconButton::new(star_icon, command_label(star_id, "Stella"))
+                let star = IconButton::new(star_icon, command_label(star_id, "Stella"))
                     .filled(message.summary.starred)
                     .accent(message.summary.starred)
-                    .show(ui)
-                    .clicked()
-                {
+                    .shortcut_hint(command_shortcut("star", "S"))
+                    .show(ui);
+                note_header_action(ui, "star", star.rect);
+                if star.clicked() {
                     action = Some(ReadingAction::Star);
                 }
                 let read_id = if message.summary.unread { "read" } else { "unread" };
                 let read_icon = if message.summary.unread { icons::MARK_READ } else { icons::MARK_UNREAD };
-                if IconButton::new(read_icon, command_label(read_id, "Letto")).show(ui).clicked() {
+                let read = IconButton::new(read_icon, command_label(read_id, "Letto")).shortcut_hint("U").show(ui);
+                note_header_action(ui, "read", read.rect);
+                if read.clicked() {
                     action = Some(ReadingAction::Read);
                 }
                 action
@@ -697,10 +821,16 @@ impl PostinoApp {
             |ui| {
                 let mut action = None;
                 if !full {
-                    if IconButton::new(command_icon("expand", icons::SQUARE), command_label("expand", "Apri a schermo intero")).show(ui).clicked() {
+                    let expand = IconButton::new(command_icon("expand", icons::SQUARE), command_label("expand", "Apri a schermo intero")).show(ui);
+                    note_header_action(ui, "expand", expand.rect);
+                    if expand.clicked() {
                         action = Some(ReadingAction::Expand);
                     }
-                    if IconButton::new(command_icon("close", icons::CLOSE), command_label("close", "Chiudi lettura")).show(ui).clicked() {
+                    let close = IconButton::new(command_icon("close", icons::CLOSE), command_label("close", "Chiudi lettura"))
+                        .shortcut_hint(command_shortcut("close", "Esc"))
+                        .show(ui);
+                    note_header_action(ui, "close", close.rect);
+                    if close.clicked() {
                         action = Some(ReadingAction::Close);
                     }
                 }
@@ -719,39 +849,46 @@ impl PostinoApp {
 
         ui.add_space(space::MD);
         let subject_text = if message.summary.subject.trim().is_empty() { "(Nessun oggetto)" } else { message.summary.subject.as_str() };
-        let subject = ui.label(typography::strong(Role::Page, subject_text, t.text));
+        let subject = header_wrapped_label(ui, subject_text, Role::Page.font(), t.text);
         reading_context_menu(subject, message.summary.subject.clone(), message.summary.from.display());
         ui.add_space(space::SM);
         let to = message.summary.to.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
         let cc = message.cc.iter().map(|address| address.display()).collect::<Vec<_>>().join(", ");
-        Sides::new().height(if cc.is_empty() { 38.0 } else { 52.0 }).show(
-            ui,
-            |ui| {
-                ui.horizontal(|ui| {
-                    avatar(ui, 34.0, &message.summary.from.initials(), t.gold, theme::FOREST);
-                    ui.add_space(space::SM);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        let sender = ui.label(typography::strong(Role::BodySmall, message.summary.from.display(), t.text));
-                        reading_context_menu(sender, message.summary.subject.clone(), message.summary.from.display());
-                        let to_line = format!("a {to}");
-                        ui.add(egui::Label::new(typography::text(Role::Meta, to_line.as_str(), t.text_muted)).truncate())
-                            .on_hover_text(to_line.as_str());
-                        if !cc.is_empty() {
-                            let cc_line = format!("Cc: {cc}");
-                            let cc_response = ui.add(egui::Label::new(typography::text(Role::Meta, cc_line.as_str(), t.text_muted)).truncate());
-                            let cc_response = cc_response.on_hover_text(cc_line.as_str());
-                            #[cfg(test)]
-                            probe::reading_cc(ui, cc_response.rect);
-                            let _ = cc_response;
-                        }
-                    });
+        let sender_text = message.summary.from.display();
+        let date_text = format_when(message.summary.date, now_utc);
+        // Reserve the date before the sender block. The sender labels truncate to the width they are
+        // given, so a plain horizontal row fills the whole header and lets the date paint past the
+        // pane edge.
+        let date_width = ui.painter().layout_no_wrap(date_text.clone(), egui::FontId::new(11.0, egui::FontFamily::Monospace), t.text_faint).size().x;
+        let sender_width = (ui.available_width() - date_width - 2.0 * ui.spacing().item_spacing.x).max(1.0);
+        ui.horizontal(|ui| {
+            let row_height = if cc.is_empty() { 38.0 } else { 52.0 };
+            ui.allocate_ui_with_layout(Vec2::new(sender_width, row_height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // `allocate_ui_with_layout` shrinks to its content; without the explicit minimum the
+                // date would sit right after the sender text instead of at the pane's right edge.
+                ui.set_min_width(sender_width);
+                avatar(ui, 34.0, &message.summary.from.initials(), t.gold, theme::FOREST);
+                ui.add_space(space::SM);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let sender = ui
+                        .add(egui::Label::new(typography::strong(Role::BodySmall, sender_text.as_str(), t.text)).truncate())
+                        .on_hover_text(sender_text.as_str());
+                    reading_context_menu(sender, message.summary.subject.clone(), message.summary.from.display());
+                    let to_line = format!("a {to}");
+                    ui.add(egui::Label::new(typography::text(Role::Meta, to_line.as_str(), t.text_muted)).truncate()).on_hover_text(to_line.as_str());
+                    if !cc.is_empty() {
+                        let cc_line = format!("Cc: {cc}");
+                        let cc_response = ui.add(egui::Label::new(typography::text(Role::Meta, cc_line.as_str(), t.text_muted)).truncate());
+                        let cc_response = cc_response.on_hover_text(cc_line.as_str());
+                        #[cfg(test)]
+                        probe::reading_cc(ui, cc_response.rect);
+                        let _ = cc_response;
+                    }
                 });
-            },
-            |ui| {
-                ui.label(typography::mono(format_when(message.summary.date, now_utc), 11.0, t.text_faint));
-            },
-        );
+            });
+            ui.label(typography::mono(date_text, 11.0, t.text_faint));
+        });
         let mut chip_filter = None;
         if !message.summary.labels.is_empty() {
             let labels = self.labels_cache.clone();
@@ -777,17 +914,18 @@ impl PostinoApp {
         // remote references, so the HTML cannot tell the pane that anything was blocked.
         if let Some(remote) = remote_images_text(message.remote_images) {
             ui.add_space(space::XS);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(icons::icon(icons::EYE_OFF, 14.0, t.gold_ink));
                 ui.add_space(space::SM);
-                ui.label(typography::text(Role::Caption, remote, t.text_faint));
+                ui.add(egui::Label::new(typography::text(Role::Caption, remote, t.text_faint)).wrap());
             });
         }
         ui.add_space(space::SM);
         ui.separator();
         ui.add_space(space::XS);
         let view = self.pgp_body_view(message.summary.id.as_str()).unwrap_or_else(|| self.rendered_body(&message));
-        ui.label(typography::text(Role::Caption, body::caption(view.as_ref()), t.text_faint));
+        let caption = body::caption(view.as_ref());
+        ui.add(egui::Label::new(typography::text(Role::Caption, caption, t.text_faint)).truncate()).on_hover_text(caption);
         ui.add_space(space::SM);
         // A pinned strip keeps the attachment and its Save button visible at 980×600, where the body
         // scroll would otherwise push it below the fold. One budget covers banner, header, chips and
@@ -809,11 +947,23 @@ impl PostinoApp {
         let mut link_budget = reading::MAX_LINKS_PER_MESSAGE;
         let mut invite_command = None;
         ui.scope_builder(UiBuilder::new().max_rect(body_rect), |ui| {
-            egui::ScrollArea::vertical()
+            // Keep egui's floating thin bars: they stay out of the way at rest, appear on hover or
+            // scroll, and thicken while dragged. `VisibleWhenNeeded` is what keeps a plain message
+            // free of a horizontal bar until a table, a preformatted line or a long token overflows.
+            // The whole body scrolls sideways, not just a table: a wide table, a long preformatted
+            // line or an unbreakable token is reachable by dragging the horizontal bar. Normal
+            // paragraphs still wrap, because the content is pinned to the viewport width below and
+            // only a block that allocates wider can push the content rect past it.
+            ui.spacing_mut().scroll = reading_scroll_style();
+            let body_scroll = egui::ScrollArea::both()
                 .id_salt(("reading-scroll", message.summary.id.as_str()))
                 .max_height(body_height)
                 .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                 .show(ui, |ui| {
+                    // `set_min_width`, not `set_width`: the latter also caps the maximum, which
+                    // would stop a wide table from ever growing the scrollable content rect.
+                    ui.set_min_width(ui.available_width());
                     let mut clicked_link = None;
                     // The card lives inside the reserved body budget: a long organizer, a warning or a
                     // 2000-name attendee list scrolls with the body instead of pushing the pinned
@@ -855,12 +1005,18 @@ impl PostinoApp {
                             }
                         }
                     }
-                    // The last line breathes above the fade instead of ending exactly on the clip.
-                    ui.add_space(space::SM);
+                    // The last line breathes above the fade instead of ending exactly on the clip,
+                    // and the horizontal bar gets a band of its own so it never covers the final
+                    // glyphs when a wide block forces it.
+                    ui.add_space(space::SM.max(BODY_SCROLL_BAR_BAND));
                     if let Some(link) = clicked_link {
                         self.request_link_open(&link);
                     }
                 });
+            #[cfg(test)]
+            probe::reading_scroll(ui, body_scroll.inner_rect, body_scroll.content_size, body_scroll.state.offset);
+            #[cfg(not(test))]
+            let _ = &body_scroll;
         });
         // A hard scroll clip slices the next line through its glyphs. The fade turns that boundary
         // into a deliberate visual end without hiding a whole line.
@@ -896,7 +1052,7 @@ impl PostinoApp {
                 let id = message.summary.id.clone();
                 self.reply_to(&id, ComposeMode::ReplyAll);
             }
-            Some(ReadingAction::ExportEml) => self.export_selected_eml(),
+            Some(ReadingAction::ExportEml) => self.reading.export_open = true,
             Some(ReadingAction::Forward) => {
                 let id = message.summary.id.clone();
                 self.reply_to(&id, ComposeMode::Forward);
@@ -1310,6 +1466,103 @@ impl PostinoApp {
             self.status = "Salvataggio annullato".to_owned();
         }
     }
+
+    /// The export format chooser. Only the `.eml` path is implemented; the PDF row stays visibly
+    /// unavailable with its reason instead of pretending to work. Escape and a backdrop click
+    /// close the sheet like every other dialog.
+    #[allow(dead_code)] // Called from app.rs with the command-table dispatch.
+    pub(super) fn export_picker_dialog(&mut self, ui: &mut Ui) {
+        if !self.reading.export_open {
+            return;
+        }
+        let t = theme::tokens(self.dark);
+        let mut export_eml = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(Id::new("postino-export-picker"))
+            .backdrop_color(theme::scrim(self.dark))
+            .frame(Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.border)).corner_radius(radius::WINDOW).inner_margin(Margin::same(inset::XL)))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(400.0_f32.min((ui.ctx().content_rect().width() - 40.0).max(280.0)));
+                ui.label(typography::strong(Role::Emphasis, "Esporta messaggio", t.text));
+                ui.add_space(space::XS);
+                ui.label(typography::text(Role::Caption, "Scegli il formato del file.", t.text_muted));
+                ui.add_space(space::LG);
+                export_eml = Button::new("Messaggio .eml").icon(icons::DOWNLOAD).full_width().show(ui).clicked();
+                ui.label(typography::text(Role::Caption, "Il messaggio originale, con intestazioni e allegati.", t.text_faint));
+                ui.add_space(space::MD);
+                ui.horizontal(|ui| {
+                    Button::new("Documento PDF")
+                        .icon(icons::TEMPLATE)
+                        .enabled(false)
+                        .disabled_reason("Esporta in PDF arriva in una versione successiva.")
+                        .show(ui);
+                    Badge::new("In arrivo").kind(BadgeKind::Accent).show(ui);
+                });
+                ui.label(typography::text(Role::Caption, "Esporta in PDF arriva in una versione successiva.", t.text_faint));
+                ui.add_space(space::LG);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    cancel = Button::new("Annulla").show(ui).clicked();
+                });
+            });
+        if export_eml {
+            self.reading.export_open = false;
+            self.export_selected_eml();
+        } else if cancel || response.should_close() {
+            self.reading.export_open = false;
+        }
+    }
+}
+
+/// The reading body keeps the thin bar geometry and handle, but drops the bar lane's background:
+/// egui paints it with `extreme_bg_color`, the near-white field colour here, which reads as a white
+/// strip across the bottom of the pane. Only the body scroll area uses this; the sidebar and list
+/// keep the global style.
+fn reading_scroll_style() -> egui::style::ScrollStyle {
+    let mut style = tokens::scroll_style();
+    style.dormant_background_opacity = 0.0;
+    style.active_background_opacity = 0.0;
+    style.interact_background_opacity = 0.0;
+    style
+}
+
+/// The width a labelled header action needs at `ButtonSize::Md`: 12 pt padding per side, the
+/// 16 pt icon and its 6 pt gap. The header reserves this before choosing the labelled layout, so
+/// the decision is made on the real budget instead of a magic breakpoint.
+fn header_button_width(ui: &Ui, label: &str, t: &Tokens) -> f32 {
+    let font = FontId::new(type_size::BODY_SMALL, theme::medium());
+    let text = ui.painter().layout_no_wrap(label.to_owned(), font, t.text).size().x;
+    2.0 * 12.0 + ui_size::ICON + space::SM + text
+}
+
+/// The width of an icon-only strip: default `IconButton` boxes, the layout's item spacing between
+/// neighbours, and the explicit group gaps the header adds.
+fn header_icon_strip_width(ui: &Ui, icons: usize, gaps: f32) -> f32 {
+    let spacing = ui.spacing().item_spacing.x;
+    let count = icons as f32;
+    count * ui_size::CONTROL + (count - 1.0).max(0.0) * spacing + gaps
+}
+
+/// Record one header action's hit rect for the overlap regression test. A no-op outside tests.
+fn note_header_action(ui: &Ui, action: &'static str, rect: Rect) {
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<(&'static str, Rect)>>(Id::new("reading-header-actions")).push((action, rect));
+    });
+    #[cfg(not(test))]
+    let _ = (ui, action, rect);
+}
+
+#[cfg(test)]
+fn clear_header_actions(ui: &Ui) {
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(Id::new("reading-header-actions"), Vec::<(&'static str, Rect)>::new());
+    });
+}
+
+/// The header action rects of the last painted frame, in paint order. Test-only.
+#[cfg(test)]
+pub(super) fn header_action_rects(ctx: &egui::Context) -> Vec<(&'static str, Rect)> {
+    ctx.data(|data| data.get_temp::<Vec<(&'static str, Rect)>>(Id::new("reading-header-actions"))).unwrap_or_default()
 }
 
 #[derive(Clone, Copy)]
@@ -1395,6 +1648,53 @@ pub(super) struct PendingAttachment {
     pub(super) focus_cancel: bool,
     /// The person already confirmed replacing this exact path.
     pub(super) overwrite_confirmed: bool,
+}
+
+/// A header line that wraps inside the pane. Normal prose wraps at word boundaries, so a word is
+/// never split just because the pane is narrow. A single unbreakable token (an address, a hashed
+/// subject) still has to be cut at a glyph, otherwise it would paint past the pane edge and widen
+/// the panel's frame rect, which then pushes the list over the left edge of the reading pane. The
+/// full value stays reachable in a tooltip in both cases.
+fn header_wrapped_label(ui: &mut Ui, text: &str, font: egui::FontId, color: egui::Color32) -> egui::Response {
+    let job = header_layout_job(ui.ctx(), text, font, color, ui.available_width());
+    // `Label` replaces the job's wrap width with the UI's available width, so narrow the child UI
+    // as well: the break-anywhere layout keeps one glyph of slack and must not be handed the full
+    // pane width back when it is painted.
+    let width = job.wrap.max_width.max(1.0);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        ui.add(egui::Label::new(job)).on_hover_text(text)
+    })
+    .inner
+}
+
+/// Build the subject job. It always wraps at word boundaries first. When a single word is wider
+/// than the available width (an address or a hashed subject with no break opportunity) the job is
+/// rebuilt with `break_anywhere`, so the token is cut at a glyph instead of running past the pane.
+pub(super) fn header_layout_job(
+    ctx: &egui::Context,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    available_width: f32,
+) -> egui::text::LayoutJob {
+    let available = available_width.max(1.0);
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font.clone(), color, available);
+    job.wrap.max_rows = 3;
+    // Measure the words without a wrap width: a word that fits never needs a glyph break, even if
+    // the paragraph as a whole has to wrap. This is what keeps normal prose from splitting mid-word.
+    let unbreakable = text.split_whitespace().any(|word| {
+        let measured = egui::text::LayoutJob::simple(word.to_owned(), font.clone(), color, f32::INFINITY);
+        ctx.fonts_mut(|fonts| fonts.layout_job(measured)).size().x > available + 0.5
+    });
+    if unbreakable {
+        // Leave one glyph of slack on the break-anywhere path: epaint's fallback can include the
+        // glyph that crosses `max_width`, so a token cut exactly at the available width still
+        // paints a few pixels past the pane. The slack keeps every painted row inside the clip.
+        job.wrap.max_width = (available - font.size).max(1.0);
+        job.wrap.break_anywhere = true;
+    }
+    job
 }
 
 fn reading_context_menu(response: egui::Response, subject: String, sender: String) {
@@ -1554,22 +1854,24 @@ fn reading_invite_card(ui: &mut Ui, invite: &CalendarInviteView, t: &Tokens) -> 
 
 /// The height reserved for the pinned attachment strip. Four rows scroll inside the 200 px cap.
 fn reading_attachment_strip_height(rows: usize) -> f32 {
-    (24.0 + rows as f32 * 52.0 + 2.0 * f32::from(inset::SM)).min(200.0)
+    (28.0 + rows as f32 * 52.0 + 2.0 * f32::from(inset::SM)).min(200.0)
 }
 
 /// Fade the last pixels of a scrollable reading body into the panel. A scroll area clips at an
-/// arbitrary pixel; without this a line can be sliced horizontally at the attachment strip.
+/// arbitrary pixel; without this a line can be sliced horizontally at the attachment strip. The
+/// fade stops above [`BODY_SCROLL_BAR_BAND`] so it never paints over a floating scroll bar.
 fn bottom_fade(ui: &Ui, rect: Rect, panel: Color32) {
-    let height = 14.0_f32.min(rect.height() * 0.4);
+    let bottom = rect.bottom() - BODY_SCROLL_BAR_BAND;
+    let height = 14.0_f32.min((bottom - rect.top()).max(0.0) * 0.4);
     if height <= 0.0 {
         return;
     }
-    let top = rect.bottom() - height;
+    let top = bottom - height;
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(pos2(rect.left(), top), Color32::TRANSPARENT);
     mesh.colored_vertex(pos2(rect.right(), top), Color32::TRANSPARENT);
-    mesh.colored_vertex(pos2(rect.left(), rect.bottom()), panel);
-    mesh.colored_vertex(pos2(rect.right(), rect.bottom()), panel);
+    mesh.colored_vertex(pos2(rect.left(), bottom), panel);
+    mesh.colored_vertex(pos2(rect.right(), bottom), panel);
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(2, 1, 3);
     ui.painter().add(egui::Shape::mesh(mesh));

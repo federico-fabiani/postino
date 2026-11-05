@@ -643,3 +643,132 @@ fn a_partial_batch_move_still_offers_undo_for_the_moved_messages() {
     app.undo_last();
     assert_eq!(app.engine.message("msg_001").map(|message| message.summary.folder_id), Some("inbox".to_owned()));
 }
+
+#[test]
+fn the_toolbar_and_status_bar_keep_their_children_off_the_separators() {
+    let (ctx, mut app) = ready_app();
+    let size = Vec2::new(1200.0, 800.0);
+    frame_at(&ctx, &mut app, size, Vec::new());
+
+    let toolbar = probe::toolbar_rect(&ctx).expect("the toolbar rect");
+    let search = probe::search_field_rect(&ctx).expect("the search field rect");
+    assert!(toolbar.contains_rect(search), "the search field escapes the toolbar: {search:?} in {toolbar:?}");
+    assert!(search.top() - toolbar.top() >= 8.0, "the search field touches the top of the toolbar: {search:?} in {toolbar:?}");
+    assert!(toolbar.bottom() - search.bottom() >= 8.0, "the search field touches the separator: {search:?} in {toolbar:?}");
+
+    let status = probe::status_bar_rect(&ctx).expect("the status bar rect");
+    for key in ["badge", "version"] {
+        let item = probe::status_item_rect(&ctx, key).unwrap_or_else(|| panic!("the {key} rect"));
+        assert!(status.contains_rect(item), "the {key} escapes the status bar: {item:?} in {status:?}");
+        assert!(item.top() - status.top() >= 5.0, "the {key} touches the top of the status bar: {item:?} in {status:?}");
+        assert!(status.bottom() - item.bottom() >= 5.0, "the {key} touches the bottom of the status bar: {item:?} in {status:?}");
+    }
+}
+
+#[test]
+fn the_sync_button_shows_a_check_then_a_cross_and_returns_to_idle() {
+    let (ctx, mut app) = ready_app();
+    let size = Vec2::new(1200.0, 800.0);
+    frame_time(&ctx, &mut app, size, Vec::new(), 10.0);
+    assert_eq!(probe::sync_button_state(&ctx).as_deref(), Some("idle"));
+    assert!(probe::sync_button_rect(&ctx).is_some(), "the sync button is painted");
+
+    app.shell.note_sync_finished(true, 10.0);
+    frame_time(&ctx, &mut app, size, Vec::new(), 10.0);
+    assert_eq!(probe::sync_button_state(&ctx).as_deref(), Some("success"), "a finished sync shows the check");
+
+    frame_time(&ctx, &mut app, size, Vec::new(), 12.6);
+    assert_eq!(probe::sync_button_state(&ctx).as_deref(), Some("idle"), "the check is transient");
+
+    app.shell.note_sync_finished(false, 20.0);
+    frame_time(&ctx, &mut app, size, Vec::new(), 20.0);
+    assert_eq!(probe::sync_button_state(&ctx).as_deref(), Some("failure"), "a failed sync shows the cross");
+
+    frame_time(&ctx, &mut app, size, Vec::new(), 24.1);
+    assert_eq!(probe::sync_button_state(&ctx).as_deref(), Some("idle"), "the cross is transient");
+}
+
+#[test]
+fn arrow_keys_never_leave_the_message_list_and_keep_the_selection_in_view() {
+    let mut app = booted_app("p11a-list-keyboard-scroll", Vec::new(), |store| {
+        seed_account_rows(store, "acc_k", "k@example.com", None);
+        for index in 0..40i64 {
+            let id = format!("msg_k_{index:03}");
+            let mut row = store_message("fld_acc_k_inbox", "acc_k", &id, &format!("Messaggio {index:02}"));
+            row.summary.date = 1_700_000_000_000 - index;
+            store.upsert_message(&row).expect("message row");
+        }
+    });
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, false);
+    let size = Vec2::new(1280.0, 720.0);
+    frame_at(&ctx, &mut app, size, Vec::new());
+
+    frame_at(&ctx, &mut app, size, vec![key(Key::J, Modifiers::NONE)]);
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let first = app.selected.clone().expect("J selects the first message");
+    let focused = ctx.memory(|memory| memory.focused()).expect("the row receives focus");
+    assert!(app.row_ids.values().any(|id| *id == focused), "the focus left the list after J: {focused:?}");
+
+    frame_at(&ctx, &mut app, size, vec![key(Key::ArrowUp, Modifiers::NONE)]);
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let focused = ctx.memory(|memory| memory.focused()).expect("the row keeps focus at the top");
+    assert!(app.row_ids.values().any(|id| *id == focused), "ArrowUp at the first row moved focus out of the list: {focused:?}");
+    assert_eq!(app.selected.as_deref(), Some(first.as_str()), "ArrowUp at the top must not wrap");
+
+    for _ in 0..25 {
+        frame_at(&ctx, &mut app, size, vec![key(Key::ArrowDown, Modifiers::NONE)]);
+    }
+    frame_at(&ctx, &mut app, size, Vec::new());
+    let selected = app.selected.clone().expect("a selected message");
+    let rows = probe::message_rows(&ctx);
+    let rect = rows.get(&selected).unwrap_or_else(|| panic!("the selected row {selected} is not painted: {:?}", rows.keys().collect::<Vec<_>>()));
+    let content = ctx.content_rect();
+    let top = content.top() + ui_size::TITLE_BAR + ui_size::TOOLBAR;
+    let bottom = content.bottom() - ui_size::STATUS;
+    assert!(rect.top() >= top && rect.bottom() <= bottom, "the selected row is outside the list viewport: {rect:?} in {top}..{bottom}");
+    let focused = ctx.memory(|memory| memory.focused()).expect("the row keeps focus after scrolling");
+    assert!(app.row_ids.values().any(|id| *id == focused), "the focus left the list after scrolling: {focused:?}");
+}
+
+#[test]
+fn every_status_bar_item_shares_one_vertical_center_in_both_themes() {
+    let size = Vec2::new(1200.0, 800.0);
+    for dark in [false, true] {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, dark);
+        let mut app = booted_app(if dark { "p11-footer-dark" } else { "p11-footer-light" }, Vec::new(), |store| {
+            seed_account_rows(store, "acc_footer", "footer@example.com", None)
+        });
+        app.dark = dark;
+        let runs = painted_runs(&ctx, &mut app, size);
+        let bar = probe::status_bar_rect(&ctx).expect("the status bar rect");
+
+        // The seeded state is ready, in-process and never synced, so all four labels paint.
+        let version = format!("Postino {}", env!("CARGO_PKG_VERSION"));
+        let labels = ["Pronto", version.as_str(), "Solo questa finestra", "Mai sincronizzato"];
+        let mut centers = Vec::new();
+        for label in labels {
+            let run = runs
+                .iter()
+                .find(|run| run.text == label)
+                .unwrap_or_else(|| panic!("{label:?} is not painted in the {} footer", if dark { "dark" } else { "light" }));
+            assert!(run.rect.top() - bar.top() >= 5.0, "{label:?} touches the top of the footer: {:?} in {bar:?}", run.rect);
+            assert!(bar.bottom() - run.rect.bottom() >= 5.0, "{label:?} touches the bottom of the footer: {:?} in {bar:?}", run.rect);
+            centers.push((label, run.rect.center().y));
+        }
+        for (label, center) in &centers {
+            assert!((center - bar.center().y).abs() <= 1.0, "{label:?} is off the footer's vertical center: {center:.2} vs {:.2}", bar.center().y);
+        }
+        for (label, center) in centers.iter().skip(1) {
+            assert!(
+                (center - centers[0].1).abs() <= 1.0,
+                "{label:?} and {:?} sit on different baselines: {center:.2} vs {:.2}",
+                centers[0].0,
+                centers[0].1
+            );
+        }
+    }
+}

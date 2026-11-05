@@ -40,12 +40,10 @@ fn narrow_reading_overlay_keeps_triage_actions() {
 }
 
 #[test]
-fn narrow_sidebar_keeps_the_editor_in_a_pinned_drawer() {
+fn narrow_sidebar_keeps_the_editor_between_labels_and_searches() {
     let (ctx, mut app) = ready_app();
     let narrow = Vec2::new(980.0, 600.0);
     frame_at(&ctx, &mut app, narrow, vec![]);
-    let offset_before = probe::scroll_offset(&ctx).expect("the sidebar scroll offset");
-    assert_eq!(offset_before, 0.0, "the sidebar starts at the top");
 
     app.start_label_create();
     for _ in 0..20 {
@@ -53,64 +51,125 @@ fn narrow_sidebar_keeps_the_editor_in_a_pinned_drawer() {
     }
 
     let view = probe::scroll_view(&ctx).expect("the sidebar scroll area");
-    let panel = probe::sidebar_panel_rect(&ctx).expect("the sidebar panel");
-    let drawer = probe::editor_drawer_rect(&ctx).expect("the editor drawer");
     let editor = probe::editor_rect(&ctx).expect("the editor content");
-    let header = probe::sidebar_header_rect(&ctx, "CARTELLE").expect("the CARTELLE header");
+    let labels_header = probe::sidebar_header_rect(&ctx, "ETICHETTE").expect("the ETICHETTE header");
+    let searches_header = probe::sidebar_header_rect(&ctx, "RICERCHE").expect("the RICERCHE header");
     let save = probe::saved_at(&ctx).expect("the editor save button");
     let cancel = probe::cancel_at(&ctx).expect("the editor cancel button");
 
-    assert!(
-        panel.min.x <= drawer.min.x && panel.max.x + 2.0 >= drawer.max.x && panel.min.y <= drawer.min.y && panel.max.y >= drawer.max.y,
-        "the drawer stays inside the sidebar: {drawer:?} vs {panel:?}"
-    );
-    assert!(drawer.min.y <= editor.min.y && drawer.max.y >= editor.max.y, "the editor is fully inside its drawer");
-    assert!(view.max.y <= drawer.min.y + 0.5, "the drawer sits below the scrolling list: {view:?} vs {drawer:?}");
-    assert!(drawer.max.y <= panel.max.y + 0.5, "the drawer ends inside the sidebar: {drawer:?} vs {panel:?}");
-    assert!(drawer.contains_rect(save) && drawer.contains_rect(cancel), "Save and Cancel are inside the drawer");
-    assert!(header.min.y >= view.min.y - 1.0 && header.max.y <= view.max.y, "the folder header stays visible at the top");
-    assert!(header.min.y <= view.min.y + 4.0, "opening the editor must not push CARTELLE down");
-    assert_eq!(probe::scroll_offset(&ctx), Some(offset_before), "opening the editor must not change the list offset");
+    assert!(view.expand2(Vec2::new(2.0, 0.0)).contains_rect(editor), "the inline editor stays in the scrolling list: {editor:?} vs {view:?}");
+    assert!(editor.contains_rect(save) && editor.contains_rect(cancel), "Save and Cancel are inside the editor card");
+    assert!(labels_header.max.y <= editor.min.y + 0.5, "the editor follows the label rows: {editor:?} vs {labels_header:?}");
+    assert!(searches_header.min.y >= editor.max.y - 0.5, "the searches section follows the editor: {editor:?} vs {searches_header:?}");
 
     // The error line is the tallest editor state; it must still fit without clipping the controls.
     if let Some(editor) = app.label_editor.as_mut() {
         editor.text = "Lavoro".to_owned();
         editor.error = Some("Esiste già un'etichetta con questo nome.".to_owned());
     }
+    app.scroll_editor_into_view = true;
     for _ in 0..4 {
         frame_at(&ctx, &mut app, narrow, vec![]);
     }
-    let drawer = probe::editor_drawer_rect(&ctx).expect("the editor drawer with an error");
+    let editor = probe::editor_rect(&ctx).expect("the editor with an error");
     let save = probe::saved_at(&ctx).expect("the editor save button with an error");
-    assert!(drawer.contains_rect(save), "an error line must not clip Save: {save:?} vs {drawer:?}");
+    let view = probe::scroll_view(&ctx).expect("the sidebar scroll area with an error");
+    assert!(editor.contains_rect(save), "an error line must not clip Save: {save:?} vs {editor:?}");
+    assert!(view.expand2(Vec2::new(2.0, 0.0)).contains_rect(editor), "the error state still fits the sidebar viewport: {editor:?} vs {view:?}");
 
     let content = probe::scroll_content(&ctx).expect("the scroll content size");
-    assert!(content.y > view.height(), "with the editor open the sidebar overflows and shows a scroll bar");
-    let style = sidebar_scroll_style();
-    assert_eq!(style.dormant_handle_opacity, 1.0, "the sidebar bar must be drawn without hovering");
-    assert!(style.foreground_color, "its handle must use the text colour, not the panel fill");
-    assert!(style.floating_width >= 4.0, "it must be more than a hairline");
+    assert!(content.y > view.height(), "with the editor open the sidebar overflows, so its bar is available");
 
-    // A single wheel gesture brings Cestino into the list viewport; the drawer does not move.
-    frame_at(&ctx, &mut app, narrow, wheel(view.center(), 16));
-    frame_at(&ctx, &mut app, narrow, vec![]);
-    frame_at(&ctx, &mut app, narrow, vec![]);
-    let rows = probe::rows(&ctx);
-    let trash = rows.get("Cestino").copied().expect("Cestino is in the sidebar");
-    assert!(
-        trash.top() >= view.top() - 1.0 && trash.bottom() <= view.bottom() + 1.0,
-        "one wheel gesture reaches Cestino while the editor stays open: {trash:?} vs {view:?}"
-    );
-    let drawer_after = probe::editor_drawer_rect(&ctx).expect("the drawer does not move");
-    assert_eq!(drawer, drawer_after, "scrolling the list must not move the drawer");
-    let last = rows.get("Fatture").copied().expect("the last label row");
-    assert!(last.bottom() > view.bottom(), "the label rows sit below the fold, so only the scroll bar reaches them");
-
+    // The editor is part of the flow, not a pinned drawer: scrolling still reaches the last row.
     frame_at(&ctx, &mut app, narrow, wheel(view.center(), 80));
     frame_at(&ctx, &mut app, narrow, vec![]);
     let scrolled = probe::rows(&ctx);
     let fatture = scrolled.get("Fatture").copied().expect("the last label row is still drawn");
     assert!(fatture.bottom() <= view.bottom() + 1.0, "a wheel scroll brings the last label row into view: {fatture:?} vs {view:?}");
+}
+
+/// The narrow, tall rect egui painted for the sidebar's vertical scroll bar, in the bar lane at
+/// the right edge of the scroll area. egui always emits the bar shapes while the area can scroll,
+/// with alpha 0 while dormant, so the alpha tells a bar the user can feel from one only a test
+/// can see.
+fn painted_sidebar_bar(ctx: &egui::Context, app: &mut PostinoApp, size: Vec2, events: Vec<egui::Event>) -> Option<(Rect, egui::Color32)> {
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+    let mut output = ctx.run_ui(raw, |ui| app.show(ui));
+    output.textures_delta.clear();
+    let panel = probe::sidebar_panel_rect(ctx).expect("the sidebar panel");
+    let view = probe::scroll_view(ctx).expect("the sidebar scroll area");
+    fn collect(shape: &egui::epaint::Shape, panel: Rect, view: Rect, bars: &mut Vec<(Rect, egui::Color32)>) {
+        match shape {
+            egui::epaint::Shape::Rect(rect) => {
+                let painted = rect.rect;
+                if painted.center().x >= view.right() - 14.0 && painted.width() <= 12.0 && painted.height() >= 20.0 && panel.contains_rect(painted) {
+                    bars.push((painted, rect.fill));
+                }
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, panel, view, bars);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut bars = Vec::new();
+    for clipped in &output.shapes {
+        collect(&clipped.shape, panel, view, &mut bars);
+    }
+    bars.into_iter().find(|(_, fill)| fill.a() > 0)
+}
+
+/// The folder/label sidebar scrolls like the list and the reading pane: no local bar override, so
+/// nothing is painted while the pointer is elsewhere, a thin sliver appears on hover and the same
+/// handle thickens over the bar lane and while dragging. The 1280×900 demo fits; 980×600 does not.
+#[test]
+fn sidebar_scroll_bar_follows_the_shared_visible_when_needed_behaviour() {
+    for (size, overflows) in [(Vec2::new(1280.0, 900.0), false), (Vec2::new(980.0, 600.0), true)] {
+        for dark in [false, true] {
+            let (ctx, mut app) = ready_app();
+            theme::apply(&ctx, dark);
+            app.dark = dark;
+            ctx.all_styles_mut(|style| style.animation_time = 0.0);
+            settle_at(&ctx, &mut app, size);
+            let view = probe::scroll_view(&ctx).expect("the sidebar scroll area");
+            let content = probe::scroll_content(&ctx).expect("the scroll content size");
+            assert_eq!(content.y > view.height(), overflows, "the demo sidebar overflow at {size:?} (dark={dark})");
+
+            // The pointer rests in the mail area: a shared floating bar is dormant, not painted.
+            let outside = sidebar_outside(view);
+            assert!(
+                painted_sidebar_bar(&ctx, &mut app, size, vec![egui::Event::PointerMoved(outside)]).is_none(),
+                "the sidebar must not paint a bar before the pointer reaches it (dark={dark}, {size:?})"
+            );
+
+            // Poised over the folders, still away from the bar lane.
+            let Some((resting, fill)) = painted_sidebar_bar(&ctx, &mut app, size, vec![egui::Event::PointerMoved(view.center())]) else {
+                assert!(!overflows, "an overflowing sidebar shows its bar on hover (dark={dark}, {size:?})");
+                continue;
+            };
+            assert!(overflows, "a sidebar that fits paints no bar, even hovered (dark={dark}): {resting:?}");
+            assert!(resting.width() <= 4.0, "the resting bar is a thin sliver, not a slab (dark={dark}): {resting:?}");
+            assert!(fill.a() > 0, "hovering the folders wakes the bar (dark={dark}), not leaves it dormant");
+
+            // Over the bar lane itself the same handle thickens, exactly like the list and pane.
+            let lane = pos2(resting.center().x, view.center().y);
+            let (thick, _) = painted_sidebar_bar(&ctx, &mut app, size, vec![egui::Event::PointerMoved(lane)]).expect("the bar under the pointer");
+            assert!(thick.width() > resting.width() + 2.0, "hovering the bar thickens it (dark={dark}): {thick:?} vs {resting:?}");
+
+            // A pressed handle keeps that thickness instead of shrinking back to a sliver.
+            frame_at(&ctx, &mut app, size, vec![egui::Event::PointerMoved(lane), pointer(lane, true)]);
+            let (dragged, _) =
+                painted_sidebar_bar(&ctx, &mut app, size, vec![egui::Event::PointerMoved(pos2(lane.x, lane.y - 30.0))]).expect("the dragged bar");
+            assert!(dragged.width() > resting.width() + 2.0, "a dragged bar stays thick (dark={dark}): {dragged:?}");
+        }
+    }
+}
+
+/// A point in the mail area left of the sidebar, so the sidebar is not hovered.
+fn sidebar_outside(view: Rect) -> egui::Pos2 {
+    pos2(view.center().x + 400.0, view.center().y)
 }
 
 #[test]
@@ -325,8 +384,10 @@ fn double_click_opens_and_expands_and_the_reading_header_restores() {
     assert!(app.reading_open, "a narrow row double-click opens the overlay");
     frame_at(&ctx, &mut app, narrow, vec![]);
     let header = probe::reading_header_rect(&ctx).expect("the overlay header");
-    double_click_at(&ctx, &mut app, header.center(), narrow);
-    assert!(!app.reading_open, "a header double-click on the overlay returns to the list");
+    // The action strip owns the left half of the header on a narrow overlay; the empty gutter
+    // before the right edge is the double-click target.
+    double_click_at(&ctx, &mut app, pos2(header.right() - 100.0, header.center().y), narrow);
+    assert!(!app.reading_open, "a header double-click on the overlay returns to the list (header {header:?}, full {})", app.reading_full);
 }
 
 #[test]
@@ -375,5 +436,44 @@ fn the_outbox_card_keeps_its_footer_inside_at_980_in_both_themes() {
         let text = painted_text(&ctx, &mut app, size);
         assert!(text.iter().any(|line| line.contains("richiede Postino aperto")), "dark={dark}: {text:?}");
         assert!(text.iter().any(|line| line.contains("Postino invia solo mentre")), "dark={dark}: {text:?}");
+    }
+}
+
+#[test]
+fn a_list_row_paints_the_focus_ring_only_while_it_is_not_selected() {
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, false);
+    let gold = theme::tokens(false).gold;
+    let size = Vec2::new(460.0, 160.0);
+    for (selected, focused, expect_ring) in [(true, true, false), (true, false, false), (false, true, true)] {
+        let row_rect = std::cell::Cell::new(Rect::NOTHING);
+        let mut rings = Vec::new();
+        for _ in 0..2 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let mut output = ctx.run_ui(raw, |ui| {
+                let row = ListRow::thread("Preventivo sito web", "Giulia Ferri, Federico · 3 messaggi", "01/11").selected(selected).focused(focused);
+                row_rect.set(row.show(ui).rect);
+            });
+            output.textures_delta.clear();
+            rings.clear();
+            fn collect(shape: &egui::epaint::Shape, gold: egui::Color32, rects: &mut Vec<Rect>) {
+                match shape {
+                    egui::epaint::Shape::Rect(rect) if rect.stroke.color == gold && rect.stroke.width >= 1.5 => rects.push(rect.rect),
+                    egui::epaint::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            collect(shape, gold, rects);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &output.shapes {
+                collect(&clipped.shape, gold, &mut rings);
+            }
+        }
+        let target = row_rect.get().expand(2.0);
+        let ring = rings.iter().any(|rect| (rect.min - target.min).length() < 0.5 && (rect.max - target.max).length() < 0.5);
+        assert_eq!(ring, expect_ring, "selected={selected} focused={focused}: rings {rings:?} around {target:?}");
     }
 }

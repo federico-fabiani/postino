@@ -3,6 +3,50 @@
 
 use super::*;
 
+/// What a finished refresh leaves on the toolbar sync button: a check for a moment, or a cross
+/// long enough to read. The engine reports the outcome; the shell only owns how long it is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SyncFlash {
+    Success,
+    Failure,
+}
+
+impl SyncFlash {
+    /// How long the glyph stays after the sync ends. A failure gets longer because it may need a
+    /// second look; a success is only a reassurance.
+    fn seconds(self) -> f64 {
+        match self {
+            Self::Success => 2.5,
+            Self::Failure => 4.0,
+        }
+    }
+}
+
+/// Shell-owned transient state: what belongs to the chrome rather than to the mail. `PostinoApp`
+/// stores one field, so a new chrome detail is added here instead of next to the engine.
+#[derive(Debug, Default)]
+pub(super) struct ShellUi {
+    sync_flash: Option<(SyncFlash, f64)>,
+}
+
+impl ShellUi {
+    /// Remember that a sync finished at `now`, so the toolbar can confirm it for a moment.
+    pub(super) fn note_sync_finished(&mut self, success: bool, now: f64) {
+        self.sync_flash = Some((if success { SyncFlash::Success } else { SyncFlash::Failure }, now));
+    }
+
+    /// The flash still visible at `now`, if any. An expired flash is simply not reported.
+    pub(super) fn sync_flash(&self, now: f64) -> Option<SyncFlash> {
+        let (flash, started) = self.sync_flash?;
+        (now - started < flash.seconds()).then_some(flash)
+    }
+
+    /// Drop the flash early, for example when the user asks for another sync by hand.
+    pub(super) fn clear_sync_flash(&mut self) {
+        self.sync_flash = None;
+    }
+}
+
 impl PostinoApp {
     /// The quiet loading line under the toolbar. It is painted only after [`LOADING_DELAY`]; the
     /// fade uses the same global animation switch, so reduced motion draws it at full alpha at once.
@@ -64,9 +108,9 @@ impl PostinoApp {
     }
     pub(super) fn toolbar(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
-        egui::Panel::top("toolbar")
+        let panel = egui::Panel::top("toolbar")
             .exact_size(ui_size::TOOLBAR)
-            .frame(Frame::new().fill(t.chrome).inner_margin(Margin::symmetric(inset::LG, inset::MD)))
+            .frame(Frame::new().fill(t.chrome).inner_margin(Margin::symmetric(inset::LG, 10)))
             .show_separator_line(true)
             .show(ui, |ui| {
                 let rect = ui.max_rect();
@@ -74,7 +118,9 @@ impl PostinoApp {
                 let side_width = (total * 0.24).min(260.0);
                 let search_width = 420.0_f32.min((total - side_width * 2.0).max(200.0));
                 let left_rect = Rect::from_min_max(rect.min, egui::pos2(rect.min.x + side_width, rect.max.y));
-                let search_rect = Rect::from_center_size(rect.center(), Vec2::new(search_width, 40.0));
+                // The field fills the content rect vertically and is centred in it, so the panel's
+                // own band stays clear of the separator above and below.
+                let search_rect = Rect::from_center_size(rect.center(), Vec2::new(search_width, rect.height()));
                 let right_rect = Rect::from_min_max(egui::pos2(rect.max.x - side_width, rect.min.y), rect.max);
 
                 ui.scope_builder(UiBuilder::new().max_rect(left_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
@@ -88,7 +134,12 @@ impl PostinoApp {
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(search_rect).layout(Layout::left_to_right(Align::Center)), |ui| {
                     let placeholder = self.search_placeholder();
-                    let response = SearchField::new(&mut self.query, &placeholder).width(search_width).focus(self.focus_search).show(ui);
+                    let mut fetch = |token: &str| self.engine.search_suggest(self.active_account.as_deref(), token, 8).unwrap_or_default();
+                    let response = SearchField::new(&mut self.query, &placeholder)
+                        .width(search_width)
+                        .focus(self.focus_search)
+                        .suggestions(&mut self.search_suggest, &mut fetch)
+                        .show(ui);
                     if self.focus_search {
                         self.focus_search = false;
                     }
@@ -117,22 +168,55 @@ impl PostinoApp {
                     }
                 });
                 ui.scope_builder(UiBuilder::new().max_rect(right_rect).layout(Layout::right_to_left(Align::Center)), |ui| {
-                    let compose = Button::primary("Scrivi").icon(icons::COMPOSE).shortcut("C").show(ui);
+                    let compose = Button::primary("Scrivi").icon(icons::COMPOSE).shortcut_hint("C").show(ui);
                     #[cfg(test)]
                     probe::compose_button(ui, compose.rect);
                     if compose.clicked() {
                         self.compose_new();
                     }
                     ui.add_space(space::SM);
-                    let sync_label = if self.sync_running() {
-                        "Aggiorna la posta · sincronizzazione già in corso"
-                    } else if !self.can_add_account() {
-                        "Aggiorna la posta · la modalità demo non ha un server"
+                    let running = self.sync_running();
+                    let flash = if running { None } else { self.shell.sync_flash(self.now) };
+                    let (icon, label, angle, success, danger) = if running {
+                        // Six radians per second: a steady turn, not a spinner race. Reduced
+                        // motion keeps the glyph still and lets the tooltip say what is happening.
+                        let angle = if self.reduced_motion { 0.0 } else { ((self.now * 6.0) % std::f64::consts::TAU) as f32 };
+                        (icons::SYNC, "Sincronizzazione in corso…", angle, false, false)
                     } else {
-                        "Aggiorna la posta"
+                        match flash {
+                            Some(SyncFlash::Success) => (icons::CHECK, "Sincronizzazione completata", 0.0, true, false),
+                            Some(SyncFlash::Failure) => (icons::CLOSE, "Sincronizzazione non riuscita · Riprova", 0.0, false, true),
+                            None => {
+                                let label = if !self.can_add_account() {
+                                    "Aggiorna la posta · la modalità demo non ha un server"
+                                } else {
+                                    "Aggiorna la posta"
+                                };
+                                (icons::SYNC, label, 0.0, false, false)
+                            }
+                        }
                     };
-                    if IconButton::new(icons::SYNC, sync_label).enabled(self.can_add_account()).show(ui).clicked() {
+                    let sync = IconButton::new(icon, label).angle(angle).success(success).danger(danger).enabled(self.can_add_account()).show(ui);
+                    #[cfg(test)]
+                    probe::sync_button(
+                        ui,
+                        sync.rect,
+                        if running {
+                            "running"
+                        } else if success {
+                            "success"
+                        } else if danger {
+                            "failure"
+                        } else {
+                            "idle"
+                        },
+                    );
+                    if sync.clicked() {
                         self.request_sync();
+                    }
+                    if running || flash.is_some() {
+                        // A flash is quiet confirmation: a slow repaint is enough to expire it.
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(if running { 16 } else { 100 }));
                     }
                     ui.add_space(space::SM);
                     let theme_icon = if self.dark { icons::SUN } else { icons::MOON };
@@ -142,6 +226,10 @@ impl PostinoApp {
                     }
                 });
             });
+        #[cfg(test)]
+        probe::toolbar(ui, panel.response.rect);
+        #[cfg(not(test))]
+        let _ = panel;
     }
     pub(super) fn status_bar(&mut self, ui: &mut Ui) {
         let t = theme::tokens(self.dark);
@@ -150,12 +238,17 @@ impl PostinoApp {
         let configuring = self.onboarding.is_some();
         let recovering = self.boot_failure.is_some();
         let mut leave_demo = false;
-        egui::Panel::bottom("status")
+        let panel = egui::Panel::bottom("status")
             .exact_size(ui_size::STATUS)
-            .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(inset::LG, inset::XS)))
+            // The bar owns one 28 pt control band, centred in its 32 pt height. A vertical frame
+            // margin would leave only 20 pt, shorter than the Sm buttons: the row then grew to 40 pt,
+            // pushed every widget after the first button 4 pt down and clipped 8 pt below the window.
+            .frame(Frame::new().fill(t.panel_alt).inner_margin(Margin::symmetric(inset::LG, 0)))
             .show_separator_line(false)
             .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
+                let content = ui.max_rect();
+                let band = Rect::from_center_size(content.center(), Vec2::new(content.width(), ui_size::CONTROL_SM));
+                ui.scope_builder(UiBuilder::new().max_rect(band).layout(Layout::left_to_right(Align::Center)), |ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
                     let dot = match kind {
                         StatusKind::Demo => t.gold_ink,
@@ -169,6 +262,8 @@ impl PostinoApp {
                             // The one demo notice in the product: a badge with one sentence of
                             // explanation, not four scattered milestone lines.
                             let badge = Badge::new("Modalità demo").kind(BadgeKind::Accent).show(ui);
+                            #[cfg(test)]
+                            probe::status_item(ui, "badge", badge.rect);
                             badge.on_hover_text(DEMO_TOOLTIP);
                             if self.demo_can_return() {
                                 ui.add_space(space::SM);
@@ -192,8 +287,12 @@ impl PostinoApp {
                             }
                         }
                     }
-                    ui.add_space(space::SM);
-                    ui.label(typography::mono(format!("Postino {}", env!("CARGO_PKG_VERSION")), 10.5, t.text_faint));
+                    status_divider(ui, &t);
+                    let version = ui.label(typography::mono(format!("Postino {}", env!("CARGO_PKG_VERSION")), 10.5, t.text_faint));
+                    #[cfg(test)]
+                    probe::status_item(ui, "version", version.rect);
+                    #[cfg(not(test))]
+                    let _ = &version;
                     // Who owns the store is part of the product surface: the window must never
                     // look like the only writer while a daemon holds the archive.
                     if !self.demo && self.boot_failure.is_none() {
@@ -263,7 +362,7 @@ impl PostinoApp {
                         })
                         .count();
                     if active_outbox > 0 {
-                        ui.add_space(space::SM);
+                        status_divider(ui, &t);
                         let uncertain = self.outbox.entries.iter().any(|entry| entry.state == postino_store::OutboxState::Uncertain);
                         let label = format!("Coda · {active_outbox}");
                         let button = if uncertain {
@@ -278,24 +377,32 @@ impl PostinoApp {
                             self.outbox_open = true;
                         }
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let hint = if recovering {
-                            "Invio riprova · la modalità demo non tocca il file"
-                        } else if configuring {
-                            "Invio continua · Esc torna indietro"
-                        } else if self.composer.open {
-                            if composer_can_send {
-                                "Ctrl+Invio invia · Esc chiude e conserva"
+                    // The hint is the first thing to go when the row gets tight: the metadata
+                    // groups on the left are the product surface, the shortcut line is a reminder.
+                    if ui.ctx().content_rect().width() >= 1100.0 {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let hint = if recovering {
+                                "Invio riprova · la modalità demo non tocca il file"
+                            } else if configuring {
+                                "Invio continua · Esc torna indietro"
+                            } else if self.composer.open {
+                                if composer_can_send {
+                                    "Ctrl+Invio invia · Esc chiude e conserva"
+                                } else {
+                                    "Invio non disponibile · Esc chiude e conserva"
+                                }
                             } else {
-                                "Invio non disponibile · Esc chiude e conserva"
-                            }
-                        } else {
-                            "Ctrl+K comandi · J/K naviga · ? scorciatoie"
-                        };
-                        ui.label(typography::text(Role::Meta, hint, t.text_faint));
-                    });
+                                "Ctrl+K comandi · J/K naviga · ? scorciatoie"
+                            };
+                            ui.label(typography::text(Role::Meta, hint, t.text_faint));
+                        });
+                    }
                 });
             });
+        #[cfg(test)]
+        probe::status_bar(ui, panel.response.rect);
+        #[cfg(not(test))]
+        let _ = panel;
         if leave_demo {
             self.leave_demo();
         }
@@ -624,6 +731,15 @@ impl PostinoApp {
             self.label_delete = None;
         }
     }
+}
+
+/// A hairline between the status metadata groups: 1 pt wide, one text line tall, so the bar stays
+/// a single row instead of growing a second one.
+fn status_divider(ui: &mut Ui, t: &theme::Tokens) {
+    ui.add_space(space::SM);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 14.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(0), t.border);
+    ui.add_space(space::SM);
 }
 
 fn window_control(ui: &mut Ui, glyph: &str, label: &str, close: bool) -> egui::Response {

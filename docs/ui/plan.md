@@ -87,10 +87,10 @@ Every component has `default`, `hover`, `active`, `focus`, `disabled` and, where
 | `Button` | primary, secondary, ghost, danger; sm/md/lg; icon-left/right; shortcut chip |
 | `IconButton` | 28/32; tooltip with label + shortcut; accessible name |
 | `TextField` | single/multi; label, hint, error, leading icon, clear button |
-| `SearchField` | centred placeholder, leading magnifier, `/` focus, `Esc` clear |
+| `SearchField` | 36 px high; centred hint while empty and left-aligned text once the user types; leading magnifier, `/` focus, `Esc` clear |
 | `Chip` | filter, label, count; selected/unselected; removable |
 | `Badge` | neutral, accent, danger; used for unread counts and roadmap states |
-| `ListRow` | message, folder, contact; selected, focused, unread, starred; no text selection; accessible name with sender/subject/state/date/Enter |
+| `ListRow` | message, folder, contact; selected, focused, unread, starred; no text selection; a selected row uses its fill as the only focus cue (no second ring); the unread total lives on the folder badge, not on rows or account headers; accessible name with sender/subject/state/date/Enter |
 | `TableHeader` | sortable, right-aligned numeric/date |
 | `SectionHeader` | title, count, action (`+`) |
 | `EmptyState` | icon, title, body, one or two actions; filter-aware copy; actions stack under the copy |
@@ -99,6 +99,7 @@ Every component has `default`, `hover`, `active`, `focus`, `disabled` and, where
 | `Dialog` | title, body, footer; scrim; focus trap; Esc |
 | `Composer` | fields, formatting bar, attachments, save/send, draft state |
 | `Pane` | resizable, collapsible, animated; min/max; remembers size |
+| `ScrollArea` | one shared geometry everywhere (sidebar, list, reading body): no bar when content fits, thin floating handle on hover, thicker while dragging; the reading body zeroes the lane background opacities so `extreme_bg_color` cannot paint a light strip across the ivory pane |
 | `StatusBar` | three honest states (Demo, Pronto, Errore), one demo badge, one line, shortcut hint |
 
 ### 4.3 Gallery
@@ -113,7 +114,7 @@ guard against drift. A headless test renders it.
 ┌──────────────────────────────────────────────────────────────┐
 │ 34  title bar: logo · postino · drag · – □ ×                │
 ├──────────────────────────────────────────────────────────────┤
-│ 56  toolbar: logo/account · [ centred search ] · sync · write│
+│ 60  toolbar: logo/account · [ centred search ] · sync · write│
 ├──────────────┬───────────────────────────────┬───────────────┤
 │ 240 sidebar  │ list (flex)                   │ reading 52%   │
 │ account      │ header + filters + bulk bar   │ actions       │
@@ -121,19 +122,26 @@ guard against drift. A headless test renders it.
 │ labels +     │                               │ body          │
 │ footer       │                               │ attachments   │
 ├──────────────┴───────────────────────────────┴───────────────┤
-│ 28  status: ● local/demo · message · shortcuts               │
+│ 32  status: ● local/demo · message · shortcuts               │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 - **Custom window chrome** on Windows/Linux: 34 px forest title bar, ivory wordmark, native-like
   minimise/maximise/close, drag via `ViewportCommand::StartDrag`, edge resize via
   `ViewportCommand::BeginResize`, double-click to maximise. Native chrome on macOS for now.
-- **Toolbar:** centred search, `Sincronizza` as a quiet icon+label, `Scrivi` as the only primary
-  button on the right, theme and account after it. No 550 px hole.
+- **Toolbar:** 60 px. Centred search with at least 8 px of air below it, `Sincronizza` as a quiet
+  icon+label, `Scrivi` as the only primary button on the right, theme and account after it. No
+  550 px hole. While syncing the icon turns; success shows a check for 2.5 s, failure a cross for
+  4 s, then it returns to the idle glyph (no motion when reduced motion is on).
 - **Sidebar:** 240 px, scrollable, collapsible below 1100 px. Account block, folders, labels with a
   `+`. Right-click on a label offers rename/delete. The demo/version notice lives once, in the
   status bar; the sidebar has no second footer line.
-- **List:** flexible. Row 44 px default, 36 px compact. Sender 140 px (100 px when the list panel is
+- **List:** flexible. One vertical scroll owned by the table: never an outer scroll area around it.
+  Keyboard moves scroll the focused row into view and the arrow keys are consumed so focus never
+  leaves the list for the toolbar at the first or last row. The filter row is only for filters
+  (`Tutti`, `Non letti`, `Allegati`); switching between conversations and messages is a quiet
+  header toggle, not a third chip. Row 44 px default, 36 px compact. Sender 140 px (100 px when
+  the list panel is
   below 560 px), date 52 px at 480 px and wider, star 28 px, unread dot 12 px, avatar 24 px only
   when the list is at least 720 px wide; otherwise no avatar. The date is compact and monospace —
   `HH:MM` today, `dd/MM` this year, `dd/MM/yy` otherwise — and is dropped only below 480 px of list
@@ -142,21 +150,32 @@ guard against drift. A headless test renders it.
   still gets at least 260 px. Subject and snippet are single-line with ellipsis. When a sender or
   subject is actually truncated, hover and keyboard focus show its full text in a tooltip. No text
   selection in rows. The star is its own 28×28 keyboard-focusable control with its own accessible
-  name; a star click never opens the message.
+  name; a star click never opens the message. Folder names are shown in Italian: known IMAP leaves
+  (`Sent Items`, `Deleted Messages`, `All Mail`, …) and `INBOX.` prefixes are translated, unknown
+  custom paths keep their hierarchy as `Parent / Child`.
 - **Reading pane:** closed when nothing is selected. It opens at 52% of the content width left by the
   240 px sidebar, clamped to `420 ..= 62%`, and capped so the list keeps its 460 px floor whenever
   the pane can honour its own 420 px minimum (from 1120 px up). At 1280×720 that is a ~541 px pane
-  and a ~499 px list, with a 140 ms width+fade. Between 1000 and 1120 px the pane sits at its 420 px
-  minimum; below 1000 px it becomes a full-width overlay. The list compresses and keeps the selected
+  and a ~499 px list. The width change is immediate: a width animation would reflow the body twice
+  and make navigating feel like the pane is breathing. Between 1000 and 1120 px the pane sits at its
+  420 px minimum; below 1000 px it becomes a full-width overlay. The list compresses and keeps the selected
   row visible. `Enter` or double-click expands it to the full content area; a double-click on the
   reading header restores the split, and `Esc` returns to the list at the same row and scroll offset.
-  Per-message scroll state.
+  Dragging the left border sets the split and the fraction is stored only when the pointer is
+  released, so resizing feels direct and the next launch remembers it. The body scrolls on both
+  axes: paragraphs wrap at the pane width, while a wide table, a long preformatted line or an
+  unbreakable token can be reached sideways. Per-message scroll state. The pane frame is computed
+  only from the window width and the stored fraction: no header or content widget may widen it, and
+  anything wider than the pane is clipped and reached through its scroll area.
 - **Bulk bar:** replaces the folder header when multi-select is active: count, mark read/unread,
   star, archive, delete, clear. Same shortcuts.
-- **Status bar:** three honest states. `Demo` is a gold `Modalità demo` badge whose tooltip explains
+- **Status bar:** 32 px, three honest states, content vertically padded and grouped with hairline
+  separators; every item shares one vertical center, so labels, the version, badges and buttons sit
+  on the same baseline. `Demo` is a gold `Modalità demo` badge whose tooltip explains
   in one sentence that the mail is synthetic and nothing leaves the computer; `Pronto` is the store;
   `Errore` is a real failure with one dismissable toast (retry only where meaningful). The version
   sits next to the state. The bar carries one transient confirmation line, never a raw engine error.
+  The shortcut hint is right-aligned and drops below 1100 px so the metadata never truncates.
 - **Loading:** a 2 px line under the toolbar, shown only after 200 ms of work, so local calls that
   return within a frame never flicker.
 
@@ -183,6 +202,8 @@ guard against drift. A headless test renders it.
 |---|---|
 | `J` / `↓` | move focus to the next message and collapse to it |
 | `K` / `↑` | move focus to the previous message and collapse to it |
+| `Alt+J` / `Alt+↓` | in an open conversation, move to the next message card without changing the selected thread |
+| `Alt+K` / `Alt+↑` | in an open conversation, move to the previous message card |
 | `Shift+J` / `Shift+K` | extend the selection from the anchor |
 | `Enter` / `O` | open / expand reading |
 | `Esc` | back from full reading, then clear selection, then close overlays |
@@ -252,35 +273,42 @@ per action, no hidden mutation.
 ### 6.6 Conversations and saved searches (P9b)
 
 - **Folder views list conversations by default.** A row shows the subject (reply/forward prefixes
-  stripped), the participants (first two names), the date and `n messaggi · m non letti`; the
-  unread dot is gold ink on ivory and gold on the forest selection, and the mailbox-wide label ids
-  are carried in the data model. J/K move the selected row without opening it, Enter loads the
+  stripped), the participants (first two names), the date and `n messaggi`; the unread dot is gold
+  ink on ivory and gold on the forest selection, and the mailbox-wide label ids are carried in the
+  data model. J/K move the selected row without opening it (even while the preview is open;
+  Alt+J/K move the cards inside it), Enter loads the
   conversation and opens its latest unread message, `Esc` goes back to the list.
 - **Search stays flat.** Entering a query switches the list to the message table; the palette command
   **Conversazioni** groups the *search hits* by thread (counts describe the hits, not the mailbox).
   Clearing the query restores the folder's threaded default. `Messaggi` in the chip row is the same
   toggle.
 - **Reading a conversation.** The top of the reading pane is a `CONVERSAZIONE` banner: subject,
-  `n messaggi · m non letti`, and one compact card per message (sender and time). Exactly one card is
-  expanded; J/K move it (the previous page is pulled in at the top edge), Enter opens the selected
+  `n messaggi`, and one compact card per message (sender and time). Exactly one card is
+  expanded; Alt+J/K move the open card (the previous page is pulled in at the top edge), Enter opens the selected
   card, R/A/F reply/reply-all/forward it. E/U/S act on the whole thread and one undo restores the
   batch; a partial move keeps the undo for the rows that did move. The thread list loads 200 rows at a
   time with **Carica altre conversazioni**; a thread over the page opens on its newest 200 messages
   and prepends older ones with **Carica messaggi precedenti**. Over 500 messages a bulk action refuses
   with a sentence. At 980×600 the pane is the existing full overlay (`Torna alla posta`, Esc).
-- **RICERCHE** sits under ETICHETTE: at most 12 named searches, with unread/total counts, a gold dot
+- **RICERCHE** sits under ETICHETTE: at most 12 named searches, with a total-message badge (the only unread count in the sidebar is the folder badge), a gold dot
   when valid and a danger dot plus “Ricerca non valida” when its label or folder disappeared. Clicking
   applies it: the query replaces the field, the label filter and unread/attachment chips clear, and
   the query's own `folder:` clause owns the scope (a query without one is account-wide, titled
   "Tutte le mail", with no folder highlighted); Esc restores the query, folder, chips, filters and view.
-  `Salva ricerca` (field `+`, palette) opens the sidebar drawer with a name and the query; rename and
-  edit reuse it; delete shows an undo toast. Applying or saving scrolls the section into view.
+  `Salva ricerca` (field `+`, palette) opens an inline editor under RICERCHE with a name and the
+  query; rename and edit reuse it; delete shows an undo toast. Applying or saving scrolls the
+  section into view.
 - A valid saved search whose FTS index is still building shows a muted dot and "Indice di ricerca in
   preparazione", not a stale warning. Counts and validity refresh after every mailbox write and every
   two seconds for another process's CRUD; deleting an account removes its rows and recent chips.
 - The last eight successful queries appear as chips when the search field is focused and empty;
   only Enter, a chip or an applied saved search records one, so debounced prefixes never fill the list.
   **Cancella ricerche recenti** in the palette clears them. They live only in the encrypted store.
+- The search field completes the token under the caret in a popover: Up/Down move, Enter or Tab
+  accepts, Esc closes, and a click picks a row. Rows come from `search_suggest`, so they are fields,
+  operators and closed values, plus labels, folders and people from the local correspondent list;
+  the popover never queries the network and never re-scans the mailbox on a keystroke. Accepting a
+  row replaces the token with the canonical clause and leaves every clause after the caret intact.
 - 980×600 light/dark screenshots: `docs/images/postino-p9b-threads-980.png`,
   `postino-p9b-threads-980-dark.png`, `postino-p9b-conversation-980.png`,
   `postino-p9b-conversation-980-dark.png`, `postino-p9b-saved-searches-980.png`,
@@ -363,10 +391,10 @@ Shipped in U0.5: the engine owns the label registry (`lbl_*`, one of `gold`, `fo
 default; choosing a folder narrows it to the intersection, so scope and counts agree, and the header
 names the scope in words. Ids are stable and never reused. The sidebar reads the cached
 `labels_list` result, so there is no second hardcoded list; the inline create/rename editor is a
-208 px drawer pinned above the sidebar footer, with a five-swatch colour row (keyboard reachable,
-default gold), Enter to save and Esc to cancel. The folder/label list scrolls independently above the
-drawer, and opening the editor never changes its scroll offset; Cestino stays one wheel away and
-CARTELLE stays at the top. The message menu and `L` open a modal, searchable checkbox
+card placed between ETICHETTE and RICERCHE inside the same sidebar scroll view, with a dense
+one-line name field at list font size, a five-swatch colour row (keyboard reachable, default gold)
+and compact icon controls for save and cancel; Enter saves and Esc cancels. Opening the editor
+scrolls it into view; Cestino stays one wheel away and CARTELLE stays at the top. The message menu and `L` open a modal, searchable checkbox
 menu with a scrim; its targets are captured when it opens, it closes on Esc or an outside click, and
 it closes if the selection or the filters change, so a multi-selection applies one label in one undo
 step and never touches a message the user cannot see selected. "Nuova etichetta…" in that menu
@@ -406,8 +434,9 @@ double-click restores. The 980 × 600 minimum window is part of the screenshot p
   preference is persisted and is also reachable as "Riduci le animazioni" in the palette.
 - **Accessibility:** every icon button has a name and a tooltip with its shortcut; rows are
   focusable, are announced as buttons with sender, subject, unread, attachment, date, selection and
-  the Enter hint; the star is its own 28×28 control; focus is always visible and follows real
-  keyboard focus, distinct from selection; metadata contrast ≥ 4.5:1; no colour-only state.
+  the Enter hint; the star is its own 28×28 control; keyboard focus is always visible, but a
+  selected row uses its forest fill as the only cue (an unselected focused row gets the ring);
+  metadata contrast ≥ 4.5:1; no colour-only state.
 
 ## 10. Work packages (no dates)
 
@@ -468,9 +497,9 @@ composer until P8; an attachment without stored bytes is refused before queueing
   `min(560, available - 2*XL)`, ten rows with an internal scroll, the search field on top, the hint at
   the bottom and the disabled reason under the list. Outside click and Esc close it; arrows keep focus
   in the field.
-- The inline label editor is a 208 px drawer above the sidebar footer. The folder/label list scrolls
-  independently and keeps its offset when the editor opens; CARTELLE stays at the top and Cestino is
-  one wheel away at 980×600.
+- The inline label editor is a card between ETICHETTE and RICERCHE in the sidebar scroll view.
+  Opening it scrolls the card into view; CARTELLE stays at the top and Cestino is one wheel away at
+  980×600.
 - The reading pane is 52% of the width after the sidebar, clamped 420..=62% and capped so the list
   keeps its 460 px floor from 1120 px up. The compact date column is kept down to 480 px of list
   panel (52 px wide: `HH:MM`, `dd/MM`, `dd/MM/yy`), the sender narrows to 100 px below 560 px and
@@ -498,8 +527,8 @@ composer until P8; an attachment without stored bytes is refused before queueing
 - **Accessible rows.** Every message row is a named button (sender, subject, unread, attachment,
   date, selection, "Premi Invio per aprire"); the star is its own 28×28 focusable control with a
   "Segna con stella"/"Togli la stella" name and never opens the row. The focus ring follows real
-  keyboard focus (Tab reaches the list), not the selection, and uses an ivory inner edge on a
-  selected forest row.
+  keyboard focus (Tab reaches the list) only while the row is not selected; a selected forest row
+  is its own focus cue, so no second gold rectangle is painted on top of it.
 - **Read state.** Any explicit flag action (read/unread/star) cancels the 600 ms auto-read, even
   when the flag is already in the requested state.
 - **Honest operational states.** `Aggiorna` is gone as an enabled no-op; a disabled `sync` item
@@ -781,7 +810,7 @@ Then M1 (IMAP/store) starts on a shell we do not have to rewrite.
   store and reopens from Bozze.
 - No ad-hoc literals in screens: spacing/type/radii/control sizes come from tokens.
 - `cargo xtask ci` stays green; headless tests cover the shell, gallery, palette, composer, sidebar
-  drawer, pane proportions and double-click.
+  editors, pane proportions and double-click.
 
 ## 12. What not to do
 
