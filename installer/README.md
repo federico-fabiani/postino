@@ -1,8 +1,10 @@
 # Postino Windows packaging (P12e)
 
-Per-user Windows packaging for the frozen `x86_64-pc-windows-gnu` binaries. No administrator,
-no Windows service, no autostart switch, no updater and no telemetry. The installer never
-enables the existing opt-in autostart setting.
+Per-user Windows packaging for the frozen x86_64 Windows binaries: the GNU host locally, the MSVC
+host with a static CRT for releases. No administrator, no Windows service, no autostart switch, no
+background updater and no telemetry. The installer never enables the existing opt-in autostart
+setting. The one update path is explicit: a check at start and a button the person presses, which
+verifies the published MSI and hands it to Windows Installer.
 
 ## Files
 
@@ -13,7 +15,7 @@ enables the existing opt-in autostart setting.
 | `Test-Package.ps1` | Static checks plus payload/manifest/provenance/DLL checks. Does not build an MSI or need a certificate. |
 | `tests/Test-Resolvers.ps1` | Fixture tests for the build-stamp provenance gate, the toolchain-only DLL allowlist and PE architecture. |
 | `wix/Postino.wxs` | Per-user MSI source: install folder, Start Menu shortcut, uninstall data choice. |
-| `wix/license.rtf` | Licence shown by `WixUI_Minimal`. |
+| `wix/installer-ui.wxs` | Four text-only native dialogs: welcome, maintenance, progress, outcome. No WiX UI extension, no licence page. |
 | `smoke-checklist.md` | Clean-VM acceptance checklist. |
 | `lib/common.ps1` | Shared helpers. |
 
@@ -27,9 +29,17 @@ $env:MAKEFLAGS = "-j$env:NUMBER_OF_PROCESSORS"
 powershell -NoProfile -ExecutionPolicy Bypass -File installer\Build-Package.ps1
 ```
 
+On the release runner the same script runs with the MSVC host and the static CRT
+(`.cargo/config.toml`), which stages no runtime DLL at all:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File installer\Build-Package.ps1 -Target x86_64-pc-windows-msvc
+```
+
 The script builds only `postino-app`, `postino-cli` and `postino-daemon` with the shared
 `target` directory. It cleans only its own `dist\Postino-<version>-windows-x64` folder. Use
 `-DryRun` to print the plan, and `-Sign` only when an external certificate is installed (see below).
+The target must match the rustc host: GNU here, MSVC on the release runner.
 
 ### Provenance and `-SkipBuild`
 
@@ -47,7 +57,7 @@ Output:
 
 ```text
 dist/
-  Postino-0.1.0-windows-x64/
+  Postino-0.1.1-windows-x64/
     postino-app.exe
     postino.exe
     postino-daemon.exe
@@ -56,7 +66,7 @@ dist/
     LICENSE-MIT, LICENSE-APACHE, ATTRIBUTION.toml, README.md, SECURITY.md
     BUILD-INFO.txt
     SHA256SUMS.txt
-  Postino-0.1.0-windows-x64.zip
+  Postino-0.1.1-windows-x64.zip
   SHA256SUMS.txt              # hashes of the ZIP and, if built, the MSI
 ```
 
@@ -65,7 +75,7 @@ file except itself. Verify with PowerShell:
 
 ```powershell
 Get-Content dist\SHA256SUMS.txt
-certutil -hashfile dist\Postino-0.1.0-windows-x64.zip SHA256
+certutil -hashfile dist\Postino-0.1.1-windows-x64.zip SHA256
 ```
 
 ## Install (MSI, per user, no admin)
@@ -74,9 +84,8 @@ Build the MSI only after staging:
 
 ```powershell
 dotnet tool install --global wix
-wix extension add -g WixToolset.UI.wixext
 powershell -NoProfile -ExecutionPolicy Bypass -File installer\Build-Msi.ps1 `
-  -StageDir dist\Postino-0.1.0-windows-x64
+  -StageDir dist\Postino-0.1.1-windows-x64
 ```
 
 The MSI installs to `%LOCALAPPDATA%\Programs\Postino`, creates one Start Menu shortcut to
@@ -90,6 +99,14 @@ installs no service. The CLI and daemon must stay next to the app because the CL
 ```
 
 The installer does not add the install folder to `PATH`.
+
+`wix/installer-ui.wxs` replaces the stock WiX wizard. Postino shows four native Windows Installer
+dialogs — a welcome page with Install, a maintenance page with Repair/Remove and the "remove my
+data" checkbox, a progress page with a working Cancel, and a single outcome page for success,
+failure or cancellation — plus the stock "files in use" prompt. There is no licence page, no
+`WixUI_Minimal`, no `WixToolset.UI.wixext` and no `license.rtf`: the licence is in `LICENSE-MIT`
+and `LICENSE-APACHE`, and `Test-Package.ps1` fails if the hand-written UI is missing or if a stock
+UI reference comes back.
 
 If WiX v4 is unavailable, `Build-Msi.ps1` exits with code 3, names the missing `wix.exe`, and
 does not create an MSI. `-DryRun` prints the command line, requires a staged payload, and writes
@@ -144,7 +161,7 @@ Windows SDK:
 $env:POSTINO_SIGN_CERT_SHA1 = "<40-hex thumbprint from the certificate store>"
 powershell -NoProfile -ExecutionPolicy Bypass -File installer\Build-Package.ps1 -Sign
 powershell -NoProfile -ExecutionPolicy Bypass -File installer\Build-Msi.ps1 `
-  -StageDir dist\Postino-0.1.0-windows-x64 -Sign
+  -StageDir dist\Postino-0.1.1-windows-x64 -Sign
 ```
 
 `signtool` uses `/fd sha256`, `/tr <timestamp-url>` and `/td sha256` (RFC 3161). The timestamp
@@ -161,15 +178,19 @@ Unsigned builds are expected during development. Windows SmartScreen or Defender
 Check the published `SHA256SUMS.txt` before running the file, or use a signed build. The
 manifest is the integrity check; it is not a substitute for a trusted publisher signature.
 
-## GNU runtime requirement
+## Runtime DLLs: GNU payload, MSVC release
 
-The binaries are `x86_64-pc-windows-gnu`, not MSVC. `Build-Package.ps1` reads each staged PE's
+Local builds are `x86_64-pc-windows-gnu`. For them `Build-Package.ps1` reads each staged PE's
 imports with `objdump` and copies every non-system DLL next to the executables (typically
 `libgcc_s_seh-1.dll`, `libstdc++-6.dll` and `libwinpthread-1.dll`). A clean VM therefore does not
 need MSYS2 or a separately installed MinGW runtime. The staging step fails loudly if an imported
 DLL cannot be found; do not ship a payload that skipped that check.
 
-DLL lookup is an explicit allowlist, never a search of `PATH`:
+The release build is `x86_64-pc-windows-msvc` with `+crt-static` (`.cargo/config.toml`). Its
+executables import only Windows system DLLs, so the staging step copies no DLL and needs no
+`objdump`, `dlltool` or MinGW toolchain. That is the payload CI ships; it is also smaller.
+
+DLL lookup, when the GNU target is built, is an explicit allowlist, never a search of `PATH`:
 
 - the toolchain directory is `$env:POSTINO_MINGW_BIN`, else the directory that owns `objdump.exe`,
   else a known MSYS2 prefix (`C:\msys64\mingw64\bin` and friends);
@@ -181,13 +202,24 @@ DLL lookup is an explicit allowlist, never a search of `PATH`:
 If `objdump.exe` is missing, `Test-Package.ps1` reports an **INFO** skip for the import check
 instead of a false failure; a release still needs that check to have run.
 
-MSVC is not a target: this host lacks `link.exe` and Visual Studio Build Tools.
+An MSVC payload legitimately imports no non-system DLL, so the import check passes with an empty
+set there.
 
-## No update service, telemetry or autostart
+## Update check, telemetry and autostart
 
-- No updater, update check, scheduled task or background download. Releases are manual,
-  signed downloads; the checksum manifest is published with the build.
-- No telemetry or analytics. The only network destinations are the user's own mail/calendar
+- **One update check, on demand.** The `update_check` operation asks
+  `https://api.github.com/repos/federico-fabiani/postino/releases/latest` for the newest published
+  release: one request, a 10 s timeout, a 1 MiB answer cap, no download and no install. The desktop
+  app asks once at start and the banner can be dismissed for the session; the CLI and MCP ask only
+  when called. The answer is a version tag and a release page, and only a page under the project is
+  accepted.
+- **One explicit install.** When the banner offers a newer release, the button runs `update_install`:
+  it downloads the `-windows-x64.msi` of that release, refuses it unless its SHA-256 matches the
+  `SHA256SUMS.txt` of the same release, writes it under `%LOCALAPPDATA%\Postino\updates` and starts
+  `msiexec /qb` detached. Nothing is downloaded or installed without that press.
+- No background download, no scheduled task and no silent install. An update is always an
+  installer the user chooses to run.
+- No telemetry or analytics. The only other network destinations are the user's own mail/calendar
   servers, configured by the user. MCP is a separate opt-in stdio process.
 - The installer does not write `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` and does
   not start the app or daemon after install. Autostart remains the existing opt-in setting in
@@ -198,7 +230,7 @@ MSVC is not a target: this host lacks `link.exe` and Visual Studio Build Tools.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File installer\Test-Package.ps1 `
-  -StageDir dist\Postino-0.1.0-windows-x64
+  -StageDir dist\Postino-0.1.1-windows-x64
 ```
 
 It checks PowerShell syntax, the WiX contract (per-user scope, no admin/service/autostart,
@@ -213,11 +245,11 @@ hash matches `dist\SHA256SUMS.txt`; it does not build the installer or sign anyt
 
 - This package ships the desktop app, CLI and daemon. Tray/autostart remain product features,
   not installer features.
-- ARM64 and MSVC packages are out of scope.
+- ARM64 packages are out of scope.
 
 ### Unverified on this host (do not claim otherwise)
 
-- **The MSI is unsigned.** WiX v4.0.6 built `dist\Postino-0.1.0-windows-x64.msi` from the staged
+- **The MSI is unsigned.** WiX v4.0.6 built `dist\Postino-0.1.1-windows-x64.msi` from the staged
   payload; no certificate is installed, so the binary carries no Authenticode signature.
 - **No clean-VM run.** The MSI was installed and uninstalled silently on the Windows 11 development
   host (both exit 0; the staged `postino.exe --version` ran; install folder and Start Menu shortcut
@@ -225,3 +257,6 @@ hash matches `dist\SHA256SUMS.txt`; it does not build the installer or sign anyt
   remain manual checks; `smoke-checklist.md` is the acceptance list.
 - The portable ZIP and its `SHA256SUMS.txt` were built from the release binaries in this round; the
   MSI hash is included in `dist\SHA256SUMS.txt`.
+- **Upgrade with a running daemon is untested.** `update_install` closes the app before `msiexec`
+  starts, but a running `postino-daemon.exe` still owns its own binary, so Windows Installer may ask
+  to close it ("files in use"). Stopping the daemon first is the next improvement.

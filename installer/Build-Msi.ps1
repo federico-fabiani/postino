@@ -37,15 +37,13 @@ if (-not $wix) {
     }
 }
 
-$license = Join-Path $PSScriptRoot 'wix\license.rtf'
+$uiWxs = Join-Path $PSScriptRoot 'wix\installer-ui.wxs'
 $wxs = Join-Path $PSScriptRoot 'wix\Postino.wxs'
 $arguments = @(
     'build', '-arch', 'x64',
-    '-ext', 'WixToolset.UI.wixext',
     '-d', "StageDir=$StageDir",
     '-d', "ProductVersion=$Version",
-    '-d', "LicenseRtf=$license",
-    $wxs, $fragmentPath,
+    $wxs, $uiWxs, $fragmentPath,
     '-o', $OutputPath
 )
 
@@ -69,7 +67,6 @@ if (-not $wix) {
     Write-Output "Generated file list: $fragmentPath ($payloadCount payload files)"
     Write-Output 'Install WiX v4, then run:'
     Write-Output '  dotnet tool install --global wix'
-    Write-Output '  wix extension add -g WixToolset.UI.wixext'
     Write-Output ("  wix " + ($arguments -join ' '))
     exit 3
 }
@@ -77,7 +74,7 @@ if (-not $wix) {
 Write-Output "Building per-user MSI with $wix ..."
 & $wix @arguments
 if ($LASTEXITCODE -ne 0) {
-    throw 'wix build failed. The MSI was not produced. Install the UI extension with: wix extension add -g WixToolset.UI.wixext'
+    throw 'wix build failed. The MSI was not produced.'
 }
 if (-not (Test-Path -LiteralPath $OutputPath)) { throw "wix build returned success but $OutputPath is missing." }
 

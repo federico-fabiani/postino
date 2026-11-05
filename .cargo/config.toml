@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --package xtask --"
+
+# The release payload is built on the MSVC host with a static CRT: no Visual C++ redistributable
+# and no MinGW runtime DLLs travel with the three executables. Local development stays on the GNU
+# host (AGENTS.md section 7), where this target is never selected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

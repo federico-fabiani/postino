@@ -15,6 +15,7 @@ $version = Get-PostinoVersion -RepoRoot $repo
 if (-not $DistRoot) { $DistRoot = Join-Path $repo 'dist' }
 if (-not $StageDir) { $StageDir = Join-Path $DistRoot "Postino-$version-windows-x64" }
 $wxs = Join-Path $PSScriptRoot 'wix\Postino.wxs'
+$uiWxs = Join-Path $PSScriptRoot 'wix\installer-ui.wxs'
 $script:passCount = 0
 $script:failCount = 0
 $script:infoCount = 0
@@ -70,6 +71,24 @@ if (-not (Test-Path -LiteralPath $wxs)) {
     Add-Fail 'installer/wix/Postino.wxs is missing'
 } else {
     $wxsText = Get-CodeText -Path $wxs
+    $uiXml = $null
+    $uiNs = $null
+    if (-not (Test-Path -LiteralPath $uiWxs)) {
+        Add-Fail 'installer/wix/installer-ui.wxs is missing'
+    } else {
+        $wxsText = $wxsText + "`n" + (Get-CodeText -Path $uiWxs)
+        try {
+            $uiXml = New-Object System.Xml.XmlDocument
+            $uiXml.PreserveWhitespace = $true
+            $uiXml.Load($uiWxs)
+            $uiNs = New-Object System.Xml.XmlNamespaceManager($uiXml.NameTable)
+            $uiNs.AddNamespace('w', 'http://wixtoolset.org/schemas/v4/wxs')
+            Add-Pass 'installer UI source is well-formed XML'
+        } catch {
+            Add-Fail "installer UI source is not well-formed XML: $($_.Exception.Message)"
+            $uiXml = $null
+        }
+    }
     try {
         $xml = New-Object System.Xml.XmlDocument
         $xml.PreserveWhitespace = $true
@@ -138,16 +157,28 @@ if (-not (Test-Path -LiteralPath $wxs)) {
         } else {
             Add-Fail 'REMOVEDATA does not default to 0'
         }
-        $checkbox = $xml.SelectSingleNode('//w:Control[@Id="RemoveDataCheckBox"]', $ns)
+        $checkbox = $null
+        if ($uiXml) {
+            $checkbox = $uiXml.SelectSingleNode('//w:Control[@Id="RemoveDataCheckBox"]', $uiNs)
+        }
         if ($checkbox -and $checkbox.GetAttribute('Property') -eq 'REMOVEDATA' -and $checkbox.GetAttribute('CheckBoxValue') -eq '1') {
-            Add-Pass 'uninstall dialog has an explicit data-removal checkbox'
+            Add-Pass 'maintenance dialog has an explicit data-removal checkbox'
         } else {
             Add-Fail 'uninstall data-removal checkbox is missing or misconfigured'
         }
-        if ($xml.SelectSingleNode('//w:Dialog[@Id="PostinoRemoveDataDlg"]', $ns)) {
-            Add-Pass 'uninstall data-choice dialog exists'
+        if ($uiXml -and $uiXml.SelectSingleNode('//w:UI[@Id="PostinoInstallerUI"]', $uiNs)) {
+            Add-Pass 'the hand-written installer UI set exists'
+            $requiredDialogs = @('InstallWelcome', 'InstallMaintenance', 'InstallProgress', 'InstallComplete', 'MsiRMFilesInUse')
+            $missingDialogs = @($requiredDialogs | Where-Object {
+                -not $uiXml.SelectSingleNode("//w:Dialog[@Id=""$_""]", $uiNs)
+            })
+            if ($missingDialogs.Count -eq 0) {
+                Add-Pass 'the installer UI has welcome, maintenance, progress, complete and files-in-use dialogs'
+            } else {
+                Add-Fail "installer UI dialogs are missing: $($missingDialogs -join ', ')"
+            }
         } else {
-            Add-Fail 'uninstall data-choice dialog is missing'
+            Add-Fail 'the hand-written installer UI set is missing'
         }
 
         $action = $xml.SelectSingleNode('//w:Package/w:CustomAction[@Id="RemovePostinoUserData"]', $ns)
@@ -189,10 +220,10 @@ if (-not (Test-Path -LiteralPath $wxs)) {
             Add-Fail 'data removal sequence entry is missing'
         }
 
-        if ($xml.SelectSingleNode('//w:Package/ui:WixUI[@Id="WixUI_Minimal"]', $ns)) {
-            Add-Pass 'WixUI_Minimal is referenced'
+        if ($xml.SelectSingleNode('//w:Package/w:UIRef[@Id="PostinoInstallerUI"]', $ns)) {
+            Add-Pass 'the package references the hand-written installer UI'
         } else {
-            Add-Fail 'WixUI_Minimal is not referenced'
+            Add-Fail 'the package does not reference the hand-written installer UI'
         }
 
         $forbidden = [regex]::Matches($wxsText, '(?i)\b(ALLUSERS|RequireAdministrator|ServiceInstall|ServiceControl|ServiceConfig|PerMachine)\b')

@@ -1,0 +1,168 @@
+# Release pipeline, modelled on the ArtCraft suite: a `release` branch (or a manual dispatch)
+# builds the Windows package, proves its provenance, and publishes a DRAFT GitHub Release.
+# Nothing here bumps the version: bump `[workspace.package] version` in Cargo.toml first, then
+# merge to `release`. The tag `v<version>` is created by the publish job.
+#
+# The build is the same `installer\Build-Package.ps1` a developer runs locally, so CI cannot
+# drift from the documented packaging path. MSI and ZIP are unsigned unless a certificate
+# thumbprint secret is provided; the manifest is integrity, not publisher trust.
+name: release
+
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release; must equal [workspace.package] version in Cargo.toml"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The same gate a pull request runs: rustfmt, clippy, tests, layers, assets, scorecard.
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      prerelease: ${{ steps.read.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: read
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = "' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')"
+          if [ -z "$version" ]; then
+            echo "::error::Cargo.toml has no workspace.package version"
+            exit 1
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::version '$version' is not MAJOR.MINOR.PATCH[-pre]"
+            exit 1
+          fi
+          requested="${{ inputs.version }}"
+          if [ -n "$requested" ] && [ "$requested" != "$version" ]; then
+            echo "::error::requested version $requested differs from Cargo.toml ($version). Bump Cargo.toml and commit first; this pipeline never writes the version."
+            exit 1
+          fi
+          tag="v$version"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::tag $tag already exists; bump the version before releasing again"
+            exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag"
+
+  windows:
+    name: windows-x64
+    needs: [check, version]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release is the MSVC host with a static CRT (`.cargo/config.toml`): one executable per
+      # binary, no Visual C++ redistributable and no MinGW DLLs. Local development stays on GNU.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install WiX v4
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.6
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build payload, ZIP and MSI
+        shell: pwsh
+        env:
+          # Optional: a 40-hex thumbprint of a certificate that is already in the store.
+          # No certificate is stored in this repository, and an unsigned release is allowed.
+          POSTINO_SIGN_CERT_SHA1: ${{ secrets.POSTINO_SIGN_CERT_SHA1 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ needs.version.outputs.version }}"
+          $stage = "dist\Postino-$version-windows-x64"
+          $sign = if ($env:POSTINO_SIGN_CERT_SHA1) { @('-Sign') } else { @() }
+          if (-not $sign) { Write-Output 'No signing certificate: the release will be unsigned.' }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File installer\Build-Package.ps1 -Target x86_64-pc-windows-msvc @sign
+          if ($LASTEXITCODE -ne 0) { throw "Build-Package.ps1 failed with $LASTEXITCODE" }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File installer\Build-Msi.ps1 -StageDir $stage @sign
+          if ($LASTEXITCODE -ne 0) { throw "Build-Msi.ps1 failed with $LASTEXITCODE" }
+
+      # Refuses a dirty provenance, a wrong architecture, a missing DLL, a WiX contract violation
+      # or a manifest that does not match the artefacts.
+      - name: Verify the package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ needs.version.outputs.version }}"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File installer\Test-Package.ps1 -StageDir "dist\Postino-$version-windows-x64"
+          if ($LASTEXITCODE -ne 0) { throw "Test-Package.ps1 failed with $LASTEXITCODE" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: postino-windows-x64
+          if-no-files-found: error
+          path: |
+            dist/Postino-*-windows-x64.msi
+            dist/Postino-*-windows-x64.zip
+            dist/SHA256SUMS.txt
+
+  publish:
+    name: draft release
+    needs: [version, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: postino-windows-x64
+          path: dist
+      - name: Verify the downloaded artefacts
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+          ls -l
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Postino $VERSION" \
+            --generate-notes \
+            "${flags[@]}" \
+            dist/Postino-"$VERSION"-windows-x64.msi \
+            dist/Postino-"$VERSION"-windows-x64.zip \
+            dist/SHA256SUMS.txt
+          echo "Draft release $TAG created. Publish it in the GitHub UI when the checksum is verified."
