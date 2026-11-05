@@ -120,10 +120,9 @@ foreach ($binary in $binaries) {
     Copy-Item -LiteralPath (Join-Path $sourceDir $binary) -Destination (Join-Path $StageDir $binary) -Force
 }
 
-$runtimeDlls = if ($copyRuntimeDlls) {
-    @(Copy-PostinoRuntimeDlls -Binaries @($binaries | ForEach-Object { Join-Path $StageDir $_ }) -StageDir $StageDir)
-} else {
-    @()
+$runtimeDlls = @()
+if ($copyRuntimeDlls) {
+    $runtimeDlls = @(Copy-PostinoRuntimeDlls -Binaries @($binaries | ForEach-Object { Join-Path $StageDir $_ }) -StageDir $StageDir)
 }
 
 $extraFiles = @(
