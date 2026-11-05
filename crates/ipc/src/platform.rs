@@ -70,11 +70,15 @@ fn platform_harden_owner_only(path: &Path) -> io::Result<()> {
 
 /// Whether a token file has exactly the owner-only shape this crate writes. Used by the client
 /// before it trusts the file and by the tests as evidence.
+///
+/// On Unix `TokenFile::read` checks the mode inline, so the Unix build only reaches this from
+/// tests; the Windows build is the one that trusts it.
+#[cfg(any(windows, test))]
 pub fn acl_is_owner_only(path: &Path) -> io::Result<bool> {
     platform_acl_is_owner_only(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn platform_acl_is_owner_only(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::PermissionsExt as _;
     let metadata = std::fs::metadata(path)?;
