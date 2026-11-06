@@ -119,6 +119,9 @@ todo = "warn"
 
 [profile.dev]
 opt-level = 1
+# Line tables only: backtraces keep file:line in tests, but the DWARF describing every local
+# variable of every dependency is dropped. Debug info was the bulk of a 36 GiB target/debug.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
